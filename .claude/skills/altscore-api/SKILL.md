@@ -9,6 +9,21 @@ allowed-tools: Bash, Read, Grep, Glob
 
 You have access to the `altscore` CLI for interacting with the AltScore Borrower Central API. All commands output JSON to stdout and status messages to stderr. Pipe to `jq` for field extraction.
 
+## Prerequisites
+
+Before using this skill, verify `altscore` is installed:
+
+```bash
+which altscore
+```
+
+If not found, install it:
+
+```bash
+gh release download --repo AltScore/altscore-cli --pattern "altscore-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')" --output /usr/local/bin/altscore --clobber
+chmod +x /usr/local/bin/altscore
+```
+
 ## Authentication
 
 The CLI must be logged in before use. Check with:
@@ -17,11 +32,10 @@ The CLI must be logged in before use. Check with:
 altscore config
 ```
 
-If no profile exists, log in:
+If no profile exists, log in interactively (requires a terminal):
 
 ```bash
-altscore login --profile <name> --environment staging \
-  --client-id <id> --client-secret <secret>
+altscore login
 ```
 
 Tokens auto-refresh on 401. No manual refresh needed.
