@@ -52,6 +52,9 @@ func ModuleURL(environment, module string) (string, error) {
 	case "cms":
 		return urls.CMS, nil
 	case "altdata":
+		if urls.AltData == "" {
+			return "", fmt.Errorf("altdata module is not available in the %q environment", environment)
+		}
 		return urls.AltData, nil
 	case "auth":
 		return urls.Auth, nil

@@ -113,6 +113,50 @@ altscore packages list --filter alias=credit-report --per-page 5
 altscore packages get <id>
 ```
 
+## AltData
+
+Discovery commands query Borrower Central (work in all environments). Execution commands hit the AltData module (production only).
+
+### Discovery
+
+```bash
+# List available data sources
+altscore altdata sources --per-page 10
+altscore altdata sources --filter country=USA --filter status=active
+
+# Field definitions for a source
+altscore altdata dictionary USA-PUB-0001 v1
+
+# Search field definitions across all sources
+altscore altdata search "credit score"
+altscore altdata search "address" --locale es
+
+# Sample output for a source
+altscore altdata sample USA-PUB-0001 v1
+```
+
+### Data Requests (production only)
+
+```bash
+# Synchronous request (blocks until complete)
+altscore altdata request-sync --body '{
+  "personId": "borrower-123",
+  "sourcesConfig": [{"sourceId": "USA-PUB-0001", "version": "v1"}]
+}'
+
+# Asynchronous request (returns requestId immediately)
+altscore altdata request-async --body '{
+  "personId": "borrower-123",
+  "sourcesConfig": [{"sourceId": "USA-PUB-0001", "version": "v1"}]
+}'
+
+# Check async request status
+altscore altdata request-status <request-id>
+
+# Collect completed request data
+altscore altdata request-collect <request-id>
+```
+
 ## Raw API Escape Hatch
 
 For endpoints not covered by resource commands:
