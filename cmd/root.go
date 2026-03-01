@@ -6,6 +6,7 @@ import (
 
 	"github.com/AltScore/altscore-cli/internal/client"
 	"github.com/AltScore/altscore-cli/internal/config"
+	"github.com/AltScore/altscore-cli/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -31,9 +32,10 @@ All commands output JSON to stdout. Status messages go to stderr.
 Use --help on any command to see available flags and examples.
 
 Quick start:
-  altscore login --profile staging --environment staging
+  altscore login
   altscore borrowers list --per-page 5
   altscore api GET /v1/borrowers?per-page=1`,
+	Version:      version.Version,
 	SilenceUsage: true,
 }
 
