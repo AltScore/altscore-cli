@@ -13,11 +13,12 @@ import (
 
 // Client handles authenticated HTTP requests to the AltScore API.
 type Client struct {
-	Profile     *config.Profile
-	Config      *config.Config
-	ProfileName string
-	HTTPClient  *http.Client
-	Verbose     bool
+	Profile          *config.Profile
+	Config           *config.Config
+	ProfileName      string
+	HTTPClient       *http.Client
+	Verbose          bool
+	BaseURLOverrides map[string]string // module -> URL overrides (e.g. from --base-url)
 }
 
 // New creates a Client from a resolved profile.
@@ -35,7 +36,12 @@ func New(cfg *config.Config, profileName string, profile *config.Profile, verbos
 // It sets auth and tenant headers, handles JSON encoding, and auto-refreshes
 // the token on 401.
 func (c *Client) Do(method, module, path string, body any) (json.RawMessage, int, error) {
-	raw, status, err := c.doOnce(method, module, path, body)
+	return c.DoWithHeaders(method, module, path, body, nil)
+}
+
+// DoWithHeaders is like Do but also sets additional HTTP headers on the request.
+func (c *Client) DoWithHeaders(method, module, path string, body any, headers map[string]string) (json.RawMessage, int, error) {
+	raw, status, err := c.doOnce(method, module, path, body, headers)
 	if err != nil {
 		return nil, status, err
 	}
@@ -48,14 +54,22 @@ func (c *Client) Do(method, module, path string, body any) (json.RawMessage, int
 		if err := c.refreshToken(); err != nil {
 			return nil, status, fmt.Errorf("token refresh failed: %w", err)
 		}
-		return c.doOnce(method, module, path, body)
+		return c.doOnce(method, module, path, body, headers)
 	}
 
 	return raw, status, nil
 }
 
-func (c *Client) doOnce(method, module, path string, body any) (json.RawMessage, int, error) {
-	baseURL, err := ModuleURL(c.Profile.Environment, module)
+// moduleURL returns the base URL for a module, checking overrides first.
+func (c *Client) moduleURL(module string) (string, error) {
+	if u, ok := c.BaseURLOverrides[module]; ok {
+		return u, nil
+	}
+	return ModuleURL(c.Profile.Environment, module)
+}
+
+func (c *Client) doOnce(method, module, path string, body any, headers map[string]string) (json.RawMessage, int, error) {
+	baseURL, err := c.moduleURL(module)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -91,6 +105,10 @@ func (c *Client) doOnce(method, module, path string, body any) (json.RawMessage,
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
+
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "%s %s\n", method, url)
@@ -175,7 +193,7 @@ func (c *Client) DoRaw(method, module, path string, bodyReader io.Reader, conten
 }
 
 func (c *Client) doRawOnce(method, module, path string, bodyReader io.Reader, contentType string) ([]byte, int, error) {
-	baseURL, err := ModuleURL(c.Profile.Environment, module)
+	baseURL, err := c.moduleURL(module)
 	if err != nil {
 		return nil, 0, err
 	}
