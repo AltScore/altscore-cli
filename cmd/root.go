@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/client"
 	"github.com/AltScore/altscore-cli/internal/config"
@@ -15,6 +16,7 @@ var (
 	flagEnvironment string
 	flagTenant      string
 	flagVerbose     bool
+	flagBaseURLs    []string
 )
 
 var rootCmd = &cobra.Command{
@@ -44,7 +46,10 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagEnvironment, "environment", "", "override profile's environment (production, staging, sandbox)")
 	rootCmd.PersistentFlags().StringVar(&flagTenant, "tenant", "", "override profile's tenant ID")
 	rootCmd.PersistentFlags().BoolVar(&flagVerbose, "verbose", false, "print request details to stderr")
+	rootCmd.PersistentFlags().StringArrayVar(&flagBaseURLs, "base-url", nil, `override module base URL (format: module=url, repeatable)
+  e.g. --base-url borrower_central=http://localhost:8000`)
 
+	rootCmd.AddCommand(makeSchemaCmd())
 	registerResources()
 }
 
@@ -208,6 +213,99 @@ available in the AltScore store.`,
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
 	})
+
+	// Workflow development resources
+
+	wtGroup := registerResource(ResourceDef{
+		Name:     "workflow-tasks",
+		Singular: "workflow-task",
+		BasePath: "/v1/workflow-tasks",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Description: `Manage workflow tasks (Python functions for remote-tasks workflows).
+
+A workflow task is a versioned Python function with typed Pydantic input/output
+models. Tasks are the atomic units of remote-tasks workflow DAGs.`,
+		CreateSchema: `  alias: string         [required] Unique task identifier
+  label: string         [required] Display name
+  code: string          Python code with InputData, OutputData, execute()`,
+		UpdateSchema: `  label: string         Display name
+  description: string   Description
+  code: string          Python code (creates new version)`,
+		ResponseSchema: `  id, alias, label, version, latestVersion, code,
+  inputSchema, outputSchema, isPublished, publishedVersion,
+  isLocked, lockedBy, lockedAt, createdAt, updatedAt`,
+		FilterHelp: `  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+	wtGroup.AddCommand(makeWtPublishCmd())
+	wtGroup.AddCommand(makeWtUnpublishCmd())
+	wtGroup.AddCommand(makeWtVersionsCmd())
+	wtGroup.AddCommand(makeWtValidateCmd())
+	wtGroup.AddCommand(makeWtExecuteCmd())
+	wtGroup.AddCommand(makeWtLambdaCmd())
+
+	ttGroup := registerResource(ResourceDef{
+		Name:     "task-tests",
+		Singular: "task-test",
+		BasePath: "/v1/task-tests",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Description: `Manage task test cases for workflow tasks.
+
+Each test case has input data, context, and expected output. The test runner
+executes the task code and compares actual vs expected using DeepDiff.`,
+		CreateSchema: `  taskId: string        [required] Parent task ID
+  name: string          [required] Test name
+  testType: string      "unit_test" or "integration_test"
+  inputData: object     Input data for the task
+  context: object       Context dict (token, tenant, etc.)
+  expectedOutputData: object  Expected output to compare against`,
+		UpdateSchema: `  name: string          Test name
+  testType: string      Test type
+  inputData: object     Input data
+  context: object       Context
+  expectedOutputData: object  Expected output`,
+		ResponseSchema: `  id, taskId, name, description, testType,
+  inputData, context, expectedOutputData, createdAt, updatedAt`,
+		FilterHelp: `  taskId                Filter by parent task ID
+  testType              "unit_test" or "integration_test"
+  search                Text search
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+	ttGroup.AddCommand(makeTtRunCmd())
+	ttGroup.AddCommand(makeTtRunAllCmd())
+	ttGroup.AddCommand(makeTtByTaskCmd())
+
+	wfGroup := registerResource(ResourceDef{
+		Name:     "workflows",
+		Singular: "workflow",
+		BasePath: "/v1/workflows",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Description: `Manage workflows (DAG definitions for task orchestration).
+
+Create remote-tasks workflows by passing remoteTasks: true. The flow definition
+describes the DAG: which tasks run, how data flows between them, and retry behavior.`,
+		CreateSchema: `  alias: string         [required] Unique workflow identifier
+  version: string       [required] Version string (e.g. "v1")
+  label: string         Display name
+  remoteTasks: bool     Set true for remote-tasks engine
+  inputSchema: string   JSON Schema string defining workflow inputs
+  flowDefinition: object  DAG definition with task_instances and connections`,
+		UpdateSchema: `  label: string         Display name
+  flowDefinition: object  Updated DAG definition
+  inputSchema: string   Updated input schema`,
+		ResponseSchema: `  id, alias, version, label, type, engine,
+  flowDefinition, inputSchema, nodes, edges, metadata,
+  createdAt, updatedAt`,
+		FilterHelp: `  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+	wfGroup.AddCommand(makeWfExecuteCmd())
+	wfGroup.AddCommand(makeWfExecuteByAliasCmd())
+	wfGroup.AddCommand(makeWfUpdateSchemaCmd())
 }
 
 // Execute runs the root command.
@@ -241,5 +339,19 @@ func loadClient() (*client.Client, error) {
 		fmt.Fprintf(os.Stderr, "warning: no access token for profile %q. Run: altscore login --profile %s\n", profileName, profileName)
 	}
 
-	return client.New(cfg, profileName, &profile, flagVerbose), nil
+	c := client.New(cfg, profileName, &profile, flagVerbose)
+
+	// Parse --base-url overrides
+	if len(flagBaseURLs) > 0 {
+		c.BaseURLOverrides = make(map[string]string)
+		for _, entry := range flagBaseURLs {
+			parts := strings.SplitN(entry, "=", 2)
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				return nil, fmt.Errorf("invalid --base-url format %q (expected module=url)", entry)
+			}
+			c.BaseURLOverrides[parts[0]] = parts[1]
+		}
+	}
+
+	return c, nil
 }
