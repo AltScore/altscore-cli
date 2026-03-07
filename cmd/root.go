@@ -50,6 +50,7 @@ func init() {
   e.g. --base-url borrower_central=http://localhost:8000`)
 
 	rootCmd.AddCommand(makeSchemaCmd())
+	rootCmd.AddCommand(makeToolsCmd())
 	registerResources()
 }
 
@@ -306,6 +307,34 @@ describes the DAG: which tasks run, how data flows between them, and retry behav
 	wfGroup.AddCommand(makeWfExecuteCmd())
 	wfGroup.AddCommand(makeWfExecuteByAliasCmd())
 	wfGroup.AddCommand(makeWfUpdateSchemaCmd())
+
+	evGroup := registerResource(ResourceDef{
+		Name:     "evaluators",
+		Singular: "evaluator",
+		BasePath: "/v1/evaluators",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Description: `Manage evaluators (code-based rule engines).
+
+An evaluator is a versioned Python-based evaluation engine that runs business
+rules, scorecards, and scoring models. Given an instance (subject + variables)
+and optional entities (co-debtors, guarantors), it returns a decision with
+score, scorecard breakdown, metrics, and rule hits.`,
+		CreateSchema: `  alias: string         [required] Unique evaluator identifier
+  version: string       [required] Version string (e.g. "v1")
+  label: string         Display name
+  description: string   Description
+  specs: object         Evaluator specification (rules, scorecard, metrics config)`,
+		UpdateSchema: `  label: string         Display name
+  description: string   Description
+  specs: object         Updated specification`,
+		ResponseSchema: `  id, alias, version, label, description, specs,
+  createdAt, updatedAt`,
+		FilterHelp: `  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+	evGroup.AddCommand(makeEvEvaluateCmd())
+	evGroup.AddCommand(makeEvEvaluateByAliasCmd())
 }
 
 // Execute runs the root command.
