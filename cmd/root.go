@@ -307,6 +307,62 @@ describes the DAG: which tasks run, how data flows between them, and retry behav
 	wfGroup.AddCommand(makeWfExecuteCmd())
 	wfGroup.AddCommand(makeWfExecuteByAliasCmd())
 	wfGroup.AddCommand(makeWfUpdateSchemaCmd())
+	wfGroup.AddCommand(makeWfInputSchemaGuideCmd())
+
+	dmGroup := registerResource(ResourceDef{
+		Name:     "data-models",
+		Singular: "data-model",
+		BasePath: "/v1/data-models",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Description: `Manage data-models (schema definitions for all AltScore entities).
+
+A data-model defines a key within an entity type: identity keys, borrower fields,
+steps, deal fields, asset groups, etc. Data-models control what fields exist on
+borrowers, deals, and assets, and what values those fields accept.
+
+There are 16 entity types grouped into 5 categories:
+  core:     identity, contact, document, borrower, point_of_contact,
+            authorization, metric, accounting_document
+  fields:   borrower_field
+  workflow:  step, decision
+  deals:    deal_field, deal_step, deal_role
+  assets:   asset_field, asset_group
+
+Use 'data-models guide' for detailed documentation on each entity type,
+required fields, validation rules, and create examples.`,
+		CreateSchema: `  key: string           [required] Unique key within entity type (per tenant)
+  label: string         [required] Display name
+  entityType: string    [required] One of the 16 entity types
+  priority: int         [required for identity] Sort order (>= -1, -1 = append)
+  order: int            [required for step, deal_step] Sequence position
+  allowedValues: [any]  Restrict values (only: borrower_field, asset_field, deal_field)
+  dataType: string      Type hint: "string", "number", "boolean", "date"
+  isSensitive: bool     Enable encryption (one-way, identity only)
+  isSegmentationField: bool  Enable audience segmentation
+  metadata: object      Free-form key-value metadata
+  path: string          Optional hierarchical path`,
+		UpdateSchema: `  key: string           Updated key
+  label: string         Updated display name
+  order: int            Updated order (step/deal_step)
+  priority: int         Updated priority (identity)
+  allowedValues: [any]  Updated allowed values
+  dataType: string      Updated type hint
+  isSegmentationField: bool  Updated segmentation flag
+  metadata: object      Updated metadata
+  path: string          Updated path
+  Note: isSensitive cannot be changed via update; use make-sensitive`,
+		ResponseSchema: `  id, path, key, label, entityType, priority, order,
+  allowedValues, dataType, metadata, isSegmentationField, isSensitive,
+  createdAt, updatedAt, deletedAt`,
+		FilterHelp: `  key                   Filter by key
+  entity-type           Filter by entity type
+  search                Text search
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+	dmGroup.AddCommand(makeDmMakeSensitiveCmd())
+	dmGroup.AddCommand(makeDmGuideCmd())
 
 	evGroup := registerResource(ResourceDef{
 		Name:     "evaluators",

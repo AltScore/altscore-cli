@@ -42,7 +42,7 @@ Tokens auto-refresh on 401. No manual refresh needed.
 
 ## Resource Commands
 
-Nine resources are available. Every resource supports `--help` which documents request body fields, response fields, and available filters.
+Ten resources are available. Every resource supports `--help` which documents request body fields, response fields, and available filters.
 
 ### Borrowers
 
@@ -231,6 +231,112 @@ altscore workflows execute-by-alias my-workflow v1 --body '{"income": 5000}'
 
 # Update input schema separately
 altscore workflows update-schema <id> --body '{"inputSchema": "{\"type\":\"object\",...}"}'
+
+# Input schema reference guide (live documentation)
+altscore workflows input-schema-guide
+altscore workflows input-schema-guide fieldTypes
+altscore workflows input-schema-guide customTypes
+altscore workflows input-schema-guide examples
+```
+
+#### Input Schema Reference
+
+The `inputSchema` field on a workflow defines execution input validation. It uses JSON-Schema-like syntax converted to a dynamic Pydantic model at runtime.
+
+**Field types:**
+
+| Type | Pydantic Type | Available Constraints |
+|------|--------------|----------------------|
+| `string` | `str` | minLength, maxLength, pattern, enum |
+| `integer` | `int` | minimum, maximum, enum |
+| `number` | `float` | minimum, maximum, enum |
+| `boolean` | `bool` | -- |
+| `object` | nested BaseModel | recursive properties |
+| `array` | `List[item_type]` | recursive items |
+
+**Format validators** (use with `"type": "string"`):
+
+| Format | Pydantic Type | Example |
+|--------|--------------|---------|
+| `email` | `EmailStr` | `{"type": "string", "format": "email"}` |
+| `date` | `date` | `{"type": "string", "format": "date"}` (YYYY-MM-DD) |
+| `date-time` | `datetime` | `{"type": "string", "format": "date-time"}` (ISO) |
+
+**Custom regional types** (use as `"type"` value instead of standard types):
+
+| Type | Description |
+|------|-------------|
+| `ecu_personal_id` | Ecuador cedula (10 digits, checksum) |
+| `bra_personal_id` | Brazil CPF (11 digits, double checksum) |
+
+Non-digit characters are stripped before validation.
+
+**Constraints mapping** (JSON Schema key -> Pydantic Field kwarg):
+
+| JSON Schema | Pydantic | Applies To |
+|-------------|----------|-----------|
+| `minLength` | `min_length` | string |
+| `maxLength` | `max_length` | string |
+| `pattern` | `regex` | string |
+| `minimum` | `ge` | number, integer |
+| `maximum` | `le` | number, integer |
+| `enum` | `Literal[values]` | string, number, integer |
+
+**UI hints:** `title` (label) and `description` (help text) control form rendering. Always provide in the end-users' language; JSON property keys stay in English.
+
+**`x-ui-widget` extension:** Set `"x-ui-widget": "deal-contact-borrower"` on a string field to render a dropdown of deal contact borrowers instead of a text input. Requires deal context.
+
+**`contact_flags` pattern:** When the schema has an array property named `contact_flags`, the Hub renders a special per-party toggle dialog instead of the standard form. Each deal party gets listed with boolean toggles. Only works for single execution (not batch/Excel).
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "deal_id": {"type": "string"},
+    "contact_flags": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "borrowerId": {"type": "string"},
+          "bureau_a": {"type": "boolean", "title": "Bureau A"},
+          "bureau_b": {"type": "boolean", "title": "Bureau B"}
+        },
+        "required": ["borrowerId"]
+      }
+    }
+  },
+  "required": ["deal_id"]
+}
+```
+
+**Validation endpoints:**
+- `POST /v1/input-validation/` -- single JSON validation
+- `POST /v1/input-validation/batch/columns` -- Excel column structure check
+- `POST /v1/input-validation/batch/rows` -- Excel row-by-row validation
+- `POST /v1/input-validation/replace-column-headers` -- remap Excel columns
+- `POST /v1/input-validation/generate-sample` -- generate sample Excel from schema
+
+**Batch note:** Arrays and nested objects only work for single execution. Batch Excel expects flat tabular data.
+
+**Example: minimal schema:**
+```json
+{"type": "object", "properties": {"borrower_id": {"title": "Borrower ID", "type": "string"}}, "required": ["borrower_id"]}
+```
+
+**Example: multi-field with constraints:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "company_id": {"title": "Company ID", "type": "string", "minLength": 5, "maxLength": 20},
+    "industry": {"title": "Industry", "type": "string", "enum": ["retail", "manufacturing", "services"]},
+    "revenue": {"title": "Revenue", "type": "number", "minimum": 0},
+    "start_date": {"title": "Start Date", "type": "string", "format": "date"},
+    "is_active": {"title": "Active", "type": "boolean"}
+  },
+  "required": ["company_id", "industry", "revenue"]
+}
 ```
 
 #### DAG data flow rules
@@ -836,6 +942,90 @@ Boolean that signals the execution should be scheduled for async callback (retry
 ```python
 {"w_schedule_callback": True}  # schedule callback to retry
 ```
+
+## Data-Models (Schema Definitions)
+
+Data-models define the fields and keys available on all AltScore entities. They control what identity keys, borrower fields, steps, deal fields, and asset groups exist on a tenant.
+
+### Entity type categories
+
+| Category | Entity Types |
+|----------|-------------|
+| core | identity, contact, document, borrower, point_of_contact, authorization, metric, accounting_document |
+| fields | borrower_field |
+| workflow | step, decision |
+| deals | deal_field, deal_step, deal_role |
+| assets | asset_field, asset_group |
+
+### CLI commands
+
+```bash
+# CRUD
+altscore data-models list --filter entity-type=identity
+altscore data-models get <id>
+altscore data-models create --body '{"key": "email", "label": "Email", "entityType": "identity", "priority": 2}'
+altscore data-models update <id> --body '{"label": "Email Address"}'
+altscore data-models delete <id>
+
+# Enable encryption (one-way, identity only)
+altscore data-models make-sensitive <id>
+
+# Best-practices guide (live documentation)
+altscore data-models guide
+altscore data-models guide identity
+altscore data-models guide borrower_field
+```
+
+### Key rules
+
+- **identity**: `priority` is required (>= -1). Use -1 to append to end. Priorities auto-shift on insert/delete.
+- **step / deal_step**: `order` is required. Orders auto-shift on insert/delete.
+- **borrower_field / asset_field / deal_field**: `allowedValues` can constrain input to a list. Other types cannot use `allowedValues`.
+- **isSensitive**: Can only be set at creation time or via `make-sensitive`. Cannot be undone or changed via update.
+- **isSegmentationField**: Makes the field available for audience segmentation in the UI.
+
+### Create examples
+
+```bash
+# Identity with priority
+altscore data-models create --body '{"key": "tax-id", "label": "Tax ID", "entityType": "identity", "priority": 0, "isSensitive": true}'
+
+# Step with order
+altscore data-models create --body '{"key": "application", "label": "Application", "entityType": "step", "order": 0}'
+
+# Borrower field with allowed values
+altscore data-models create --body '{"key": "industry", "label": "Industry", "entityType": "borrower_field", "allowedValues": ["retail", "manufacturing", "services"], "isSegmentationField": true}'
+```
+
+### SDK usage (inside workflow tasks)
+
+```python
+bc = alts_acli.borrower_central
+
+# List data-models by entity type
+models = await bc.data_models.query(entity_type="identity")
+
+# Create a data-model
+dm_id = await bc.data_models.create({
+    "key": "phone",
+    "label": "Phone Number",
+    "entityType": "identity",
+    "priority": 3,
+})
+
+# Retrieve
+dm = await bc.data_models.retrieve(dm_id)
+
+# Update
+await bc.data_models.patch(dm_id, {"label": "Mobile Phone"})
+
+# Delete
+await bc.data_models.delete(dm_id)
+```
+
+### Live guide
+
+Use `altscore data-models guide` to get the full best-practices reference including required fields per entity type, validation rules, special behaviors (priority shifting, order shifting), and annotated create examples. Filter by entity type with `altscore data-models guide <type>`.
 
 ## Report Generation (PDF)
 

@@ -104,6 +104,49 @@ workflow input as --body. Supports the same --async and --tags flags.`,
 	return cmd
 }
 
+func makeWfInputSchemaGuideCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "input-schema-guide [section]",
+		Short: "Show the input schema reference guide",
+		Long: `Query the workflow input schema guide for field type documentation,
+format validators, custom regional types, constraints, and examples.
+
+Without arguments, returns the full guide.
+
+With a section argument, returns just that section.
+
+Available sections:
+  overview, fieldTypes, formatValidators, customTypes, constraints,
+  uiHints, uiWidgets, specialPatterns, validationEndpoints,
+  batchNotes, examples`,
+		Example: `  # Full guide
+  altscore workflows input-schema-guide
+
+  # Specific section
+  altscore workflows input-schema-guide fieldTypes
+  altscore workflows input-schema-guide customTypes
+  altscore workflows input-schema-guide examples`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := loadClient()
+			if err != nil {
+				return err
+			}
+
+			path := "/v1/meta/input-schema"
+			if len(args) > 0 {
+				path = fmt.Sprintf("/v1/meta/input-schema?section=%s", args[0])
+			}
+
+			data, _, err := c.Do("GET", "borrower_central", path, nil)
+			if err != nil {
+				return err
+			}
+			return output.RawJSON(data)
+		},
+	}
+}
+
 func makeWfUpdateSchemaCmd() *cobra.Command {
 	var bodyFlag string
 
