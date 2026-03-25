@@ -55,12 +55,15 @@ func init() {
 }
 
 func registerResources() {
+	// --- Core business entities ---
+
 	registerResource(ResourceDef{
 		Name:     "borrowers",
 		Singular: "borrower",
 		BasePath: "/v1/borrowers",
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
 		Description: `Manage borrowers in the AltScore Borrower Central API.
 
 A borrower represents an individual or company that is a customer or
@@ -73,7 +76,7 @@ prospect. Borrowers have identities, documents, and can participate in deals.`,
   tags: [string]        Tags (default: [])`,
 		UpdateSchema: `  label: string         Display name
   tags: [string]        Tags`,
-		ResponseSchema: `  id, persona, label, externalId, avatarUrl, tags, flag,
+		ResponseSchema: `  id, persona, label, externalId, avatarUrl, tags, flag, isTest,
   riskRating, repaymentRiskRating, currentStep{stepId, order, key, createdAt},
   cmsClientIds, createdAt, updatedAt`,
 		FilterHelp: `  persona               "individual" or "company"
@@ -91,6 +94,7 @@ prospect. Borrowers have identities, documents, and can participate in deals.`,
 		BasePath: "/v1/identities",
 		Module:   "borrower_central",
 		Actions:  []string{"list", "create", "delete"},
+		HasTestMode: true,
 		Description: `Manage identities attached to borrowers.
 
 An identity is a key-value pair associated with a borrower, such as
@@ -100,7 +104,7 @@ uniquely identify and deduplicate borrowers.`,
   key: string           [required] Identity type (e.g. "email", "tax-id")
   value: string         Identity value
   tags: [string]        Tags (default: [])`,
-		ResponseSchema: `  id, borrowerId, key, label, value (masked), priority, tags,
+		ResponseSchema: `  id, borrowerId, key, label, value (masked), priority, tags, isTest,
   hasAttachments, createdAt, updatedAt`,
 		FilterHelp: `  borrower-id           Parent borrower ID
   key                   Identity type
@@ -116,6 +120,7 @@ uniquely identify and deduplicate borrowers.`,
 		BasePath: "/v1/documents",
 		Module:   "borrower_central",
 		Actions:  []string{"list", "create", "delete"},
+		HasTestMode: true,
 		Description: `Manage documents attached to borrowers.
 
 Documents store structured data and can have file attachments. Use
@@ -129,7 +134,7 @@ to attach a file.`,
 		UpdateSchema: `  key: string           Document type/key
   value: any            Document data
   tags: [string]        Tags`,
-		ResponseSchema: `  id, borrowerId, dealId, key, label, value, tags,
+		ResponseSchema: `  id, borrowerId, dealId, key, label, value, tags, isTest,
   hasAttachments, createdAt, updatedAt`,
 		FilterHelp: `  borrower-id           Parent borrower ID
   deal-id               Parent deal ID
@@ -145,6 +150,7 @@ to attach a file.`,
 		BasePath: "/v1/deals",
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "update"},
+		HasTestMode: true,
 		Description: `Manage deals (loan applications, credit lines, etc.).
 
 A deal represents a financial product application or agreement
@@ -160,7 +166,7 @@ associated with a borrower.`,
   status: string        Status
   riskRating: string    Risk rating
   tags: [string]        Tags`,
-		ResponseSchema: `  id, label, description, status, externalId,
+		ResponseSchema: `  id, label, description, status, externalId, isTest,
   currentStep{stepId, order, key, label, createdAt},
   riskRating, tags, createdAt, updatedAt`,
 		FilterHelp: `  borrower-id           Parent borrower ID
@@ -171,17 +177,224 @@ associated with a borrower.`,
 	})
 
 	registerResource(ResourceDef{
+		Name:     "assets",
+		Singular: "asset",
+		BasePath: "/v1/assets",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage assets attached to deals.
+
+An asset represents a physical or financial asset associated with a deal,
+such as a vehicle, property, or piece of equipment.`,
+		CreateSchema: `  dealId: string        [required] Parent deal ID
+  key: string           [required] Asset type/key
+  label: string         Display name
+  tags: [string]        Tags (default: [])`,
+		UpdateSchema: `  label: string         Display name
+  tags: [string]        Tags`,
+		ResponseSchema: `  id, dealId, key, label, tags, isTest, createdAt, updatedAt`,
+		FilterHelp: `  deal-id               Parent deal ID
+  key                   Asset type/key
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	registerResource(ResourceDef{
+		Name:     "borrower-fields",
+		Singular: "borrower-field",
+		BasePath: "/v1/borrower-fields",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage borrower fields (key-value data attached to borrowers).
+
+A borrower field stores a typed value under a data-model key for a borrower.`,
+		CreateSchema: `  borrowerId: string    [required] Parent borrower ID
+  key: string           [required] Field key (must match a data-model)
+  value: any            Field value`,
+		UpdateSchema: `  value: any            Updated field value`,
+		ResponseSchema: `  id, borrowerId, key, label, value, isTest, createdAt, updatedAt`,
+		FilterHelp: `  borrower-id           Parent borrower ID
+  key                   Field key
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	registerResource(ResourceDef{
+		Name:     "deal-fields",
+		Singular: "deal-field",
+		BasePath: "/v1/deal-fields",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage deal fields (key-value data attached to deals).
+
+A deal field stores a typed value under a data-model key for a deal.`,
+		CreateSchema: `  dealId: string        [required] Parent deal ID
+  key: string           [required] Field key (must match a data-model)
+  value: any            Field value`,
+		UpdateSchema: `  value: any            Updated field value`,
+		ResponseSchema: `  id, dealId, key, label, value, isTest, createdAt, updatedAt`,
+		FilterHelp: `  deal-id               Parent deal ID
+  key                   Field key
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	registerResource(ResourceDef{
+		Name:     "asset-fields",
+		Singular: "asset-field",
+		BasePath: "/v1/asset-fields",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage asset fields (key-value data attached to assets).
+
+An asset field stores a typed value under a data-model key for an asset.`,
+		CreateSchema: `  assetId: string       [required] Parent asset ID
+  key: string           [required] Field key (must match a data-model)
+  value: any            Field value`,
+		UpdateSchema: `  value: any            Updated field value`,
+		ResponseSchema: `  id, assetId, key, label, value, isTest, createdAt, updatedAt`,
+		FilterHelp: `  asset-id              Parent asset ID
+  key                   Field key
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	registerResource(ResourceDef{
+		Name:     "points-of-contact",
+		Singular: "point-of-contact",
+		BasePath: "/v1/points-of-contact",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage points of contact for borrowers.
+
+A point of contact is a communication channel (email, phone, etc.)
+associated with a borrower.`,
+		CreateSchema: `  borrowerId: string    [required] Parent borrower ID
+  key: string           [required] Contact type key
+  value: string         Contact value (email, phone number, etc.)
+  tags: [string]        Tags (default: [])`,
+		UpdateSchema: `  value: string         Updated contact value
+  tags: [string]        Tags`,
+		ResponseSchema: `  id, borrowerId, key, label, value, tags, isTest,
+  isVerified, createdAt, updatedAt`,
+		FilterHelp: `  borrower-id           Parent borrower ID
+  key                   Contact type key
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	registerResource(ResourceDef{
+		Name:     "deal-contacts",
+		Singular: "deal-contact",
+		BasePath: "/v1/deal-contacts",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage deal contacts (borrowers linked to deals with a role).
+
+A deal contact associates a borrower with a deal in a specific role
+(e.g. co-debtor, guarantor).`,
+		CreateSchema: `  dealId: string        [required] Parent deal ID
+  borrowerId: string    [required] Linked borrower ID
+  role: string          Contact role`,
+		UpdateSchema: `  role: string          Updated role`,
+		ResponseSchema: `  id, dealId, borrowerId, role, isTest, createdAt, updatedAt`,
+		FilterHelp: `  deal-id               Parent deal ID
+  borrower-id           Linked borrower ID
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	registerResource(ResourceDef{
+		Name:     "authorizations",
+		Singular: "authorization",
+		BasePath: "/v1/authorizations",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "delete"},
+		HasTestMode: true,
+		Description: `Manage authorizations (consent records for borrowers).
+
+An authorization tracks borrower consent for data access, terms acceptance,
+or other legal agreements. Supports digital signatures and OTP verification.`,
+		CreateSchema: `  borrowerId: string    [required] Parent borrower ID
+  key: string           [required] Authorization type key
+  tags: [string]        Tags (default: [])`,
+		ResponseSchema: `  id, borrowerId, key, label, tags, isTest,
+  isSigned, createdAt, updatedAt`,
+		FilterHelp: `  borrower-id           Parent borrower ID
+  key                   Authorization type key
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	registerResource(ResourceDef{
+		Name:     "metrics",
+		Singular: "metric",
+		BasePath: "/v1/metrics",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage metrics (computed values attached to borrowers).
+
+A metric is a key-value record that stores computed or derived data
+for a borrower, such as scores, ratios, or aggregated values.`,
+		CreateSchema: `  borrowerId: string    [required] Parent borrower ID
+  key: string           [required] Metric key
+  value: any            Metric value`,
+		UpdateSchema: `  value: any            Updated metric value`,
+		ResponseSchema: `  id, borrowerId, key, label, value, isTest, createdAt, updatedAt`,
+		FilterHelp: `  borrower-id           Parent borrower ID
+  key                   Metric key
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	registerResource(ResourceDef{
+		Name:     "artifacts",
+		Singular: "artifact",
+		BasePath: "/v1/artifacts",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage artifacts (versioned document templates and generated content).
+
+An artifact is a versioned template or generated document that can be
+associated with borrowers or deals. Supports drafts, publishing, and
+version history.`,
+		CreateSchema: `  key: string           [required] Artifact key
+  borrowerId: string    Parent borrower ID
+  dealId: string        Parent deal ID
+  tags: [string]        Tags (default: [])`,
+		UpdateSchema: `  tags: [string]        Tags`,
+		ResponseSchema: `  id, key, label, borrowerId, dealId, tags, isTest,
+  createdAt, updatedAt`,
+		FilterHelp: `  borrower-id           Parent borrower ID
+  deal-id               Parent deal ID
+  key                   Artifact key
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	// --- Workflow execution resources (filter-only, no set-test) ---
+
+	registerResource(ResourceDef{
 		Name:     "executions",
 		Singular: "execution",
 		BasePath: "/v1/executions",
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get"},
+		HasTestFilter: true,
 		Description: `View workflow executions.
 
 An execution represents a running or completed workflow step,
 such as a scoring model run or data retrieval.`,
 		ResponseSchema: `  id, workflowId, workflowAlias, workflowVersion, workflowType,
-  borrowerId, dealId, batchId, billableId, status, tags,
+  borrowerId, dealId, batchId, billableId, status, tags, isTest,
   isSuccess, isBillable, currentDecision, createdAt, executionTime`,
 		FilterHelp: `  borrower-id           Parent borrower ID
   deal-id               Parent deal ID
@@ -189,6 +402,29 @@ such as a scoring model run or data retrieval.`,
   workflow-alias        Workflow alias
   billable-id           Billable ID
   status                Execution status
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	registerResource(ResourceDef{
+		Name:     "execution-batches",
+		Singular: "execution-batch",
+		BasePath: "/v1/execution-batches",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update"},
+		HasTestFilter: true,
+		Description: `Manage execution batches (bulk workflow runs).
+
+An execution batch runs a workflow across multiple borrowers or deals.
+Supports pause, resume, cancel, and retry operations.`,
+		CreateSchema: `  workflowId: string    [required] Workflow to execute
+  borrowerIds: [string] Borrower IDs to process
+  tags: [string]        Tags (default: [])`,
+		UpdateSchema: `  tags: [string]        Tags`,
+		ResponseSchema: `  id, workflowId, status, totalItems, processedItems, tags, isTest,
+  createdAt, updatedAt`,
+		FilterHelp: `  workflow-id           Workflow ID
+  status                Batch status
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
 	})
@@ -215,7 +451,163 @@ available in the AltScore store.`,
   sort-direction        "asc" or "desc"`,
 	})
 
-	// Workflow development resources
+	// --- Config/rules entities ---
+
+	dmGroup := registerResource(ResourceDef{
+		Name:     "data-models",
+		Singular: "data-model",
+		BasePath: "/v1/data-models",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage data-models (schema definitions for all AltScore entities).
+
+A data-model defines a key within an entity type: identity keys, borrower fields,
+steps, deal fields, asset groups, etc. Data-models control what fields exist on
+borrowers, deals, and assets, and what values those fields accept.
+
+There are 16 entity types grouped into 5 categories:
+  core:     identity, contact, document, borrower, point_of_contact,
+            authorization, metric, accounting_document
+  fields:   borrower_field
+  workflow:  step, decision
+  deals:    deal_field, deal_step, deal_role
+  assets:   asset_field, asset_group
+
+Use 'data-models guide' for detailed documentation on each entity type,
+required fields, validation rules, and create examples.`,
+		CreateSchema: `  key: string           [required] Unique key within entity type (per tenant)
+  label: string         [required] Display name
+  entityType: string    [required] One of the 16 entity types
+  priority: int         [required for identity] Sort order (>= -1, -1 = append)
+  order: int            [required for step, deal_step] Sequence position
+  allowedValues: [any]  Restrict values (only: borrower_field, asset_field, deal_field)
+  dataType: string      Type hint: "string", "number", "boolean", "date"
+  isSensitive: bool     Enable encryption (one-way, identity only)
+  isSegmentationField: bool  Enable audience segmentation
+  metadata: object      Free-form key-value metadata
+  path: string          Optional hierarchical path`,
+		UpdateSchema: `  key: string           Updated key
+  label: string         Updated display name
+  order: int            Updated order (step/deal_step)
+  priority: int         Updated priority (identity)
+  allowedValues: [any]  Updated allowed values
+  dataType: string      Updated type hint
+  isSegmentationField: bool  Updated segmentation flag
+  metadata: object      Updated metadata
+  path: string          Updated path
+  Note: isSensitive cannot be changed via update; use make-sensitive`,
+		ResponseSchema: `  id, path, key, label, entityType, priority, order, isTest,
+  allowedValues, dataType, metadata, isSegmentationField, isSensitive,
+  createdAt, updatedAt, deletedAt`,
+		FilterHelp: `  key                   Filter by key
+  entity-type           Filter by entity type
+  search                Text search
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+	dmGroup.AddCommand(makeDmMakeSensitiveCmd())
+	dmGroup.AddCommand(makeDmGuideCmd())
+
+	evGroup := registerResource(ResourceDef{
+		Name:     "evaluators",
+		Singular: "evaluator",
+		BasePath: "/v1/evaluators",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage evaluators (code-based rule engines).
+
+An evaluator is a versioned Python-based evaluation engine that runs business
+rules, scorecards, and scoring models. Given an instance (subject + variables)
+and optional entities (co-debtors, guarantors), it returns a decision with
+score, scorecard breakdown, metrics, and rule hits.`,
+		CreateSchema: `  alias: string         [required] Unique evaluator identifier
+  version: string       [required] Version string (e.g. "v1")
+  label: string         Display name
+  description: string   Description
+  specs: object         Evaluator specification (rules, scorecard, metrics config)`,
+		UpdateSchema: `  label: string         Display name
+  description: string   Description
+  specs: object         Updated specification`,
+		ResponseSchema: `  id, alias, version, label, description, specs, isTest,
+  createdAt, updatedAt`,
+		FilterHelp: `  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+	evGroup.AddCommand(makeEvEvaluateCmd())
+	evGroup.AddCommand(makeEvEvaluateByAliasCmd())
+
+	registerResource(ResourceDef{
+		Name:     "evaluation-rules",
+		Singular: "evaluation-rule",
+		BasePath: "/v1/evaluation-rules",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage evaluation rules (individual business rules).
+
+An evaluation rule defines a single business rule with conditions and actions
+that can be composed into evaluators or used standalone.`,
+		CreateSchema: `  alias: string         [required] Unique rule identifier
+  label: string         Display name
+  description: string   Description
+  specs: object         Rule specification`,
+		UpdateSchema: `  label: string         Display name
+  description: string   Description
+  specs: object         Updated specification`,
+		ResponseSchema: `  id, alias, label, description, specs, isTest, createdAt, updatedAt`,
+		FilterHelp: `  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	registerResource(ResourceDef{
+		Name:     "policy-rules",
+		Singular: "policy-rule",
+		BasePath: "/v1/rules",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage policy rules (automated policy enforcement rules).
+
+A policy rule defines conditions that trigger alerts or actions on borrowers,
+deals, or other entities when certain criteria are met.`,
+		CreateSchema: `  alias: string         [required] Unique rule identifier
+  label: string         Display name
+  description: string   Description
+  specs: object         Rule specification`,
+		UpdateSchema: `  label: string         Display name
+  description: string   Description
+  specs: object         Updated specification`,
+		ResponseSchema: `  id, alias, label, description, specs, isTest, createdAt, updatedAt`,
+		FilterHelp: `  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	registerResource(ResourceDef{
+		Name:     "rule-trees",
+		Singular: "rule-tree",
+		BasePath: "/v1/rule-trees",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		HasTestMode: true,
+		Description: `Manage rule trees (hierarchical decision trees).
+
+A rule tree is a tree-structured set of conditions and outcomes used
+for complex decision logic with branching paths.`,
+		CreateSchema: `  alias: string         [required] Unique tree identifier
+  label: string         Display name
+  description: string   Description
+  specs: object         Tree specification`,
+		UpdateSchema: `  label: string         Display name
+  description: string   Description
+  specs: object         Updated specification`,
+		ResponseSchema: `  id, alias, label, description, specs, isTest, createdAt, updatedAt`,
+		FilterHelp: `  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+
+	// --- Workflow development resources ---
 
 	wtGroup := registerResource(ResourceDef{
 		Name:     "workflow-tasks",
@@ -308,89 +700,6 @@ describes the DAG: which tasks run, how data flows between them, and retry behav
 	wfGroup.AddCommand(makeWfExecuteByAliasCmd())
 	wfGroup.AddCommand(makeWfUpdateSchemaCmd())
 	wfGroup.AddCommand(makeWfInputSchemaGuideCmd())
-
-	dmGroup := registerResource(ResourceDef{
-		Name:     "data-models",
-		Singular: "data-model",
-		BasePath: "/v1/data-models",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
-		Description: `Manage data-models (schema definitions for all AltScore entities).
-
-A data-model defines a key within an entity type: identity keys, borrower fields,
-steps, deal fields, asset groups, etc. Data-models control what fields exist on
-borrowers, deals, and assets, and what values those fields accept.
-
-There are 16 entity types grouped into 5 categories:
-  core:     identity, contact, document, borrower, point_of_contact,
-            authorization, metric, accounting_document
-  fields:   borrower_field
-  workflow:  step, decision
-  deals:    deal_field, deal_step, deal_role
-  assets:   asset_field, asset_group
-
-Use 'data-models guide' for detailed documentation on each entity type,
-required fields, validation rules, and create examples.`,
-		CreateSchema: `  key: string           [required] Unique key within entity type (per tenant)
-  label: string         [required] Display name
-  entityType: string    [required] One of the 16 entity types
-  priority: int         [required for identity] Sort order (>= -1, -1 = append)
-  order: int            [required for step, deal_step] Sequence position
-  allowedValues: [any]  Restrict values (only: borrower_field, asset_field, deal_field)
-  dataType: string      Type hint: "string", "number", "boolean", "date"
-  isSensitive: bool     Enable encryption (one-way, identity only)
-  isSegmentationField: bool  Enable audience segmentation
-  metadata: object      Free-form key-value metadata
-  path: string          Optional hierarchical path`,
-		UpdateSchema: `  key: string           Updated key
-  label: string         Updated display name
-  order: int            Updated order (step/deal_step)
-  priority: int         Updated priority (identity)
-  allowedValues: [any]  Updated allowed values
-  dataType: string      Updated type hint
-  isSegmentationField: bool  Updated segmentation flag
-  metadata: object      Updated metadata
-  path: string          Updated path
-  Note: isSensitive cannot be changed via update; use make-sensitive`,
-		ResponseSchema: `  id, path, key, label, entityType, priority, order,
-  allowedValues, dataType, metadata, isSegmentationField, isSensitive,
-  createdAt, updatedAt, deletedAt`,
-		FilterHelp: `  key                   Filter by key
-  entity-type           Filter by entity type
-  search                Text search
-  sort-by               Field to sort by
-  sort-direction        "asc" or "desc"`,
-	})
-	dmGroup.AddCommand(makeDmMakeSensitiveCmd())
-	dmGroup.AddCommand(makeDmGuideCmd())
-
-	evGroup := registerResource(ResourceDef{
-		Name:     "evaluators",
-		Singular: "evaluator",
-		BasePath: "/v1/evaluators",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
-		Description: `Manage evaluators (code-based rule engines).
-
-An evaluator is a versioned Python-based evaluation engine that runs business
-rules, scorecards, and scoring models. Given an instance (subject + variables)
-and optional entities (co-debtors, guarantors), it returns a decision with
-score, scorecard breakdown, metrics, and rule hits.`,
-		CreateSchema: `  alias: string         [required] Unique evaluator identifier
-  version: string       [required] Version string (e.g. "v1")
-  label: string         Display name
-  description: string   Description
-  specs: object         Evaluator specification (rules, scorecard, metrics config)`,
-		UpdateSchema: `  label: string         Display name
-  description: string   Description
-  specs: object         Updated specification`,
-		ResponseSchema: `  id, alias, version, label, description, specs,
-  createdAt, updatedAt`,
-		FilterHelp: `  sort-by               Field to sort by
-  sort-direction        "asc" or "desc"`,
-	})
-	evGroup.AddCommand(makeEvEvaluateCmd())
-	evGroup.AddCommand(makeEvEvaluateByAliasCmd())
 }
 
 // Execute runs the root command.

@@ -62,9 +62,47 @@ altscore update
 
 Downloads the latest release from GitHub, verifies the SHA-256 checksum, and replaces the binary in-place. If the repo is private, set `GITHUB_TOKEN` first.
 
+## Test Mode (UAT)
+
+Most entities support a test mode (`isTest`) for UAT data in production. Test records are **excluded from list results by default**.
+
+### Listing test records
+
+```bash
+# Include test records alongside real ones
+altscore borrowers list --include-tests
+
+# Show only test records
+altscore borrowers list --test-only
+```
+
+### Creating test records
+
+```bash
+# Create a borrower as test
+altscore borrowers create --is-test --body '{"persona": "individual", "label": "Test User"}'
+```
+
+### Toggling test mode on existing records
+
+```bash
+# Mark as test (cascades to children: identities, documents, fields, etc.)
+altscore borrowers set-test <id> --enable
+
+# Clear test flag (safe: won't un-toggle children with independent test sources)
+altscore borrowers set-test <id> --disable
+```
+
+Entities with full test mode (`set-test` + list filters + `--is-test` on create):
+  borrowers, identities, documents, deals, assets, borrower-fields, deal-fields,
+  asset-fields, points-of-contact, deal-contacts, authorizations, metrics,
+  artifacts, data-models, evaluators, evaluation-rules, policy-rules, rule-trees
+
+Entities with filter-only (no `set-test`): executions, execution-batches
+
 ## Resource Commands
 
-Ten resources are available. Every resource supports `--help` which documents request body fields, response fields, and available filters.
+Every resource supports `--help` which documents request body fields, response fields, and available filters.
 
 ### Borrowers
 
