@@ -176,8 +176,22 @@ altscore deals update <id> --body '{"status": "approved", "riskRating": "B+"}'
 ### Executions (read-only)
 
 ```bash
+# List executions
 altscore executions list --filter borrower-id=<id> --filter status=complete
 altscore executions get <id>
+
+# Query execution outputs (result data across executions)
+altscore executions query-outputs --filter borrower-id=<id>
+altscore executions query-outputs --filter workflow-alias=my-workflow --per-page 10
+
+# Get a single execution's output
+altscore executions get-output <execution-id>
+altscore executions get-output <execution-id> | jq '.output'
+altscore executions get-output <execution-id> | jq '.customOutput'
+
+# Get attachments from an execution output (returns download URLs)
+altscore executions get-output-attachments <execution-id>
+altscore executions get-output-attachments <execution-id> | jq '.[].url'
 ```
 
 ### Packages (read-only)

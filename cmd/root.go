@@ -382,7 +382,7 @@ version history.`,
 
 	// --- Workflow execution resources (filter-only, no set-test) ---
 
-	registerResource(ResourceDef{
+	exGroup := registerResource(ResourceDef{
 		Name:     "executions",
 		Singular: "execution",
 		BasePath: "/v1/executions",
@@ -405,6 +405,9 @@ such as a scoring model run or data retrieval.`,
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
 	})
+	exGroup.AddCommand(makeExQueryOutputsCmd())
+	exGroup.AddCommand(makeExGetOutputCmd())
+	exGroup.AddCommand(makeExGetOutputAttachmentsCmd())
 
 	registerResource(ResourceDef{
 		Name:     "execution-batches",
