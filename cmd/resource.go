@@ -29,19 +29,20 @@ func article(word string) string {
 
 // ResourceDef defines a REST resource that can be registered as a set of Cobra subcommands.
 type ResourceDef struct {
-	Name           string   // plural: "borrowers"
-	Singular       string   // "borrower"
-	BasePath       string   // "/v1/borrowers"
-	Module         string   // "borrower_central"
-	ParentFlag     string   // "" or "borrower" (adds --borrower required flag)
-	Actions        []string // subset of: "list", "get", "create", "update", "delete"
-	Description    string   // long description of the resource
-	CreateSchema   string   // documents the JSON body for create
-	UpdateSchema   string   // documents the JSON body for update
-	ResponseSchema string   // documents the fields in GET responses
-	FilterHelp     string   // documents query parameters for list
-	HasTestMode    bool     // adds set-test command + --include-tests/--test-only on list + --is-test on create
-	HasTestFilter  bool     // adds only --include-tests/--test-only on list (no set-test, no create flag)
+	Name           string                                // plural: "borrowers"
+	Singular       string                                // "borrower"
+	BasePath       string                                // "/v1/borrowers"
+	Module         string                                // "borrower_central"
+	ParentFlag     string                                // "" or "borrower" (adds --borrower required flag)
+	Actions        []string                              // subset of: "list", "get", "create", "update", "delete"
+	Description    string                                // long description of the resource
+	CreateSchema   string                                // documents the JSON body for create
+	UpdateSchema   string                                // documents the JSON body for update
+	ResponseSchema string                                // documents the fields in GET responses
+	FilterHelp     string                                // documents query parameters for list
+	HasTestMode    bool                                  // adds set-test command + --include-tests/--test-only on list + --is-test on create
+	HasTestFilter  bool                                  // adds only --include-tests/--test-only on list (no set-test, no create flag)
+	BodyValidator  func(body json.RawMessage) error      // optional hook called before POST/PATCH; aborts the request if it returns an error
 }
 
 // registerResource creates a Cobra command group for the resource and adds
@@ -150,6 +151,29 @@ Use --filter for field-based filters, --per-page and --page for pagination.`, de
 			}
 
 			for _, f := range filters {
+				// Auto-translate the most common test-mode filter mistake. Agents
+				// reach for --filter is-test=true before discovering --test-only,
+				// and the backend silently drops unknown filter keys -- so this
+				// would return non-test records without complaint. On resources
+				// that support test mode we translate to the canonical query
+				// params; on resources that don't, we let the filter fall through
+				// (it might be a legitimate backend filter we don't know about).
+				if hasTestFlags {
+					norm := strings.ToLower(strings.TrimSpace(f))
+					switch norm {
+					case "is-test=true", "istest=true", "is_test=true":
+						if includeTests || testOnly {
+							return fmt.Errorf("--filter %s conflicts with --include-tests/--test-only; use only one", f)
+						}
+						params = append(params, "test-only=true")
+						fmt.Fprintf(cmd.OutOrStderr(), "# auto-translating --filter %s to --test-only (the canonical form for this resource)\n", f)
+						continue
+					case "is-test=false", "istest=false", "is_test=false":
+						// Default behavior already excludes test records; nothing to add.
+						fmt.Fprintf(cmd.OutOrStderr(), "# --filter %s is a no-op (test records are excluded by default)\n", f)
+						continue
+					}
+				}
 				params = append(params, f)
 			}
 
@@ -256,6 +280,12 @@ This allows piping JSON: echo '{"key":"value"}' | altscore %s create`, def.Singu
 				}
 			}
 
+			if def.BodyValidator != nil {
+				if err := def.BodyValidator(body); err != nil {
+					return err
+				}
+			}
+
 			path := def.BasePath
 			if def.ParentFlag != "" {
 				if parentID == "" {
@@ -313,6 +343,12 @@ When --body is omitted and stdin is not a terminal, the body is read from stdin.
 			body, err := readBody(bodyFlag)
 			if err != nil {
 				return err
+			}
+
+			if def.BodyValidator != nil {
+				if err := def.BodyValidator(body); err != nil {
+					return err
+				}
 			}
 
 			data, _, err := c.Do("PATCH", def.Module, def.BasePath+"/"+args[0], body)
@@ -416,8 +452,21 @@ The file is sent as a multipart form upload to the document's attachment endpoin
 }
 
 // readBody reads JSON from --body flag or stdin.
+// Supports curl-style @filename for the --body flag (e.g. --body @spec.json).
 func readBody(bodyFlag string) (json.RawMessage, error) {
 	if bodyFlag != "" {
+		if strings.HasPrefix(bodyFlag, "@") {
+			path := strings.TrimPrefix(bodyFlag, "@")
+			fileBytes, err := os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("cannot read --body file %q: %w", path, err)
+			}
+			var raw json.RawMessage
+			if err := json.Unmarshal(fileBytes, &raw); err != nil {
+				return nil, fmt.Errorf("invalid JSON in %s: %w", path, err)
+			}
+			return raw, nil
+		}
 		var raw json.RawMessage
 		if err := json.Unmarshal([]byte(bodyFlag), &raw); err != nil {
 			return nil, fmt.Errorf("invalid JSON in --body: %w", err)

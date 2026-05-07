@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -130,6 +131,101 @@ Response fields:
 			return output.RawJSON(data)
 		},
 	}
+}
+
+// makeExStateCmd surfaces per-task outputs and per-task statuses for an
+// execution, with a primary read of /v1/executions/{id}/state (what the Hub's
+// ExecutionDebugPanel uses) and a fallback to /v1/executions/{id}/output's
+// customOutput when no state record exists.
+//
+// We expose a single intent-driven command rather than two endpoint-driven
+// ones because agents asking "what did each task produce?" don't care which
+// collection answered -- they care that the data is reachable in one call.
+//
+// State vs Output, in plain terms:
+//   - /state has live engine state -- task_outputs, task_states, execution_logs.
+//     Populated for in-flight executions and ones that explicitly persist state
+//     (matches what the Hub's debug panel shows). Often 404 for completed sync
+//     v2 GraphWorkflow runs.
+//   - /output is the durable post-execution record. v2 declarative tasks write
+//     their results into customOutput, keyed by task type (e.g. customOutput.
+//     altdata_enrichment_result[], customOutput.scorecard_result[]).
+//
+// The fallback fetches /output and returns just the customOutput slice, plus a
+// '_source' marker so callers can tell which surface answered. Hub-style
+// drilldowns (state.data_flow.task_outputs.<alias>) only work on the first
+// path; on the fallback, drill via .customOutput.<task_type>_result.
+func makeExStateCmd() *cobra.Command {
+	var noFallback bool
+	cmd := &cobra.Command{
+		Use:   "state <execution-id>",
+		Short: "Get per-task outputs and statuses for an execution",
+		Long: `Retrieve per-task outputs and per-task statuses for a workflow execution.
+
+Reads two surfaces with a fallback:
+
+  1. GET /v1/executions/{id}/state  -- live engine state (Hub debug panel uses this)
+     Response: {state: {data_flow: {task_outputs: {<alias>: ...}, task_states: {<alias>: ...}}}}
+     Often 404 for completed sync v2 executions where the engine didn't persist state.
+
+  2. GET /v1/executions/{id}/output -- durable post-execution record (fallback)
+     Response: {customOutput: {<task_type>_result: [...], ...}, output, ...}
+     v2 declarative tasks write results to customOutput, keyed by task TYPE
+     (altdata_enrichment_result, scorecard_result, rule_tree_result, mapping_table_result,
+     evaluate_rules_result, conditional_result, ...).
+
+When the fallback is used, the response wraps customOutput and includes
+'_source: "output_customOutput"' so you can tell which surface answered.
+
+Common drilldowns:
+  # state surface (Hub-style, by task alias)
+  altscore executions state <id> | jq '.state.data_flow.task_outputs'
+  altscore executions state <id> | jq '.state.data_flow.task_states | to_entries | map({k:.key, status:.value.status})'
+
+  # customOutput fallback (by task type, arrays)
+  altscore executions state <id> | jq '.customOutput'
+  altscore executions state <id> | jq '.customOutput.scorecard_result[0]'`,
+		Example: `  altscore executions state <execution-id>
+  altscore executions state <execution-id> --no-fallback   # strict /state, no fallback`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := loadClient()
+			if err != nil {
+				return err
+			}
+			data, status, err := c.Do("GET", "borrower_central", fmt.Sprintf("/v1/executions/%s/state", args[0]), nil)
+			if err == nil && status < 400 {
+				return output.RawJSON(data)
+			}
+			if noFallback || status != 404 {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStderr(), "# /state returned 404; falling back to /output customOutput (v2 declarative tasks write results here, keyed by task type)")
+			outData, _, oerr := c.Do("GET", "borrower_central", fmt.Sprintf("/v1/executions/%s/output", args[0]), nil)
+			if oerr != nil {
+				return fmt.Errorf("/state 404 and /output fallback failed: %w", oerr)
+			}
+			var outResp map[string]any
+			if err := json.Unmarshal(outData, &outResp); err != nil {
+				return fmt.Errorf("/output returned malformed JSON: %w", err)
+			}
+			synthetic := map[string]any{
+				"_source":      "output_customOutput",
+				"executionId":  outResp["id"],
+				"customOutput": outResp["customOutput"],
+				"output":       outResp["output"],
+				"isSuccess":    outResp["isSuccess"],
+				"status":       outResp["status"],
+			}
+			body, err := json.Marshal(synthetic)
+			if err != nil {
+				return err
+			}
+			return output.RawJSON(body)
+		},
+	}
+	cmd.Flags().BoolVar(&noFallback, "no-fallback", false, "fail on 404 instead of falling back to /output customOutput")
+	return cmd
 }
 
 func makeExGetOutputAttachmentsCmd() *cobra.Command {
