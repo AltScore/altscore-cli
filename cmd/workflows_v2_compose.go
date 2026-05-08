@@ -805,17 +805,61 @@ var reservedMappingScopes = map[string]bool{
 	"task_outputs_by_type": true,
 }
 
+// mappingDependencyRef returns the spec-local task ref that an inputMappings
+// VALUE depends on, or "" when the value is a literal / refers to a reserved
+// namespace / doesn't have a path-like shape. Used by both the topological
+// sort (to know which task each mapping depends on) and rewriteRefsInMappings
+// (to know whether the head needs rewriting).
+//
+// Recognised forms:
+//
+//	"task_outputs.<ref>.<deep>" -> "<ref>"
+//	"<ref>.<rest>"              -> "<ref>" (when head is not a reserved scope)
+//	"inputs.<name>"             -> ""     (reserved scope, no task dep)
+//	"custom.<name>"             -> ""     (reserved scope)
+//	"<literal>" (no dot)        -> ""
+func mappingDependencyRef(s string) string {
+	dot := strings.Index(s, ".")
+	if dot <= 0 {
+		return ""
+	}
+	if strings.HasPrefix(s, "task_outputs.") {
+		rest := s[len("task_outputs."):]
+		innerDot := strings.Index(rest, ".")
+		if innerDot <= 0 {
+			return ""
+		}
+		return rest[:innerDot]
+	}
+	head := s[:dot]
+	if reservedMappingScopes[head] {
+		return ""
+	}
+	return head
+}
+
 // rewriteRefsInMappings replaces leading spec-local refs in mapping values
 // with the server-assigned alias from refMap. Handles both forms:
-//   - canonical "<taskRef>.<outputName>" (what the API validator accepts)
-//   - long "task_outputs.<taskRef>.<field>" (template-style; agents sometimes
-//     write this even though the inputMappings validator rejects it)
+//   - canonical "<taskRef>.<outputName>" (rewritten to
+//     "task_outputs.<server-alias>.<outputName>" so the runtime resolver's
+//     namespace check passes -- a bare ref head fails at execute time with
+//     "Unknown variable namespace")
+//   - long "task_outputs.<taskRef>.<field>" -> "task_outputs.<server-alias>.<field>"
 //
 // Reserved scopes (inputs, custom, system, task_outputs, task_outputs_by_type)
 // are never treated as refs.
-func rewriteRefsInMappings(mappings map[string]any, refMap map[string]string) map[string]any {
-	if len(refMap) == 0 {
-		return mappings
+//
+// Errors when a mapping value has a path-like shape whose head is neither a
+// reserved scope nor a known ref. Previously this was a silent pass-through
+// that produced runtime "Unknown variable namespace" failures on execute --
+// for example, a task whose inputMappings referenced a downstream task that
+// hadn't been created yet (typical when the spec listed tasks in non-
+// topological order). composeWorkflowBody now sorts tasks topologically
+// before this runs, so a remaining unknown ref is always either a typo or a
+// reference to a task that simply isn't in spec.tasks.
+func rewriteRefsInMappings(mappings map[string]any, refMap map[string]string) (map[string]any, error) {
+	if len(mappings) == 0 {
+		return mappings, nil
 	}
 	out := map[string]any{}
 	for k, v := range mappings {
@@ -831,24 +875,151 @@ func rewriteRefsInMappings(mappings map[string]any, refMap map[string]string) ma
 				ref := rest[:dot]
 				if alias, found := refMap[ref]; found {
 					s = "task_outputs." + alias + rest[dot:]
+				} else if !isServerAlias(ref) {
+					return nil, fmt.Errorf(
+						"inputMappings[%q]=%q references task_outputs.%s.* but %q is not a known spec ref. "+
+							"Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type.)",
+						k, v, ref, ref, sortedRefMapKeys(refMap))
 				}
 			}
 		} else if dot := strings.Index(s, "."); dot > 0 {
 			// Bare <ref>.<rest> -- rewrite to task_outputs.<alias>.<rest>.
-			// The runtime resolver requires the leading segment to be a valid
-			// namespace (inputs/task_outputs/task_outputs_by_type/custom/system);
-			// a bare task alias is not a namespace and triggers
-			// "Unknown variable namespace" at execution time.
 			head := s[:dot]
 			if !reservedMappingScopes[head] {
 				if alias, found := refMap[head]; found {
 					s = "task_outputs." + alias + s[dot:]
+				} else if isServerAlias(head) {
+					// User supplied a server-style alias directly (e.g. wired
+					// into an externally-created entity). Wrap with the
+					// task_outputs. namespace so the runtime resolves it.
+					s = "task_outputs." + s
+				} else {
+					return nil, fmt.Errorf(
+						"inputMappings[%q]=%q has head %q which is neither a reserved namespace "+
+							"nor a known spec ref nor a server alias (slug-NNNNNN). At execute time the "+
+							"runtime resolver fails with 'Unknown variable namespace: %s'. "+
+							"Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type.)",
+						k, v, head, head, sortedRefMapKeys(refMap))
 				}
 			}
 		}
 		out[k] = s
 	}
-	return out
+	return out, nil
+}
+
+// sortedRefMapKeys returns refMap's keys sorted -- used in error messages so
+// the agent can scan for a near-typo without re-running 'workflows-v2 list'.
+func sortedRefMapKeys(refMap map[string]string) string {
+	keys := make([]string, 0, len(refMap))
+	for k := range refMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ", ")
+}
+
+// topologicalTaskOrder returns the indices of spec.Tasks sorted so that each
+// task's dependencies (incoming edges + tasks referenced in its inputMappings)
+// come BEFORE it. Without this, a task whose inputMappings reads from a
+// downstream task in the spec produces a bare ref that survives
+// rewriteRefsInMappings (refMap doesn't yet have the downstream alias) and
+// then fails at runtime.
+//
+// Stability: independent tasks retain their original spec order.
+//
+// Returns an error when a cycle prevents a complete ordering. Cycles are
+// also rejected by the runtime engine but surfacing here gives a faster,
+// clearer message naming the unresolved tasks.
+func topologicalTaskOrder(tasks []map[string]any, edges []map[string]any) ([]int, error) {
+	n := len(tasks)
+	if n == 0 {
+		return nil, nil
+	}
+	refToIdx := map[string]int{}
+	refs := make([]string, n)
+	for i, t := range tasks {
+		ref := localRef(t, fmt.Sprintf("t%d", i))
+		refs[i] = ref
+		refToIdx[ref] = i
+	}
+
+	// deps[i] = task indices that task i depends on.
+	deps := make([]map[int]bool, n)
+	for i := range deps {
+		deps[i] = map[int]bool{}
+	}
+	addDep := func(consumer int, depRef string) {
+		if depRef == "" {
+			return
+		}
+		depIdx, ok := refToIdx[depRef]
+		if !ok || depIdx == consumer {
+			return
+		}
+		deps[consumer][depIdx] = true
+	}
+
+	// Edge dependencies: A -> B means A is a dep of B.
+	for _, e := range edges {
+		from, to := edgeEndpoints(e)
+		toIdx, hasTo := refToIdx[to]
+		if !hasTo {
+			continue // edge endpoint isn't a task (likely an extraNode like start/end)
+		}
+		addDep(toIdx, from)
+	}
+
+	// inputMappings dependencies: a value pointing at task_outputs.X or X.Y
+	// makes the consumer depend on X.
+	for i, t := range tasks {
+		mappings, _ := t["inputMappings"].(map[string]any)
+		for _, v := range mappings {
+			s, _ := v.(string)
+			addDep(i, mappingDependencyRef(s))
+		}
+	}
+
+	// Stable topological sort: scan original order each iteration, emitting
+	// any task whose deps are all visited. O(n²) but n is typically <50.
+	out := make([]int, 0, n)
+	visited := make([]bool, n)
+	for {
+		progress := false
+		for i := 0; i < n; i++ {
+			if visited[i] {
+				continue
+			}
+			ready := true
+			for d := range deps[i] {
+				if !visited[d] {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				out = append(out, i)
+				visited[i] = true
+				progress = true
+			}
+		}
+		if !progress {
+			break
+		}
+	}
+	if len(out) != n {
+		unresolved := []string{}
+		for i := 0; i < n; i++ {
+			if !visited[i] {
+				unresolved = append(unresolved, refs[i])
+			}
+		}
+		return nil, fmt.Errorf(
+			"cyclic task dependency detected; could not topologically order: %s. "+
+				"Each task in inputMappings can only reference upstream tasks (or those that don't depend on it).",
+			strings.Join(unresolved, ", "))
+	}
+	return out, nil
 }
 
 // humanizeKey turns "borrower_id" into "Borrower Id", "minScore" into "Min Score",
@@ -945,7 +1116,23 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 		taskByRef[localRef(t, fmt.Sprintf("t%d", i))] = t
 	}
 
-	for i, task := range spec.Tasks {
+	// Topologically sort task creation order so cross-task inputMappings
+	// always resolve at the time we POST each task. Without this, a task
+	// listed in spec.tasks BEFORE the task it references would have a bare
+	// "<ref>.<output>" value persist verbatim -- the runtime resolver then
+	// fails with "Unknown variable namespace". rewriteRefsInMappings now
+	// errors on unresolved refs as a safety net, so this ordering is the
+	// difference between "compose works regardless of spec ordering" and
+	// "compose silently produces broken workflows when authors list tasks
+	// in flow order rather than dependency order".
+	order, err := topologicalTaskOrder(spec.Tasks, spec.Edges)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, specIdx := range order {
+		i := specIdx
+		task := spec.Tasks[specIdx]
 		ref := localRef(task, fmt.Sprintf("t%d", i))
 		label, _ := task["label"].(string)
 		taskType, _ := task["type"].(string)
@@ -956,10 +1143,16 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 		// Strip the spec-only `ref` field before posting; it's not part of the API.
 		delete(task, "ref")
 
-		// Rewrite inputMappings using refs resolved so far. Tasks must be listed in
-		// dependency order (consumer after producer) for cross-task refs to resolve.
+		// Rewrite inputMappings using refs resolved so far. Topological
+		// ordering above guarantees every dependency is in refMap by the
+		// time we get here, so an "unknown ref" error here always means a
+		// typo or a reference to a task that simply isn't in spec.tasks.
 		if mappings, ok := task["inputMappings"].(map[string]any); ok {
-			task["inputMappings"] = rewriteRefsInMappings(mappings, refMap)
+			rewritten, rerr := rewriteRefsInMappings(mappings, refMap)
+			if rerr != nil {
+				return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, rerr)
+			}
+			task["inputMappings"] = rewritten
 		}
 
 		// Type-specific normalization: enrich altdata-enrichment with inputKeys
