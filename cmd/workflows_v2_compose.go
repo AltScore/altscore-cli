@@ -770,6 +770,19 @@ func preflightTasks(spec *composeSpec) error {
 	knownAliases := map[string]bool{}
 	for i, task := range spec.Tasks {
 		ref := localRef(task, fmt.Sprintf("t%d", i))
+		// 'ref' becomes the server-assigned alias prefix (and thus the
+		// nodeId) when no explicit 'alias' is set, so the same URL-safety
+		// constraint applies. Reject upper-case / spaces / punctuation
+		// upfront -- otherwise it propagates to nodeIds that misbehave in
+		// downstream cmds (set-mapping --node-id, lock acquire by alias).
+		if !validAliasPattern.MatchString(ref) {
+			return fmt.Errorf(
+				"tasks[%d]: ref %q has invalid characters. Refs become server-assigned aliases (and nodeIds), "+
+					"so must be lowercase alphanumeric with internal dashes only "+
+					"(regex: ^[a-z0-9][a-z0-9-]*$). Don't use spaces, slashes, uppercase, or punctuation.",
+				i, ref,
+			)
+		}
 		if knownRefs[ref] {
 			return fmt.Errorf(
 				"tasks[%d]: duplicate ref %q -- two tasks share the same spec-local key. "+
@@ -854,9 +867,26 @@ func preflightTasks(spec *composeSpec) error {
 	}
 
 	// Edge topology: every from/to must reference a known ref; reject
-	// duplicate edges and self-loops (almost always bugs).
+	// duplicate edges and self-loops (almost always bugs). Also reject
+	// unknown edge keys -- the most common is 'branchName' (a natural-
+	// feeling but unsupported alias for 'sourceHandle' that disappears
+	// silently and leaves conditional outgoing edges with sourceHandle:
+	// null, breaking the conditional at runtime).
 	seenEdges := map[string]bool{}
 	for i, edge := range spec.Edges {
+		for k := range edge {
+			if !validEdgeKeys[k] {
+				hint := ""
+				if k == "branchName" || k == "branch_name" || k == "branch" {
+					hint = " (use 'sourceHandle' instead -- conditional branches are wired by branch_<idx> or 'branch-else')"
+				} else if k == "fromHandle" {
+					hint = " (did you mean 'sourceHandle'?)"
+				} else if k == "toHandle" {
+					hint = " (did you mean 'targetHandle'?)"
+				}
+				return fmt.Errorf("edges[%d]: unknown key %q%s. Valid keys: from, to, sourceNodeId, targetNodeId, sourceHandle, targetHandle, label, id.", i, k, hint)
+			}
+		}
 		from, _ := edge["from"].(string)
 		to, _ := edge["to"].(string)
 		// Some specs use sourceNodeId/targetNodeId directly with explicit
@@ -1125,6 +1155,22 @@ func preflightTasks(spec *composeSpec) error {
 		}
 	}
 	return nil
+}
+
+// validEdgeKeys is the whitelist for edge object keys in the compose spec.
+// 'from'/'to' are spec-local conveniences; 'sourceNodeId'/'targetNodeId' are
+// the canonical API names. 'sourceHandle' wires conditional + array-router
+// branches by handle id; 'branchName' was a common typo that silently
+// dropped and broke conditionals at runtime, so we reject it explicitly.
+var validEdgeKeys = map[string]bool{
+	"from":         true,
+	"to":           true,
+	"sourceNodeId": true,
+	"targetNodeId": true,
+	"sourceHandle": true,
+	"targetHandle": true,
+	"label":        true,
+	"id":           true,
 }
 
 // validWorkflowCategories mirrors the backend's WorkflowCategory enum.
