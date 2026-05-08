@@ -1023,6 +1023,21 @@ func preflightTasks(spec *composeSpec) error {
 			if eid == "" && eal == "" {
 				return fmt.Errorf("tasks[%d] (ref=%q): child-workflow task requires 'executorId' or 'executorAlias'", i, ref)
 			}
+		case "compute-variables":
+			// compute-variables expressions live in the customVariables DSL
+			// scope; the runtime evaluates them against the workflow's
+			// customVariables dict, NOT the task's inputMappings. Wiring
+			// inputs via inputMappings on this task type is a no-op:
+			// inputMappings populates task_outputs.<this-task>.<field>
+			// AFTER the expression runs (which is itself silently
+			// useless since the DSL doesn't see them).
+			if im, _ := task["inputMappings"].(map[string]any); len(im) > 0 {
+				fmt.Fprintf(os.Stderr,
+					"# warning: tasks[%d] (ref=%q): compute-variables has inputMappings but those are NOT visible to the expression DSL. "+
+						"The DSL evaluates against the workflow's customVariables dict; reference values via the customVariable names directly. "+
+						"Wire upstream values into customVariables via the workflow body, not into this task's inputMappings.\n",
+					i, ref)
+			}
 		case "array-router":
 			// The runtime activity reads the source array via
 			// inputMappings.source_array, NOT the top-level
@@ -1195,6 +1210,40 @@ func preflightTasks(spec *composeSpec) error {
 					)
 				}
 			}
+		}
+	}
+
+	// Orphan task detection: every task ref must appear as an edge
+	// endpoint at least once. Tasks unwired from the graph never run
+	// (lint flags them post-publish, but compose should catch earlier
+	// so the user doesn't waste a publish round-trip).
+	connected := map[string]bool{}
+	for _, edge := range spec.Edges {
+		if from, _ := edge["from"].(string); from != "" {
+			connected[from] = true
+		} else if from, _ := edge["sourceNodeId"].(string); from != "" {
+			connected[from] = true
+		}
+		if to, _ := edge["to"].(string); to != "" {
+			connected[to] = true
+		} else if to, _ := edge["targetNodeId"].(string); to != "" {
+			connected[to] = true
+		}
+	}
+	for i, task := range spec.Tasks {
+		ref := localRef(task, fmt.Sprintf("t%d", i))
+		taskType, _ := task["type"].(string)
+		// Comments are decorative -- they're allowed to be orphaned.
+		if taskType == "comment" {
+			continue
+		}
+		if !connected[ref] {
+			return fmt.Errorf(
+				"tasks[%d] (ref=%q, type=%q) has no incident edges -- it's unreachable. "+
+					"Add at least one 'edges' entry connecting %q to the rest of the graph, "+
+					"or remove the task. (Comment tasks are allowed to be orphaned; everything else isn't.)",
+				i, ref, taskType, ref,
+			)
 		}
 	}
 
