@@ -65,19 +65,6 @@ func mutateAndAutosaveV2(
 		return nil, err
 	}
 
-	// Status pre-check: autosave only works on DRAFT workflows. Without this
-	// the backend returns a generic "Cannot autosave non-DRAFT workflow.
-	// Current status: ACTIVE" with no fix instructions; surface a sharper
-	// error here so add-node / add-edge / set-mapping / set-variable etc.
-	// all fail fast with the same actionable message.
-	if status, _ := wf["status"].(string); status != "" && status != "DRAFT" {
-		return nil, fmt.Errorf(
-			"workflow %s has status=%q; autosave-based mutations require DRAFT. "+
-				"Run 'altscore workflows-v2 create-draft %s' to make a draft, edit that draft, then publish.",
-			workflowID, status, workflowID,
-		)
-	}
-
 	alias, _ := wf["alias"].(string)
 
 	if lockToken == "" {
@@ -112,27 +99,6 @@ func mutateAndAutosaveV2(
 		saveBody["lastKnownVersion"] = v
 	}
 
-	// Defensive optimistic-concurrency guard: the backend's autosave
-	// validator only flags 'lastKnownVersion > server.version' as a
-	// conflict, missing the canonical case where the client view is
-	// STALE (lastKnownVersion < server.version). The mutateAndAutosave
-	// helper already pulls server.version into saveBody, so this is a
-	// no-op here; but if a caller hand-crafts saveBody with a stale
-	// lastKnownVersion, surface it as an error.
-	if lkv, ok := saveBody["lastKnownVersion"]; ok {
-		if serverV, sok := wf["version"]; sok && lkv != nil && serverV != nil {
-			if lkvF, lf := toFloat(lkv); lf {
-				if svF, sf := toFloat(serverV); sf && lkvF < svF {
-					return nil, fmt.Errorf(
-						"stale autosave: lastKnownVersion=%v < server.version=%v. "+
-							"Re-fetch the workflow before retrying so your edits build on the latest state.",
-						lkv, serverV,
-					)
-				}
-			}
-		}
-	}
-
 	raw, err := json.Marshal(saveBody)
 	if err != nil {
 		return nil, fmt.Errorf("encode autosave body: %w", err)
@@ -142,21 +108,6 @@ func mutateAndAutosaveV2(
 		return nil, fmt.Errorf("autosave: %w", err)
 	}
 	return result, nil
-}
-
-// toFloat coerces a JSON number value (which is float64 after Unmarshal) or
-// an int into a float64 for arithmetic comparison. Returns (0, false) for
-// other types.
-func toFloat(v any) (float64, bool) {
-	switch n := v.(type) {
-	case float64:
-		return n, true
-	case int:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	}
-	return 0, false
 }
 
 // asSlice coerces any (possibly nil) value into []any.

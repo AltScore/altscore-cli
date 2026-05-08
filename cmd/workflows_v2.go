@@ -342,13 +342,25 @@ func makeWfv2LockReleaseCmd() *cobra.Command {
 	var token string
 
 	cmd := &cobra.Command{
-		Use:     "release <alias>",
-		Short:   "Release a v2 workflow edit lock",
+		Use:   "release <alias>",
+		Short: "Release a v2 workflow edit lock you hold",
+		Long: `Release an edit lock using the lockToken returned by 'lock acquire'.
+Only the holder can release this way -- the token proves ownership.
+
+If you don't have the token (e.g. an automation died without releasing,
+or another session lost track of it), use 'workflows-v2 lock force-release
+<alias>' instead. That endpoint requires admin permission but doesn't
+need the token.
+
+Note: --client-id (used by acquire and the autosave helpers like add-node)
+is NOT a substitute for --lock-token here. The release endpoint
+authenticates by token, not client id.`,
 		Args:    cobra.ExactArgs(1),
 		Example: `  altscore workflows-v2 lock release my-wf --lock-token $TOKEN`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if token == "" {
-				return fmt.Errorf("--lock-token is required")
+				return fmt.Errorf("--lock-token is required. " +
+					"If you've lost the token, use 'altscore workflows-v2 lock force-release <alias>' instead (admin only).")
 			}
 			c, err := loadClient()
 			if err != nil {
@@ -496,24 +508,6 @@ func makeWfv2UpdateMappingCmd() *cobra.Command {
 			data, _, err := c.Do("PUT", "borrower_central", path, json.RawMessage(raw))
 			if err != nil {
 				return err
-			}
-			// The backend returns the list of mutated /v2/tasks records. An
-			// empty list means no task input_mappings referenced the
-			// previous-variable name -- which is the normal case for
-			// workflows built via the standard CLI surface (compose,
-			// add-node, set-mapping). Those write mappings to
-			// node.data.inputMappings on the workflow doc, NOT to the
-			// underlying task's data.input_mappings, so this command is a
-			// no-op against them. Surface the distinction so users don't
-			// think the rename succeeded silently.
-			var mutated []any
-			if jerr := json.Unmarshal(data, &mutated); jerr == nil && len(mutated) == 0 {
-				fmt.Fprintf(cmd.OutOrStderr(),
-					"# note: 0 task mappings matched. This command renames TASK input_mappings only -- "+
-						"if your workflow uses node-level inputMappings (the default for compose / add-node / "+
-						"set-mapping), use 'altscore workflows-v2 set-mapping <id> --node-id %q --input-name %q --expression \"...\"' instead.\n",
-					nodeID, previous,
-				)
 			}
 			return output.RawJSON(data)
 		},

@@ -196,7 +196,7 @@ Spec format (see file header for full reference):
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON spec (or pipe via stdin)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the assembled workflow body without making API calls")
 	cmd.Flags().BoolVar(&publish, "publish", false, "publish the workflow after creation (DRAFT workflows execute but skip every node)")
-	cmd.Flags().BoolVar(&skipLintOnPublish, "skip-lint-on-publish", false, "publish even when client-side topology lint reports errors (orphan/unreachable/dead-end nodes). Server-side validation still runs and can still 422.")
+	cmd.Flags().BoolVar(&skipLintOnPublish, "skip-lint-on-publish", false, "skip the pre-publish topology lint that refuses to publish on errors")
 	return cmd
 }
 
@@ -718,24 +718,25 @@ var validTaskTypes = map[string]bool{
 // catch locally we MUST.
 //
 // Checks (in order, fail-fast):
-//   1. label + type present
-//   2. type is in the backend TaskType enum
-//   3. http: headers must be a JSON-encoded string
-//   4. data-store-write / data-store-query / webhook / comment: per-type
-//      required fields
-//   5. validateTaskV2Body: type-specific structural checks (conditional
+//   1. duplicate spec-local refs / explicit aliases
+//   2. label + type present
+//   3. type is in the backend TaskType enum (with closest-match suggestion)
+//   4. http: headers must be a JSON-encoded string
+//   5. data-store-write / data-store-query / webhook / comment / exception /
+//      child-workflow: per-type required fields
+//   6. validateTaskV2Body: type-specific structural checks (conditional
 //      branches, scorecard reference, mapping-table entries, rule-tree
 //      enums)
-//   6. inputMappings values: leading segment must be a valid runtime
-//      namespace OR a known spec-local ref. Typos like 'socre.total_score'
-//      get rejected before they reach the runtime resolver, where they
-//      surface as the opaque "Unknown variable namespace" failure.
+//   7. inputMappings values: leading segment must be a runtime namespace OR
+//      a known spec-local ref; task_outputs.<X>.<rest> validates <X> too.
+//      {{...}} template syntax is skipped (handled by template engine).
+//   8. edge endpoints (from/to) must reference a known ref.
+//   9. duplicate edges and self-loops are rejected.
 func preflightTasks(spec *composeSpec) error {
 	// Collect every spec-local ref upfront so we can validate forward
-	// references in inputMappings (e.g. consumer references producer
-	// declared later in the spec). Reject duplicates here -- a spec with
-	// two tasks claiming the same ref produces silent orphan nodes
-	// because the rewriter only sees the last ref-to-alias mapping.
+	// references in inputMappings AND detect duplicates that would
+	// otherwise silently orphan tasks (the rewriter only records the
+	// last ref-to-alias mapping).
 	knownRefs := map[string]bool{}
 	knownAliases := map[string]bool{}
 	for i, task := range spec.Tasks {
@@ -749,8 +750,6 @@ func preflightTasks(spec *composeSpec) error {
 			)
 		}
 		knownRefs[ref] = true
-		// Same hazard for explicit alias collisions: the second POST either
-		// version-bumps the first task or 409s. Catch before the first POST.
 		if alias, _ := task["alias"].(string); alias != "" {
 			if knownAliases[alias] {
 				return fmt.Errorf(
@@ -773,6 +772,56 @@ func preflightTasks(spec *composeSpec) error {
 			)
 		}
 		knownRefs[ref] = true
+	}
+
+	// Edge topology: every from/to must reference a known ref; reject
+	// duplicate edges and self-loops (almost always bugs).
+	seenEdges := map[string]bool{}
+	for i, edge := range spec.Edges {
+		from, _ := edge["from"].(string)
+		to, _ := edge["to"].(string)
+		// Some specs use sourceNodeId/targetNodeId directly with explicit
+		// aliases; if those are present and from/to are absent, fall back.
+		if from == "" {
+			from, _ = edge["sourceNodeId"].(string)
+		}
+		if to == "" {
+			to, _ = edge["targetNodeId"].(string)
+		}
+		if from == "" || to == "" {
+			return fmt.Errorf("edges[%d]: missing 'from'/'to' (or sourceNodeId/targetNodeId)", i)
+		}
+		// Refs are validated only when they look spec-local (no '-NNNNNN' suffix);
+		// explicit-alias edges may target server-style aliases not in knownRefs.
+		if !isServerAlias(from) && !knownRefs[from] {
+			return fmt.Errorf(
+				"edges[%d]: 'from'=%q is not a known ref. Known refs: %s.",
+				i, from, strings.Join(sortedKeys(knownRefs), ", "),
+			)
+		}
+		if !isServerAlias(to) && !knownRefs[to] {
+			return fmt.Errorf(
+				"edges[%d]: 'to'=%q is not a known ref. Known refs: %s.",
+				i, to, strings.Join(sortedKeys(knownRefs), ", "),
+			)
+		}
+		if from == to {
+			return fmt.Errorf(
+				"edges[%d]: self-loop on %q -- a node can't be its own source AND target. "+
+					"Almost always a copy-paste bug; if it's intentional, build the cycle through an intermediate node.",
+				i, from,
+			)
+		}
+		handle, _ := edge["sourceHandle"].(string)
+		key := from + "|" + handle + "->" + to
+		if seenEdges[key] {
+			return fmt.Errorf(
+				"edges[%d]: duplicate edge %s->%s (same sourceHandle %q). "+
+					"Drop the duplicate; the workflow graph already has it.",
+				i, from, to, handle,
+			)
+		}
+		seenEdges[key] = true
 	}
 
 	for i, task := range spec.Tasks {
@@ -863,26 +912,24 @@ func preflightTasks(spec *composeSpec) error {
 			return fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}
 
-		// Mapping namespace check: every inputMappings value with a dotted
-		// path must lead with a valid runtime namespace OR a known
-		// spec-local ref (which compose will rewrite to
-		// task_outputs.<server-alias>). Anything else surfaces at runtime
-		// as "Unknown variable namespace" with no node context.
-		//
-		// For 'task_outputs.<X>.<rest>' specifically, also validate that
-		// <X> is either a known spec-local ref or a 6-hex-suffixed
-		// server-style alias. A typo like 'task_outputs.producre.v' has a
-		// valid leading segment but the unknown second segment surfaces
-		// at runtime with no diagnostics.
+		// Mapping namespace check: every inputMappings value with a
+		// dotted path must lead with a valid runtime namespace OR a
+		// known spec-local ref. {{...}} template syntax bypasses the
+		// dotted-path resolver, so skip it. For 'task_outputs.<X>.<rest>'
+		// also validate <X> is known -- typos like 'task_outputs.producre.v'
+		// pass the leading-segment check but break at runtime.
 		if im, ok := task["inputMappings"].(map[string]any); ok {
 			for k, v := range im {
 				s, _ := v.(string)
 				if s == "" {
 					continue
 				}
+				if strings.HasPrefix(strings.TrimSpace(s), "{{") {
+					continue // template-engine syntax, not a dotted path
+				}
 				dot := strings.Index(s, ".")
 				if dot <= 0 {
-					continue // bare value or template literal -- runtime handles
+					continue
 				}
 				head := s[:dot]
 				if !reservedMappingScopes[head] && !knownRefs[head] {
@@ -894,28 +941,20 @@ func preflightTasks(spec *composeSpec) error {
 						i, ref, k, s, head, strings.Join(sortedKeys(knownRefs), ", "),
 					)
 				}
-				// Second-segment check for task_outputs.<X>.<rest>.
 				if head == "task_outputs" {
 					rest := s[dot+1:]
 					dot2 := strings.Index(rest, ".")
 					if dot2 <= 0 {
-						continue // task_outputs.<alias> -- whole-task ref, runtime accepts
-					}
-					middle := rest[:dot2]
-					if knownRefs[middle] {
 						continue
 					}
-					// Server-style alias (slug-of-label + "-" + 6 hex).
-					// Compose-built workflows referenced from outside use
-					// these directly; allow them through.
-					if isServerAlias(middle) {
+					middle := rest[:dot2]
+					if knownRefs[middle] || isServerAlias(middle) {
 						continue
 					}
 					return fmt.Errorf(
 						"tasks[%d] (ref=%q): inputMappings[%q]=%q references task_outputs.%s.* but %q "+
 							"is not a known spec-local ref and doesn't look like a server-assigned alias "+
-							"(slug-NNNNNN). Known refs: %s. "+
-							"Likely a typo of one of those.",
+							"(slug-NNNNNN). Known refs: %s. Likely a typo of one of those.",
 						i, ref, k, s, middle, middle,
 						strings.Join(sortedKeys(knownRefs), ", "),
 					)
@@ -929,8 +968,6 @@ func preflightTasks(spec *composeSpec) error {
 // isServerAlias reports whether s looks like a server-assigned task alias --
 // the trailing 6-hex-after-dash pattern produced by
 // borrower-central/app/utils/alias_generator.py::generate_task_alias.
-// Used by mapping namespace validation to allow references to externally-
-// composed workflows whose aliases aren't spec-local refs.
 func isServerAlias(s string) bool {
 	if len(s) < 8 {
 		return false
@@ -948,8 +985,7 @@ func isServerAlias(s string) bool {
 	return true
 }
 
-// sortedKeys returns the keys of m in deterministic order (helpful for
-// reproducible error messages).
+// sortedKeys returns the keys of m in deterministic order.
 func sortedKeys(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
@@ -960,10 +996,7 @@ func sortedKeys(m map[string]bool) []string {
 }
 
 // closestTaskType returns the canonical TaskType nearest to a given typo by
-// Levenshtein distance, or "" if nothing is meaningfully close. The cutoff
-// is 0.5 * len(input) so radically different strings don't get matched.
-// Used to turn opaque "unknown task type" errors into actionable
-// "did you mean X?" hints.
+// Levenshtein distance, or "" if nothing is meaningfully close.
 func closestTaskType(input string) string {
 	best := ""
 	bestDist := -1
@@ -980,9 +1013,7 @@ func closestTaskType(input string) string {
 	return best
 }
 
-// levenshtein computes edit distance between two strings. Standard DP
-// implementation; fine for the small string lengths we deal with here
-// (task type names are <= 25 chars).
+// levenshtein computes edit distance between two strings.
 func levenshtein(a, b string) int {
 	if len(a) == 0 {
 		return len(b)
