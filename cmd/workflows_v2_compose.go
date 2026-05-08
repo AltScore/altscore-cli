@@ -247,6 +247,47 @@ func localRef(entry map[string]any, fallback string) string {
 	return fallback
 }
 
+// slugifyWorkflowLabel mirrors borrower-central's
+// app/utils/workflow_alias.py:slugify_workflow_label so compose can predict
+// the alias the server will assign before any task POST happens. Knowing the
+// alias up-front matters because credit-decisioning entities
+// (evaluation-rules, rule-trees, mapping-tables, scorecards) only show up in
+// a workflow's builder pickers when their workflowAlias matches the
+// workflow's alias -- and the alias is server-derived from the label, not
+// settable from the body. When a label like "All 5 types" silently slugs to
+// "all-5-types", entities stamped with "all-types" become invisible.
+//
+// Rules (must match BC byte-for-byte):
+//   - lowercase + strip
+//   - replace any run of non-[a-z0-9] with "-"
+//   - collapse repeated "-"
+//   - trim leading/trailing "-"
+//   - cap at 100 chars
+//   - default to "workflow" when empty
+func slugifyWorkflowLabel(label string) string {
+	s := strings.ToLower(strings.TrimSpace(label))
+	var b strings.Builder
+	b.Grow(len(s))
+	prevDash := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevDash = false
+		} else if !prevDash {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > 100 {
+		out = out[:100]
+	}
+	if out == "" {
+		out = "workflow"
+	}
+	return out
+}
+
 // edgeEndpoints reads the source/target ref or nodeId of an edge entry,
 // preferring the spec-side `from`/`to` shortcuts.
 func edgeEndpoints(e map[string]any) (from, to string) {
@@ -471,6 +512,21 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 	if err := validateEntityTypeVsTaskTypes(spec); err != nil {
 		return nil, err
 	}
+
+	// Surface the predicted workflow alias up-front. The server slugifies
+	// `label` and ignores any `alias` key in the body, so callers can't
+	// influence it after the fact. Credit-decisioning entities scoped via
+	// --workflow-alias on create only show up in pickers when their
+	// workflowAlias matches THIS slug, so tell the caller exactly what to
+	// stamp before they create entities -- not after, when the workflow's
+	// pickers come up empty and they have to re-stamp.
+	predictedAlias := slugifyWorkflowLabel(spec.Label)
+	fmt.Printf("# Workflow alias will be: %q (server-derived from label %q).\n", predictedAlias, spec.Label)
+	fmt.Printf("# Stamp entities with this alias on create:\n")
+	fmt.Printf("#   altscore evaluation-rules create --workflow-alias %s ...\n", predictedAlias)
+	fmt.Printf("#   altscore rule-trees       create --workflow-alias %s ...\n", predictedAlias)
+	fmt.Printf("#   altscore mapping-tables   create --workflow-alias %s ...\n", predictedAlias)
+	fmt.Printf("#   altscore scorecards       create --workflow-alias %s ...\n", predictedAlias)
 
 	// Pre-flight: validate every task's REQUIRED-field shape locally before
 	// posting anything. The previous loop would create tasks 0..N-1 on the
