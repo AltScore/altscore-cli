@@ -597,8 +597,16 @@ var entityCache = map[string]map[string]any{}
 
 // lookupEntity fetches /v1/{resource}?code=<codeOrId> (best-effort) and
 // returns the first matching record. Used for non-blocking warnings when
-// a task references something that doesn't exist on the tenant.
+// a task references something that doesn't exist on the tenant, and for
+// outputSchema refinement (e.g. mapping-tables outputType=number).
+//
+// The lookup runs in dry-run too -- skipping it makes dry-run preview a
+// different shape than real compose, defeating the purpose of dry-run.
+// Matches the lookupAltdataSource contract above. The dryRun flag is kept
+// in the signature for symmetry with sibling normalizers and so callers
+// can opt in to dry-run-only printf behavior.
 func lookupEntity(c *client.Client, resource, codeOrID string, dryRun bool) (map[string]any, error) {
+	_ = dryRun
 	if codeOrID == "" {
 		return nil, nil
 	}
@@ -606,7 +614,7 @@ func lookupEntity(c *client.Client, resource, codeOrID string, dryRun bool) (map
 	if cached, ok := entityCache[cacheKey]; ok {
 		return cached, nil
 	}
-	if dryRun || c == nil {
+	if c == nil {
 		return nil, nil
 	}
 	q := url.Values{}
