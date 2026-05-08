@@ -247,6 +247,122 @@ func localRef(entry map[string]any, fallback string) string {
 	return fallback
 }
 
+// edgeEndpoints reads the source/target ref or nodeId of an edge entry,
+// preferring the spec-side `from`/`to` shortcuts.
+func edgeEndpoints(e map[string]any) (from, to string) {
+	from, _ = e["from"].(string)
+	if from == "" {
+		from, _ = e["sourceNodeId"].(string)
+	}
+	to, _ = e["to"].(string)
+	if to == "" {
+		to, _ = e["targetNodeId"].(string)
+	}
+	return from, to
+}
+
+// buildEndAutoWiring returns inputSchema + inputMappings for an `end` task by
+// walking ALL transitive ancestors (not just direct predecessors) and
+// emitting the per-task-type entries the Hub auto-wires. Mirrors
+// `buildSectionsFromPredecessors` in altscore-ai-chat/lib/stores/workflow-builder-v2/actions/edge/pdf-data-source-auto-mapping.ts,
+// which calls getPredecessorsSorted -- a BFS over incoming edges that yields
+// every upstream task, not just the immediate parent.
+//
+// Without this wiring, the end task's PDF report editor sees no available
+// sections (each section is keyed off `task_type_underscored_result_<alias>`
+// in inputSchema). The runtime end_activity.py also reads task outputs via
+// these mapping keys with context.get(); missing keys silently produce empty
+// values in the PDF.
+//
+// Five upstream task types are recognised (those the Hub knows how to
+// auto-wire): altdata-enrichment, scorecard, mapping-table, rule-tree,
+// evaluate-rules. Other predecessor types are skipped silently (matches Hub).
+//
+// The function falls through gracefully when:
+//   - no predecessors found (e.g. end is detached from the graph in the spec)
+//   - a predecessor's ref isn't in refMap (e.g. dry-run partial map)
+//   - a predecessor type isn't in the recognised set
+// Callers can rely on the maps always being non-nil.
+func buildEndAutoWiring(endRef string, edges []map[string]any, taskByRef map[string]map[string]any, refMap map[string]string) (inputSchema, inputMappings map[string]any) {
+	inputSchema = map[string]any{}
+	inputMappings = map[string]any{}
+
+	// BFS over incoming edges starting from endRef. Direct parents come first
+	// (they're at depth 1) but we accumulate every ancestor in `visited` so
+	// the end task sees outputs from every upstream credit-decisioning task.
+	parents := map[string][]string{}
+	for _, e := range edges {
+		from, to := edgeEndpoints(e)
+		if from == "" || to == "" {
+			continue
+		}
+		parents[to] = append(parents[to], from)
+	}
+	visited := map[string]bool{endRef: true}
+	queue := append([]string{}, parents[endRef]...)
+	ancestors := []string{}
+	for len(queue) > 0 {
+		ref := queue[0]
+		queue = queue[1:]
+		if visited[ref] {
+			continue
+		}
+		visited[ref] = true
+		ancestors = append(ancestors, ref)
+		queue = append(queue, parents[ref]...)
+	}
+
+	for _, ancestorRef := range ancestors {
+		predTask, hasTask := taskByRef[ancestorRef]
+		predAlias := refMap[ancestorRef]
+		if !hasTask || predAlias == "" {
+			continue
+		}
+		predType, _ := predTask["type"].(string)
+		predLabel, _ := predTask["label"].(string)
+		if predLabel == "" {
+			predLabel = predAlias
+		}
+
+		// One-section-per-ancestor: emit the <task-type-underscored>_result_<alias>
+		// pair (schema + mapping) the Hub also persists. The Hub source code
+		// emits more keys (alerts/alerts_count for evaluate-rules,
+		// <outputVar>_rule_code etc. for rule-tree), but those were never seen
+		// in the persisted-and-working end task observed in production -- and
+		// the strict CreateTaskV2 validator rejects any inputMappings key that
+		// isn't in inputSchema. Sticking to the minimal observed set keeps the
+		// validator happy AND matches what the Hub actually ships.
+		switch predType {
+		case "altdata-enrichment":
+			key := "sources_output_packages_" + predAlias
+			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
+			inputMappings[key] = "task_outputs." + predAlias + ".sources_output_packages"
+
+		case "scorecard":
+			key := "scorecard_result_" + predAlias
+			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
+			inputMappings[key] = "task_outputs." + predAlias
+
+		case "mapping-table":
+			key := "mapping_table_result_" + predAlias
+			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
+			inputMappings[key] = "task_outputs." + predAlias
+
+		case "rule-tree":
+			key := "rule_tree_result_" + predAlias
+			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
+			inputMappings[key] = "task_outputs." + predAlias
+
+		case "evaluate-rules":
+			key := "evaluate_rules_result_" + predAlias
+			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
+			inputMappings[key] = "task_outputs." + predAlias
+		}
+	}
+
+	return inputSchema, inputMappings
+}
+
 // reservedMappingScopes are the leading segments in a mapping value that are
 // NOT spec-local refs and must not be rewritten.
 var reservedMappingScopes = map[string]bool{
@@ -372,6 +488,15 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 
 	// refMap: spec-local reference -> server-assigned alias.
 	refMap := map[string]string{}
+
+	// taskByRef: spec-local reference -> task body. Captured BEFORE the task
+	// loop strips `ref` so the end-node auto-wiring (run later from the
+	// extraNodes loop) can look up each predecessor's task body to read its
+	// type, label, and config (scorecardConfig.totalScoreVariable, etc.).
+	taskByRef := map[string]map[string]any{}
+	for i, t := range spec.Tasks {
+		taskByRef[localRef(t, fmt.Sprintf("t%d", i))] = t
+	}
 
 	for i, task := range spec.Tasks {
 		ref := localRef(task, fmt.Sprintf("t%d", i))
@@ -518,9 +643,24 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 		taskID, _ := n["taskId"].(string)
 		if taskAlias == "" && taskID == "" {
 			// Auto-create a trivial backing task: just type + label.
+			// For `end` nodes we also auto-wire inputSchema / inputMappings
+			// from upstream tasks so the PDF report editor (and end_activity's
+			// context.get() calls) have the data they expect. Without this,
+			// the end task ships with empty schemas and the PDF picker shows
+			// nothing -- matching the bug the user hit before manually
+			// recreating the end node in the Hub UI.
 			taskBody := map[string]any{
 				"label": label,
 				"type":  nodeType,
+			}
+			if strings.ToLower(nodeType) == "end" {
+				inSchema, inMappings := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap)
+				if len(inSchema) > 0 {
+					taskBody["inputSchema"] = inSchema
+				}
+				if len(inMappings) > 0 {
+					taskBody["inputMappings"] = inMappings
+				}
 			}
 			raw, err := json.Marshal(taskBody)
 			if err != nil {
@@ -574,6 +714,23 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 		}
 		if _, hasData := n["data"]; !hasData {
 			n["data"] = map[string]any{}
+		}
+		// Mirror Hub: end nodes carry isEndNode + inputMappings on node.data
+		// in addition to their backing task body. Task body powers the runtime
+		// (end_activity.py reads from there); node.data powers the canvas
+		// renderer and the PDF editor's section picker.
+		if strings.ToLower(nodeType) == "end" {
+			data, _ := n["data"].(map[string]any)
+			if data == nil {
+				data = map[string]any{}
+			}
+			data["isEndNode"] = true
+			if _, hasMappings := data["inputMappings"]; !hasMappings {
+				if _, inMappings := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap); len(inMappings) > 0 {
+					data["inputMappings"] = inMappings
+				}
+			}
+			n["data"] = data
 		}
 		allNodes = append(allNodes, n)
 	}
