@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/output"
@@ -30,6 +31,22 @@ func validateWorkflowV2Body(body json.RawMessage) error {
 	if err := json.Unmarshal(body, &wf); err != nil {
 		// Not our problem -- the API will reject with a clear parse error.
 		return nil
+	}
+
+	// Warn (don't block) when the body has an `alias` field. The server
+	// derives the workflow's alias from `label` and silently drops any alias
+	// supplied in the body -- both on create and on update. Surfacing this
+	// here saves the trap where a caller stamps entities with the alias they
+	// THOUGHT the workflow would have, only to find the slugifier picked a
+	// different one. The compose dry-run preview also shows the slug, but
+	// users go through `workflows-v2 update` after compose for ad-hoc edits
+	// and hit the same drop silently.
+	if v, has := wf["alias"]; has {
+		if s, _ := v.(string); s != "" {
+			fmt.Fprintf(os.Stderr,
+				"# warning: body has \"alias\": %q -- the API will silently drop it. The workflow's alias is server-derived from `label` (slugified). Use `compose --dry-run` to preview the slug.\n",
+				s)
+		}
 	}
 
 	var problems []string
@@ -131,6 +148,12 @@ Exits with non-zero status if any issue is found.`,
 			}
 
 			report := lintWorkflowV2(wf)
+			// Silent-PDF check: an end node with data-source ancestors but
+			// endConfig.pdfConfig.enabled != true silently skips report
+			// rendering. Caught only by reading each end node's backing task
+			// body (the workflow body has nodes, not their config), so this
+			// runs in RunE rather than inside the pure lintWorkflowV2.
+			lintEndNodesPDF(c, wf, &report)
 			raw, _ := json.Marshal(report)
 			if err := output.RawJSON(json.RawMessage(raw)); err != nil {
 				return err
@@ -140,6 +163,121 @@ Exits with non-zero status if any issue is found.`,
 			}
 			return nil
 		},
+	}
+}
+
+// pdfDataSourceTaskTypes mirrors the Hub's auto-mapping list. End nodes with
+// any ancestor of these types get their endConfig.pdfConfig auto-wired by
+// compose; an end with such ancestors but pdfConfig.enabled != true is the
+// "silent PDF" failure mode the user hit before commit 3d77e33.
+var pdfDataSourceTaskTypes = map[string]bool{
+	"altdata-enrichment": true,
+	"scorecard":          true,
+	"mapping-table":      true,
+	"rule-tree":          true,
+	"evaluate-rules":     true,
+}
+
+// lintEndNodesPDF appends warnings to the report for every end node whose
+// backing task has data-source ancestors but doesn't have
+// endConfig.pdfConfig.enabled=true. Best-effort: HTTP failures fall through
+// silently so lint stays useful even when a single task GET 404s.
+func lintEndNodesPDF(c interface {
+	Do(method, module, path string, body any) (json.RawMessage, int, error)
+}, wf map[string]any, report *lintReport) {
+	if c == nil {
+		return
+	}
+	nodes := asSlice(wf["nodes"])
+	if len(nodes) == 0 {
+		return
+	}
+	// Build parents map from edges so we can BFS upstream from each end node.
+	parents := map[string][]string{}
+	for _, e := range asSlice(wf["edges"]) {
+		em, _ := e.(map[string]any)
+		src, _ := em["sourceNodeId"].(string)
+		tgt, _ := em["targetNodeId"].(string)
+		if src == "" || tgt == "" {
+			continue
+		}
+		parents[tgt] = append(parents[tgt], src)
+	}
+	// nodeId -> task type, for ancestor-type lookup.
+	nodeType := map[string]string{}
+	for _, n := range nodes {
+		nm, _ := n.(map[string]any)
+		id, _ := nm["nodeId"].(string)
+		t, _ := nm["type"].(string)
+		if id != "" {
+			nodeType[id] = strings.ToLower(t)
+		}
+	}
+
+	for _, n := range nodes {
+		nm, _ := n.(map[string]any)
+		id, _ := nm["nodeId"].(string)
+		t, _ := nm["type"].(string)
+		if strings.ToLower(t) != "end" || id == "" {
+			continue
+		}
+		// Walk transitive ancestors; stop early if we find a data-source type.
+		hasDataSource := false
+		visited := map[string]bool{id: true}
+		queue := append([]string{}, parents[id]...)
+		for len(queue) > 0 && !hasDataSource {
+			cur := queue[0]
+			queue = queue[1:]
+			if visited[cur] {
+				continue
+			}
+			visited[cur] = true
+			if pdfDataSourceTaskTypes[nodeType[cur]] {
+				hasDataSource = true
+				break
+			}
+			queue = append(queue, parents[cur]...)
+		}
+		if !hasDataSource {
+			continue
+		}
+		// Read the end task's backing body to inspect endConfig.
+		alias, _ := nm["taskAlias"].(string)
+		if alias == "" {
+			continue
+		}
+		taskData, _, err := c.Do("GET", "borrower_central", "/v2/tasks/"+alias, nil)
+		if err != nil {
+			continue
+		}
+		var task map[string]any
+		if err := json.Unmarshal(taskData, &task); err != nil {
+			continue
+		}
+		endCfg, _ := task["endConfig"].(map[string]any)
+		pdfCfg, _ := endCfg["pdfConfig"].(map[string]any)
+		enabled, _ := pdfCfg["enabled"].(bool)
+		if !enabled {
+			report.Issues = append(report.Issues, lintIssue{
+				Severity: "warning",
+				NodeID:   id,
+				Message: fmt.Sprintf(
+					"end node has data-source ancestors (PDF report would be useful) but endConfig.pdfConfig.enabled is not true on backing task %q -- PDF generation will silently skip. Re-compose with the latest CLI, or add the section/components manually via api POST /v2/tasks/%s.",
+					alias, alias),
+			})
+			continue
+		}
+		// Even when enabled, an empty sourcesConfig produces no PDF.
+		sources, _ := pdfCfg["sourcesConfig"].([]any)
+		if len(sources) == 0 {
+			report.Issues = append(report.Issues, lintIssue{
+				Severity: "warning",
+				NodeID:   id,
+				Message: fmt.Sprintf(
+					"end node %q has endConfig.pdfConfig.enabled=true but sourcesConfig is empty -- PDF will render with no sections. Add at least one section.",
+					alias),
+			})
+		}
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/client"
@@ -37,15 +38,59 @@ var conditionOperators = map[string]bool{
 }
 
 // validateTaskV2Body is a non-mutating, network-free check used by the
-// tasks-v2 create / create-version commands. It catches the most common
-// agent mistakes before the request hits the API:
+// tasks-v2 create / create-version commands. It runs the structural pass
+// (validateTaskV2BodyStructural) plus a sourcable-only pass that catches
+// the altdata-enrichment-with-empty-inputKeys mistake. The sourcable pass
+// is split out because compose's preflight runs BEFORE its normalize step
+// (which auto-fills inputKeys from the source's inputFields metadata) --
+// surfacing the empty-inputKeys error there would block specs that compose
+// can fix on its own. Manual `tasks-v2 create` callers don't run normalize,
+// so for them the error remains useful.
+//
+// validateTaskV2Body = structural + sourcable. Compose calls structural only.
+func validateTaskV2Body(body json.RawMessage) error {
+	if err := validateTaskV2BodyStructural(body); err != nil {
+		return err
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	var task map[string]any
+	if err := json.Unmarshal(body, &task); err != nil {
+		return nil
+	}
+	if t, _ := task["type"].(string); t == "altdata-enrichment" {
+		sources := asSlice(task["sourcesConfig"])
+		if len(sources) == 0 {
+			return nil
+		}
+		inputKeys := asMap(task["inputKeys"])
+		if len(inputKeys) == 0 {
+			return fmt.Errorf(
+				"altdata-enrichment task with non-empty sourcesConfig but empty inputKeys -- " +
+					"the Hub UI will show an unwired source. Run 'altscore workflows-v2 sources-status --filter id=<SOURCE_ID>' " +
+					"to see the source's required inputFields, then add an inputKeys entry per field, " +
+					`e.g. inputKeys: {"personId": "{{personId}}"}. Compose does this automatically.`)
+		}
+	}
+	return nil
+}
+
+// validateTaskV2BodyStructural runs the network-free structural checks that
+// are safe to invoke regardless of whether normalize will run afterward.
+// Catches:
 //   - conditional task with 'expression' instead of structured 'conditions'
 //   - conditional task using 'is_else' (snake_case) instead of 'isElse'
 //   - conditional task with no isElse:true default branch
 //   - conditional branch with neither 'conditions' nor 'isElse:true'
-//   - altdata-enrichment task with sourcesConfig but no inputKeys
-//     (warning, not error -- some sources may not need them)
-func validateTaskV2Body(body json.RawMessage) error {
+//   - missing required fields on credit-decisioning tasks (rulesConfig
+//     non-empty, mappingTableConfig.entries non-empty, scorecardCode set,
+//     ruleTreeCode + outputVariable set)
+//
+// Does NOT catch the altdata-enrichment empty-inputKeys case (see
+// validateTaskV2Body). Compose's preflight uses this so a compose spec
+// missing inputKeys is fixed by normalize, not rejected by preflight.
+func validateTaskV2BodyStructural(body json.RawMessage) error {
 	if len(body) == 0 {
 		return nil
 	}
@@ -61,19 +106,6 @@ func validateTaskV2Body(body json.RawMessage) error {
 		var copyTask map[string]any
 		_ = json.Unmarshal(copyJSON, &copyTask)
 		return normalizeConditionalTask(copyTask)
-	case "altdata-enrichment":
-		sources := asSlice(task["sourcesConfig"])
-		if len(sources) == 0 {
-			return nil
-		}
-		inputKeys := asMap(task["inputKeys"])
-		if len(inputKeys) == 0 {
-			return fmt.Errorf(
-				"altdata-enrichment task with non-empty sourcesConfig but empty inputKeys -- " +
-					"the Hub UI will show an unwired source. Run 'altscore workflows-v2 sources-status --filter id=<SOURCE_ID>' " +
-					"to see the source's required inputFields, then add an inputKeys entry per field, " +
-					`e.g. inputKeys: {"personId": "{{personId}}"}. Compose does this automatically.`)
-		}
 	case "evaluate-rules":
 		if rules := asSlice(task["rulesConfig"]); len(rules) == 0 {
 			return fmt.Errorf("evaluate-rules task requires rulesConfig: a non-empty array of {ruleCode: \"<code>\"} references")
@@ -106,29 +138,73 @@ func validateTaskV2Body(body json.RawMessage) error {
 	return nil
 }
 
+// composeNormalizeOpts threads the cross-cutting context that several
+// normalizers need without bloating the normalizeTaskBody signature.
+//   - PredictedAlias: workflow's eventual server-derived alias. Used by the
+//     entity-lookup normalizers to warn when a referenced credit-decisioning
+//     entity is scoped to a different workflow alias (or to none) -- the
+//     entity exists, but the picker won't show it.
+//   - CustomVariables: workflow-level customVariables (from the spec). Needed
+//     by compute-variables tasks to derive outputSchema. Pass nil when the
+//     normalizer runs outside compose (e.g. tasks-v2 create).
+type composeNormalizeOpts struct {
+	PredictedAlias  string
+	CustomVariables map[string]any
+}
+
+// warnEntityWorkflowAliasMismatch prints a stderr warning when a credit-
+// decisioning entity's workflowAlias doesn't match the workflow being
+// composed. Silent when the entity has no workflowAlias (global scope) or
+// when the lookup didn't find anything (lookupEntity already warned), or
+// when we don't know the predicted alias (non-compose context).
+func warnEntityWorkflowAliasMismatch(entity map[string]any, predictedAlias, resourceKind, ref string) {
+	if entity == nil || predictedAlias == "" {
+		return
+	}
+	actual, _ := entity["workflowAlias"].(string)
+	if actual == "" {
+		return
+	}
+	if actual == predictedAlias {
+		return
+	}
+	id, _ := entity["id"].(string)
+	if id == "" {
+		id = "<id>"
+	}
+	fmt.Fprintf(os.Stderr,
+		"# warning: %s %q is scoped to workflowAlias=%q, but this workflow's alias will be %q. The entity exists but won't appear in this workflow's picker. Re-scope with: altscore %s update %s --workflow-alias %s\n",
+		resourceKind, ref, actual, predictedAlias, resourceKind, id, predictedAlias)
+}
+
 // normalizeTaskBody mutates the task spec in place to match the canonical
 // shape the Hub UI expects. Returns an error if the body is fundamentally
 // broken (missing isElse branch, expression instead of conditions, etc.).
 //
-// customVariables (from the workflow spec) is needed to derive outputSchema
-// for compute-variables tasks; pass nil if not relevant (e.g. tasks-v2 create).
-func normalizeTaskBody(c *client.Client, task map[string]any, customVariables map[string]any, dryRun bool) error {
+// opts threads the compose-time context (workflow's predicted alias for
+// cross-checking entity scopes, customVariables for compute-variables
+// outputSchema derivation). Pass nil when running outside compose -- the
+// normalizers degrade gracefully (e.g. mismatch warnings are skipped).
+func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
+	if opts == nil {
+		opts = &composeNormalizeOpts{}
+	}
 	taskType, _ := task["type"].(string)
 	switch taskType {
 	case "altdata-enrichment":
 		return normalizeAltdataTask(c, task, dryRun)
 	case "compute-variables":
-		return normalizeComputeVariablesTask(task, customVariables)
+		return normalizeComputeVariablesTask(task, opts.CustomVariables)
 	case "conditional":
 		return normalizeConditionalTask(task)
 	case "evaluate-rules":
-		return normalizeEvaluateRulesTask(c, task, dryRun)
+		return normalizeEvaluateRulesTask(c, task, opts.PredictedAlias, dryRun)
 	case "mapping-table":
-		return normalizeMappingTableTask(c, task, dryRun)
+		return normalizeMappingTableTask(c, task, opts.PredictedAlias, dryRun)
 	case "scorecard":
-		return normalizeScorecardTask(c, task, dryRun)
+		return normalizeScorecardTask(c, task, opts.PredictedAlias, dryRun)
 	case "rule-tree":
-		return normalizeRuleTreeTask(c, task, dryRun)
+		return normalizeRuleTreeTask(c, task, opts.PredictedAlias, dryRun)
 	}
 	return nil
 }
@@ -359,7 +435,7 @@ func lookupAltdataSource(c *client.Client, sourceID, version string, dryRun bool
 	}
 	if c == nil {
 		if dryRun {
-			fmt.Printf("# (dry-run) skipping live source lookup for %s %s; assuming personId/taxId\n", sourceID, version)
+			fmt.Fprintf(os.Stderr, "# (dry-run) skipping live source lookup for %s %s; assuming personId/taxId\n", sourceID, version)
 			return &altdataSourceInfo{
 				inputFields:  []string{"personId", "taxId"},
 				outputSchema: map[string]any{},
@@ -373,7 +449,7 @@ func lookupAltdataSource(c *client.Client, sourceID, version string, dryRun bool
 	data, _, err := c.Do("GET", "borrower_central", path, nil)
 	if err != nil {
 		if dryRun {
-			fmt.Printf("# (dry-run) source lookup failed for %s %s (%v); using stub\n", sourceID, version, err)
+			fmt.Fprintf(os.Stderr, "# (dry-run) source lookup failed for %s %s (%v); using stub\n", sourceID, version, err)
 			return &altdataSourceInfo{
 				inputFields:  []string{"personId", "taxId"},
 				outputSchema: map[string]any{},
@@ -648,7 +724,7 @@ func lookupEntity(c *client.Client, resource, codeOrID string, dryRun bool) (map
 // of {ruleCode, ruleId} references and pre-fills outputSchema with the
 // canonical alerts/alerts_count fields produced by the activity at
 // borrower-central/app/temporal/activities/evaluate_rules_activity.py.
-func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, dryRun bool) error {
+func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, predictedAlias string, dryRun bool) error {
 	rules := asSlice(task["rulesConfig"])
 	if len(rules) == 0 {
 		return fmt.Errorf("evaluate-rules task requires rulesConfig: a non-empty array of {ruleCode: \"<code>\"} references")
@@ -663,14 +739,16 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, dryRun bo
 		if code == "" && id == "" {
 			return fmt.Errorf("rulesConfig[%d]: must include ruleCode (preferred) or ruleId", i)
 		}
-		// Best-effort tenant existence check.
+		// Best-effort tenant existence check + workflow-alias scope check.
 		ref := code
 		if ref == "" {
 			ref = id
 		}
-		if found, _ := lookupEntity(c, "evaluation-rules", ref, dryRun); found == nil && !dryRun && c != nil {
-			fmt.Printf("# warning: evaluate-rules rulesConfig[%d] references %q which was not found on the tenant\n", i, ref)
+		entity, _ := lookupEntity(c, "evaluation-rules", ref, dryRun)
+		if entity == nil && !dryRun && c != nil {
+			fmt.Fprintf(os.Stderr, "# warning: evaluate-rules rulesConfig[%d] references %q which was not found on the tenant\n", i, ref)
 		}
+		warnEntityWorkflowAliasMismatch(entity, predictedAlias, "evaluation-rules", ref)
 	}
 	out := asMap(task["outputSchema"])
 	if _, has := out["alerts"]; !has {
@@ -696,7 +774,7 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, dryRun bo
 // tasks see them as top-level outputs. Each entry needs a stable id (the
 // runtime MappingTableEntry pydantic model requires it); compose mints a
 // UUID v4 when the agent omits it, matching what the Hub editor does.
-func normalizeMappingTableTask(c *client.Client, task map[string]any, dryRun bool) error {
+func normalizeMappingTableTask(c *client.Client, task map[string]any, predictedAlias string, dryRun bool) error {
 	cfg := asMap(task["mappingTableConfig"])
 	entries := asSlice(cfg["entries"])
 	if len(entries) == 0 {
@@ -734,8 +812,9 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, dryRun boo
 			}
 		}
 		if entity == nil && !dryRun && c != nil {
-			fmt.Printf("# warning: mapping-table entries[%d] references %q which was not found on the tenant\n", i, ref)
+			fmt.Fprintf(os.Stderr, "# warning: mapping-table entries[%d] references %q which was not found on the tenant\n", i, ref)
 		}
+		warnEntityWorkflowAliasMismatch(entity, predictedAlias, "mapping-tables", ref)
 		if _, has := out[outVar]; !has {
 			out[outVar] = map[string]any{
 				"type":  outType,
@@ -756,7 +835,7 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, dryRun boo
 // uses the entity's rules; any inline 'rules' on the task body are ignored.
 // Compose preserves user-supplied inline rules (for legacy bodies) but never
 // requires them.
-func normalizeScorecardTask(c *client.Client, task map[string]any, dryRun bool) error {
+func normalizeScorecardTask(c *client.Client, task map[string]any, predictedAlias string, dryRun bool) error {
 	cfg := asMap(task["scorecardConfig"])
 	id, _ := cfg["scorecardId"].(string)
 	code, _ := cfg["scorecardCode"].(string)
@@ -770,9 +849,11 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, dryRun bool) 
 	if ref == "" {
 		ref = id
 	}
-	if entity, _ := lookupEntity(c, "scorecards", ref, dryRun); entity == nil && !dryRun && c != nil {
-		fmt.Printf("# warning: scorecard task references %q which was not found on the tenant\n", ref)
+	entity, _ := lookupEntity(c, "scorecards", ref, dryRun)
+	if entity == nil && !dryRun && c != nil {
+		fmt.Fprintf(os.Stderr, "# warning: scorecard task references %q which was not found on the tenant\n", ref)
 	}
+	warnEntityWorkflowAliasMismatch(entity, predictedAlias, "scorecards", ref)
 	out := asMap(task["outputSchema"])
 	totalVar, _ := cfg["totalScoreVariable"].(string)
 	if totalVar == "" {
@@ -808,7 +889,7 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, dryRun bool) 
 
 // normalizeRuleTreeTask validates ruleTreeConfig and pre-fills outputSchema
 // with the configured outputVariable using the configured outputType.
-func normalizeRuleTreeTask(c *client.Client, task map[string]any, dryRun bool) error {
+func normalizeRuleTreeTask(c *client.Client, task map[string]any, predictedAlias string, dryRun bool) error {
 	cfg := asMap(task["ruleTreeConfig"])
 	id, _ := cfg["ruleTreeId"].(string)
 	code, _ := cfg["ruleTreeCode"].(string)
@@ -833,9 +914,11 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, dryRun bool) e
 	if ref == "" {
 		ref = id
 	}
-	if entity, _ := lookupEntity(c, "rule-trees", ref, dryRun); entity == nil && !dryRun && c != nil {
-		fmt.Printf("# warning: rule-tree task references %q which was not found on the tenant\n", ref)
+	entity, _ := lookupEntity(c, "rule-trees", ref, dryRun)
+	if entity == nil && !dryRun && c != nil {
+		fmt.Fprintf(os.Stderr, "# warning: rule-tree task references %q which was not found on the tenant\n", ref)
 	}
+	warnEntityWorkflowAliasMismatch(entity, predictedAlias, "rule-trees", ref)
 	out := asMap(task["outputSchema"])
 	if _, has := out[outVar]; !has {
 		out[outVar] = map[string]any{

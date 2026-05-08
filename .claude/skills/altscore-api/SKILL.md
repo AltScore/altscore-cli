@@ -836,6 +836,8 @@ Four entity types power the credit-decisioning v2 task surface. They live at `/v
 
 > **`workflowAlias` is load-bearing — set it on every entity.**
 > The v2 builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias`. An entity created without one is invisible to that workflow, even though the entity itself is fine. Always pass `--workflow-alias <alias>` (matches the workflow's `alias`) on `create`, `update`, and `import`. The CLI prints a stderr warning on `create` if neither the flag nor a body field sets it.
+>
+> **The workflow's alias is server-derived from its label** — `"Customer Onboarding"` slugifies to `customer-onboarding`, `"All 5 types"` to `all-5-types`. The body's `alias` field is silently dropped on `workflows-v2 create`. A common trap: stamping entities with a guess like `customer-onboarding-v1` when the workflow's actual alias becomes `customer-onboarding-v-1`. Run `altscore workflows-v2 compose --body @spec.json --dry-run` first — it prints the predicted alias up front and tells you what to pass to `--workflow-alias` on entity creates. Or compute it locally: lowercase, replace non-`[a-z0-9]+` with `-`, collapse repeated `-`, trim, cap at 100 chars.
 
 #### Mapping tables — `mapping-tables`
 

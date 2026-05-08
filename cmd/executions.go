@@ -354,6 +354,19 @@ each write into the decision's history rather than overwriting blindly.`,
 			if err != nil {
 				return err
 			}
+			// The POST endpoint returns an empty body on success. Read the
+			// decision back so the caller can pipe the result into jq without
+			// a follow-up GET (and without making the cmd silently produce
+			// nothing on stdout, which had previously broken automation).
+			if len(data) == 0 {
+				readBack, _, gerr := c.Do("GET", "borrower_central", path, nil)
+				if gerr == nil && len(readBack) > 0 {
+					return output.RawJSON(readBack)
+				}
+				fmt.Fprintf(cmd.ErrOrStderr(), "Decision recorded. (POST returned empty body; follow-up GET %s%s)\n",
+					path, errSuffix(gerr))
+				return nil
+			}
 			return output.RawJSON(data)
 		},
 	}
@@ -362,6 +375,16 @@ each write into the decision's history rather than overwriting blindly.`,
 	cmd.Flags().StringVar(&label, "label", "", "optional human-readable label for this decision")
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON body (overridden by --key / --type / --label when set)")
 	return cmd
+}
+
+// errSuffix returns " (read-back failed: <err>)" when err is non-nil, else "".
+// Used by commands that POST then GET so the user sees why the read-back fell
+// through without obscuring the primary success message.
+func errSuffix(err error) string {
+	if err == nil {
+		return ""
+	}
+	return " (read-back failed: " + err.Error() + ")"
 }
 
 func makeExDeleteDecisionCmd() *cobra.Command {

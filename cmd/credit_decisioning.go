@@ -3,6 +3,8 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/output"
 	"github.com/spf13/cobra"
@@ -18,14 +20,47 @@ import (
 // workflowAlias on each top-level object. Used by the import commands so a
 // single --workflow-alias flag can scope an entire bundle without editing
 // the source file.
-func stampWorkflowAliasOnArray(body json.RawMessage, alias string) (json.RawMessage, error) {
-	if alias == "" {
-		return body, nil
-	}
+//
+// When alias is empty AND the body's items don't already carry a
+// workflowAlias, prints a warning to stderr (mirrors the --workflow-alias
+// missing warning in resource.go::makeCreateCmd). entityKind is the resource
+// name in plural form, used in the warning text.
+func stampWorkflowAliasOnArray(body json.RawMessage, alias, entityKind string, warnWriter io.Writer) (json.RawMessage, error) {
 	var items []map[string]json.RawMessage
 	if err := json.Unmarshal(body, &items); err != nil {
-		return nil, fmt.Errorf("--workflow-alias requires the import body to be a JSON array of objects: %w", err)
+		// Body isn't a JSON array; let the API decide what to do (some import
+		// endpoints accept objects with an `items` key). No alias stamping
+		// possible without an array shape.
+		if alias != "" {
+			return nil, fmt.Errorf("--workflow-alias requires the import body to be a JSON array of objects: %w", err)
+		}
+		return body, nil
 	}
+
+	if alias == "" {
+		// Warn only if at least one item lacks a workflowAlias of its own; an
+		// already-stamped bundle is fine without the flag.
+		anyMissing := false
+		for _, item := range items {
+			v, has := item["workflowAlias"]
+			if !has {
+				anyMissing = true
+				break
+			}
+			s := strings.TrimSpace(string(v))
+			if s == "" || s == `""` || s == "null" {
+				anyMissing = true
+				break
+			}
+		}
+		if anyMissing && warnWriter != nil {
+			fmt.Fprintf(warnWriter,
+				"# warning: --workflow-alias not set and at least one imported %s has no \"workflowAlias\"; those records will not appear in any workflow builder.\n",
+				entityKind)
+		}
+		return body, nil
+	}
+
 	encoded, err := json.Marshal(alias)
 	if err != nil {
 		return nil, err
@@ -60,7 +95,7 @@ evaluate-rules picker.`,
 			if err != nil {
 				return err
 			}
-			body, err = stampWorkflowAliasOnArray(body, workflowAlias)
+			body, err = stampWorkflowAliasOnArray(body, workflowAlias, "evaluation-rules", cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
@@ -121,7 +156,7 @@ rule-tree picker.`,
 			if err != nil {
 				return err
 			}
-			body, err = stampWorkflowAliasOnArray(body, workflowAlias)
+			body, err = stampWorkflowAliasOnArray(body, workflowAlias, "rule-trees", cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
@@ -160,7 +195,7 @@ workflow's mapping-table picker.`,
 			if err != nil {
 				return err
 			}
-			body, err = stampWorkflowAliasOnArray(body, workflowAlias)
+			body, err = stampWorkflowAliasOnArray(body, workflowAlias, "mapping-tables", cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
@@ -199,7 +234,7 @@ scorecard picker.`,
 			if err != nil {
 				return err
 			}
-			body, err = stampWorkflowAliasOnArray(body, workflowAlias)
+			body, err = stampWorkflowAliasOnArray(body, workflowAlias, "scorecards", cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

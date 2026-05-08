@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -28,12 +27,23 @@ The module determines which base URL is used:
   cms               CMS API
   altdata           AltData API
 
-METHOD must be an HTTP method: GET, POST, PUT, PATCH, DELETE.`,
+METHOD must be an HTTP method: GET, POST, PUT, PATCH, DELETE.
+
+The body can be supplied three ways, mirroring the resource subcommands:
+  - inline: --body '{"key":"value"}'
+  - from file: --body @path/to/body.json
+  - from stdin: omit --body and pipe JSON in (only when stdin isn't a tty)`,
 	Example: `  # GET request
   altscore api GET /v1/borrowers?per-page=1
 
-  # POST with body
+  # POST with inline body
   altscore api POST /v1/borrowers --body '{"label": "Test"}'
+
+  # POST with body from file
+  altscore api POST /v2/tasks/end-abc123 --body @end-task.json
+
+  # POST with body from stdin
+  echo '{"label":"Test"}' | altscore api POST /v1/borrowers
 
   # Use a different module
   altscore api GET /v1/content --module cms
@@ -59,13 +69,22 @@ func runAPI(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Read body via the shared resource-command path: handles inline JSON,
+	// `@filename`, and stdin uniformly. GET/DELETE are body-less so we
+	// silence the "no JSON body provided" error for those methods.
 	var body any
-	if apiBody != "" {
-		var raw json.RawMessage
-		if err := json.Unmarshal([]byte(apiBody), &raw); err != nil {
-			return fmt.Errorf("invalid JSON in --body: %w", err)
+	if apiBody != "" || !apiStdinIsTerminal() {
+		raw, rerr := readBody(apiBody)
+		if rerr != nil {
+			if method == "GET" || method == "DELETE" || method == "HEAD" {
+				// Treat missing body as no-op for body-less methods.
+				body = nil
+			} else {
+				return rerr
+			}
+		} else {
+			body = raw
 		}
-		body = raw
 	}
 
 	data, status, err := c.Do(method, apiModule, path, body)
@@ -79,4 +98,11 @@ func runAPI(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintf(cmd.ErrOrStderr(), "HTTP %d (empty body)\n", status)
 	return nil
+}
+
+// apiStdinIsTerminal reports whether stdin is a tty. When piping JSON in,
+// it's not -- and we should attempt to read it. When the user is typing,
+// it is, and we shouldn't block.
+func apiStdinIsTerminal() bool {
+	return isStdinTerminal()
 }

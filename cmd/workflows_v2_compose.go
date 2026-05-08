@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -146,6 +147,12 @@ Spec format (see file header for full reference):
 				return fmt.Errorf("create workflow: %w", err)
 			}
 
+			// Summary on stderr: list every server-assigned task alias keyed by
+			// its node type. Saves a follow-up `workflows-v2 get | jq` to learn
+			// what compose just created. Skipped on dry-run since nothing was
+			// actually created.
+			printComposeSummary(cmd.ErrOrStderr(), workflow)
+
 			if publish {
 				var created map[string]any
 				if err := json.Unmarshal(data, &created); err != nil {
@@ -247,6 +254,47 @@ func localRef(entry map[string]any, fallback string) string {
 	return fallback
 }
 
+// slugifyWorkflowLabel mirrors borrower-central's
+// app/utils/workflow_alias.py:slugify_workflow_label so compose can predict
+// the alias the server will assign before any task POST happens. Knowing the
+// alias up-front matters because credit-decisioning entities
+// (evaluation-rules, rule-trees, mapping-tables, scorecards) only show up in
+// a workflow's builder pickers when their workflowAlias matches the
+// workflow's alias -- and the alias is server-derived from the label, not
+// settable from the body. When a label like "All 5 types" silently slugs to
+// "all-5-types", entities stamped with "all-types" become invisible.
+//
+// Rules (must match BC byte-for-byte):
+//   - lowercase + strip
+//   - replace any run of non-[a-z0-9] with "-"
+//   - collapse repeated "-"
+//   - trim leading/trailing "-"
+//   - cap at 100 chars
+//   - default to "workflow" when empty
+func slugifyWorkflowLabel(label string) string {
+	s := strings.ToLower(strings.TrimSpace(label))
+	var b strings.Builder
+	b.Grow(len(s))
+	prevDash := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevDash = false
+		} else if !prevDash {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > 100 {
+		out = out[:100]
+	}
+	if out == "" {
+		out = "workflow"
+	}
+	return out
+}
+
 // edgeEndpoints reads the source/target ref or nodeId of an edge entry,
 // preferring the spec-side `from`/`to` shortcuts.
 func edgeEndpoints(e map[string]any) (from, to string) {
@@ -261,31 +309,60 @@ func edgeEndpoints(e map[string]any) (from, to string) {
 	return from, to
 }
 
-// buildEndAutoWiring returns inputSchema + inputMappings for an `end` task by
-// walking ALL transitive ancestors (not just direct predecessors) and
-// emitting the per-task-type entries the Hub auto-wires. Mirrors
-// `buildSectionsFromPredecessors` in altscore-ai-chat/lib/stores/workflow-builder-v2/actions/edge/pdf-data-source-auto-mapping.ts,
-// which calls getPredecessorsSorted -- a BFS over incoming edges that yields
-// every upstream task, not just the immediate parent.
+// endNodeBilliableIDSchema is the canonical billable_id slot the Hub end-task
+// plugin adds to every end node. We mirror it byte-for-byte so compose's end
+// task matches a Hub-recreated one.
+var endNodeBilliableIDSchema = map[string]any{
+	"description": "Optional billable identifier, default Customer ID",
+	"title":       "Billable ID",
+	"type":        "string",
+}
+
+// pdfTitleByType is the section title the PDF report editor uses for each
+// supported ancestor type. Verified against a Hub-recreated end task: titles
+// are the type's display name, NOT the upstream task's label (with one
+// exception: altdata uses the literal string "AltData").
+var pdfTitleByType = map[string]string{
+	"altdata-enrichment": "AltData",
+	"scorecard":          "Scorecard",
+	"mapping-table":      "Mapping Table",
+	"rule-tree":          "Rule Tree",
+	"evaluate-rules":     "Evaluate Rules",
+}
+
+// buildEndAutoWiring returns the four end-node task fields the Hub auto-wires
+// when an end node is dropped on a canvas with credit-decisioning predecessors:
 //
-// Without this wiring, the end task's PDF report editor sees no available
-// sections (each section is keyed off `task_type_underscored_result_<alias>`
-// in inputSchema). The runtime end_activity.py also reads task outputs via
-// these mapping keys with context.get(); missing keys silently produce empty
-// values in the PDF.
+//	inputSchema   -- one entry per ancestor type, plus the canonical
+//	                 billable_id slot. Verified byte-for-byte against a
+//	                 Hub-recreated end task in production.
+//	inputMappings -- matching entries pointing at task_outputs.<alias>(.<deep>)
+//	pdfSections   -- the endConfig.pdfConfig.sourcesConfig array. WITHOUT
+//	                 this, the end task ships with endConfig:null and the
+//	                 PDF generator sees no enabled config -- the report
+//	                 silently doesn't render. This was the root cause of the
+//	                 user's "PDF didn't come out" report on the first
+//	                 compose-generated workflow.
+//	hasAltdata    -- whether at least one ancestor is altdata-enrichment.
+//	                 Triggers the two-phase create at the call site (the
+//	                 strict CreateTaskV2 validator rejects multi-dot
+//	                 inputMappings values; only altdata produces them).
 //
-// Five upstream task types are recognised (those the Hub knows how to
-// auto-wire): altdata-enrichment, scorecard, mapping-table, rule-tree,
-// evaluate-rules. Other predecessor types are skipped silently (matches Hub).
+// Mirrors `buildSectionsFromPredecessors` in
+// altscore-ai-chat/lib/stores/workflow-builder-v2/actions/edge/pdf-data-source-auto-mapping.ts.
+// Walks ALL transitive ancestors via BFS over incoming edges (matches the
+// Hub's getPredecessorsSorted), not just direct parents.
 //
-// The function falls through gracefully when:
-//   - no predecessors found (e.g. end is detached from the graph in the spec)
-//   - a predecessor's ref isn't in refMap (e.g. dry-run partial map)
-//   - a predecessor type isn't in the recognised set
-// Callers can rely on the maps always being non-nil.
-func buildEndAutoWiring(endRef string, edges []map[string]any, taskByRef map[string]map[string]any, refMap map[string]string) (inputSchema, inputMappings map[string]any) {
-	inputSchema = map[string]any{}
+// Five upstream task types are recognised: altdata-enrichment, scorecard,
+// mapping-table, rule-tree, evaluate-rules. Other predecessor types are
+// skipped silently (matches Hub). All return slices/maps are non-nil so
+// callers can use len() unconditionally.
+func buildEndAutoWiring(endRef string, edges []map[string]any, taskByRef map[string]map[string]any, refMap map[string]string) (inputSchema, inputMappings map[string]any, pdfSections []map[string]any, hasAltdata bool) {
+	inputSchema = map[string]any{
+		"billable_id": endNodeBilliableIDSchema,
+	}
 	inputMappings = map[string]any{}
+	pdfSections = []map[string]any{}
 
 	// BFS over incoming edges starting from endRef. Direct parents come first
 	// (they're at depth 1) but we accumulate every ancestor in `visited` so
@@ -324,43 +401,398 @@ func buildEndAutoWiring(endRef string, edges []map[string]any, taskByRef map[str
 			predLabel = predAlias
 		}
 
-		// One-section-per-ancestor: emit the <task-type-underscored>_result_<alias>
-		// pair (schema + mapping) the Hub also persists. The Hub source code
-		// emits more keys (alerts/alerts_count for evaluate-rules,
-		// <outputVar>_rule_code etc. for rule-tree), but those were never seen
-		// in the persisted-and-working end task observed in production -- and
-		// the strict CreateTaskV2 validator rejects any inputMappings key that
-		// isn't in inputSchema. Sticking to the minimal observed set keeps the
-		// validator happy AND matches what the Hub actually ships.
+		// section is the per-ancestor entry that lands in
+		// endConfig.pdfConfig.sourcesConfig. Title comes from pdfTitleByType
+		// (matches Hub's persisted shape -- generic display names, not the
+		// upstream task's label). Subtitle uses the upstream label so the
+		// rendered PDF is still self-describing.
+		title, ok := pdfTitleByType[predType]
+		if !ok {
+			continue // unrecognised type; skip silently like the Hub
+		}
+		var sourceInputSchema string
+		var mappingValue string
+		var components []map[string]any
+
 		switch predType {
 		case "altdata-enrichment":
-			key := "sources_output_packages_" + predAlias
-			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
-			inputMappings[key] = "task_outputs." + predAlias + ".sources_output_packages"
+			sourceInputSchema = "sources_output_packages_" + predAlias
+			// Multi-dot mapping value: triggers two-phase create at the call
+			// site so the strict CreateTaskV2 validator doesn't reject it.
+			mappingValue = "task_outputs." + predAlias + ".sources_output_packages"
+			hasAltdata = true
+			// One component per source in the upstream's sourcesConfig.
+			for _, raw := range asSlice(predTask["sourcesConfig"]) {
+				s, _ := raw.(map[string]any)
+				if s == nil {
+					continue
+				}
+				sid, _ := s["sourceId"].(string)
+				ver, _ := s["version"].(string)
+				if ver == "" {
+					ver = "v1"
+				}
+				components = append(components, map[string]any{
+					"id":             newUUIDv4(),
+					"name":           sid + "_" + ver,
+					"altdataPackage": sid,
+				})
+			}
 
 		case "scorecard":
-			key := "scorecard_result_" + predAlias
-			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
-			inputMappings[key] = "task_outputs." + predAlias
+			sourceInputSchema = "scorecard_result_" + predAlias
+			mappingValue = "task_outputs." + predAlias
+			cfg, _ := predTask["scorecardConfig"].(map[string]any)
+			totalVar := "total_score"
+			breakdownVar := "score_breakdown"
+			if cfg != nil {
+				if v, _ := cfg["totalScoreVariable"].(string); v != "" {
+					totalVar = v
+				}
+				if v, _ := cfg["breakdownVariable"].(string); v != "" {
+					breakdownVar = v
+				}
+			}
+			components = append(components, map[string]any{
+				"id":                 newUUIDv4(),
+				"name":               "scorecardResult",
+				"totalScoreVariable": totalVar,
+				"breakdownVariable":  breakdownVar,
+			})
 
 		case "mapping-table":
-			key := "mapping_table_result_" + predAlias
-			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
-			inputMappings[key] = "task_outputs." + predAlias
+			sourceInputSchema = "mapping_table_result_" + predAlias
+			mappingValue = "task_outputs." + predAlias
+			cfg, _ := predTask["mappingTableConfig"].(map[string]any)
+			outputVariables := []map[string]any{}
+			if cfg != nil {
+				for _, raw := range asSlice(cfg["entries"]) {
+					em, _ := raw.(map[string]any)
+					v, _ := em["outputVariable"].(string)
+					if v == "" {
+						continue
+					}
+					outputVariables = append(outputVariables, map[string]any{
+						"variable": v,
+						"label":    v,
+					})
+				}
+			}
+			components = append(components, map[string]any{
+				"id":              newUUIDv4(),
+				"name":            "mappingTableResult",
+				"outputVariables": outputVariables,
+			})
 
 		case "rule-tree":
-			key := "rule_tree_result_" + predAlias
-			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
-			inputMappings[key] = "task_outputs." + predAlias
+			sourceInputSchema = "rule_tree_result_" + predAlias
+			mappingValue = "task_outputs." + predAlias
+			cfg, _ := predTask["ruleTreeConfig"].(map[string]any)
+			outVar := "decision"
+			if cfg != nil {
+				if v, _ := cfg["outputVariable"].(string); v != "" {
+					outVar = v
+				}
+			}
+			components = append(components, map[string]any{
+				"id":             newUUIDv4(),
+				"name":           "ruleTreeResult",
+				"outputVariable": outVar,
+			})
 
 		case "evaluate-rules":
-			key := "evaluate_rules_result_" + predAlias
-			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
-			inputMappings[key] = "task_outputs." + predAlias
+			sourceInputSchema = "evaluate_rules_result_" + predAlias
+			mappingValue = "task_outputs." + predAlias
+			components = append(components, map[string]any{
+				"id":   newUUIDv4(),
+				"name": "evaluateRulesResult",
+			})
 		}
+
+		inputSchema[sourceInputSchema] = map[string]any{"type": "object", "title": predLabel}
+		inputMappings[sourceInputSchema] = mappingValue
+
+		// PDF section. type=altdata-enrichment maps to PDF type='altdata' (the
+		// renderer's discriminator drops the suffix). All other types pass
+		// through verbatim.
+		pdfType := predType
+		if pdfType == "altdata-enrichment" {
+			pdfType = "altdata"
+		}
+		pdfSections = append(pdfSections, map[string]any{
+			"id":                newUUIDv4(),
+			"type":              pdfType,
+			"title":             title,
+			"subtitle":          "From " + predLabel,
+			"enabled":           true,
+			"page_break":        true,
+			"sourceInputSchema": sourceInputSchema,
+			"taskAlias":         predAlias,
+			"components":        components,
+		})
 	}
 
-	return inputSchema, inputMappings
+	return inputSchema, inputMappings, pdfSections, hasAltdata
+}
+
+// readSpecHTMLSections extracts the spec-only `htmlSections` field from an
+// extraNode. Returns nil when the field is absent or shaped wrong (compose
+// silently ignores malformed entries; the spec validator would have caught
+// truly broken JSON before we got here).
+func readSpecHTMLSections(node map[string]any) []map[string]any {
+	raw, ok := node["htmlSections"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, r := range raw {
+		if m, ok := r.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// htmlSectionVarRegex matches {<word>} placeholders in HTML content -- same
+// shape that runtime safe_format() resolves. Compose uses it to discover
+// which workflow input/custom variables a section references so it can wire
+// them into the end task's inputMappings (otherwise safe_format leaves
+// {var} as a literal because the runtime context never resolves it).
+var htmlSectionVarRegex = regexp.MustCompile(`\{(\w+)\}`)
+
+// buildHTMLSections turns spec htmlSections into pdfConfig.sourcesConfig
+// entries with components shaped as {name:"htmlBlock", content, context}.
+// Returns:
+//   - sections: ready-to-append entries for endConfig.pdfConfig.sourcesConfig
+//   - inputSchema additions: a slot per input/custom variable referenced in
+//     any section's content
+//   - inputMappings additions: matching wiring (inputs.<name> or
+//     custom.<name>) so safe_format resolves at runtime
+//
+// Each section accepts:
+//   - title: PDF heading (default "")
+//   - subtitle: PDF subheading (default "")
+//   - content: the raw HTML string with {var} interpolation tokens
+//   - context: visual treatment "none" | "info" | "warning" | "success" |
+//     "danger" (default "none")
+//   - pageBreak: whether to start a new PDF page (default true)
+func buildHTMLSections(sections []map[string]any, inputVars, customVars map[string]any) (
+	built []map[string]any,
+	schema map[string]any,
+	mappings map[string]any,
+) {
+	built = make([]map[string]any, 0, len(sections))
+	schema = map[string]any{}
+	mappings = map[string]any{}
+
+	for _, s := range sections {
+		content, _ := s["content"].(string)
+		title, _ := s["title"].(string)
+		subtitle, _ := s["subtitle"].(string)
+		ctx, _ := s["context"].(string)
+		if ctx == "" {
+			ctx = "none"
+		}
+		pageBreak := true
+		if v, has := s["pageBreak"].(bool); has {
+			pageBreak = v
+		}
+
+		built = append(built, map[string]any{
+			"id":         newUUIDv4(),
+			"type":       "htmlBlock",
+			"title":      title,
+			"subtitle":   subtitle,
+			"enabled":    true,
+			"page_break": pageBreak,
+			"components": []map[string]any{{
+				"id":      newUUIDv4(),
+				"name":    "htmlBlock",
+				"content": content,
+				"context": ctx,
+			}},
+		})
+
+		// Auto-wire workflow-scope variables referenced in the content.
+		// Task-output references resolve via end_activity's enriched_context
+		// promotion (no wiring needed); only inputs/custom vars need to be
+		// pulled into the end task's resolved-context root.
+		for _, m := range htmlSectionVarRegex.FindAllStringSubmatch(content, -1) {
+			name := m[1]
+			if _, has := mappings[name]; has {
+				continue
+			}
+			if _, isInput := inputVars[name]; isInput {
+				mappings[name] = "inputs." + name
+				schema[name] = inferSchemaForVar(inputVars[name], name)
+				continue
+			}
+			if _, isCustom := customVars[name]; isCustom {
+				mappings[name] = "custom." + name
+				schema[name] = inferSchemaForVar(customVars[name], name)
+				continue
+			}
+			// Else: assume the name is a task output (alerts, credit_score,
+			// decision, ...). end_activity promotes those to root, so no
+			// inputMappings entry is needed -- safe_format will find them.
+		}
+	}
+	return built, schema, mappings
+}
+
+// inferSchemaForVar derives an inputSchema entry for a workflow-scope
+// variable, falling back to type:"string" when the spec doesn't define one
+// (or when the spec value isn't shaped as a JSON-Schema-style object).
+func inferSchemaForVar(specValue any, name string) map[string]any {
+	out := map[string]any{
+		"type":  "string",
+		"title": humanizeKey(name),
+	}
+	v, ok := specValue.(map[string]any)
+	if !ok {
+		return out
+	}
+	if t, _ := v["type"].(string); t != "" {
+		out["type"] = t
+	}
+	if title, _ := v["title"].(string); title != "" {
+		out["title"] = title
+	} else if label, _ := v["label"].(string); label != "" {
+		out["title"] = label
+	}
+	return out
+}
+
+// printComposeSummary writes a one-line-per-task summary to stderr after
+// compose finishes its real (non-dry-run) POSTs. Without this, the only thing
+// compose returns to stdout is `{"id": "..."}` of the workflow -- the user
+// then has to GET the workflow + each task to discover server-assigned
+// aliases. Format mirrors `workflows-v2 lint`'s short report style.
+func printComposeSummary(w io.Writer, workflow map[string]any) {
+	if w == nil {
+		return
+	}
+	rawNodes, ok := workflow["nodes"].([]map[string]any)
+	if !ok {
+		// Try the slice-of-any form some assemblies produce.
+		alt, _ := workflow["nodes"].([]any)
+		for _, item := range alt {
+			if m, ok := item.(map[string]any); ok {
+				rawNodes = append(rawNodes, m)
+			}
+		}
+	}
+	if len(rawNodes) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "# created %d task(s) backing the workflow nodes:\n", len(rawNodes))
+	for _, n := range rawNodes {
+		typ, _ := n["type"].(string)
+		alias, _ := n["taskAlias"].(string)
+		label, _ := n["label"].(string)
+		if alias == "" {
+			continue
+		}
+		fmt.Fprintf(w, "#   %-20s  alias=%-40s  label=%q\n", typ, alias, label)
+	}
+}
+
+// postTaskWithMultiDotFallback posts a task body to /v2/tasks and handles the
+// strict-vs-lenient validator split that the v2 task API enforces:
+//
+//   - POST /v2/tasks runs CreateTaskV2 (strict). It rejects inputMappings
+//     values like "task_outputs.<alias>.<deep>" (multi-dot) AND any
+//     inputMappings key that isn't in inputSchema.
+//   - POST /v2/tasks/{alias} runs CreateTaskVersionV2 (lenient). It accepts
+//     both shapes and persists them verbatim.
+//
+// When the body contains multi-dot mappings, this helper does a two-phase
+// create:
+//
+//	Phase 1: POST /v2/tasks with inputMappings + inputSchema stripped so the
+//	         strict validator passes. Server returns the assigned alias and
+//	         creates v=1.
+//	Phase 2: POST /v2/tasks/{alias} with the full body. Server bumps to v=2
+//	         with the canonical mappings persisted.
+//
+// Returns the server-assigned alias and final version. In dryRun mode the
+// caller-supplied `ref` is used as the alias and version is 2 if multi-dot
+// (so downstream extraNode positioning matches what real-run produces).
+//
+// Used by both the tasks loop and the extraNodes end branch (the only
+// extraNode that ships with multi-dot mappings is `end` -- see
+// buildEndAutoWiring's altdata branch).
+func postTaskWithMultiDotFallback(c *client.Client, body map[string]any, ref string, dryRun bool, label string) (alias string, version int, err error) {
+	multiDot := taskHasMultiDotMapping(body)
+
+	var firstPhaseBytes []byte
+	if multiDot {
+		stub := shallowCopy(body)
+		delete(stub, "inputMappings")
+		delete(stub, "inputSchema")
+		firstPhaseBytes, err = json.Marshal(stub)
+	} else {
+		firstPhaseBytes, err = json.Marshal(body)
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("encode %s: %w", label, err)
+	}
+	fullBytes, err := json.Marshal(body)
+	if err != nil {
+		return "", 0, fmt.Errorf("encode full %s: %w", label, err)
+	}
+
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "# Would POST /v2/tasks (%s): %s\n", label, string(firstPhaseBytes))
+		if multiDot {
+			fmt.Fprintf(os.Stderr, "# Would POST /v2/tasks/{alias} (%s phase 2 -- multi-dot mappings): %s\n", label, string(fullBytes))
+		}
+		if a, _ := body["alias"].(string); a != "" {
+			alias = a
+		} else {
+			alias = ref
+		}
+		version = 1
+		if multiDot {
+			version = 2
+		}
+		return alias, version, nil
+	}
+
+	data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(firstPhaseBytes))
+	if err != nil {
+		return "", 0, err
+	}
+	var created map[string]any
+	if err := json.Unmarshal(data, &created); err != nil {
+		return "", 0, fmt.Errorf("parse %s response: %w", label, err)
+	}
+	if a, _ := created["alias"].(string); a != "" {
+		alias = a
+	} else {
+		return "", 0, fmt.Errorf("%s: server returned no alias", label)
+	}
+	if v, ok := created["version"].(float64); ok {
+		version = int(v)
+	} else {
+		version = 1
+	}
+
+	if multiDot {
+		path := "/v2/tasks/" + alias
+		v2Data, _, err := c.Do("POST", "borrower_central", path, json.RawMessage(fullBytes))
+		if err != nil {
+			return alias, version, fmt.Errorf("%s phase 2: %w", label, err)
+		}
+		var v2created map[string]any
+		if err := json.Unmarshal(v2Data, &v2created); err != nil {
+			return alias, version, fmt.Errorf("%s phase 2 parse response: %w", label, err)
+		}
+		if v, ok := v2created["version"].(float64); ok {
+			version = int(v)
+		}
+	}
+	return alias, version, nil
 }
 
 // reservedMappingScopes are the leading segments in a mapping value that are
@@ -472,6 +904,21 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 		return nil, err
 	}
 
+	// Surface the predicted workflow alias up-front. The server slugifies
+	// `label` and ignores any `alias` key in the body, so callers can't
+	// influence it after the fact. Credit-decisioning entities scoped via
+	// --workflow-alias on create only show up in pickers when their
+	// workflowAlias matches THIS slug, so tell the caller exactly what to
+	// stamp before they create entities -- not after, when the workflow's
+	// pickers come up empty and they have to re-stamp.
+	predictedAlias := slugifyWorkflowLabel(spec.Label)
+	fmt.Fprintf(os.Stderr, "# Workflow alias will be: %q (server-derived from label %q).\n", predictedAlias, spec.Label)
+	fmt.Fprintf(os.Stderr, "# Stamp entities with this alias on create:\n")
+	fmt.Fprintf(os.Stderr, "#   altscore evaluation-rules create --workflow-alias %s ...\n", predictedAlias)
+	fmt.Fprintf(os.Stderr, "#   altscore rule-trees       create --workflow-alias %s ...\n", predictedAlias)
+	fmt.Fprintf(os.Stderr, "#   altscore mapping-tables   create --workflow-alias %s ...\n", predictedAlias)
+	fmt.Fprintf(os.Stderr, "#   altscore scorecards       create --workflow-alias %s ...\n", predictedAlias)
+
 	// Pre-flight: validate every task's REQUIRED-field shape locally before
 	// posting anything. The previous loop would create tasks 0..N-1 on the
 	// server, then fail on N because a label/type was missing or an enum was
@@ -517,91 +964,22 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 
 		// Type-specific normalization: enrich altdata-enrichment with inputKeys
 		// from source inputFields, validate conditional branches, etc.
-		if err := normalizeTaskBody(c, task, spec.CustomVariables, dryRun); err != nil {
+		if err := normalizeTaskBody(c, task, &composeNormalizeOpts{
+			PredictedAlias:  predictedAlias,
+			CustomVariables: spec.CustomVariables,
+		}, dryRun); err != nil {
 			return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}
 
-		// Detect cross-task mappings (task_outputs.<alias>.<deep>). The strict
-		// CreateTaskV2 Pydantic validator rejects multi-dot mapping values, but
-		// the runtime resolver requires them. CreateTaskVersionV2 has a lenient
-		// validator. So when we have multi-dot mappings, do a two-phase create:
-		//   Phase 1: POST /v2/tasks with inputMappings + inputSchema stripped
-		//            so the strict validator skips. Server creates v=1 stub.
-		//   Phase 2: POST /v2/tasks/{alias} with the full body, server bumps to
-		//            v=2 with the canonical mappings persisted.
-		multiDot := taskHasMultiDotMapping(task)
-
-		var firstPhaseBody []byte
-		var encErr error
-		if multiDot {
-			stub := shallowCopy(task)
-			delete(stub, "inputMappings")
-			delete(stub, "inputSchema")
-			firstPhaseBody, encErr = json.Marshal(stub)
-		} else {
-			firstPhaseBody, encErr = json.Marshal(task)
-		}
-		if encErr != nil {
-			return nil, fmt.Errorf("tasks[%d]: encode: %w", i, encErr)
-		}
-		fullBody, encErr := json.Marshal(task)
-		if encErr != nil {
-			return nil, fmt.Errorf("tasks[%d]: encode full body: %w", i, encErr)
-		}
-
-		var (
-			version     = 1
-			serverAlias string
+		serverAlias, version, err := postTaskWithMultiDotFallback(
+			c, task, ref, dryRun,
+			fmt.Sprintf("tasks[%d] ref=%q", i, ref),
 		)
-		if dryRun {
-			fmt.Printf("# Would POST /v2/tasks: %s\n", string(firstPhaseBody))
-			if multiDot {
-				fmt.Printf("# Would POST /v2/tasks/{alias} (phase 2 -- multi-dot mappings): %s\n", string(fullBody))
-			}
-			if a, _ := task["alias"].(string); a != "" {
-				serverAlias = a
-			} else {
-				serverAlias = ref
-			}
-			if multiDot {
-				version = 2
-			}
-		} else {
-			data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(firstPhaseBody))
-			if err != nil {
-				return nil, fmt.Errorf("tasks[%d] (ref=%q): %w (created so far: %v)", i, ref, err, createdAliases)
-			}
-			var created map[string]any
-			if err := json.Unmarshal(data, &created); err != nil {
-				return nil, fmt.Errorf("tasks[%d] (ref=%q): parse response: %w", i, ref, err)
-			}
-			if v, ok := created["version"].(float64); ok {
-				version = int(v)
-			}
-			if a, _ := created["alias"].(string); a != "" {
-				serverAlias = a
-			} else {
-				return nil, fmt.Errorf("tasks[%d] (ref=%q): server returned no alias", i, ref)
-			}
+		if err != nil {
+			return nil, fmt.Errorf("%w (created so far: %v)", err, createdAliases)
+		}
+		if !dryRun {
 			createdAliases = append(createdAliases, serverAlias)
-
-			// Phase 2: re-post with the full body (multi-dot mappings, full
-			// inputSchema). The lenient CreateTaskVersionV2 validator accepts
-			// the canonical task_outputs.<alias>.<deep.path> form.
-			if multiDot {
-				path := "/v2/tasks/" + serverAlias
-				v2Data, _, err := c.Do("POST", "borrower_central", path, json.RawMessage(fullBody))
-				if err != nil {
-					return nil, fmt.Errorf("tasks[%d] (ref=%q) phase 2: %w", i, ref, err)
-				}
-				var v2created map[string]any
-				if err := json.Unmarshal(v2Data, &v2created); err != nil {
-					return nil, fmt.Errorf("tasks[%d] (ref=%q) phase 2: parse response: %w", i, ref, err)
-				}
-				if v, ok := v2created["version"].(float64); ok {
-					version = int(v)
-				}
-			}
 		}
 
 		refMap[ref] = serverAlias
@@ -654,85 +1032,72 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 				"type":  nodeType,
 			}
 			if strings.ToLower(nodeType) == "end" {
-				inSchema, inMappings := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap)
+				inSchema, inMappings, pdfSections, _ := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap)
+
+				// Spec extension: per-end-node htmlSections render as
+				// additional PDF sections at the top of the report (before
+				// the auto-wired data-source sections). Each section
+				// interpolates {var} tokens against the end task's resolved
+				// context at runtime; compose auto-wires the inputMappings
+				// for any input or custom variable referenced in the
+				// content, so safe_format finds them. Task-output references
+				// (e.g. {credit_score}) need no wiring -- end_activity
+				// promotes upstream task outputs to root in enriched_context.
+				if rawSections := readSpecHTMLSections(n); len(rawSections) > 0 {
+					built, htmlSchema, htmlMappings := buildHTMLSections(rawSections, spec.InputVariables, spec.CustomVariables)
+					pdfSections = append(built, pdfSections...)
+					for k, v := range htmlSchema {
+						if _, exists := inSchema[k]; !exists {
+							inSchema[k] = v
+						}
+					}
+					for k, v := range htmlMappings {
+						if _, exists := inMappings[k]; !exists {
+							inMappings[k] = v
+						}
+					}
+				}
+				// htmlSections is spec sugar, not part of the API node shape.
+				delete(n, "htmlSections")
+
 				if len(inSchema) > 0 {
 					taskBody["inputSchema"] = inSchema
 				}
 				if len(inMappings) > 0 {
 					taskBody["inputMappings"] = inMappings
 				}
+				// endConfig.pdfConfig.enabled=true is what actually flips the
+				// PDF generator on. Without it, the runtime end_activity sees
+				// endConfig=null and skips report rendering entirely -- the
+				// failure mode the user hit on the first compose-generated
+				// workflow ("PDF didn't come out").
+				taskBody["endConfig"] = map[string]any{
+					"decisionConfig": nil,
+					"outputJson":     "",
+					"pdfConfig": map[string]any{
+						"brandLogo":             nil,
+						"enabled":               true,
+						"filePrefix":            "",
+						"pdfGenerationRequired": false,
+						"sourcesConfig":         pdfSections,
+						"title":                 "Report",
+						"subtitle":              "",
+					},
+				}
 			}
 
-			// Two-phase create when the body has multi-dot mapping values
-			// (currently only altdata-enrichment ancestors trigger this:
-			// task_outputs.<alias>.sources_output_packages). The strict
-			// CreateTaskV2 validator rejects multi-dot values, so phase 1
-			// posts a stub without inputMappings/inputSchema, then phase 2
-			// re-posts the full body via /v2/tasks/{alias} which uses the
-			// lenient CreateTaskVersionV2 validator. Same pattern as the
-			// tasks loop above; without it, an `end` node downstream of an
-			// altdata-enrichment task fails at create with HTTP 400.
-			multiDot := taskHasMultiDotMapping(taskBody)
-			var firstPhaseBody []byte
-			var encErr error
-			if multiDot {
-				stub := shallowCopy(taskBody)
-				delete(stub, "inputMappings")
-				delete(stub, "inputSchema")
-				firstPhaseBody, encErr = json.Marshal(stub)
-			} else {
-				firstPhaseBody, encErr = json.Marshal(taskBody)
+			alias, version, err := postTaskWithMultiDotFallback(
+				c, taskBody, ref, dryRun,
+				fmt.Sprintf("extraNodes[%d] ref=%q (extra-node backing)", i, ref),
+			)
+			if err != nil {
+				return nil, err
 			}
-			if encErr != nil {
-				return nil, fmt.Errorf("extraNodes[%d] (ref=%q): encode task: %w", i, ref, encErr)
-			}
-			fullBody, encErr := json.Marshal(taskBody)
-			if encErr != nil {
-				return nil, fmt.Errorf("extraNodes[%d] (ref=%q): encode full body: %w", i, ref, encErr)
-			}
-			if dryRun {
-				fmt.Printf("# Would POST /v2/tasks (extra-node backing): %s\n", string(firstPhaseBody))
-				if multiDot {
-					fmt.Printf("# Would POST /v2/tasks/{alias} (extra-node phase 2 -- multi-dot mappings): %s\n", string(fullBody))
-				}
-				taskAlias = ref
-				n["taskAlias"] = taskAlias
-				n["taskVersion"] = 1
-				if multiDot {
-					n["taskVersion"] = 2
-				}
-			} else {
-				data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(firstPhaseBody))
-				if err != nil {
-					return nil, fmt.Errorf("extraNodes[%d] (ref=%q): create backing task: %w", i, ref, err)
-				}
-				var created map[string]any
-				if err := json.Unmarshal(data, &created); err != nil {
-					return nil, fmt.Errorf("extraNodes[%d] (ref=%q): parse task response: %w", i, ref, err)
-				}
-				if a, ok := created["alias"].(string); ok && a != "" {
-					taskAlias = a
-					n["taskAlias"] = a
-				}
-				if v, ok := created["version"].(float64); ok {
-					n["taskVersion"] = int(v)
-				}
-				createdAliases = append(createdAliases, fmt.Sprint(n["taskAlias"]))
-
-				if multiDot {
-					path := "/v2/tasks/" + taskAlias
-					v2Data, _, err := c.Do("POST", "borrower_central", path, json.RawMessage(fullBody))
-					if err != nil {
-						return nil, fmt.Errorf("extraNodes[%d] (ref=%q) phase 2: %w", i, ref, err)
-					}
-					var v2created map[string]any
-					if err := json.Unmarshal(v2Data, &v2created); err != nil {
-						return nil, fmt.Errorf("extraNodes[%d] (ref=%q) phase 2: parse response: %w", i, ref, err)
-					}
-					if v, ok := v2created["version"].(float64); ok {
-						n["taskVersion"] = int(v)
-					}
-				}
+			taskAlias = alias
+			n["taskAlias"] = alias
+			n["taskVersion"] = version
+			if !dryRun {
+				createdAliases = append(createdAliases, alias)
 			}
 		}
 
@@ -771,7 +1136,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 			}
 			data["isEndNode"] = true
 			if _, hasMappings := data["inputMappings"]; !hasMappings {
-				if _, inMappings := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap); len(inMappings) > 0 {
+				if _, inMappings, _, _ := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap); len(inMappings) > 0 {
 					data["inputMappings"] = inMappings
 				}
 			}
@@ -1291,7 +1656,12 @@ func preflightTasks(spec *composeSpec) error {
 		if err != nil {
 			return fmt.Errorf("tasks[%d] (ref=%q): cannot encode for preflight: %w", i, ref, err)
 		}
-		if err := validateTaskV2Body(json.RawMessage(body)); err != nil {
+		// Structural-only: the altdata-enrichment empty-inputKeys check
+		// belongs in validateTaskV2Body (used by manual tasks-v2 create),
+		// not here. Compose's normalize step fills inputKeys from each
+		// source's inputFields automatically; rejecting the spec at preflight
+		// would block work that compose can fix on its own.
+		if err := validateTaskV2BodyStructural(json.RawMessage(body)); err != nil {
 			return fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}
 
