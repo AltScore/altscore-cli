@@ -763,7 +763,7 @@ func preflightTasks(spec *composeSpec) error {
 			knownAliases[alias] = true
 		}
 	}
-	hasStart, hasEnd := false, false
+	startCount, endCount := 0, 0
 	for i, node := range spec.ExtraNodes {
 		ref := localRef(node, fmt.Sprintf("n%d", i))
 		if knownRefs[ref] {
@@ -781,9 +781,9 @@ func preflightTasks(spec *composeSpec) error {
 		nodeType, _ := node["type"].(string)
 		switch nodeType {
 		case "start":
-			hasStart = true
+			startCount++
 		case "end":
-			hasEnd = true
+			endCount++
 		default:
 			return fmt.Errorf(
 				"extraNodes[%d] (ref=%q): type=%q is not allowed in extraNodes. "+
@@ -794,14 +794,21 @@ func preflightTasks(spec *composeSpec) error {
 			)
 		}
 	}
-	if !hasStart {
+	if startCount == 0 {
 		return fmt.Errorf(
 			"compose spec has no 'start' node in extraNodes. Every workflow needs exactly one " +
 				"start node; the engine doesn't know where to begin without it. Add: " +
 				`{"ref": "start", "type": "start", "label": "Start"} to extraNodes.`,
 		)
 	}
-	if !hasEnd {
+	if startCount > 1 {
+		return fmt.Errorf(
+			"compose spec has %d 'start' nodes in extraNodes. Every workflow needs exactly ONE "+
+				"start; multiple starts make the engine's traversal non-deterministic. Drop the extras.",
+			startCount,
+		)
+	}
+	if endCount == 0 {
 		// 'end' is conventional but not strictly required; warn-only via
 		// stderr, never block. Keep this open for niche use cases (e.g.
 		// workflows that terminate via 'exception' branches).
@@ -925,8 +932,19 @@ func preflightTasks(spec *composeSpec) error {
 				return fmt.Errorf("tasks[%d] (ref=%q): data-store-query task requires dataStoreQueryConfig.tableName", i, ref)
 			}
 		case "exception":
-			if m, _ := task["errorMessage"].(string); m == "" {
-				return fmt.Errorf("tasks[%d] (ref=%q): exception task requires 'errorMessage'", i, ref)
+			// The runtime ExecutionNotice model wants 'message', not
+			// 'errorMessage' -- but the schema-guide and earlier preflights
+			// documented 'errorMessage'. Accept both, then mirror to
+			// 'message' so the runtime activity finds it. Unmirrored
+			// 'errorMessage' surfaces at execution as a Pydantic
+			// ValidationError "message none is not an allowed value".
+			em, _ := task["errorMessage"].(string)
+			m, _ := task["message"].(string)
+			if em == "" && m == "" {
+				return fmt.Errorf("tasks[%d] (ref=%q): exception task requires 'errorMessage' (or equivalently 'message') -- the failure message surfaced when this branch fires", i, ref)
+			}
+			if m == "" && em != "" {
+				task["message"] = em
 			}
 		case "child-workflow":
 			eid, _ := task["executorId"].(string)
@@ -945,6 +963,56 @@ func preflightTasks(spec *composeSpec) error {
 		}
 		if err := validateTaskV2Body(json.RawMessage(body)); err != nil {
 			return fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
+		}
+
+		// inputSchema.<field>.type must be in the JSON-Schema-style enum
+		// the runtime accepts. Backend rejects unknown values with a
+		// misleading "permitted: 'array'" message; surface the full
+		// enum here so the agent picks the right value.
+		if is, ok := task["inputSchema"].(map[string]any); ok {
+			for fname, fdef := range is {
+				fm, _ := fdef.(map[string]any)
+				if fm == nil {
+					continue
+				}
+				t, _ := fm["type"].(string)
+				if t == "" {
+					continue
+				}
+				if !validInputSchemaTypes[t] {
+					return fmt.Errorf(
+						"tasks[%d] (ref=%q): inputSchema.%s.type=%q is not a valid type. "+
+							"Valid: string, integer, number, boolean, object, array.",
+						i, ref, fname, t,
+					)
+				}
+			}
+		}
+
+		// Conditional task: every branch's condition.field must exist in
+		// inputSchema, otherwise the branch silently never matches at
+		// runtime.
+		if taskType == "conditional" {
+			schemaFields := map[string]bool{}
+			if is, ok := task["inputSchema"].(map[string]any); ok {
+				for k := range is {
+					schemaFields[k] = true
+				}
+			}
+			branches := asSlice(task["branches"])
+			for bi, b := range branches {
+				bm, _ := b.(map[string]any)
+				if bm == nil {
+					continue
+				}
+				if missing := unknownConditionFields(asMap(bm["conditions"]), schemaFields); len(missing) > 0 {
+					return fmt.Errorf(
+						"tasks[%d] (ref=%q): conditional branch[%d] references field(s) not declared in inputSchema: %s. "+
+							"Add them to inputSchema (with type + inputMappings) or fix the typo -- otherwise the branch silently never matches at runtime.",
+						i, ref, bi, strings.Join(missing, ", "),
+					)
+				}
+			}
 		}
 
 		// Mapping namespace check: every inputMappings value with a
@@ -998,6 +1066,54 @@ func preflightTasks(spec *composeSpec) error {
 		}
 	}
 	return nil
+}
+
+// validInputSchemaTypes mirrors the SchemaTypes Pydantic discriminated union
+// in borrower-central. The backend's error message lies ("permitted:
+// 'array'"); the real enum is below. Used by preflight to reject typos in
+// inputSchema.<field>.type before the API round-trip.
+var validInputSchemaTypes = map[string]bool{
+	"string":  true,
+	"integer": true,
+	"number":  true,
+	"boolean": true,
+	"object":  true,
+	"array":   true,
+}
+
+// unknownConditionFields walks a ConditionGroup tree and returns every leaf
+// 'field' value that isn't in the schemaFields set. Used to validate that
+// conditional branches only reference fields the task declares -- otherwise
+// the branch silently never matches at runtime.
+func unknownConditionFields(group map[string]any, schemaFields map[string]bool) []string {
+	if len(group) == 0 || len(schemaFields) == 0 {
+		return nil
+	}
+	var missing []string
+	items := asSlice(group["items"])
+	for _, it := range items {
+		im, _ := it.(map[string]any)
+		if im == nil {
+			continue
+		}
+		// Nested ConditionGroup
+		if _, isGroup := im["operator"]; isGroup {
+			if _, hasItems := im["items"]; hasItems {
+				missing = append(missing, unknownConditionFields(im, schemaFields)...)
+				continue
+			}
+		}
+		// Leaf ConditionItem -- skip when valueType=variable (those
+		// reference RHS fields that may live on a different scope).
+		field, _ := im["field"].(string)
+		if field == "" {
+			continue
+		}
+		if !schemaFields[field] {
+			missing = append(missing, field)
+		}
+	}
+	return missing
 }
 
 // isServerAlias reports whether s looks like a server-assigned task alias --
