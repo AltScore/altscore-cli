@@ -1023,6 +1023,49 @@ func preflightTasks(spec *composeSpec) error {
 			if eid == "" && eal == "" {
 				return fmt.Errorf("tasks[%d] (ref=%q): child-workflow task requires 'executorId' or 'executorAlias'", i, ref)
 			}
+		case "array-router":
+			// The runtime activity reads the source array via
+			// inputMappings.source_array, NOT the top-level
+			// sourceArrayPath field documented on the task body. Mirror
+			// the value into inputMappings (and inputSchema) at
+			// serialize time so the schema-guide contract still works
+			// without forcing every spec to declare the wiring twice.
+			if sap, _ := task["sourceArrayPath"].(string); sap != "" {
+				im := asMap(task["inputMappings"])
+				if _, exists := im["source_array"]; !exists {
+					im["source_array"] = sap
+					task["inputMappings"] = im
+				}
+				is := asMap(task["inputSchema"])
+				if _, exists := is["source_array"]; !exists {
+					is["source_array"] = map[string]any{"type": "array"}
+					task["inputSchema"] = is
+				}
+			}
+		case "customer", "deal", "asset":
+			// sourcesConfig entries control which fields are written/read.
+			// Each entry needs at minimum a 'key' AND a 'type' (the
+			// data-model type, not the schema type) -- the runtime
+			// activity 'Fetch Customer fail 'type'' on missing fields.
+			sources := asSlice(task["sourcesConfig"])
+			for sci, sc := range sources {
+				sm, ok := sc.(map[string]any)
+				if !ok {
+					return fmt.Errorf("tasks[%d] (ref=%q): %s sourcesConfig[%d] must be an object", i, ref, taskType, sci)
+				}
+				if k, _ := sm["key"].(string); k == "" {
+					return fmt.Errorf("tasks[%d] (ref=%q): %s sourcesConfig[%d] missing 'key'", i, ref, taskType, sci)
+				}
+				if t, _ := sm["type"].(string); t == "" {
+					return fmt.Errorf(
+						"tasks[%d] (ref=%q): %s sourcesConfig[%d] missing 'type'. "+
+							"The runtime activity needs the data-model type per entry "+
+							"(e.g. 'identity_key', 'borrower_field') -- a missing 'type' "+
+							"surfaces at runtime as an opaque KeyError.",
+						i, ref, taskType, sci,
+					)
+				}
+			}
 		}
 
 		// Reuse the type-specific structural validator (conditional
@@ -1154,7 +1197,115 @@ func preflightTasks(spec *composeSpec) error {
 			}
 		}
 	}
+
+	// DAG topology check: each task's inputMappings can only read from
+	// task_outputs.<X> where X is a transitive ancestor in the edge graph.
+	// Otherwise the value isn't produced when the consumer runs and
+	// surfaces as a runtime KeyError. Built once across the whole spec.
+	ancestors := buildAncestors(spec)
+	for i, task := range spec.Tasks {
+		ref := localRef(task, fmt.Sprintf("t%d", i))
+		im, _ := task["inputMappings"].(map[string]any)
+		if im == nil {
+			continue
+		}
+		for k, v := range im {
+			s, _ := v.(string)
+			if s == "" || strings.HasPrefix(strings.TrimSpace(s), "{{") {
+				continue
+			}
+			head, middle := mappingHeadAndMiddle(s)
+			if head != "task_outputs" || middle == "" {
+				continue
+			}
+			// Only validate when the middle segment is a known spec-local
+			// ref (server-style aliases reference workflows we don't have
+			// the topology for).
+			if !knownRefs[middle] || isServerAlias(middle) {
+				continue
+			}
+			if middle == ref {
+				return fmt.Errorf(
+					"tasks[%d] (ref=%q): inputMappings[%q]=%q references its own output -- "+
+						"a task cannot consume its own task_outputs.<self>. Did you mean a different ref?",
+					i, ref, k, s,
+				)
+			}
+			if !ancestors[ref][middle] {
+				return fmt.Errorf(
+					"tasks[%d] (ref=%q): inputMappings[%q]=%q references task_outputs.%s.* but "+
+						"%q is not an ancestor of %q in the edge graph (it doesn't run before this task). "+
+						"At runtime task_outputs.%s won't exist yet -- add an edge from %q to %q (directly or transitively) or remove the mapping.",
+					i, ref, k, s, middle, middle, ref, middle, middle, ref,
+				)
+			}
+		}
+	}
 	return nil
+}
+
+// mappingHeadAndMiddle parses 'task_outputs.<middle>.<rest>' or
+// '<head>.<rest>' and returns the leading two dotted segments. Empty
+// strings indicate not-applicable.
+func mappingHeadAndMiddle(s string) (head, middle string) {
+	dot := strings.Index(s, ".")
+	if dot <= 0 {
+		return "", ""
+	}
+	head = s[:dot]
+	rest := s[dot+1:]
+	dot2 := strings.Index(rest, ".")
+	if dot2 <= 0 {
+		return head, rest
+	}
+	return head, rest[:dot2]
+}
+
+// buildAncestors does one BFS per task ref over the edge graph and
+// returns ancestors[ref] = {set of refs that can reach ref through
+// edges}. Edges in the spec use ref/from-to so we don't need to wait
+// for server-assigned aliases. Used by the DAG mapping check.
+func buildAncestors(spec *composeSpec) map[string]map[string]bool {
+	// parents[X] = direct predecessors of X
+	parents := map[string]map[string]bool{}
+	for _, edge := range spec.Edges {
+		from, _ := edge["from"].(string)
+		to, _ := edge["to"].(string)
+		if from == "" {
+			from, _ = edge["sourceNodeId"].(string)
+		}
+		if to == "" {
+			to, _ = edge["targetNodeId"].(string)
+		}
+		if from == "" || to == "" {
+			continue
+		}
+		if parents[to] == nil {
+			parents[to] = map[string]bool{}
+		}
+		parents[to][from] = true
+	}
+	ancestors := map[string]map[string]bool{}
+	var visit func(node string, set map[string]bool)
+	visit = func(node string, set map[string]bool) {
+		for p := range parents[node] {
+			if set[p] {
+				continue
+			}
+			set[p] = true
+			visit(p, set)
+		}
+	}
+	for _, task := range spec.Tasks {
+		ref := localRef(task, "")
+		if ref == "" {
+			continue
+		}
+		set := map[string]bool{}
+		visit(ref, set)
+		ancestors[ref] = set
+	}
+	return ancestors
 }
 
 // validEdgeKeys is the whitelist for edge object keys in the compose spec.
