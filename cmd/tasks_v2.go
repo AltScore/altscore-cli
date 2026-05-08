@@ -25,12 +25,22 @@ func registerTasksV2(parent *cobra.Command) {
 		Long: `Tasks-v2 are versioned executable building blocks at /v2/tasks. Each v2
 workflow node references a task by alias (and optionally pinned version).
 
-Common types: altdata-enrichment, evaluate-rules, http, conditional, wait,
-webhook, compute-variables, data-store, pdf-report, end. Each type has
-its own config fields (sourcesConfig for altdata, evaluatorAlias for
-evaluators, url+method for http, branches for conditional, etc.).
+Active types (palette + backend): altdata-enrichment, http, conditional,
+wait, exception, comment, start, end, evaluate-rules, mapping-table,
+scorecard, rule-tree, compute-variables, customer, deal, asset,
+credit-line, child-workflow, array-router, list-of-similars,
+data-store-write, data-store-query.
 
-Run 'altscore workflows-v2 schema-guide taskTypes' for the field list per type.`,
+Each type has its own config fields (sourcesConfig for altdata,
+scorecardCode for scorecard, url+method for http, branches for
+conditional, entries[] for mapping-table, etc.).
+
+Run 'altscore workflows-v2 schema-guide tasks' for the canonical
+per-type field list. The 'tasks.deprecatedTypes' subsection in that
+output covers types you may see in legacy workflow bodies but
+shouldn't use in new ones (data-store, pdf-report, webhook,
+create-identity, create-borrower, update-borrower,
+fetch-borrower-entities, fetch-entity, soap).`,
 	}
 	group.AddCommand(makeTv2CreateCmd())
 	group.AddCommand(makeTv2CreateVersionCmd())

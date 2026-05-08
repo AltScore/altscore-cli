@@ -497,6 +497,24 @@ func makeWfv2UpdateMappingCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// The backend returns the list of mutated /v2/tasks records. An
+			// empty list means no task input_mappings referenced the
+			// previous-variable name -- which is the normal case for
+			// workflows built via the standard CLI surface (compose,
+			// add-node, set-mapping). Those write mappings to
+			// node.data.inputMappings on the workflow doc, NOT to the
+			// underlying task's data.input_mappings, so this command is a
+			// no-op against them. Surface the distinction so users don't
+			// think the rename succeeded silently.
+			var mutated []any
+			if jerr := json.Unmarshal(data, &mutated); jerr == nil && len(mutated) == 0 {
+				fmt.Fprintf(cmd.OutOrStderr(),
+					"# note: 0 task mappings matched. This command renames TASK input_mappings only -- "+
+						"if your workflow uses node-level inputMappings (the default for compose / add-node / "+
+						"set-mapping), use 'altscore workflows-v2 set-mapping <id> --node-id %q --input-name %q --expression \"...\"' instead.\n",
+					nodeID, previous,
+				)
+			}
 			return output.RawJSON(data)
 		},
 	}

@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/client"
@@ -725,7 +726,24 @@ var validTaskTypes = map[string]bool{
 //   5. validateTaskV2Body: type-specific structural checks (conditional
 //      branches, scorecard reference, mapping-table entries, rule-tree
 //      enums)
+//   6. inputMappings values: leading segment must be a valid runtime
+//      namespace OR a known spec-local ref. Typos like 'socre.total_score'
+//      get rejected before they reach the runtime resolver, where they
+//      surface as the opaque "Unknown variable namespace" failure.
 func preflightTasks(spec *composeSpec) error {
+	// Collect every spec-local ref upfront so we can validate forward
+	// references in inputMappings (e.g. consumer references producer
+	// declared later in the spec).
+	knownRefs := map[string]bool{}
+	for i, task := range spec.Tasks {
+		ref := localRef(task, fmt.Sprintf("t%d", i))
+		knownRefs[ref] = true
+	}
+	for i, node := range spec.ExtraNodes {
+		ref := localRef(node, fmt.Sprintf("n%d", i))
+		knownRefs[ref] = true
+	}
+
 	for i, task := range spec.Tasks {
 		ref := localRef(task, fmt.Sprintf("t%d", i))
 		label, _ := task["label"].(string)
@@ -734,12 +752,18 @@ func preflightTasks(spec *composeSpec) error {
 			return fmt.Errorf("tasks[%d] (ref=%q): label and type are required (validated before any POST)", i, ref)
 		}
 		if !validTaskTypes[taskType] {
+			suggestion := closestTaskType(taskType)
+			suggestionLine := ""
+			if suggestion != "" {
+				suggestionLine = fmt.Sprintf("Did you mean %q? ", suggestion)
+			}
 			return fmt.Errorf(
-				"tasks[%d] (ref=%q): unknown task type %q. The backend TaskType enum has %d values; "+
-					"common typos: 'data-store' should be 'data-store-write' or 'data-store-query'; "+
+				"tasks[%d] (ref=%q): unknown task type %q. %s"+
+					"The backend TaskType enum has %d values; "+
+					"common deprecations: 'data-store' is split into 'data-store-write'/'data-store-query', "+
 					"'pdf-report' is now part of the 'end' task's endConfig (use type='html-template' for standalone). "+
 					"Run 'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' for the canonical list.",
-				i, ref, taskType, len(validTaskTypes),
+				i, ref, taskType, suggestionLine, len(validTaskTypes),
 			)
 		}
 
@@ -807,8 +831,106 @@ func preflightTasks(spec *composeSpec) error {
 		if err := validateTaskV2Body(json.RawMessage(body)); err != nil {
 			return fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}
+
+		// Mapping namespace check: every inputMappings value with a dotted
+		// path must lead with a valid runtime namespace OR a known
+		// spec-local ref (which compose will rewrite to
+		// task_outputs.<server-alias>). Anything else surfaces at runtime
+		// as "Unknown variable namespace" with no node context.
+		if im, ok := task["inputMappings"].(map[string]any); ok {
+			for k, v := range im {
+				s, _ := v.(string)
+				if s == "" {
+					continue
+				}
+				dot := strings.Index(s, ".")
+				if dot <= 0 {
+					continue // bare value or template literal -- runtime handles
+				}
+				head := s[:dot]
+				if reservedMappingScopes[head] || knownRefs[head] {
+					continue
+				}
+				return fmt.Errorf(
+					"tasks[%d] (ref=%q): inputMappings[%q]=%q has unknown leading segment %q. "+
+						"Valid namespaces: inputs, custom, system, task_outputs, task_outputs_by_type. "+
+						"Or use a spec-local ref (one of: %s) which compose rewrites to task_outputs.<alias>. "+
+						"Without one of these the runtime resolver fails with 'Unknown variable namespace' at execution.",
+					i, ref, k, s, head, strings.Join(sortedKeys(knownRefs), ", "),
+				)
+			}
+		}
 	}
 	return nil
+}
+
+// sortedKeys returns the keys of m in deterministic order (helpful for
+// reproducible error messages).
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// closestTaskType returns the canonical TaskType nearest to a given typo by
+// Levenshtein distance, or "" if nothing is meaningfully close. The cutoff
+// is 0.5 * len(input) so radically different strings don't get matched.
+// Used to turn opaque "unknown task type" errors into actionable
+// "did you mean X?" hints.
+func closestTaskType(input string) string {
+	best := ""
+	bestDist := -1
+	cutoff := len(input) / 2
+	if cutoff < 2 {
+		cutoff = 2
+	}
+	for t := range validTaskTypes {
+		d := levenshtein(input, t)
+		if d <= cutoff && (bestDist == -1 || d < bestDist) {
+			best, bestDist = t, d
+		}
+	}
+	return best
+}
+
+// levenshtein computes edit distance between two strings. Standard DP
+// implementation; fine for the small string lengths we deal with here
+// (task type names are <= 25 chars).
+func levenshtein(a, b string) int {
+	if len(a) == 0 {
+		return len(b)
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+	prev := make([]int, len(b)+1)
+	curr := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		curr[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			del, ins, sub := prev[j]+1, curr[j-1]+1, prev[j-1]+cost
+			m := del
+			if ins < m {
+				m = ins
+			}
+			if sub < m {
+				m = sub
+			}
+			curr[j] = m
+		}
+		prev, curr = curr, prev
+	}
+	return prev[len(b)]
 }
 
 // validateEntityTypeVsTaskTypes rejects compose specs whose task-type set
