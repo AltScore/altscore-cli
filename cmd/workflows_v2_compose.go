@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -734,6 +735,33 @@ var validTaskTypes = map[string]bool{
 //   8. edge endpoints (from/to) must reference a known ref.
 //   9. duplicate edges and self-loops are rejected.
 func preflightTasks(spec *composeSpec) error {
+	// Spec-level checks: workflow category + inputVariables shape. These
+	// fail with opaque backend errors otherwise; surface here.
+	if spec.Category != "" && !validWorkflowCategories[strings.ToUpper(spec.Category)] {
+		return fmt.Errorf(
+			"workflow.category=%q is not a valid value. Valid: ACTION, EVALUATION, CONTACT, OTHER. "+
+				"Note: CUSTOMER and DEAL are workflow ENTITY TYPES (config.entityType), not categories.",
+			spec.Category,
+		)
+	}
+	for name, def := range spec.InputVariables {
+		dm, _ := def.(map[string]any)
+		if dm == nil {
+			continue
+		}
+		t, _ := dm["type"].(string)
+		if t == "" {
+			continue
+		}
+		if !validInputSchemaTypes[t] {
+			return fmt.Errorf(
+				"workflow.inputVariables.%s.type=%q is not a valid type. "+
+					"Valid: string, integer, number, boolean, object, array.",
+				name, t,
+			)
+		}
+	}
+
 	// Collect every spec-local ref upfront so we can validate forward
 	// references in inputMappings AND detect duplicates that would
 	// otherwise silently orphan tasks (the rewriter only records the
@@ -752,6 +780,15 @@ func preflightTasks(spec *composeSpec) error {
 		}
 		knownRefs[ref] = true
 		if alias, _ := task["alias"].(string); alias != "" {
+			if !validAliasPattern.MatchString(alias) {
+				return fmt.Errorf(
+					"tasks[%d] (ref=%q): alias %q has invalid characters. Aliases end up in URL paths "+
+						"so must be lowercase alphanumeric with internal dashes only "+
+						"(regex: ^[a-z0-9][a-z0-9-]*$). "+
+						"Don't use spaces, slashes, uppercase, or punctuation.",
+					i, ref, alias,
+				)
+			}
 			if knownAliases[alias] {
 				return fmt.Errorf(
 					"tasks[%d] (ref=%q): duplicate explicit alias %q -- two tasks declare the same alias. "+
@@ -881,10 +918,12 @@ func preflightTasks(spec *composeSpec) error {
 			}
 			return fmt.Errorf(
 				"tasks[%d] (ref=%q): unknown task type %q. %s"+
-					"The backend TaskType enum has %d values; "+
-					"common deprecations: 'data-store' is split into 'data-store-write'/'data-store-query', "+
-					"'pdf-report' is now part of the 'end' task's endConfig (use type='html-template' for standalone). "+
-					"Run 'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' for the canonical list.",
+					"The backend TaskType enum accepts %d values (active + deprecated combined). "+
+					"For new workflows use the active palette (20 types) -- run "+
+					"'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' to list them, "+
+					"and '.tasks.deprecatedTypes | keys' for the legacy ones. "+
+					"Common deprecations: 'data-store' is split into 'data-store-write'/'data-store-query'; "+
+					"'pdf-report' is now part of the 'end' task's endConfig.",
 				i, ref, taskType, suggestionLine, len(validTaskTypes),
 			)
 		}
@@ -932,12 +971,11 @@ func preflightTasks(spec *composeSpec) error {
 				return fmt.Errorf("tasks[%d] (ref=%q): data-store-query task requires dataStoreQueryConfig.tableName", i, ref)
 			}
 		case "exception":
-			// The runtime ExecutionNotice model wants 'message', not
-			// 'errorMessage' -- but the schema-guide and earlier preflights
-			// documented 'errorMessage'. Accept both, then mirror to
-			// 'message' so the runtime activity finds it. Unmirrored
-			// 'errorMessage' surfaces at execution as a Pydantic
-			// ValidationError "message none is not an allowed value".
+			// Runtime ExecutionNotice / ExecutionOutputData are strict
+			// Pydantic models. Schema-guide documents 'errorMessage' +
+			// optional 'statusCode'; runtime requires 'message' +
+			// non-null 'statusCode'. Mirror both at serialize time so
+			// neither field surfaces as an opaque ValidationError mid-execution.
 			em, _ := task["errorMessage"].(string)
 			m, _ := task["message"].(string)
 			if em == "" && m == "" {
@@ -945,6 +983,9 @@ func preflightTasks(spec *composeSpec) error {
 			}
 			if m == "" && em != "" {
 				task["message"] = em
+			}
+			if _, hasSC := task["statusCode"]; !hasSC {
+				task["statusCode"] = 400
 			}
 		case "child-workflow":
 			eid, _ := task["executorId"].(string)
@@ -991,12 +1032,30 @@ func preflightTasks(spec *composeSpec) error {
 
 		// Conditional task: every branch's condition.field must exist in
 		// inputSchema, otherwise the branch silently never matches at
-		// runtime.
+		// runtime. Also: inputMappings keys must match inputSchema keys --
+		// stray keys are wired to nothing.
 		if taskType == "conditional" {
 			schemaFields := map[string]bool{}
 			if is, ok := task["inputSchema"].(map[string]any); ok {
 				for k := range is {
 					schemaFields[k] = true
+				}
+			}
+			if im, ok := task["inputMappings"].(map[string]any); ok {
+				strays := []string{}
+				for k := range im {
+					if !schemaFields[k] {
+						strays = append(strays, k)
+					}
+				}
+				if len(strays) > 0 {
+					sort.Strings(strays)
+					return fmt.Errorf(
+						"tasks[%d] (ref=%q): conditional inputMappings has key(s) not in inputSchema: %s. "+
+							"Every inputMappings key must match an inputSchema key (the schema declares the type, the mapping wires the value). "+
+							"Add to inputSchema or remove from inputMappings.",
+						i, ref, strings.Join(strays, ", "),
+					)
 				}
 			}
 			branches := asSlice(task["branches"])
@@ -1067,6 +1126,22 @@ func preflightTasks(spec *composeSpec) error {
 	}
 	return nil
 }
+
+// validWorkflowCategories mirrors the backend's WorkflowCategory enum.
+// Common confusion: CUSTOMER and DEAL are entity TYPES (config.entityType),
+// not categories. Keep these distinct in error messages.
+var validWorkflowCategories = map[string]bool{
+	"ACTION":     true,
+	"EVALUATION": true,
+	"CONTACT":    true,
+	"OTHER":      true,
+}
+
+// validAliasPattern matches the alias regex the backend treats as URL-safe.
+// Lowercase alphanumeric with internal dashes; backend does additional
+// length/uniqueness checks but at minimum aliases must match this shape so
+// they round-trip through path parameters.
+var validAliasPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
 // validInputSchemaTypes mirrors the SchemaTypes Pydantic discriminated union
 // in borrower-central. The backend's error message lies ("permitted:
