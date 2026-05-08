@@ -662,17 +662,47 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 					taskBody["inputMappings"] = inMappings
 				}
 			}
-			raw, err := json.Marshal(taskBody)
-			if err != nil {
-				return nil, fmt.Errorf("extraNodes[%d] (ref=%q): encode task: %w", i, ref, err)
+
+			// Two-phase create when the body has multi-dot mapping values
+			// (currently only altdata-enrichment ancestors trigger this:
+			// task_outputs.<alias>.sources_output_packages). The strict
+			// CreateTaskV2 validator rejects multi-dot values, so phase 1
+			// posts a stub without inputMappings/inputSchema, then phase 2
+			// re-posts the full body via /v2/tasks/{alias} which uses the
+			// lenient CreateTaskVersionV2 validator. Same pattern as the
+			// tasks loop above; without it, an `end` node downstream of an
+			// altdata-enrichment task fails at create with HTTP 400.
+			multiDot := taskHasMultiDotMapping(taskBody)
+			var firstPhaseBody []byte
+			var encErr error
+			if multiDot {
+				stub := shallowCopy(taskBody)
+				delete(stub, "inputMappings")
+				delete(stub, "inputSchema")
+				firstPhaseBody, encErr = json.Marshal(stub)
+			} else {
+				firstPhaseBody, encErr = json.Marshal(taskBody)
+			}
+			if encErr != nil {
+				return nil, fmt.Errorf("extraNodes[%d] (ref=%q): encode task: %w", i, ref, encErr)
+			}
+			fullBody, encErr := json.Marshal(taskBody)
+			if encErr != nil {
+				return nil, fmt.Errorf("extraNodes[%d] (ref=%q): encode full body: %w", i, ref, encErr)
 			}
 			if dryRun {
-				fmt.Printf("# Would POST /v2/tasks (extra-node backing): %s\n", string(raw))
+				fmt.Printf("# Would POST /v2/tasks (extra-node backing): %s\n", string(firstPhaseBody))
+				if multiDot {
+					fmt.Printf("# Would POST /v2/tasks/{alias} (extra-node phase 2 -- multi-dot mappings): %s\n", string(fullBody))
+				}
 				taskAlias = ref
 				n["taskAlias"] = taskAlias
 				n["taskVersion"] = 1
+				if multiDot {
+					n["taskVersion"] = 2
+				}
 			} else {
-				data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(raw))
+				data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(firstPhaseBody))
 				if err != nil {
 					return nil, fmt.Errorf("extraNodes[%d] (ref=%q): create backing task: %w", i, ref, err)
 				}
@@ -688,6 +718,21 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 					n["taskVersion"] = int(v)
 				}
 				createdAliases = append(createdAliases, fmt.Sprint(n["taskAlias"]))
+
+				if multiDot {
+					path := "/v2/tasks/" + taskAlias
+					v2Data, _, err := c.Do("POST", "borrower_central", path, json.RawMessage(fullBody))
+					if err != nil {
+						return nil, fmt.Errorf("extraNodes[%d] (ref=%q) phase 2: %w", i, ref, err)
+					}
+					var v2created map[string]any
+					if err := json.Unmarshal(v2Data, &v2created); err != nil {
+						return nil, fmt.Errorf("extraNodes[%d] (ref=%q) phase 2: parse response: %w", i, ref, err)
+					}
+					if v, ok := v2created["version"].(float64); ok {
+						n["taskVersion"] = int(v)
+					}
+				}
 			}
 		}
 
