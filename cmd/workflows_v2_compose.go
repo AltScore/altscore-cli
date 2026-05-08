@@ -196,7 +196,7 @@ Spec format (see file header for full reference):
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON spec (or pipe via stdin)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the assembled workflow body without making API calls")
 	cmd.Flags().BoolVar(&publish, "publish", false, "publish the workflow after creation (DRAFT workflows execute but skip every node)")
-	cmd.Flags().BoolVar(&skipLintOnPublish, "skip-lint-on-publish", false, "skip the pre-publish topology lint that refuses to publish on errors")
+	cmd.Flags().BoolVar(&skipLintOnPublish, "skip-lint-on-publish", false, "publish even when client-side topology lint reports errors (orphan/unreachable/dead-end nodes). Server-side validation still runs and can still 422.")
 	return cmd
 }
 
@@ -733,14 +733,45 @@ var validTaskTypes = map[string]bool{
 func preflightTasks(spec *composeSpec) error {
 	// Collect every spec-local ref upfront so we can validate forward
 	// references in inputMappings (e.g. consumer references producer
-	// declared later in the spec).
+	// declared later in the spec). Reject duplicates here -- a spec with
+	// two tasks claiming the same ref produces silent orphan nodes
+	// because the rewriter only sees the last ref-to-alias mapping.
 	knownRefs := map[string]bool{}
+	knownAliases := map[string]bool{}
 	for i, task := range spec.Tasks {
 		ref := localRef(task, fmt.Sprintf("t%d", i))
+		if knownRefs[ref] {
+			return fmt.Errorf(
+				"tasks[%d]: duplicate ref %q -- two tasks share the same spec-local key. "+
+					"Compose's edge rewriter only records the LAST ref-to-alias mapping, so the earlier "+
+					"task ends up with no incident edges (silent orphan). Give each task a unique 'ref'.",
+				i, ref,
+			)
+		}
 		knownRefs[ref] = true
+		// Same hazard for explicit alias collisions: the second POST either
+		// version-bumps the first task or 409s. Catch before the first POST.
+		if alias, _ := task["alias"].(string); alias != "" {
+			if knownAliases[alias] {
+				return fmt.Errorf(
+					"tasks[%d] (ref=%q): duplicate explicit alias %q -- two tasks declare the same alias. "+
+						"The second create either version-bumps the first or 409s. "+
+						"Either drop the alias on one (compose will pick a unique one) or pick distinct aliases.",
+					i, ref, alias,
+				)
+			}
+			knownAliases[alias] = true
+		}
 	}
 	for i, node := range spec.ExtraNodes {
 		ref := localRef(node, fmt.Sprintf("n%d", i))
+		if knownRefs[ref] {
+			return fmt.Errorf(
+				"extraNodes[%d]: duplicate ref %q -- collides with a task or another extraNode. "+
+					"Give each node a unique 'ref'.",
+				i, ref,
+			)
+		}
 		knownRefs[ref] = true
 	}
 
@@ -837,6 +868,12 @@ func preflightTasks(spec *composeSpec) error {
 		// spec-local ref (which compose will rewrite to
 		// task_outputs.<server-alias>). Anything else surfaces at runtime
 		// as "Unknown variable namespace" with no node context.
+		//
+		// For 'task_outputs.<X>.<rest>' specifically, also validate that
+		// <X> is either a known spec-local ref or a 6-hex-suffixed
+		// server-style alias. A typo like 'task_outputs.producre.v' has a
+		// valid leading segment but the unknown second segment surfaces
+		// at runtime with no diagnostics.
 		if im, ok := task["inputMappings"].(map[string]any); ok {
 			for k, v := range im {
 				s, _ := v.(string)
@@ -848,20 +885,67 @@ func preflightTasks(spec *composeSpec) error {
 					continue // bare value or template literal -- runtime handles
 				}
 				head := s[:dot]
-				if reservedMappingScopes[head] || knownRefs[head] {
-					continue
+				if !reservedMappingScopes[head] && !knownRefs[head] {
+					return fmt.Errorf(
+						"tasks[%d] (ref=%q): inputMappings[%q]=%q has unknown leading segment %q. "+
+							"Valid namespaces: inputs, custom, system, task_outputs, task_outputs_by_type. "+
+							"Or use a spec-local ref (one of: %s) which compose rewrites to task_outputs.<alias>. "+
+							"Without one of these the runtime resolver fails with 'Unknown variable namespace' at execution.",
+						i, ref, k, s, head, strings.Join(sortedKeys(knownRefs), ", "),
+					)
 				}
-				return fmt.Errorf(
-					"tasks[%d] (ref=%q): inputMappings[%q]=%q has unknown leading segment %q. "+
-						"Valid namespaces: inputs, custom, system, task_outputs, task_outputs_by_type. "+
-						"Or use a spec-local ref (one of: %s) which compose rewrites to task_outputs.<alias>. "+
-						"Without one of these the runtime resolver fails with 'Unknown variable namespace' at execution.",
-					i, ref, k, s, head, strings.Join(sortedKeys(knownRefs), ", "),
-				)
+				// Second-segment check for task_outputs.<X>.<rest>.
+				if head == "task_outputs" {
+					rest := s[dot+1:]
+					dot2 := strings.Index(rest, ".")
+					if dot2 <= 0 {
+						continue // task_outputs.<alias> -- whole-task ref, runtime accepts
+					}
+					middle := rest[:dot2]
+					if knownRefs[middle] {
+						continue
+					}
+					// Server-style alias (slug-of-label + "-" + 6 hex).
+					// Compose-built workflows referenced from outside use
+					// these directly; allow them through.
+					if isServerAlias(middle) {
+						continue
+					}
+					return fmt.Errorf(
+						"tasks[%d] (ref=%q): inputMappings[%q]=%q references task_outputs.%s.* but %q "+
+							"is not a known spec-local ref and doesn't look like a server-assigned alias "+
+							"(slug-NNNNNN). Known refs: %s. "+
+							"Likely a typo of one of those.",
+						i, ref, k, s, middle, middle,
+						strings.Join(sortedKeys(knownRefs), ", "),
+					)
+				}
 			}
 		}
 	}
 	return nil
+}
+
+// isServerAlias reports whether s looks like a server-assigned task alias --
+// the trailing 6-hex-after-dash pattern produced by
+// borrower-central/app/utils/alias_generator.py::generate_task_alias.
+// Used by mapping namespace validation to allow references to externally-
+// composed workflows whose aliases aren't spec-local refs.
+func isServerAlias(s string) bool {
+	if len(s) < 8 {
+		return false
+	}
+	dash := strings.LastIndex(s, "-")
+	if dash < 1 || len(s)-dash-1 != 6 {
+		return false
+	}
+	for i := dash + 1; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // sortedKeys returns the keys of m in deterministic order (helpful for

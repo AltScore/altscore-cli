@@ -507,6 +507,8 @@ For "Create a workflow that does X", use `workflows-v2 compose`. It takes a sing
 
 **Refs vs aliases.** The spec uses `ref` as a stable spec-local key. Edges and inputMappings reference tasks by `ref`, and compose rewrites them with the server-assigned aliases at create time. You can also still pass an explicit `alias` if you need a specific name (e.g. for cross-workflow reuse) — compose passes that through. Edges use `from`/`to` as shortcuts for `sourceNodeId`/`targetNodeId`.
 
+> **`ref` is write-only spec syntax — the persisted nodeId differs.** When you don't supply an explicit `alias`, the server generates one as `<slug-of-label>-<6-hex>` (e.g. `ref: "score"` with `label: "Scorecard"` becomes nodeId `scorecard-9a1f8e`). Subsequent `set-mapping --node-id score` / `add-edge --from score` calls will 404 because that nodeId never existed on disk. To find real nodeIds: `altscore workflows-v2 get <id> | jq '.nodes[] | {nodeId, label}'`. For stable, predictable nodeIds, supply `"alias": "score"` on the task body — compose passes it through and the server uses it as the nodeId. Heads-up: explicit aliases are tenant-scoped, so two workflows in the same tenant can't both have a task aliased `score`.
+
 ```bash
 cat > /tmp/spec.json <<'EOF'
 {
