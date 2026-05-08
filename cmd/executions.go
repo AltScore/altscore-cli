@@ -236,6 +236,160 @@ Common drilldowns:
 	return cmd
 }
 
+// Execution decisions surface /v1/executions/{id}/decisions, where workflows
+// record their final / preliminary outcomes. Decision keys must already be
+// registered in the tenant's decision data-models (see 'altscore decisions
+// list'); the API returns 400 with "key not found for entity type: decision"
+// otherwise. Three thin commands: get to read what an execution decided, set
+// to write a decision (or override one), delete to clear it.
+
+func makeExGetDecisionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "get-decision <execution-id>",
+		Short: "Get the decision an execution recorded",
+		Long: `GET /v1/executions/{id}/decisions. Returns the latest decision the workflow
+recorded for this execution, including its history.
+
+Response fields:
+  id, executionId, key, label, decisionType ("preliminary"|"final"),
+  history (audit trail), createdAt, updatedAt`,
+		Example: `  altscore executions get-decision <execution-id>
+  altscore executions get-decision <execution-id> | jq '.key'`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := loadClient()
+			if err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/v1/executions/%s/decisions", args[0])
+			data, _, err := c.Do("GET", "borrower_central", path, nil)
+			if err != nil {
+				return err
+			}
+			return output.RawJSON(data)
+		},
+	}
+}
+
+func makeExSetDecisionCmd() *cobra.Command {
+	var key string
+	var decisionType string
+	var label string
+	var bodyFlag string
+
+	cmd := &cobra.Command{
+		Use:   "set-decision <execution-id>",
+		Short: "Record (or override) the decision for an execution",
+		Long: `POST /v1/executions/{id}/decisions.
+
+The 'key' must match a decision data-model registered for the tenant -- run
+'altscore decisions list' to see the valid set, or 'altscore decisions create
+--key <k> --label <l>' to register a new one. Submitting an unregistered key
+returns HTTP 400 "key not found for entity type: decision".
+
+decisionType is either "preliminary" (interim, can be overridden) or "final"
+(default; usually the rule-tree task's outputVariable). The endpoint records
+each write into the decision's history rather than overwriting blindly.`,
+		Example: `  # Record a final decision
+  altscore executions set-decision <id> --key approve
+
+  # Preliminary decision with a custom label
+  altscore executions set-decision <id> --key manual-review --type preliminary --label "Pending document upload"
+
+  # From a body (e.g. when piping from another tool)
+  altscore executions set-decision <id> --body '{"key":"reject","decisionType":"final"}'`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := loadClient()
+			if err != nil {
+				return err
+			}
+
+			body := json.RawMessage("{}")
+			if bodyFlag != "" {
+				rb, err := readBody(bodyFlag)
+				if err != nil {
+					return err
+				}
+				body = rb
+			}
+			if key != "" {
+				body, err = jsonForceSetString(body, "key", key)
+				if err != nil {
+					return err
+				}
+			}
+			// decisionType is required by the API; default to "final" when neither
+			// --type nor a body field provides it. Most rule-tree task outcomes are
+			// final; "preliminary" is the rarer path (interim decisions that get
+			// overwritten later in the run).
+			if decisionType != "" {
+				switch decisionType {
+				case "preliminary", "final":
+					body, err = jsonForceSetString(body, "decisionType", decisionType)
+					if err != nil {
+						return err
+					}
+				default:
+					return fmt.Errorf("--type must be 'preliminary' or 'final', got %q", decisionType)
+				}
+			} else if !bodyHasKey(body, "decisionType") {
+				body, err = jsonForceSetString(body, "decisionType", "final")
+				if err != nil {
+					return err
+				}
+			}
+			if label != "" {
+				body, err = jsonForceSetString(body, "label", label)
+				if err != nil {
+					return err
+				}
+			}
+			if !bodyHasKey(body, "key") {
+				return fmt.Errorf("set-decision requires --key (or a 'key' field in --body)")
+			}
+
+			path := fmt.Sprintf("/v1/executions/%s/decisions", args[0])
+			data, _, err := c.Do("POST", "borrower_central", path, body)
+			if err != nil {
+				return err
+			}
+			return output.RawJSON(data)
+		},
+	}
+	cmd.Flags().StringVar(&key, "key", "", "decision key (must be a registered decision data-model)")
+	cmd.Flags().StringVar(&decisionType, "type", "", "decisionType: preliminary | final (default: final)")
+	cmd.Flags().StringVar(&label, "label", "", "optional human-readable label for this decision")
+	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON body (overridden by --key / --type / --label when set)")
+	return cmd
+}
+
+func makeExDeleteDecisionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "delete-decision <execution-id>",
+		Short: "Delete the decision an execution recorded (admin only)",
+		Long: `DELETE /v1/executions/{id}/decisions.
+
+Requires the bc.private.delete scope. Use sparingly: this clears the recorded
+decision but does NOT replay the workflow.`,
+		Example: `  altscore executions delete-decision <execution-id>`,
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := loadClient()
+			if err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/v1/executions/%s/decisions", args[0])
+			_, status, err := c.Do("DELETE", "borrower_central", path, nil)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStderr(), "Decision deleted (HTTP %d).\n", status)
+			return nil
+		},
+	}
+}
+
 func makeExGetOutputAttachmentsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "get-output-attachments <execution-id>",

@@ -900,7 +900,7 @@ altscore evaluation-rules create --workflow-alias underwriting-v1 --body '{
   },
   "alertLevel":   2,
   "alertMessage": "Borrower has an inactive RUC",
-  "decisionKey":  "REJECTED"
+  "decisionKey":  "reject"
 }'
 ```
 
@@ -908,7 +908,32 @@ altscore evaluation-rules create --workflow-alias underwriting-v1 --body '{
 
 **`alertLevel` and `decisionKey` are load-bearing.** They look optional in the schema, but the runtime treats absence as silent skip:
 - A rule that hits but has no `alertLevel` produces NO entry in the `evaluate-rules` task's `alerts[]` output. Set `alertLevel` (1=info, 2=warning, 3=critical) when you want the alert recorded.
-- A rule referenced from a `rule-tree` task with no `decisionKey` leaves the rule-tree's `outputVariable` null even when conditions match. Set `decisionKey` (e.g. `"APPROVED"`, `"REJECTED"`) to populate the decision.
+- A rule referenced from a `rule-tree` task with no `decisionKey` leaves the rule-tree's `outputVariable` null even when conditions match. Set `decisionKey` (e.g. `"approve"`, `"reject"`) to populate the decision.
+
+**`decisionKey` must match a tenant-registered decision** (case-sensitive). See the Decisions section below — `altscore decisions list` shows the valid set; `altscore decisions create --key reject --label Reject` registers a new one. Using an unregistered key (or a case mismatch like `"REJECTED"` when the tenant has lowercase `reject`) makes downstream `executions set-decision` calls fail with HTTP 400 `"key not found for entity type: decision"`, and the rule-tree's outputVariable carries a value the platform can't write back as a final decision.
+
+#### Decisions — `decisions`
+
+Decision keys (`approve`, `reject`, `manual_review`, ...) are stored as data-model records with `entityType=decision`. The CLI exposes them as their own group; under the hood it's a thin facade over `/v1/data-models?entity-type=decision` so anything you do here is interchangeable with `data-models` commands using that filter.
+
+```bash
+# Discover the tenant's decision vocabulary BEFORE writing decisionKey on rules
+altscore decisions list
+
+# Register a new decision key
+altscore decisions create --key manual-review --label "Manual review"
+
+# Inspect the decision an execution recorded
+altscore executions get-decision <execution-id>
+
+# Override or set the decision on an execution (--type defaults to "final")
+altscore executions set-decision <execution-id> --key reject --type final --label "Inactive borrower"
+
+# Admin-only clear (does NOT replay the workflow)
+altscore executions delete-decision <execution-id>
+```
+
+`decisionType` is `"preliminary"` (interim, can be overridden later in the same run) or `"final"` (default, what the rule-tree task usually emits). The endpoint records each write into a `history` array — read with `executions get-decision` to see the audit trail. Submitting a `key` not registered in the tenant's decision data-models returns HTTP 400 `"key not found for entity type: decision"`.
 
 #### Rule trees — `rule-trees`
 
@@ -987,6 +1012,7 @@ Compose auto-fills:
 - **Scorecard rules require a mapping table per rule.** When you `altscore scorecards create`, every entry in `rules[]` must include `mappingTableCode` (or `mappingTableId`). Buckets on the rule are NOT a substitute — the runtime reads buckets from the linked mapping table and fails with `Rule '<label>' must be linked to a mapping table` otherwise.
 - **`alertLevel` is required to produce alerts.** A matching `evaluate-rules` rule with no `alertLevel` set produces nothing in the task's `alerts[]` output. Set `alertLevel: 1|2|3` (with optional `alertMessage`) on the rule when alerts are wanted.
 - **`decisionKey` drives `rule-tree` output.** The first matching rule's `decisionKey` becomes the rule-tree task's `outputVariable` value. Without `decisionKey` on the rule, the rule-tree's decision is null even on a hit.
+- **`decisionKey` is case-sensitive and must match a tenant-registered decision.** Run `altscore decisions list` before writing rules; case mismatches (e.g. `"REJECTED"` when the tenant has `"reject"`) compose and lint clean but fail downstream when the run tries to record the decision via `/v1/executions/{id}/decisions` ("key not found for entity type: decision").
 - **`rule-tree` `outputVariable` becomes a top-level task output.** Downstream conditionals reference `task_outputs.<rule-tree-alias>.<outputVariable>` (e.g. `task_outputs.tree.decision`). `outputType` must be `string` | `number` | `boolean`.
 - **`is-test` toggles on evaluation rules / rule trees** isolate them from production execution. Use `altscore evaluation-rules set-test <id> --enable` while iterating, then `--disable` once stable.
 

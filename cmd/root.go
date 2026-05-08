@@ -409,6 +409,9 @@ such as a scoring model run or data retrieval.`,
 	exGroup.AddCommand(makeExGetOutputCmd())
 	exGroup.AddCommand(makeExGetOutputAttachmentsCmd())
 	exGroup.AddCommand(makeExStateCmd())
+	exGroup.AddCommand(makeExGetDecisionCmd())
+	exGroup.AddCommand(makeExSetDecisionCmd())
+	exGroup.AddCommand(makeExDeleteDecisionCmd())
 
 	registerResource(ResourceDef{
 		Name:     "execution-batches",
@@ -678,6 +681,11 @@ tasks via scorecardConfig (inline rules + totalScoreVariable).`,
 	scGroup.AddCommand(makeScImportCmd())
 	scGroup.AddCommand(makeScUsageCmd())
 
+	// Decision keys are stored as data-model records but agents (and rule-tree
+	// task pickers) expect to find them under their own surface. cmd/decisions.go
+	// is a thin facade with entityType=decision baked in.
+	rootCmd.AddCommand(makeDecisionsGroupCmd())
+
 	// --- Workflow development resources ---
 
 	wtGroup := registerResource(ResourceDef{
@@ -855,6 +863,8 @@ reference.`,
 	wfv2Group.AddCommand(makeWfv2LintCmd())
 
 	registerTasksV2(rootCmd)
+
+	registerExternalSourceConfigs()
 }
 
 // Execute runs the root command.
