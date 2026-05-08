@@ -7,9 +7,69 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/config"
 )
+
+// formatHTTPError parses the standard borrower-central error envelope and
+// formats it for human consumption. Surfaces details.errorSubCode (which
+// callers script against per CLAUDE.md) and any per-field validation
+// messages in details. Falls back to the raw body when the envelope shape
+// doesn't match (e.g. a non-BC service or a pre-error proxy response) so
+// the caller can still see what went wrong.
+//
+// Envelope shape:
+//
+//	{
+//	  "code":    "BadRequestError",
+//	  "message": "wrong input values, please check your request",
+//	  "details": {
+//	    "errorSubCode": "DATA_MODEL_NOT_IDENTITY",
+//	    "field":        "additional context"
+//	  }
+//	}
+func formatHTTPError(status int, body []byte) error {
+	if len(body) == 0 {
+		return fmt.Errorf("HTTP %d", status)
+	}
+	var env struct {
+		Code    string         `json:"code"`
+		Message string         `json:"message"`
+		Details map[string]any `json:"details"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil || env.Code == "" {
+		// Body isn't a JSON envelope -- emit the raw response so curl-style
+		// debugging still works.
+		return fmt.Errorf("HTTP %d: %s", status, string(body))
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "HTTP %d %s", status, env.Code)
+	if env.Message != "" {
+		fmt.Fprintf(&b, ": %s", env.Message)
+	}
+	if subCode, _ := env.Details["errorSubCode"].(string); subCode != "" {
+		fmt.Fprintf(&b, " [errorSubCode=%s]", subCode)
+	}
+	// Surface remaining detail fields (excluding errorSubCode which we
+	// already promoted) so per-field validation errors don't get dropped.
+	if len(env.Details) > 0 {
+		extras := make([]string, 0, len(env.Details))
+		for k, v := range env.Details {
+			if k == "errorSubCode" {
+				continue
+			}
+			extras = append(extras, fmt.Sprintf("%s=%v", k, v))
+		}
+		sort.Strings(extras)
+		if len(extras) > 0 {
+			fmt.Fprintf(&b, " (%s)", strings.Join(extras, ", "))
+		}
+	}
+	return fmt.Errorf("%s", b.String())
+}
 
 // Client handles authenticated HTTP requests to the AltScore API.
 type Client struct {
@@ -134,7 +194,7 @@ func (c *Client) doOnce(method, module, path string, body any, headers map[strin
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, resp.StatusCode, formatHTTPError(resp.StatusCode, respBody)
 	}
 
 	// Some endpoints return no body (204, etc.)
@@ -237,7 +297,7 @@ func (c *Client) doRawOnce(method, module, path string, bodyReader io.Reader, co
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, resp.StatusCode, formatHTTPError(resp.StatusCode, respBody)
 	}
 
 	return respBody, resp.StatusCode, nil

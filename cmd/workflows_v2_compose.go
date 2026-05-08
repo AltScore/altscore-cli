@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -145,6 +146,12 @@ Spec format (see file header for full reference):
 			if err != nil {
 				return fmt.Errorf("create workflow: %w", err)
 			}
+
+			// Summary on stderr: list every server-assigned task alias keyed by
+			// its node type. Saves a follow-up `workflows-v2 get | jq` to learn
+			// what compose just created. Skipped on dry-run since nothing was
+			// actually created.
+			printComposeSummary(cmd.ErrOrStderr(), workflow)
 
 			if publish {
 				var created map[string]any
@@ -528,6 +535,138 @@ func buildEndAutoWiring(endRef string, edges []map[string]any, taskByRef map[str
 	return inputSchema, inputMappings, pdfSections, hasAltdata
 }
 
+// printComposeSummary writes a one-line-per-task summary to stderr after
+// compose finishes its real (non-dry-run) POSTs. Without this, the only thing
+// compose returns to stdout is `{"id": "..."}` of the workflow -- the user
+// then has to GET the workflow + each task to discover server-assigned
+// aliases. Format mirrors `workflows-v2 lint`'s short report style.
+func printComposeSummary(w io.Writer, workflow map[string]any) {
+	if w == nil {
+		return
+	}
+	rawNodes, ok := workflow["nodes"].([]map[string]any)
+	if !ok {
+		// Try the slice-of-any form some assemblies produce.
+		alt, _ := workflow["nodes"].([]any)
+		for _, item := range alt {
+			if m, ok := item.(map[string]any); ok {
+				rawNodes = append(rawNodes, m)
+			}
+		}
+	}
+	if len(rawNodes) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "# created %d task(s) backing the workflow nodes:\n", len(rawNodes))
+	for _, n := range rawNodes {
+		typ, _ := n["type"].(string)
+		alias, _ := n["taskAlias"].(string)
+		label, _ := n["label"].(string)
+		if alias == "" {
+			continue
+		}
+		fmt.Fprintf(w, "#   %-20s  alias=%-40s  label=%q\n", typ, alias, label)
+	}
+}
+
+// postTaskWithMultiDotFallback posts a task body to /v2/tasks and handles the
+// strict-vs-lenient validator split that the v2 task API enforces:
+//
+//   - POST /v2/tasks runs CreateTaskV2 (strict). It rejects inputMappings
+//     values like "task_outputs.<alias>.<deep>" (multi-dot) AND any
+//     inputMappings key that isn't in inputSchema.
+//   - POST /v2/tasks/{alias} runs CreateTaskVersionV2 (lenient). It accepts
+//     both shapes and persists them verbatim.
+//
+// When the body contains multi-dot mappings, this helper does a two-phase
+// create:
+//
+//	Phase 1: POST /v2/tasks with inputMappings + inputSchema stripped so the
+//	         strict validator passes. Server returns the assigned alias and
+//	         creates v=1.
+//	Phase 2: POST /v2/tasks/{alias} with the full body. Server bumps to v=2
+//	         with the canonical mappings persisted.
+//
+// Returns the server-assigned alias and final version. In dryRun mode the
+// caller-supplied `ref` is used as the alias and version is 2 if multi-dot
+// (so downstream extraNode positioning matches what real-run produces).
+//
+// Used by both the tasks loop and the extraNodes end branch (the only
+// extraNode that ships with multi-dot mappings is `end` -- see
+// buildEndAutoWiring's altdata branch).
+func postTaskWithMultiDotFallback(c *client.Client, body map[string]any, ref string, dryRun bool, label string) (alias string, version int, err error) {
+	multiDot := taskHasMultiDotMapping(body)
+
+	var firstPhaseBytes []byte
+	if multiDot {
+		stub := shallowCopy(body)
+		delete(stub, "inputMappings")
+		delete(stub, "inputSchema")
+		firstPhaseBytes, err = json.Marshal(stub)
+	} else {
+		firstPhaseBytes, err = json.Marshal(body)
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("encode %s: %w", label, err)
+	}
+	fullBytes, err := json.Marshal(body)
+	if err != nil {
+		return "", 0, fmt.Errorf("encode full %s: %w", label, err)
+	}
+
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "# Would POST /v2/tasks (%s): %s\n", label, string(firstPhaseBytes))
+		if multiDot {
+			fmt.Fprintf(os.Stderr, "# Would POST /v2/tasks/{alias} (%s phase 2 -- multi-dot mappings): %s\n", label, string(fullBytes))
+		}
+		if a, _ := body["alias"].(string); a != "" {
+			alias = a
+		} else {
+			alias = ref
+		}
+		version = 1
+		if multiDot {
+			version = 2
+		}
+		return alias, version, nil
+	}
+
+	data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(firstPhaseBytes))
+	if err != nil {
+		return "", 0, err
+	}
+	var created map[string]any
+	if err := json.Unmarshal(data, &created); err != nil {
+		return "", 0, fmt.Errorf("parse %s response: %w", label, err)
+	}
+	if a, _ := created["alias"].(string); a != "" {
+		alias = a
+	} else {
+		return "", 0, fmt.Errorf("%s: server returned no alias", label)
+	}
+	if v, ok := created["version"].(float64); ok {
+		version = int(v)
+	} else {
+		version = 1
+	}
+
+	if multiDot {
+		path := "/v2/tasks/" + alias
+		v2Data, _, err := c.Do("POST", "borrower_central", path, json.RawMessage(fullBytes))
+		if err != nil {
+			return alias, version, fmt.Errorf("%s phase 2: %w", label, err)
+		}
+		var v2created map[string]any
+		if err := json.Unmarshal(v2Data, &v2created); err != nil {
+			return alias, version, fmt.Errorf("%s phase 2 parse response: %w", label, err)
+		}
+		if v, ok := v2created["version"].(float64); ok {
+			version = int(v)
+		}
+	}
+	return alias, version, nil
+}
+
 // reservedMappingScopes are the leading segments in a mapping value that are
 // NOT spec-local refs and must not be rewritten.
 var reservedMappingScopes = map[string]bool{
@@ -645,12 +784,12 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 	// stamp before they create entities -- not after, when the workflow's
 	// pickers come up empty and they have to re-stamp.
 	predictedAlias := slugifyWorkflowLabel(spec.Label)
-	fmt.Printf("# Workflow alias will be: %q (server-derived from label %q).\n", predictedAlias, spec.Label)
-	fmt.Printf("# Stamp entities with this alias on create:\n")
-	fmt.Printf("#   altscore evaluation-rules create --workflow-alias %s ...\n", predictedAlias)
-	fmt.Printf("#   altscore rule-trees       create --workflow-alias %s ...\n", predictedAlias)
-	fmt.Printf("#   altscore mapping-tables   create --workflow-alias %s ...\n", predictedAlias)
-	fmt.Printf("#   altscore scorecards       create --workflow-alias %s ...\n", predictedAlias)
+	fmt.Fprintf(os.Stderr, "# Workflow alias will be: %q (server-derived from label %q).\n", predictedAlias, spec.Label)
+	fmt.Fprintf(os.Stderr, "# Stamp entities with this alias on create:\n")
+	fmt.Fprintf(os.Stderr, "#   altscore evaluation-rules create --workflow-alias %s ...\n", predictedAlias)
+	fmt.Fprintf(os.Stderr, "#   altscore rule-trees       create --workflow-alias %s ...\n", predictedAlias)
+	fmt.Fprintf(os.Stderr, "#   altscore mapping-tables   create --workflow-alias %s ...\n", predictedAlias)
+	fmt.Fprintf(os.Stderr, "#   altscore scorecards       create --workflow-alias %s ...\n", predictedAlias)
 
 	// Pre-flight: validate every task's REQUIRED-field shape locally before
 	// posting anything. The previous loop would create tasks 0..N-1 on the
@@ -697,91 +836,22 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 
 		// Type-specific normalization: enrich altdata-enrichment with inputKeys
 		// from source inputFields, validate conditional branches, etc.
-		if err := normalizeTaskBody(c, task, spec.CustomVariables, dryRun); err != nil {
+		if err := normalizeTaskBody(c, task, &composeNormalizeOpts{
+			PredictedAlias:  predictedAlias,
+			CustomVariables: spec.CustomVariables,
+		}, dryRun); err != nil {
 			return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}
 
-		// Detect cross-task mappings (task_outputs.<alias>.<deep>). The strict
-		// CreateTaskV2 Pydantic validator rejects multi-dot mapping values, but
-		// the runtime resolver requires them. CreateTaskVersionV2 has a lenient
-		// validator. So when we have multi-dot mappings, do a two-phase create:
-		//   Phase 1: POST /v2/tasks with inputMappings + inputSchema stripped
-		//            so the strict validator skips. Server creates v=1 stub.
-		//   Phase 2: POST /v2/tasks/{alias} with the full body, server bumps to
-		//            v=2 with the canonical mappings persisted.
-		multiDot := taskHasMultiDotMapping(task)
-
-		var firstPhaseBody []byte
-		var encErr error
-		if multiDot {
-			stub := shallowCopy(task)
-			delete(stub, "inputMappings")
-			delete(stub, "inputSchema")
-			firstPhaseBody, encErr = json.Marshal(stub)
-		} else {
-			firstPhaseBody, encErr = json.Marshal(task)
-		}
-		if encErr != nil {
-			return nil, fmt.Errorf("tasks[%d]: encode: %w", i, encErr)
-		}
-		fullBody, encErr := json.Marshal(task)
-		if encErr != nil {
-			return nil, fmt.Errorf("tasks[%d]: encode full body: %w", i, encErr)
-		}
-
-		var (
-			version     = 1
-			serverAlias string
+		serverAlias, version, err := postTaskWithMultiDotFallback(
+			c, task, ref, dryRun,
+			fmt.Sprintf("tasks[%d] ref=%q", i, ref),
 		)
-		if dryRun {
-			fmt.Printf("# Would POST /v2/tasks: %s\n", string(firstPhaseBody))
-			if multiDot {
-				fmt.Printf("# Would POST /v2/tasks/{alias} (phase 2 -- multi-dot mappings): %s\n", string(fullBody))
-			}
-			if a, _ := task["alias"].(string); a != "" {
-				serverAlias = a
-			} else {
-				serverAlias = ref
-			}
-			if multiDot {
-				version = 2
-			}
-		} else {
-			data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(firstPhaseBody))
-			if err != nil {
-				return nil, fmt.Errorf("tasks[%d] (ref=%q): %w (created so far: %v)", i, ref, err, createdAliases)
-			}
-			var created map[string]any
-			if err := json.Unmarshal(data, &created); err != nil {
-				return nil, fmt.Errorf("tasks[%d] (ref=%q): parse response: %w", i, ref, err)
-			}
-			if v, ok := created["version"].(float64); ok {
-				version = int(v)
-			}
-			if a, _ := created["alias"].(string); a != "" {
-				serverAlias = a
-			} else {
-				return nil, fmt.Errorf("tasks[%d] (ref=%q): server returned no alias", i, ref)
-			}
+		if err != nil {
+			return nil, fmt.Errorf("%w (created so far: %v)", err, createdAliases)
+		}
+		if !dryRun {
 			createdAliases = append(createdAliases, serverAlias)
-
-			// Phase 2: re-post with the full body (multi-dot mappings, full
-			// inputSchema). The lenient CreateTaskVersionV2 validator accepts
-			// the canonical task_outputs.<alias>.<deep.path> form.
-			if multiDot {
-				path := "/v2/tasks/" + serverAlias
-				v2Data, _, err := c.Do("POST", "borrower_central", path, json.RawMessage(fullBody))
-				if err != nil {
-					return nil, fmt.Errorf("tasks[%d] (ref=%q) phase 2: %w", i, ref, err)
-				}
-				var v2created map[string]any
-				if err := json.Unmarshal(v2Data, &v2created); err != nil {
-					return nil, fmt.Errorf("tasks[%d] (ref=%q) phase 2: parse response: %w", i, ref, err)
-				}
-				if v, ok := v2created["version"].(float64); ok {
-					version = int(v)
-				}
-			}
 		}
 
 		refMap[ref] = serverAlias
@@ -861,76 +931,18 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 				}
 			}
 
-			// Two-phase create when the body has multi-dot mapping values
-			// (currently only altdata-enrichment ancestors trigger this:
-			// task_outputs.<alias>.sources_output_packages). The strict
-			// CreateTaskV2 validator rejects multi-dot values, so phase 1
-			// posts a stub without inputMappings/inputSchema, then phase 2
-			// re-posts the full body via /v2/tasks/{alias} which uses the
-			// lenient CreateTaskVersionV2 validator. Same pattern as the
-			// tasks loop above; without it, an `end` node downstream of an
-			// altdata-enrichment task fails at create with HTTP 400.
-			multiDot := taskHasMultiDotMapping(taskBody)
-			var firstPhaseBody []byte
-			var encErr error
-			if multiDot {
-				stub := shallowCopy(taskBody)
-				delete(stub, "inputMappings")
-				delete(stub, "inputSchema")
-				firstPhaseBody, encErr = json.Marshal(stub)
-			} else {
-				firstPhaseBody, encErr = json.Marshal(taskBody)
+			alias, version, err := postTaskWithMultiDotFallback(
+				c, taskBody, ref, dryRun,
+				fmt.Sprintf("extraNodes[%d] ref=%q (extra-node backing)", i, ref),
+			)
+			if err != nil {
+				return nil, err
 			}
-			if encErr != nil {
-				return nil, fmt.Errorf("extraNodes[%d] (ref=%q): encode task: %w", i, ref, encErr)
-			}
-			fullBody, encErr := json.Marshal(taskBody)
-			if encErr != nil {
-				return nil, fmt.Errorf("extraNodes[%d] (ref=%q): encode full body: %w", i, ref, encErr)
-			}
-			if dryRun {
-				fmt.Printf("# Would POST /v2/tasks (extra-node backing): %s\n", string(firstPhaseBody))
-				if multiDot {
-					fmt.Printf("# Would POST /v2/tasks/{alias} (extra-node phase 2 -- multi-dot mappings): %s\n", string(fullBody))
-				}
-				taskAlias = ref
-				n["taskAlias"] = taskAlias
-				n["taskVersion"] = 1
-				if multiDot {
-					n["taskVersion"] = 2
-				}
-			} else {
-				data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(firstPhaseBody))
-				if err != nil {
-					return nil, fmt.Errorf("extraNodes[%d] (ref=%q): create backing task: %w", i, ref, err)
-				}
-				var created map[string]any
-				if err := json.Unmarshal(data, &created); err != nil {
-					return nil, fmt.Errorf("extraNodes[%d] (ref=%q): parse task response: %w", i, ref, err)
-				}
-				if a, ok := created["alias"].(string); ok && a != "" {
-					taskAlias = a
-					n["taskAlias"] = a
-				}
-				if v, ok := created["version"].(float64); ok {
-					n["taskVersion"] = int(v)
-				}
-				createdAliases = append(createdAliases, fmt.Sprint(n["taskAlias"]))
-
-				if multiDot {
-					path := "/v2/tasks/" + taskAlias
-					v2Data, _, err := c.Do("POST", "borrower_central", path, json.RawMessage(fullBody))
-					if err != nil {
-						return nil, fmt.Errorf("extraNodes[%d] (ref=%q) phase 2: %w", i, ref, err)
-					}
-					var v2created map[string]any
-					if err := json.Unmarshal(v2Data, &v2created); err != nil {
-						return nil, fmt.Errorf("extraNodes[%d] (ref=%q) phase 2: parse response: %w", i, ref, err)
-					}
-					if v, ok := v2created["version"].(float64); ok {
-						n["taskVersion"] = int(v)
-					}
-				}
+			taskAlias = alias
+			n["taskAlias"] = alias
+			n["taskVersion"] = version
+			if !dryRun {
+				createdAliases = append(createdAliases, alias)
 			}
 		}
 
