@@ -549,6 +549,7 @@ score, scorecard breakdown, metrics, and rule hits.`,
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
+		WorkflowAlias: true,
 		Description: `Manage evaluation rules (individual business rules).
 
 An evaluation rule has a label, code, and a structured 'conditions' tree
@@ -562,7 +563,9 @@ Referenced by alias from v2 evaluate-rules tasks via {ruleCode: "<code>"}.`,
   alertLevel: integer          Optional (legacy)
   alertMessage: string         Optional (legacy)
   decisionKey: string          Optional decision key
-  workflowAlias: string        Optional workflow scope`,
+  workflowAlias: string        Workflow scope -- REQUIRED for the rule to appear in
+                                that workflow's evaluate-rules picker (CLI flag
+                                --workflow-alias <alias> is the canonical way to set this)`,
 		UpdateSchema: `  label, code, description, conditions, alertLevel, alertMessage, decisionKey, workflowAlias`,
 		ResponseSchema: `  id, label, code, description, conditions, alertLevel, alertMessage,
   decisionKey, workflowAlias, isTest, createdAt, updatedAt`,
@@ -599,6 +602,7 @@ deals, or other entities when certain criteria are met.`,
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
+		WorkflowAlias: true,
 		Description: `Manage rule trees (ordered evaluation rule sequences).
 
 A rule tree references evaluation rules by id/code in a specific order with
@@ -608,7 +612,8 @@ ruleTreeConfig.ruleTreeId / ruleTreeCode.`,
   code: string          [required] Stable identifier
   description: string   Optional
   rules: array          [{ruleId, ruleCode, order, isDefault}]
-  workflowAlias: string Optional workflow scope`,
+  workflowAlias: string Workflow scope -- REQUIRED for the rule tree to appear in
+                        that workflow's rule-tree task picker (use --workflow-alias)`,
 		UpdateSchema: `  label, code, description, rules, workflowAlias`,
 		ResponseSchema: `  id, label, code, description, rules, workflowAlias, isTest, createdAt, updatedAt`,
 		FilterHelp: `  code, workflow-alias, sort-by, sort-direction`,
@@ -620,6 +625,7 @@ ruleTreeConfig.ruleTreeId / ruleTreeCode.`,
 		BasePath: "/v1/mapping-tables",
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "update", "delete"},
+		WorkflowAlias: true,
 		Description: `Manage mapping tables (numerical / categorical lookups).
 
 A mapping table converts an input value into an output value via
@@ -631,7 +637,8 @@ mappingTableConfig.entries[].mappingTableId.`,
   outputType: string        "string" | "number" (default "string")
   buckets: array            [{order, label, lowerLimit, upperLimit, lowerInclusive, upperInclusive, values, outputValue, includeNa}]
   defaultValue: any         Default output value when no bucket matches
-  workflowAlias: string     Optional workflow scope`,
+  workflowAlias: string     Workflow scope -- REQUIRED for the table to appear in
+                             that workflow's mapping-table picker (use --workflow-alias)`,
 		UpdateSchema: `  label, code, mappingType, outputType, buckets, defaultValue, workflowAlias`,
 		ResponseSchema: `  id, label, code, mappingType, outputType, buckets, defaultValue,
   workflowAlias, createdAt, updatedAt`,
@@ -644,6 +651,7 @@ mappingTableConfig.entries[].mappingTableId.`,
 		BasePath: "/v1/scorecards",
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "update", "delete"},
+		WorkflowAlias: true,
 		Description: `Manage scorecards (weighted scoring tables).
 
 A scorecard maps multiple input fields to points via per-field rules and
@@ -655,7 +663,8 @@ tasks via scorecardConfig (inline rules + totalScoreVariable).`,
                               maxPoints, mappingTableId?, mappingTableCode?,
                               buckets: [{order, label, points, lowerLimit, upperLimit,
                                          values, includeNa, isDefault}]}]
-  workflowAlias: string     Optional workflow scope`,
+  workflowAlias: string     Workflow scope -- REQUIRED for the scorecard to appear in
+                             that workflow's scorecard task picker (use --workflow-alias)`,
 		UpdateSchema: `  label, code, rules, workflowAlias`,
 		ResponseSchema: `  id, label, code, rules, workflowAlias, createdAt, updatedAt`,
 		FilterHelp: `  code, workflow-alias, sort-by, sort-direction`,

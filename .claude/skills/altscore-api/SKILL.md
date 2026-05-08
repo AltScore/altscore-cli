@@ -834,12 +834,15 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 
 Four entity types power the credit-decisioning v2 task surface. They live at `/v1/{evaluation-rules, mapping-tables, scorecards, rule-trees}` and are referenced by alias from v2 tasks. All four have full CRUD + `import` extras; scorecards add `usage`; evaluation-rules add `history`.
 
+> **`workflowAlias` is load-bearing — set it on every entity.**
+> The v2 builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias`. An entity created without one is invisible to that workflow, even though the entity itself is fine. Always pass `--workflow-alias <alias>` (matches the workflow's `alias`) on `create`, `update`, and `import`. The CLI prints a stderr warning on `create` if neither the flag nor a body field sets it.
+
 #### Mapping tables — `mapping-tables`
 
 ```bash
 altscore mapping-tables list --filter mapping-type=numerical
 altscore mapping-tables get <id>
-altscore mapping-tables create --body '{
+altscore mapping-tables create --workflow-alias underwriting-v1 --body '{
   "label": "Score band to risk tier",
   "code": "score_to_tier",
   "mappingType": "numerical",
@@ -851,7 +854,7 @@ altscore mapping-tables create --body '{
   ],
   "defaultValue": "D"
 }'
-altscore mapping-tables import --body @bundle.json
+altscore mapping-tables import --body @bundle.json --workflow-alias underwriting-v1
 ```
 
 `mappingType: "categorical"` swaps `lowerLimit/upperLimit` for `values: [...]` per bucket.
@@ -862,7 +865,7 @@ A scorecard is a list of rules; **each rule must link to a `/v1/mapping-tables` 
 
 ```bash
 altscore scorecards usage <id>          # before deleting / refactoring -- shows workflow refs
-altscore scorecards create --body '{
+altscore scorecards create --workflow-alias underwriting-v1 --body '{
   "label": "Credit base score",
   "code": "credit_base",
   "rules": [
@@ -884,8 +887,8 @@ The Hub auto-slugs `code` from `label` (`label.toLowerCase().replace(/[^a-z0-9]/
 
 ```bash
 altscore evaluation-rules history <id>            # version history
-altscore evaluation-rules import --body @rules.json
-altscore evaluation-rules create --body '{
+altscore evaluation-rules import --body @rules.json --workflow-alias underwriting-v1
+altscore evaluation-rules create --workflow-alias underwriting-v1 --body '{
   "label": "Active SRI taxpayer required",
   "code": "ecu_active_taxpayer",
   "description": "Borrower must have an active RUC",
@@ -910,7 +913,7 @@ altscore evaluation-rules create --body '{
 #### Rule trees — `rule-trees`
 
 ```bash
-altscore rule-trees create --body '{
+altscore rule-trees create --workflow-alias underwriting-v1 --body '{
   "label": "Credit decision tree",
   "code": "credit_decision_tree",
   "description": "Ordered evaluation of approve/reject rules",
@@ -919,7 +922,7 @@ altscore rule-trees create --body '{
     {"ruleCode": "ecu_no_firm_debt",    "order": 1, "isDefault": false}
   ]
 }'
-altscore rule-trees import --body @rule-trees.json
+altscore rule-trees import --body @rule-trees.json --workflow-alias underwriting-v1
 ```
 
 References evaluation rules by id and/or code in a specific order with an `isDefault` marker.
@@ -979,6 +982,7 @@ Compose auto-fills:
 
 #### Common pitfalls (credit-decisioning specific)
 
+- **`workflowAlias` decides picker visibility.** The Hub builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias` matching the workflow. Entities created without it exist on the tenant but are invisible to that workflow. Always pass `--workflow-alias <alias>` (matching the workflow's `alias`) to `create`, `update`, and `import`. To re-scope an existing entity: `altscore <resource> update <id> --workflow-alias <alias>`.
 - **All four task types are reference-only.** `evaluate-rules` → `rulesConfig: [{ruleCode}]`, `mapping-table` → `mappingTableConfig.entries[].mappingTableCode`, `scorecard` → `scorecardConfig.scorecardCode`, `rule-tree` → `ruleTreeConfig.ruleTreeCode`. Inline rule/scorecard/table definitions on the task body are silently ignored at runtime; create the entity via the matching CRUD command first, then reference by code in compose.
 - **Scorecard rules require a mapping table per rule.** When you `altscore scorecards create`, every entry in `rules[]` must include `mappingTableCode` (or `mappingTableId`). Buckets on the rule are NOT a substitute — the runtime reads buckets from the linked mapping table and fails with `Rule '<label>' must be linked to a mapping table` otherwise.
 - **`alertLevel` is required to produce alerts.** A matching `evaluate-rules` rule with no `alertLevel` set produces nothing in the task's `alerts[]` output. Set `alertLevel: 1|2|3` (with optional `alertMessage`) on the rule when alerts are wanted.
