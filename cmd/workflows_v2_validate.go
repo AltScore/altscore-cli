@@ -154,6 +154,13 @@ Exits with non-zero status if any issue is found.`,
 			// body (the workflow body has nodes, not their config), so this
 			// runs in RunE rather than inside the pure lintWorkflowV2.
 			lintEndNodesPDF(c, wf, &report)
+			// inputMappings namespace check: every value's head must be a
+			// reserved scope (inputs/custom/system/task_outputs/...) or the
+			// runtime resolver fails with "Unknown variable namespace" at
+			// execute. Walks each task's persisted body via /v2/tasks/{alias},
+			// since the workflow body's data.inputMappings mirror is only
+			// populated for compose-built workflows.
+			lintTaskInputMappingsNamespace(c, wf, &report)
 			raw, _ := json.Marshal(report)
 			if err := output.RawJSON(json.RawMessage(raw)); err != nil {
 				return err
@@ -276,6 +283,74 @@ func lintEndNodesPDF(c interface {
 				Message: fmt.Sprintf(
 					"end node %q has endConfig.pdfConfig.enabled=true but sourcesConfig is empty -- PDF will render with no sections. Add at least one section.",
 					alias),
+			})
+		}
+	}
+}
+
+// runtimeReservedScopes are the leading namespace tokens the v2 runtime
+// resolver accepts in inputMappings values. Anything else fails at execute
+// time with "Unknown variable namespace: <head>". Mirrors
+// reservedMappingScopes in cmd/workflows_v2_compose.go -- if you add to one,
+// add to the other.
+var runtimeReservedScopes = map[string]bool{
+	"inputs":               true,
+	"custom":               true,
+	"system":               true,
+	"task_outputs":         true,
+	"task_outputs_by_type": true,
+}
+
+// lintTaskInputMappingsNamespace fetches each task's persisted body and
+// flags any inputMappings value whose head segment isn't a reserved runtime
+// namespace. This catches workflows where rewriteRefsInMappings produced
+// (or pre-fix compose persisted) bare "<task-alias>.<output>" references --
+// they survive lint's structural pass but blow up on execute with "Unknown
+// variable namespace: <task-alias>".
+//
+// Best-effort: HTTP failures fall through silently so a single 404 doesn't
+// mask other issues.
+func lintTaskInputMappingsNamespace(c interface {
+	Do(method, module, path string, body any) (json.RawMessage, int, error)
+}, wf map[string]any, report *lintReport) {
+	if c == nil {
+		return
+	}
+	for _, n := range asSlice(wf["nodes"]) {
+		nm, _ := n.(map[string]any)
+		nodeID, _ := nm["nodeId"].(string)
+		nodeType, _ := nm["type"].(string)
+		alias, _ := nm["taskAlias"].(string)
+		if nodeID == "" || alias == "" {
+			continue
+		}
+		taskData, _, err := c.Do("GET", "borrower_central", "/v2/tasks/"+alias, nil)
+		if err != nil {
+			continue
+		}
+		var task map[string]any
+		if err := json.Unmarshal(taskData, &task); err != nil {
+			continue
+		}
+		mappings, _ := task["inputMappings"].(map[string]any)
+		for k, v := range mappings {
+			s, _ := v.(string)
+			dot := strings.Index(s, ".")
+			if dot <= 0 {
+				continue
+			}
+			head := s[:dot]
+			if runtimeReservedScopes[head] {
+				continue
+			}
+			report.Issues = append(report.Issues, lintIssue{
+				Severity: "error",
+				NodeID:   nodeID,
+				Message: fmt.Sprintf(
+					"type=%q task=%q inputMappings[%q]=%q has head %q which is not a valid runtime namespace. "+
+						"Cross-task references must use task_outputs.<server-alias>.<output-field>; the runtime resolver fails at execute time with 'Unknown variable namespace: %s'. "+
+						"Re-compose with the latest CLI (which topologically orders task creation and rewrites bare refs to the long form), or PATCH the task via /v2/tasks/%s with the corrected mapping.",
+					nodeType, alias, k, s, head, head, alias),
 			})
 		}
 	}
