@@ -1001,21 +1001,20 @@ func preflightTasks(spec *composeSpec) error {
 				return fmt.Errorf("tasks[%d] (ref=%q): data-store-query task requires dataStoreQueryConfig.tableName", i, ref)
 			}
 		case "exception":
-			// Runtime ExecutionNotice / ExecutionOutputData are strict
-			// Pydantic models. Schema-guide documents 'errorMessage' +
-			// optional 'statusCode'; runtime requires 'message' +
-			// non-null 'statusCode'. Mirror both at serialize time so
-			// neither field surfaces as an opaque ValidationError mid-execution.
+			// BC unified the exception task on 'errorMessage' as the
+			// canonical wire name and defaults statusCode to 400 server-
+			// side, so the CLI no longer mirrors. We still tolerate legacy
+			// specs that carry the old 'message' key by promoting it to
+			// 'errorMessage' (BC also accepts the legacy form via its
+			// pre-validator; this just normalizes our outgoing body).
 			em, _ := task["errorMessage"].(string)
 			m, _ := task["message"].(string)
 			if em == "" && m == "" {
-				return fmt.Errorf("tasks[%d] (ref=%q): exception task requires 'errorMessage' (or equivalently 'message') -- the failure message surfaced when this branch fires", i, ref)
+				return fmt.Errorf("tasks[%d] (ref=%q): exception task requires 'errorMessage' -- the failure message surfaced when this branch fires", i, ref)
 			}
-			if m == "" && em != "" {
-				task["message"] = em
-			}
-			if _, hasSC := task["statusCode"]; !hasSC {
-				task["statusCode"] = 400
+			if em == "" && m != "" {
+				task["errorMessage"] = m
+				delete(task, "message")
 			}
 		case "child-workflow":
 			eid, _ := task["executorId"].(string)
