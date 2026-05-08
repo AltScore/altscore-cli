@@ -535,6 +535,134 @@ func buildEndAutoWiring(endRef string, edges []map[string]any, taskByRef map[str
 	return inputSchema, inputMappings, pdfSections, hasAltdata
 }
 
+// readSpecHTMLSections extracts the spec-only `htmlSections` field from an
+// extraNode. Returns nil when the field is absent or shaped wrong (compose
+// silently ignores malformed entries; the spec validator would have caught
+// truly broken JSON before we got here).
+func readSpecHTMLSections(node map[string]any) []map[string]any {
+	raw, ok := node["htmlSections"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, r := range raw {
+		if m, ok := r.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// htmlSectionVarRegex matches {<word>} placeholders in HTML content -- same
+// shape that runtime safe_format() resolves. Compose uses it to discover
+// which workflow input/custom variables a section references so it can wire
+// them into the end task's inputMappings (otherwise safe_format leaves
+// {var} as a literal because the runtime context never resolves it).
+var htmlSectionVarRegex = regexp.MustCompile(`\{(\w+)\}`)
+
+// buildHTMLSections turns spec htmlSections into pdfConfig.sourcesConfig
+// entries with components shaped as {name:"htmlBlock", content, context}.
+// Returns:
+//   - sections: ready-to-append entries for endConfig.pdfConfig.sourcesConfig
+//   - inputSchema additions: a slot per input/custom variable referenced in
+//     any section's content
+//   - inputMappings additions: matching wiring (inputs.<name> or
+//     custom.<name>) so safe_format resolves at runtime
+//
+// Each section accepts:
+//   - title: PDF heading (default "")
+//   - subtitle: PDF subheading (default "")
+//   - content: the raw HTML string with {var} interpolation tokens
+//   - context: visual treatment "none" | "info" | "warning" | "success" |
+//     "danger" (default "none")
+//   - pageBreak: whether to start a new PDF page (default true)
+func buildHTMLSections(sections []map[string]any, inputVars, customVars map[string]any) (
+	built []map[string]any,
+	schema map[string]any,
+	mappings map[string]any,
+) {
+	built = make([]map[string]any, 0, len(sections))
+	schema = map[string]any{}
+	mappings = map[string]any{}
+
+	for _, s := range sections {
+		content, _ := s["content"].(string)
+		title, _ := s["title"].(string)
+		subtitle, _ := s["subtitle"].(string)
+		ctx, _ := s["context"].(string)
+		if ctx == "" {
+			ctx = "none"
+		}
+		pageBreak := true
+		if v, has := s["pageBreak"].(bool); has {
+			pageBreak = v
+		}
+
+		built = append(built, map[string]any{
+			"id":         newUUIDv4(),
+			"type":       "htmlBlock",
+			"title":      title,
+			"subtitle":   subtitle,
+			"enabled":    true,
+			"page_break": pageBreak,
+			"components": []map[string]any{{
+				"id":      newUUIDv4(),
+				"name":    "htmlBlock",
+				"content": content,
+				"context": ctx,
+			}},
+		})
+
+		// Auto-wire workflow-scope variables referenced in the content.
+		// Task-output references resolve via end_activity's enriched_context
+		// promotion (no wiring needed); only inputs/custom vars need to be
+		// pulled into the end task's resolved-context root.
+		for _, m := range htmlSectionVarRegex.FindAllStringSubmatch(content, -1) {
+			name := m[1]
+			if _, has := mappings[name]; has {
+				continue
+			}
+			if _, isInput := inputVars[name]; isInput {
+				mappings[name] = "inputs." + name
+				schema[name] = inferSchemaForVar(inputVars[name], name)
+				continue
+			}
+			if _, isCustom := customVars[name]; isCustom {
+				mappings[name] = "custom." + name
+				schema[name] = inferSchemaForVar(customVars[name], name)
+				continue
+			}
+			// Else: assume the name is a task output (alerts, credit_score,
+			// decision, ...). end_activity promotes those to root, so no
+			// inputMappings entry is needed -- safe_format will find them.
+		}
+	}
+	return built, schema, mappings
+}
+
+// inferSchemaForVar derives an inputSchema entry for a workflow-scope
+// variable, falling back to type:"string" when the spec doesn't define one
+// (or when the spec value isn't shaped as a JSON-Schema-style object).
+func inferSchemaForVar(specValue any, name string) map[string]any {
+	out := map[string]any{
+		"type":  "string",
+		"title": humanizeKey(name),
+	}
+	v, ok := specValue.(map[string]any)
+	if !ok {
+		return out
+	}
+	if t, _ := v["type"].(string); t != "" {
+		out["type"] = t
+	}
+	if title, _ := v["title"].(string); title != "" {
+		out["title"] = title
+	} else if label, _ := v["label"].(string); label != "" {
+		out["title"] = label
+	}
+	return out
+}
+
 // printComposeSummary writes a one-line-per-task summary to stderr after
 // compose finishes its real (non-dry-run) POSTs. Without this, the only thing
 // compose returns to stdout is `{"id": "..."}` of the workflow -- the user
@@ -905,6 +1033,33 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 			}
 			if strings.ToLower(nodeType) == "end" {
 				inSchema, inMappings, pdfSections, _ := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap)
+
+				// Spec extension: per-end-node htmlSections render as
+				// additional PDF sections at the top of the report (before
+				// the auto-wired data-source sections). Each section
+				// interpolates {var} tokens against the end task's resolved
+				// context at runtime; compose auto-wires the inputMappings
+				// for any input or custom variable referenced in the
+				// content, so safe_format finds them. Task-output references
+				// (e.g. {credit_score}) need no wiring -- end_activity
+				// promotes upstream task outputs to root in enriched_context.
+				if rawSections := readSpecHTMLSections(n); len(rawSections) > 0 {
+					built, htmlSchema, htmlMappings := buildHTMLSections(rawSections, spec.InputVariables, spec.CustomVariables)
+					pdfSections = append(built, pdfSections...)
+					for k, v := range htmlSchema {
+						if _, exists := inSchema[k]; !exists {
+							inSchema[k] = v
+						}
+					}
+					for k, v := range htmlMappings {
+						if _, exists := inMappings[k]; !exists {
+							inMappings[k] = v
+						}
+					}
+				}
+				// htmlSections is spec sugar, not part of the API node shape.
+				delete(n, "htmlSections")
+
 				if len(inSchema) > 0 {
 					taskBody["inputSchema"] = inSchema
 				}
@@ -1501,7 +1656,12 @@ func preflightTasks(spec *composeSpec) error {
 		if err != nil {
 			return fmt.Errorf("tasks[%d] (ref=%q): cannot encode for preflight: %w", i, ref, err)
 		}
-		if err := validateTaskV2Body(json.RawMessage(body)); err != nil {
+		// Structural-only: the altdata-enrichment empty-inputKeys check
+		// belongs in validateTaskV2Body (used by manual tasks-v2 create),
+		// not here. Compose's normalize step fills inputKeys from each
+		// source's inputFields automatically; rejecting the spec at preflight
+		// would block work that compose can fix on its own.
+		if err := validateTaskV2BodyStructural(json.RawMessage(body)); err != nil {
 			return fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}
 

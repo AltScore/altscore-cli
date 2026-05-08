@@ -38,15 +38,59 @@ var conditionOperators = map[string]bool{
 }
 
 // validateTaskV2Body is a non-mutating, network-free check used by the
-// tasks-v2 create / create-version commands. It catches the most common
-// agent mistakes before the request hits the API:
+// tasks-v2 create / create-version commands. It runs the structural pass
+// (validateTaskV2BodyStructural) plus a sourcable-only pass that catches
+// the altdata-enrichment-with-empty-inputKeys mistake. The sourcable pass
+// is split out because compose's preflight runs BEFORE its normalize step
+// (which auto-fills inputKeys from the source's inputFields metadata) --
+// surfacing the empty-inputKeys error there would block specs that compose
+// can fix on its own. Manual `tasks-v2 create` callers don't run normalize,
+// so for them the error remains useful.
+//
+// validateTaskV2Body = structural + sourcable. Compose calls structural only.
+func validateTaskV2Body(body json.RawMessage) error {
+	if err := validateTaskV2BodyStructural(body); err != nil {
+		return err
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	var task map[string]any
+	if err := json.Unmarshal(body, &task); err != nil {
+		return nil
+	}
+	if t, _ := task["type"].(string); t == "altdata-enrichment" {
+		sources := asSlice(task["sourcesConfig"])
+		if len(sources) == 0 {
+			return nil
+		}
+		inputKeys := asMap(task["inputKeys"])
+		if len(inputKeys) == 0 {
+			return fmt.Errorf(
+				"altdata-enrichment task with non-empty sourcesConfig but empty inputKeys -- " +
+					"the Hub UI will show an unwired source. Run 'altscore workflows-v2 sources-status --filter id=<SOURCE_ID>' " +
+					"to see the source's required inputFields, then add an inputKeys entry per field, " +
+					`e.g. inputKeys: {"personId": "{{personId}}"}. Compose does this automatically.`)
+		}
+	}
+	return nil
+}
+
+// validateTaskV2BodyStructural runs the network-free structural checks that
+// are safe to invoke regardless of whether normalize will run afterward.
+// Catches:
 //   - conditional task with 'expression' instead of structured 'conditions'
 //   - conditional task using 'is_else' (snake_case) instead of 'isElse'
 //   - conditional task with no isElse:true default branch
 //   - conditional branch with neither 'conditions' nor 'isElse:true'
-//   - altdata-enrichment task with sourcesConfig but no inputKeys
-//     (warning, not error -- some sources may not need them)
-func validateTaskV2Body(body json.RawMessage) error {
+//   - missing required fields on credit-decisioning tasks (rulesConfig
+//     non-empty, mappingTableConfig.entries non-empty, scorecardCode set,
+//     ruleTreeCode + outputVariable set)
+//
+// Does NOT catch the altdata-enrichment empty-inputKeys case (see
+// validateTaskV2Body). Compose's preflight uses this so a compose spec
+// missing inputKeys is fixed by normalize, not rejected by preflight.
+func validateTaskV2BodyStructural(body json.RawMessage) error {
 	if len(body) == 0 {
 		return nil
 	}
@@ -62,19 +106,6 @@ func validateTaskV2Body(body json.RawMessage) error {
 		var copyTask map[string]any
 		_ = json.Unmarshal(copyJSON, &copyTask)
 		return normalizeConditionalTask(copyTask)
-	case "altdata-enrichment":
-		sources := asSlice(task["sourcesConfig"])
-		if len(sources) == 0 {
-			return nil
-		}
-		inputKeys := asMap(task["inputKeys"])
-		if len(inputKeys) == 0 {
-			return fmt.Errorf(
-				"altdata-enrichment task with non-empty sourcesConfig but empty inputKeys -- " +
-					"the Hub UI will show an unwired source. Run 'altscore workflows-v2 sources-status --filter id=<SOURCE_ID>' " +
-					"to see the source's required inputFields, then add an inputKeys entry per field, " +
-					`e.g. inputKeys: {"personId": "{{personId}}"}. Compose does this automatically.`)
-		}
 	case "evaluate-rules":
 		if rules := asSlice(task["rulesConfig"]); len(rules) == 0 {
 			return fmt.Errorf("evaluate-rules task requires rulesConfig: a non-empty array of {ruleCode: \"<code>\"} references")
