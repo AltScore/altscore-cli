@@ -785,7 +785,10 @@ v2 workflows have draft/active/archived lifecycle states, version history,
 edit locks, autosave, schedules, and a graph-based structure (nodes + edges +
 input/custom variables). Use 'schema-guide' for the canonical node/edge/variable
 reference.`,
-		CreateSchema: `  label: string         [required] Display name (alias derived from this)
+		CreateSchema: `  label: string         [required] Display name. The alias is server-derived
+                         from this (slugified label); any "alias" key in the
+                         request body is silently dropped. Pick the label you
+                         want the alias to come from.
   description: string   Free-form description
   category: string      ACTION | EVALUATION | CONTACT | OTHER
   status: string        DRAFT | ACTIVE (default DRAFT)
