@@ -219,6 +219,10 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 		report.Issues = append(report.Issues, lintIssue{Severity: "warning", Message: "no node of type 'end'"})
 	}
 
+	// Track edge endpoints so we can detect truly disconnected nodes (orphans).
+	hasIncoming := map[string]bool{}
+	hasOutgoing := map[string]bool{}
+
 	for i, e := range edges {
 		em, _ := e.(map[string]any)
 		eid, _ := em["id"].(string)
@@ -228,11 +232,72 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 			report.Issues = append(report.Issues, lintIssue{Severity: "error", EdgeID: eid, Message: fmt.Sprintf("edges[%d]: missing sourceNodeId", i)})
 		} else if _, ok := seenIDs[src]; !ok {
 			report.Issues = append(report.Issues, lintIssue{Severity: "error", EdgeID: eid, Message: fmt.Sprintf("sourceNodeId %q does not match any node", src)})
+		} else {
+			hasOutgoing[src] = true
 		}
 		if tgt == "" {
 			report.Issues = append(report.Issues, lintIssue{Severity: "error", EdgeID: eid, Message: fmt.Sprintf("edges[%d]: missing targetNodeId", i)})
 		} else if _, ok := seenIDs[tgt]; !ok {
 			report.Issues = append(report.Issues, lintIssue{Severity: "error", EdgeID: eid, Message: fmt.Sprintf("targetNodeId %q does not match any node", tgt)})
+		} else {
+			hasIncoming[tgt] = true
+		}
+	}
+
+	// Flag orphan nodes (no edges in OR out). Start nodes are exempt from the
+	// incoming-edge requirement; end nodes are exempt from outgoing. Comment
+	// nodes are decorative -- the Hub allows them anywhere -- but a fully
+	// disconnected comment is dead weight; flag it as a 'warning' (not error)
+	// so agents see it but it doesn't block compose.
+	for _, n := range nodes {
+		nm, _ := n.(map[string]any)
+		id, _ := nm["nodeId"].(string)
+		nodeType := strings.ToLower(fmt.Sprint(nm["type"]))
+		if id == "" {
+			continue
+		}
+		incoming, outgoing := hasIncoming[id], hasOutgoing[id]
+		needsIn := nodeType != "start"
+		needsOut := nodeType != "end" && nodeType != "exception"
+		// Identify by id+type so a workflow with multiple nodes of the same
+		// type (common for multi-source altdata-enrichment, multi-step
+		// compute-variables, etc.) lets the operator click the right node.
+		nodeRef := fmt.Sprintf("nodeId=%q type=%q", id, nodeType)
+		if !incoming && !outgoing {
+			sev := "warning"
+			if nodeType == "comment" {
+				sev = "warning" // comments are decorative; warn but don't block
+			} else {
+				sev = "error" // any non-comment orphan is a real problem
+			}
+			report.Issues = append(report.Issues, lintIssue{
+				Severity: sev,
+				NodeID:   id,
+				Message:  fmt.Sprintf("%s is fully disconnected (no edges in or out) -- unreachable", nodeRef),
+			})
+			continue
+		}
+		if needsIn && !incoming {
+			sev := "warning"
+			if nodeType != "comment" {
+				sev = "error"
+			}
+			report.Issues = append(report.Issues, lintIssue{
+				Severity: sev,
+				NodeID:   id,
+				Message:  fmt.Sprintf("%s has no incoming edge -- unreachable from start", nodeRef),
+			})
+		}
+		if needsOut && !outgoing {
+			sev := "warning"
+			if nodeType != "comment" {
+				sev = "error"
+			}
+			report.Issues = append(report.Issues, lintIssue{
+				Severity: sev,
+				NodeID:   id,
+				Message:  fmt.Sprintf("%s has no outgoing edge -- execution will dead-end here", nodeRef),
+			})
 		}
 	}
 

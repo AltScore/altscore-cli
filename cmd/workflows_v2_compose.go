@@ -75,6 +75,7 @@ func makeWfv2ComposeCmd() *cobra.Command {
 	var bodyFlag string
 	var dryRun bool
 	var publish bool
+	var skipLintOnPublish bool
 
 	cmd := &cobra.Command{
 		Use:   "compose",
@@ -151,6 +152,38 @@ Spec format (see file header for full reference):
 				if wfID == "" {
 					return fmt.Errorf("compose succeeded but response had no 'id' field; cannot publish")
 				}
+				// Pre-publish lint: refuse to publish a workflow with topology
+				// errors (orphan nodes, dangling edges, missing start/end). The
+				// engine would silently no-op on most of those; better to surface
+				// before the workflow goes ACTIVE. Always run lint even with
+				// --skip-lint-on-publish so we can WARN about the override
+				// rather than ship a broken workflow silently.
+				lintData, _, lerr := c.Do("GET", "borrower_central", "/v2/workflows/"+wfID, nil)
+				if lerr == nil {
+					var wfFull map[string]any
+					if err := json.Unmarshal(lintData, &wfFull); err == nil {
+						report := lintWorkflowV2(wfFull)
+						errs := []string{}
+						for _, issue := range report.Issues {
+							if issue.Severity == "error" {
+								errs = append(errs, "  - "+issue.Message)
+							}
+						}
+						if len(errs) > 0 {
+							if skipLintOnPublish {
+								fmt.Fprintf(cmd.OutOrStderr(),
+									"# WARNING: pre-publish lint found %d topology error(s) but --skip-lint-on-publish was set; publishing anyway:\n%s\n",
+									len(errs), strings.Join(errs, "\n"))
+							} else {
+								return fmt.Errorf(
+									"workflow %s created but pre-publish lint found %d topology error(s); refusing to publish:\n%s\n"+
+										"Fix the spec, run 'altscore workflows-v2 publish %s' manually after editing, or pass --skip-lint-on-publish.",
+									wfID, len(errs), strings.Join(errs, "\n"), wfID,
+								)
+							}
+						}
+					}
+				}
 				if _, _, err := c.Do("POST", "borrower_central", "/v2/workflows/"+wfID+"/publish", nil); err != nil {
 					return fmt.Errorf("workflow %s created but publish failed: %w", wfID, err)
 				}
@@ -162,6 +195,7 @@ Spec format (see file header for full reference):
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON spec (or pipe via stdin)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the assembled workflow body without making API calls")
 	cmd.Flags().BoolVar(&publish, "publish", false, "publish the workflow after creation (DRAFT workflows execute but skip every node)")
+	cmd.Flags().BoolVar(&skipLintOnPublish, "skip-lint-on-publish", false, "skip the pre-publish topology lint that refuses to publish on errors")
 	return cmd
 }
 
@@ -315,6 +349,21 @@ func humanizeKey(key string) string {
 // caller provided `alias` in a task body, that alias is sent to the API; if
 // absent, the server picks one and we use whatever it returns.
 func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[string]any, error) {
+	if err := validateEntityTypeVsTaskTypes(spec); err != nil {
+		return nil, err
+	}
+
+	// Pre-flight: validate every task's REQUIRED-field shape locally before
+	// posting anything. The previous loop would create tasks 0..N-1 on the
+	// server, then fail on N because a label/type was missing or an enum was
+	// wrong. Without a tasks-v2 DELETE endpoint there's no cleanup, so we
+	// surface those errors before the first HTTP call. Server-side errors
+	// (e.g. "headers must be JSON-encoded string") still happen mid-loop, but
+	// the cheap-and-obvious mistakes are now blocked client-side.
+	if err := preflightTasks(spec); err != nil {
+		return nil, err
+	}
+
 	createdAliases := []string{}
 	taskNodes := []map[string]any{}
 
@@ -624,4 +673,180 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 		wf["notes"] = spec.Notes
 	}
 	return wf, nil
+}
+
+// customerHiddenTypes / dealHiddenTypes mirror the Hub's palette filter at
+// altscore-ai-chat/components/workflow-builder-v2/canvas/ComponentsMenu.tsx
+// (CUSTOMER_HIDDEN_TYPES / DEAL_HIDDEN_TYPES). A workflow whose
+// config.entityType is "customer" cannot include these task types in the
+// Hub editor, so a CLI-composed workflow that uses them would render as a
+// non-editable graph -- catch it at compose time instead.
+var customerHiddenTypes = map[string]bool{
+	"deal":         true,
+	"asset":        true,
+	"array-router": true,
+}
+var dealHiddenTypes = map[string]bool{
+	"customer":         true,
+	"list-of-similars": true,
+}
+
+// validTaskTypes mirrors the backend TaskType enum at
+// borrower-central/app/model/workflows_v2/task.py. Sourced once and kept in
+// sync as the enum evolves. Used by preflight to reject typos like
+// "data-store" (correct: data-store-write/data-store-query) BEFORE creating
+// any /v2/tasks rows. Without this check, a typo would orphan all earlier
+// tasks in the compose loop (no rollback path exists today).
+var validTaskTypes = map[string]bool{
+	"http": true, "conditional": true, "comment": true,
+	"start": true, "end": true, "wait": true, "webhook": true,
+	"create-borrower": true, "update-borrower": true, "update-borrower-name": true,
+	"evaluate-rules": true, "altdata-enrichment": true, "create-identity": true,
+	"fetch-entity": true, "html-template": true, "fetch-borrower-entities": true,
+	"child-workflow": true, "exception": true, "soap": true,
+	"mapping-table": true, "scorecard": true, "rule-tree": true,
+	"compute-variables": true, "data-store-write": true, "data-store-query": true,
+	"customer": true, "deal": true, "credit-line": true,
+	"list-of-similars": true, "array-router": true, "asset": true,
+}
+
+// preflightTasks runs cheap, local-only validation across every task in the
+// spec before composeWorkflowBody starts POSTing. Catches the mistakes that
+// would otherwise create orphan /v2/tasks rows mid-loop. Without a tasks-v2
+// DELETE endpoint, partial-failure cleanup is impossible; everything we can
+// catch locally we MUST.
+//
+// Checks (in order, fail-fast):
+//   1. label + type present
+//   2. type is in the backend TaskType enum
+//   3. http: headers must be a JSON-encoded string
+//   4. data-store-write / data-store-query / webhook / comment: per-type
+//      required fields
+//   5. validateTaskV2Body: type-specific structural checks (conditional
+//      branches, scorecard reference, mapping-table entries, rule-tree
+//      enums)
+func preflightTasks(spec *composeSpec) error {
+	for i, task := range spec.Tasks {
+		ref := localRef(task, fmt.Sprintf("t%d", i))
+		label, _ := task["label"].(string)
+		taskType, _ := task["type"].(string)
+		if label == "" || taskType == "" {
+			return fmt.Errorf("tasks[%d] (ref=%q): label and type are required (validated before any POST)", i, ref)
+		}
+		if !validTaskTypes[taskType] {
+			return fmt.Errorf(
+				"tasks[%d] (ref=%q): unknown task type %q. The backend TaskType enum has %d values; "+
+					"common typos: 'data-store' should be 'data-store-write' or 'data-store-query'; "+
+					"'pdf-report' is now part of the 'end' task's endConfig (use type='html-template' for standalone). "+
+					"Run 'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' for the canonical list.",
+				i, ref, taskType, len(validTaskTypes),
+			)
+		}
+
+		// Per-type required-field checks. These cover the orphan-task class
+		// of bug seen in iter-3 smoke tests.
+		switch taskType {
+		case "http":
+			if h, present := task["headers"]; present {
+				if _, ok := h.(string); !ok {
+					return fmt.Errorf(
+						"tasks[%d] (ref=%q): http task 'headers' must be a JSON-encoded string, "+
+							"not an inline object. Wrap it: \"headers\": \"{\\\"Content-Type\\\":\\\"application/json\\\"}\". "+
+							"The runtime fails with an opaque 'str type expected' error otherwise.",
+						i, ref,
+					)
+				}
+			}
+			if u, _ := task["url"].(string); u == "" {
+				return fmt.Errorf("tasks[%d] (ref=%q): http task requires 'url'", i, ref)
+			}
+		case "webhook":
+			if u, _ := task["url"].(string); u == "" {
+				return fmt.Errorf("tasks[%d] (ref=%q): webhook task requires 'url'", i, ref)
+			}
+			if s, _ := task["secret"].(string); s == "" {
+				return fmt.Errorf("tasks[%d] (ref=%q): webhook task requires 'secret'", i, ref)
+			}
+		case "comment":
+			if c, _ := task["comment"].(string); c == "" {
+				return fmt.Errorf(
+					"tasks[%d] (ref=%q): comment task requires a non-empty 'comment' field "+
+						"(the canvas annotation body, distinct from 'label' which is the node header).",
+					i, ref,
+				)
+			}
+		case "data-store-write":
+			cfg := asMap(task["dataStoreWriteConfig"])
+			if t, _ := cfg["tableName"].(string); t == "" {
+				return fmt.Errorf("tasks[%d] (ref=%q): data-store-write task requires dataStoreWriteConfig.tableName", i, ref)
+			}
+		case "data-store-query":
+			cfg := asMap(task["dataStoreQueryConfig"])
+			if t, _ := cfg["tableName"].(string); t == "" {
+				return fmt.Errorf("tasks[%d] (ref=%q): data-store-query task requires dataStoreQueryConfig.tableName", i, ref)
+			}
+		case "exception":
+			if m, _ := task["errorMessage"].(string); m == "" {
+				return fmt.Errorf("tasks[%d] (ref=%q): exception task requires 'errorMessage'", i, ref)
+			}
+		case "child-workflow":
+			eid, _ := task["executorId"].(string)
+			eal, _ := task["executorAlias"].(string)
+			if eid == "" && eal == "" {
+				return fmt.Errorf("tasks[%d] (ref=%q): child-workflow task requires 'executorId' or 'executorAlias'", i, ref)
+			}
+		}
+
+		// Reuse the type-specific structural validator (conditional
+		// branches, scorecard reference model, mapping-table entries,
+		// rule-tree enums).
+		body, err := json.Marshal(task)
+		if err != nil {
+			return fmt.Errorf("tasks[%d] (ref=%q): cannot encode for preflight: %w", i, ref, err)
+		}
+		if err := validateTaskV2Body(json.RawMessage(body)); err != nil {
+			return fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
+		}
+	}
+	return nil
+}
+
+// validateEntityTypeVsTaskTypes rejects compose specs whose task-type set
+// would render as a broken palette in the Hub for the declared entityType.
+// No-op if entityType is unset (the workflow gets the generic palette).
+func validateEntityTypeVsTaskTypes(spec *composeSpec) error {
+	cfg := spec.Config
+	if cfg == nil {
+		return nil
+	}
+	entityType, _ := cfg["entityType"].(string)
+	if entityType == "" {
+		return nil
+	}
+	var hidden map[string]bool
+	switch strings.ToLower(entityType) {
+	case "customer":
+		hidden = customerHiddenTypes
+	case "deal":
+		hidden = dealHiddenTypes
+	default:
+		return nil
+	}
+	violations := []string{}
+	for i, task := range spec.Tasks {
+		t, _ := task["type"].(string)
+		if hidden[t] {
+			ref := localRef(task, fmt.Sprintf("t%d", i))
+			violations = append(violations, fmt.Sprintf("tasks[%d] (ref=%q) type=%q", i, ref, t))
+		}
+	}
+	if len(violations) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"config.entityType=%q hides these task types from the Hub palette, but the spec uses them: %s. "+
+			"The workflow would compose successfully but the Hub editor couldn't render it. "+
+			"Either change config.entityType, drop the task type, or remove config.entityType to get the generic palette.",
+		entityType, strings.Join(violations, ", "),
+	)
 }

@@ -476,12 +476,17 @@ func makeWfv2UpdateMappingCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Backend UpdateMappingWorkflow expects snake_case body keys
+			// (node_id / previous_variable_name / new_variable_name) -- the
+			// model in app/api/workflows_v2/handler.py:101 doesn't declare
+			// camelCase aliases, unlike the rest of v2 which does. Sending
+			// camelCase 400s with "field required". Match the model.
 			body := map[string]any{
-				"nodeId":               nodeID,
-				"previousVariableName": previous,
+				"node_id":                nodeID,
+				"previous_variable_name": previous,
 			}
 			if cmd.Flags().Changed("new") {
-				body["newVariableName"] = newName
+				body["new_variable_name"] = newName
 			}
 			raw, err := json.Marshal(body)
 			if err != nil {
@@ -1417,15 +1422,29 @@ Returns a list of suggested mappings. May return 503 if the LLM is not configure
 func makeWfv2SchemaGuideCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "schema-guide [section]",
-		Short: "Canonical reference for v2 workflow shape (nodes, edges, variables, taskTypes, examples)",
+		Short: "Canonical reference for v2 workflow shape (nodes, edges, tasks, examples, ...)",
 		Long: `Fetch the canonical reference for v2 workflow construction from the
 backend (/v1/meta/workflows-v2-schema).
 
-Sections: overview, lifecycle, nodes, edges, variables, mappings,
-taskTypes, examples, gotchas, preflightChecks.`,
+Available sections (run with no arg to see the full structure):
+  architecture                          tasks-first overview
+  endpoints                             /v2 routes the CLI wraps
+  nodes                                 graph node shape (camelCase fields)
+  edges                                 graph edge shape
+  variables                             input/custom/system/task_outputs scopes
+  mappings                              inputMappings rules + multi-dot syntax
+  tasks                                 per-type config (perType + deprecatedTypes)
+  composeSpec                           the spec format used by 'workflows-v2 compose'
+  conditions                            ConditionGroup operator vocabulary
+  creditDecisioningEntities             /v1/{evaluation-rules,mapping-tables,scorecards,rule-trees}
+  examples                              full minimal_shell + scoring_pipeline templates
+  gotchas                               common compose mistakes + fixes
+  gotchas_about_branches_and_inputkeys  conditional/array-router pitfalls
+  preflightChecks                       validation order before compose persists`,
 		Example: `  altscore workflows-v2 schema-guide
-  altscore workflows-v2 schema-guide examples
-  altscore workflows-v2 schema-guide nodes`,
+  altscore workflows-v2 schema-guide tasks
+  altscore workflows-v2 schema-guide composeSpec
+  altscore workflows-v2 schema-guide tasks | jq '.tasks.perType | keys'`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()

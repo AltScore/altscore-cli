@@ -209,6 +209,10 @@ Common drilldowns:
 			if err := json.Unmarshal(outData, &outResp); err != nil {
 				return fmt.Errorf("/output returned malformed JSON: %w", err)
 			}
+			// Surface failure context that lives on /output but not /state. An
+			// agent that sees isSuccess=false in `executions state` should
+			// immediately see WHY -- the runtime puts the human-readable
+			// failure on errorMessage / notices, not on customOutput.
 			synthetic := map[string]any{
 				"_source":      "output_customOutput",
 				"executionId":  outResp["id"],
@@ -216,6 +220,10 @@ Common drilldowns:
 				"output":       outResp["output"],
 				"isSuccess":    outResp["isSuccess"],
 				"status":       outResp["status"],
+				"statusCode":   outResp["statusCode"],
+				"errorMessage": outResp["errorMessage"],
+				"notes":        outResp["notes"],
+				"notices":      outResp["notices"],
 			}
 			body, err := json.Marshal(synthetic)
 			if err != nil {
