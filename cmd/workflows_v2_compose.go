@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -762,6 +763,7 @@ func preflightTasks(spec *composeSpec) error {
 			knownAliases[alias] = true
 		}
 	}
+	hasStart, hasEnd := false, false
 	for i, node := range spec.ExtraNodes {
 		ref := localRef(node, fmt.Sprintf("n%d", i))
 		if knownRefs[ref] {
@@ -772,6 +774,39 @@ func preflightTasks(spec *composeSpec) error {
 			)
 		}
 		knownRefs[ref] = true
+		// extraNodes is for trivial type-only graph nodes (start/end). Other
+		// types belong in 'tasks' where they get full validation; putting
+		// them in extraNodes 400s at the backing-task POST with an opaque
+		// "field required" because compose synthesizes a minimal body.
+		nodeType, _ := node["type"].(string)
+		switch nodeType {
+		case "start":
+			hasStart = true
+		case "end":
+			hasEnd = true
+		default:
+			return fmt.Errorf(
+				"extraNodes[%d] (ref=%q): type=%q is not allowed in extraNodes. "+
+					"Only 'start' and 'end' belong here -- those are trivial type-only nodes that compose "+
+					"synthesizes a backing task for. Move %q to 'tasks' instead so its required config "+
+					"fields can be supplied (compose will reject the task body if anything's missing).",
+				i, ref, nodeType, nodeType,
+			)
+		}
+	}
+	if !hasStart {
+		return fmt.Errorf(
+			"compose spec has no 'start' node in extraNodes. Every workflow needs exactly one " +
+				"start node; the engine doesn't know where to begin without it. Add: " +
+				`{"ref": "start", "type": "start", "label": "Start"} to extraNodes.`,
+		)
+	}
+	if !hasEnd {
+		// 'end' is conventional but not strictly required; warn-only via
+		// stderr, never block. Keep this open for niche use cases (e.g.
+		// workflows that terminate via 'exception' branches).
+		fmt.Fprintln(os.Stderr,
+			"# warning: compose spec has no 'end' node in extraNodes. Most workflows need one for the engine to know where to terminate cleanly.")
 	}
 
 	// Edge topology: every from/to must reference a known ref; reject

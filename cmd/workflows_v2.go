@@ -1201,7 +1201,12 @@ func makeWfv2ExecuteBatchCmd() *cobra.Command {
 		Short: "Batch-execute a v2 workflow",
 		Long: `Body fields: inputs[], optional label, description, tags[], costCenter,
 businessPriority (0-10), parallelExecutions (default 50), maxRetryAttempts
-(default 3), continueOnFailures (default true), testMode + testTaskId.`,
+(default 3), continueOnFailures (default true), testMode + testTaskId.
+
+Body shape note: 'inputs' MUST be an array of objects, one per execution.
+A flat sync-shape body like '{"borrower_id":"abc"}' is the wrong shape
+for batch -- it'll create an empty/zombie batch that never executes.
+Use 'workflows-v2 execute' for single sync runs.`,
 		Args:    cobra.ExactArgs(1),
 		Example: `  altscore workflows-v2 execute-batch <id> --body '{"inputs":[{"borrower_id":"a"},{"borrower_id":"b"}],"label":"smoke"}'`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1212,6 +1217,26 @@ businessPriority (0-10), parallelExecutions (default 50), maxRetryAttempts
 			body, err := readBody(bodyFlag)
 			if err != nil {
 				return err
+			}
+			// Preflight: batch needs inputs:[...]. Without it the API
+			// happily creates a no-op batch ID; agents copy-pasting from
+			// 'execute' get a silent zombie.
+			var parsed map[string]any
+			if jerr := json.Unmarshal(body, &parsed); jerr == nil {
+				rawInputs, present := parsed["inputs"]
+				if !present {
+					return fmt.Errorf(
+						"execute-batch body has no 'inputs' field. " +
+							"Batch executions require inputs:[{...}, {...}], one object per execution. " +
+							"For a single sync run, use 'altscore workflows-v2 execute' (which takes a flat body).")
+				}
+				inputs, ok := rawInputs.([]any)
+				if !ok {
+					return fmt.Errorf("execute-batch body 'inputs' must be an array of objects, got %T", rawInputs)
+				}
+				if len(inputs) == 0 {
+					return fmt.Errorf("execute-batch body 'inputs' is empty -- nothing to execute")
+				}
 			}
 			path := fmt.Sprintf("/v2/workflows/%s/execute-batch", args[0])
 			data, _, err := c.Do("POST", "borrower_central", path, body)
