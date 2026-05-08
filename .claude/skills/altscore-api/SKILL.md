@@ -184,15 +184,34 @@ altscore executions get <id>
 altscore executions query-outputs --filter borrower-id=<id>
 altscore executions query-outputs --filter workflow-alias=my-workflow --per-page 10
 
-# Get a single execution's output
+# Get a single execution's output (workflow envelope: w_* keys + customOutput)
 altscore executions get-output <execution-id>
 altscore executions get-output <execution-id> | jq '.output'
 altscore executions get-output <execution-id> | jq '.customOutput'
+
+# Get per-task outputs (intent-driven: tries /state first, falls back to /output customOutput).
+# The CLI hides the two-surface mess so you don't have to know which collection answered.
+altscore executions state <execution-id>
+
+# Drilldowns differ by source. Check ._source to branch:
+#   "_source" absent          -> primary /state hit, drill via state.data_flow
+#   "_source" == "output_..."  -> fallback used, drill via customOutput keyed by task TYPE
+altscore executions state <execution-id> | jq 'if has("_source") then .customOutput else .state.data_flow.task_outputs end'
+altscore executions state <execution-id> | jq '.customOutput.scorecard_result[0]'              # fallback shape
+altscore executions state <execution-id> | jq '.state.data_flow.task_states | to_entries | map({k:.key, status:.value.status})'  # primary shape
 
 # Get attachments from an execution output (returns download URLs)
 altscore executions get-output-attachments <execution-id>
 altscore executions get-output-attachments <execution-id> | jq '.[].url'
 ```
+
+> **Per-task vs envelope outputs.** v2 declarative tasks (altdata-enrichment, scorecard, rule-tree, mapping-table, evaluate-rules, conditional, http) do NOT write into the top-level `output` envelope. So `executions get-output | jq '.output'` is `null` and `.customOutput` may look empty for a workflow whose tasks didn't explicitly emit `w_*` keys.
+>
+> The runtime stores per-task results in two different surfaces depending on the engine variant:
+> - `GET /v1/executions/{id}/state` — `state.data_flow.task_outputs.<taskAlias>` (alias-keyed). Hub debug panel reads this. Only present for in-flight or state-persisting executions; often 404 for completed sync v2 runs.
+> - `GET /v1/executions/{id}/output` — `customOutput.<task_type>_result[]` (type-keyed, arrays). Always present for completed executions.
+>
+> `altscore executions state` hides this mess: it tries `/state` first, falls back to `/output` on 404, and stamps `_source: "output_customOutput"` on the fallback response so your `jq` knows which shape to expect. Use `--no-fallback` to opt out.
 
 ### Packages (read-only)
 
@@ -433,27 +452,611 @@ task_B sees workflow input fields merged with task_A's output. task_A's output w
 
 **Rule of thumb:** For each task, ask "does this task need fields that only exist in the original input?" If yes, add `workflow_args` as a parent.
 
+### Workflows V2 (Visual Builder)
+
+> **⚠️ STOP — read this before doing anything.**
+>
+> If the user asks "create a v2 workflow that does X", run **`altscore workflows-v2 compose`** with a single spec file. Do not call `workflows-v2 create` directly with hand-built nodes — that path produces orphan nodes (no `taskAlias`) that save successfully but break the Hub UI (`GET /v2/tasks/null` 404 for every node). The CLI now rejects orphan-node bodies at write time with an error pointing at compose; if you see that error, you're on the wrong path — switch to compose.
+>
+> Compose is the **only** recommended greenfield path. Direct `create` is for special cases where you've already created the tasks via `tasks-v2 create` and assembled a body with proper `taskAlias` references on every non-start/non-end node.
+>
+> **Two more silent traps the API doesn't reject** (the CLI now rejects both, but agents must understand the canonical shape):
+>
+> 1. **Conditional branches use structured `conditions`, not `expression` strings.** The API stores `expression` as a no-op and the branch never fires. Use:
+>    ```json
+>    "branches": [
+>      {"id": "branch_approve", "label": "Approve", "isElse": false, "order": 0,
+>       "conditions": {"operator": "AND",
+>         "items": [{"field": "score", "operator": "gte", "value": "700", "valueType": "value"}]}},
+>      {"id": "branch-else", "label": "Reject", "isElse": true, "order": 1, "conditions": null}
+>    ]
+>    ```
+>    Operators: `eq, neq, gt, gte, lt, lte, contains, startsWith, endsWith, in, notIn, between, isNull, isNotNull, arrayContainsAny, arrayContainsAll, isAltdataEmpty, isAltdataNotCalculated, isAltdataError, isAltdataNull, isNotAltdataNull`. `valueType` is `"value"` (literal) or `"variable"` (reference to another inputSchema field). Field is `isElse` (camelCase), not `is_else`.
+>
+> 2. **`altdata-enrichment` tasks need `inputKeys` to wire source-required fields.** Each source (e.g. `ECU-PUB-0002`) declares `inputFields` like `personId`, `taxId`. The task must include `inputKeys: {"personId": "{{personId}}", "taxId": "{{taxId}}"}` matched against an `inputSchema` that declares those keys, plus `dataAge` (cache TTL minutes, default 30) and `packageAlias` (where to store results) on each `sourcesConfig` entry. Compose auto-derives `inputKeys` by querying `sources-status` for each source's `inputFields` — use it.
+>
+> Run `altscore workflows-v2 schema-guide conditions` and `... schema-guide tasks` for the canonical reference.
+
+Workflows V2 is the API surface for the visual graph builder in the Hub. It uses **two collaborating resources**:
+
+| Resource | Path | Purpose |
+|---|---|---|
+| **Tasks** | `/v2/tasks` | Versioned executable units (HTTP url, evaluator alias, sources_config, branches, ...) |
+| **Workflows** | `/v2/workflows` | The graph: `nodes[]` + `edges[]` + variables. Each node references a task by `taskAlias` |
+
+This is **not** v1 (`/v1/workflows`). Use v2 for anything created in the visual editor.
+
+**Key insight: tasks first, then workflow.** **Every** graph node — including `start`, `end`, and `conditional` — needs a `taskAlias`. The Hub creates trivial backing tasks (just `type` + `label`) for start/end so it can render them. Verified by inspecting working tenant workflows: every node has a non-null `taskAlias`. Use `compose`, which creates a backing task for every node automatically.
+
+After creating a workflow, run `altscore workflows-v2 lint <id>` to verify there are no orphan nodes, dangling edges, or duplicate ids. The lint command also runs the same checks as the create-time validator and is the fastest way to triage a misbehaving workflow.
+
+For canonical field-by-field reference run:
+
+```bash
+altscore workflows-v2 schema-guide               # full guide
+altscore workflows-v2 schema-guide architecture  # the tasks-first explanation
+altscore workflows-v2 schema-guide nodes         # node shape (camelCase: nodeId, label, taskAlias, ...)
+altscore workflows-v2 schema-guide edges         # edge shape (sourceNodeId, targetNodeId)
+altscore workflows-v2 schema-guide tasks         # task shape + per-type config fields
+altscore workflows-v2 schema-guide examples      # full scoring_pipeline template
+```
+
+#### Recommended path: `compose` (one-shot greenfield)
+
+For "Create a workflow that does X", use `workflows-v2 compose`. It takes a single spec, calls `/v2/tasks` for each task (server picks the alias), then creates the workflow with nodes auto-wired to those server-assigned aliases. Use `--dry-run` first to inspect what will be sent.
+
+**Refs vs aliases.** The spec uses `ref` as a stable spec-local key. Edges and inputMappings reference tasks by `ref`, and compose rewrites them with the server-assigned aliases at create time. You can also still pass an explicit `alias` if you need a specific name (e.g. for cross-workflow reuse) — compose passes that through. Edges use `from`/`to` as shortcuts for `sourceNodeId`/`targetNodeId`.
+
+```bash
+cat > /tmp/spec.json <<'EOF'
+{
+  "label": "Scoring pipeline",
+  "category": "EVALUATION",
+  "description": "Fetch, score, route",
+  "inputVariables": {
+    "borrower_id": {"type": "string", "required": true},
+    "min_score":   {"type": "integer", "default": 700}
+  },
+  "tasks": [
+    {
+      "ref": "fetch",
+      "label": "Fetch ECU bureau",
+      "type": "altdata-enrichment",
+      "sourcesConfig": [{"sourceId": "ECU-PUB-0002", "version": "v1"}],
+      "borrowerIdField": "personId",
+      "inputMappings": {"personId": "inputs.borrower_id"}
+    },
+    {
+      "ref": "score",
+      "label": "Score",
+      "type": "evaluate-rules",
+      "evaluatorTask": "scoring",
+      "inputSchema": {"credit_data": {"type": "object"}},
+      "inputMappings": {"credit_data": "task_outputs.fetch.sources_output_packages"}
+    },
+    {
+      "ref": "route",
+      "label": "Approve or reject",
+      "type": "conditional",
+      "inputSchema": {
+        "score":     {"type": "number"},
+        "min_score": {"type": "integer"}
+      },
+      "inputMappings": {
+        "score":     "task_outputs.score.value",
+        "min_score": "inputs.min_score"
+      },
+      "branches": [
+        {"label": "Approve",
+         "conditions": {"operator": "AND",
+           "items": [{"field": "score", "operator": "gte", "value": "min_score", "valueType": "variable"}]}},
+        {"label": "Reject", "isElse": true}
+      ]
+    }
+  ],
+  "extraNodes": [
+    {"ref": "start", "type": "start", "label": "Start"},
+    {"ref": "end",   "type": "end",   "label": "End"}
+  ],
+  "edges": [
+    {"from": "start", "to": "fetch"},
+    {"from": "fetch", "to": "score"},
+    {"from": "score", "to": "route"},
+    {"from": "route", "to": "end", "sourceHandle": "branch_0"}
+  ]
+}
+EOF
+
+altscore workflows-v2 compose --body @/tmp/spec.json --dry-run   # inspect first
+altscore workflows-v2 compose --body @/tmp/spec.json --publish   # create + publish (the one you usually want)
+altscore workflows-v2 compose --body @/tmp/spec.json             # create only -- leaves workflow in DRAFT
+altscore workflows-v2 publish <id>                                # standalone publish step
+```
+
+> **DRAFT trap.** Compose creates workflows in `status: "DRAFT"` by default — mirrors the Hub's "save-then-publish" editor flow. **A DRAFT workflow executes successfully but the engine skips every node**: `executions get` returns `status: complete, isSuccess: true`, the envelope output is `null`, and per-task outputs (`executions state <id> | jq '.state.data_flow.task_outputs'`) is `{}`. This looks like the workflow ran when nothing actually happened. Always pass `--publish` (or run `altscore workflows-v2 publish <id>` after) before executing. The CLI's `workflows-v2 execute` now does a pre-flight check and warns to stderr if the workflow isn't `ACTIVE`; pass `--skip-status-check` to suppress.
+
+If the agent asks for help building a workflow, default to compose. Other paths exist for special cases:
+
+- **Clone-and-modify** (highest success when a similar workflow exists): `export <similar-id>` → edit JSON → `validate-rules` → `import --new-label "..."`
+- **Incremental edit on an existing workflow**: hold a lock + use `add-node`/`add-edge`/`set-mapping`/`set-variable` helpers (see Helpers section below)
+- **Manual** (only if you need explicit control): `tasks-v2 create` per task, then `workflows-v2 create --body @workflow.json` with hand-built nodes
+
+#### Tasks (`/v2/tasks`)
+
+```bash
+# Create a task (alias optional; auto-generated if omitted).
+# altdata-enrichment requires inputKeys when sourcesConfig is non-empty:
+altscore tasks-v2 create --body '{
+  "alias":"fetch-ecu",
+  "label":"Fetch ECU bureau",
+  "type":"altdata-enrichment",
+  "sourcesConfig":[{"sourceId":"ECU-PUB-0002","version":"v1","dataAge":30,"packageAlias":"ecu_pub_0002"}],
+  "borrowerIdField":"personId",
+  "inputSchema":{"personId":{"type":"string"},"taxId":{"type":"string"}},
+  "inputKeys":{"personId":"{{personId}}","taxId":"{{taxId}}"},
+  "inputMappings":{"personId":"inputs.borrower_id"},
+  "mode":"single","savePackages":true,"timeout":60
+}'
+
+# Bump version (existing nodes pinning v1 are unaffected)
+altscore tasks-v2 create-version fetch-ecu --body '{
+  "label":"Fetch ECU bureau v2",
+  "type":"altdata-enrichment",
+  "sourcesConfig":[
+    {"sourceId":"ECU-PUB-0002","version":"v1","dataAge":30,"packageAlias":"ecu_pub_0002"},
+    {"sourceId":"ECU-PUB-0014","version":"v1","dataAge":30,"packageAlias":"ecu_pub_0014"}
+  ],
+  "inputKeys":{"personId":"{{personId}}","taxId":"{{taxId}}"}
+}'
+
+# Inspect (returns latest + version history)
+altscore tasks-v2 get fetch-ecu
+```
+
+There is **no LIST endpoint** for tasks today. Discover task aliases via the workflows that use them.
+
+Per-type config (full reference: `schema-guide tasks`):
+
+| type | key fields |
+|---|---|
+| `altdata-enrichment` | `sourcesConfig`, `borrowerIdField`, `mode`, `savePackages` |
+| `evaluate-rules` | `evaluatorTask`, optional `rulesConfig`/`scorecardConfig`/`ruleTreeConfig` |
+| `http` | `url`, `method`, `headers` (JSON string), `body`, auth fields |
+| `conditional` | `branches`: `[{label, expression, is_else}]` |
+| `wait` | `seconds` or `untilCondition` |
+| `webhook` | `secret` |
+| `compute-variables` | `selectedVariables` |
+| `data-store` | `dataStoreWriteConfig` or `dataStoreQueryConfig` |
+| `pdf-report` / `end` | `endConfig: {title, subtitle, brand_logo}` |
+
+#### Workflow CRUD
+
+```bash
+altscore workflows-v2 list --filter status=ACTIVE --filter is-latest=true
+altscore workflows-v2 get  <id>
+altscore workflows-v2 lint <id>                                    # check for orphan nodes / dangling edges
+altscore workflows-v2 update <id> --body '{"label":"Renamed"}'     # prefer autosave for graph edits
+altscore workflows-v2 delete <id>
+
+# Direct create is gated by client-side validation -- prefer compose for greenfield.
+# If you really need to create from a hand-built body (and have already created
+# all referenced /v2/tasks), the body must use camelCase (nodeId, sourceNodeId,
+# targetNodeId) and every non-start/non-end node must have taskAlias or taskId.
+altscore workflows-v2 create --body @already-wired.json
+```
+
+`list` returns the **full DTO** with `nodes` and `edges`. Empty arrays = the workflow is genuinely empty, not a summary projection.
+
+After any create or autosave, run `altscore workflows-v2 lint <id>` to confirm no orphan nodes, dangling edges, or duplicate node ids.
+
+#### Lock dance (required before edits)
+
+```bash
+TOKEN=$(altscore workflows-v2 lock acquire my-wf --client-id "agent-$(uuidgen)" | jq -r .lockToken)
+
+altscore workflows-v2 lock heartbeat my-wf --lock-token "$TOKEN"   # every ~60s during long edits
+
+altscore workflows-v2 autosave <id> --lock-token "$TOKEN" --last-known-version 3 \
+  --body '{"label":"Renamed","nodes":[...],"edges":[...]}'
+
+altscore workflows-v2 lock release my-wf --lock-token "$TOKEN"
+
+# Inspect / unstick
+altscore workflows-v2 lock get my-wf
+altscore workflows-v2 lock force-release my-wf       # admin only
+```
+
+`autosave` returning 409 means concurrent modification — re-fetch with `get`, merge, retry.
+
+#### Lifecycle
+
+```bash
+altscore workflows-v2 create-draft <active-id>                   # branch off ACTIVE
+altscore workflows-v2 publish <draft-id>                         # DRAFT -> ACTIVE
+altscore workflows-v2 revert my-wf <version-id>                  # restore prior version into a draft
+altscore workflows-v2 revert my-wf <version-id> --mode publish   # replace ACTIVE directly
+altscore workflows-v2 archive <id>                               # archive all versions
+altscore workflows-v2 restore <id>                               # un-archive
+altscore workflows-v2 duplicate <id> --new-label "Copy of X"
+```
+
+#### Versions, executions, mappings
+
+```bash
+altscore workflows-v2 versions my-wf --include-changes
+altscore workflows-v2 get-version my-wf latest
+altscore workflows-v2 executions <id> --per-page 20 --sort-by createdAt --sort-direction desc
+
+altscore workflows-v2 update-mapping <id> --node-id score --previous old --new new
+altscore workflows-v2 update-mapping <id> --node-id score --previous old --new ""    # clear
+altscore workflows-v2 resolve-mappings <id>                                          # auto-wire unresolved
+```
+
+#### Schedules
+
+```bash
+# Always dry-run cron expressions before saving
+altscore workflows-v2 schedule preview --cron "0 9 * * *" --utc-delta -5 --count 5
+altscore workflows-v2 schedule validate --cron "0 9 * * MON" --utc-delta -5
+
+altscore workflows-v2 schedule get    <id>
+altscore workflows-v2 schedule create <id> --body '{"schedule":{"cron":"0 9 * * *","utcDeltaHours":-5}}'
+altscore workflows-v2 schedule update <id> --body '{"scheduleBatch":{"cron":"0 0 * * SUN","utcDeltaHours":0}}'
+altscore workflows-v2 schedule delete <id> --individual    # or --batch, or both
+```
+
+`utcDeltaHours` accepts -12 to 14.
+
+#### Import / export
+
+```bash
+altscore workflows-v2 export <id> > my-wf.json
+altscore workflows-v2 validate-rules --body @my-wf.json     # which referenced rules already exist?
+altscore workflows-v2 import --body @my-wf.json --new-label "Imported Copy"
+altscore workflows-v2 import --body @my-wf.json --new-label "Light" --skip-evaluation-rules --skip-scorecards
+```
+
+#### Execute
+
+> **Body shape — sync vs batch differ.** `execute` and `execute-by-alias` take a **flat** object whose keys are the workflow's `inputVariables` directly (`{"borrower_id":"abc"}`). `execute-batch` takes a **wrapped** object (`{"inputs": [{...}, {...}]}`). Wrapping a sync call (`{"inputs": {...}}`) returns HTTP 400 `Required variable '<name>' is missing` because the resolver looks for top-level keys. Despite the runtime variable namespace being `inputs.<name>`, the request body is flat — the namespace is added server-side after parsing.
+
+```bash
+altscore workflows-v2 execute <id> --body '{"borrower_id":"abc"}'                          # sync, flat keys
+altscore workflows-v2 execute <id> --body '{...}' --execution-mode async --tags smoke      # async returns executionId
+altscore workflows-v2 execute-by-alias my-wf latest --body '{...}'
+
+# Test mode
+altscore workflows-v2 execute <id> --body '{...}' \
+  --test-task-id <task-id> --test-timeout-seconds 60 --store-logs true
+
+# Batch -- wrapped under "inputs": [...]
+altscore workflows-v2 execute-batch <id> --body '{
+  "inputs":[{"borrower_id":"a"},{"borrower_id":"b"}],
+  "label":"smoke","parallelExecutions":50,"continueOnFailures":true
+}'
+altscore workflows-v2 batch pause     <batch-id>
+altscore workflows-v2 batch continue  <batch-id>
+altscore workflows-v2 batch terminate <batch-id>
+```
+
+#### Sources and AI helpers
+
+```bash
+altscore workflows-v2 sources-status --country ECU --status active
+altscore workflows-v2 external-sources-status
+
+altscore workflows-v2 ai suggest-mappings --body '{
+  "fields":[{"name":"borrower_id","type":"string"}],
+  "availableOutputs":[{"source":"taskOutput","type":"string","taskAlias":"fetch","outputName":"id"}]
+}'
+```
+
+#### Ergonomic builder helpers (for INCREMENTAL EDIT path)
+
+These mutate an existing workflow in place. Each handles fetch + lock + autosave internally. **Do not use these for greenfield** — use `compose` instead.
+
+```bash
+TOKEN=$(altscore workflows-v2 lock acquire my-wf --client-id "agent-$$" | jq -r .lockToken)
+
+altscore workflows-v2 add-node <id> --lock-token "$TOKEN" \
+  --type http --node-id notify --label "Webhook" --task-alias notify-approve
+
+altscore workflows-v2 add-edge <id> --lock-token "$TOKEN" \
+  --source route --target notify --source-handle branch_0
+
+altscore workflows-v2 set-mapping <id> --lock-token "$TOKEN" \
+  --node-id notify --input-name decision --expression "task_outputs.score.decision"
+
+altscore workflows-v2 set-variable <id> --lock-token "$TOKEN" \
+  --scope input --name escalation_email --type string --required
+
+altscore workflows-v2 lock release my-wf --lock-token "$TOKEN"
+```
+
+| Helper | Purpose |
+|---|---|
+| `add-node <id>` | Append a node. **Reference an existing task with `--task-alias`** (and optional `--task-version`). Field names: `nodeId`, `label`, `taskAlias`, `taskVersion` |
+| `remove-node <id>` | Remove by `--node-id` (also drops incident edges unless `--keep-edges`) |
+| `add-edge <id>` | Append an edge. `--source` / `--target` get serialized as `sourceNodeId` / `targetNodeId` |
+| `remove-edge <id>` | By `--id` or by `--source` + `--target` |
+| `set-variable <id>` | `--scope input\|custom`, `--name`, `--type`, `--default <json>`, `--required` |
+| `unset-variable <id>` | Remove by `--scope` + `--name` |
+| `set-mapping <id>` | Wire a node input: `--node-id`, `--input-name`, `--expression`. Use `--clear` to remove |
+
+Both `--lock-token` (caller-managed) and `--client-id` (auto-acquire/release) are supported.
+
+#### Pre-flight checklist (before constructing or modifying)
+
+The workflow body is permissive — it'll save with bad refs and fail at execute time. Verify external references exist first:
+
+```bash
+altscore altdata describe <SOURCE_ID>                        # altdata-enrichment refs (canonical)
+altscore evaluators list --filter alias=<ALIAS>              # evaluate-rules refs
+altscore data-models list --filter key=<KEY>                 # custom field refs
+altscore api GET "/v1/rules?alias=<ALIAS>"                   # rule refs
+```
+
+`altdata describe` is the one-shot pre-flight: it returns the source's metadata, available versions, required input fields, and outputSchema keys in a single call. Prefer it over chaining `altdata sources` + `altdata dictionary` + `altdata sample`.
+
+#### Variable resolution syntax (templates and mappings)
+
+The runtime resolver accepts these leading namespaces — anything else fails with `Unknown variable namespace`:
+
+| Scope | Syntax | Example |
+|---|---|---|
+| Workflow input | `inputs.<name>` | `inputs.borrower_id` |
+| Task output (top-level) | `task_outputs.<taskAlias>.<field>` | `task_outputs.fetch.sources_output_packages` |
+| Task output (deep path) | `task_outputs.<taskAlias>.<deep>.<path>.<to>.<field>` | `task_outputs.fetch.ECU-PUB-0002.data.pdEc_sri_esActivo` |
+| Custom variable | `custom.<name>` | `custom.normalized_score` |
+| System | `system.<key>` | `system.execution_id` |
+| Indexed by type | `task_outputs_by_type.<taskType>[<idx>].<field>` | `task_outputs_by_type.altdata-enrichment[0].result` |
+
+**Deep paths into altdata output**: an `altdata-enrichment` task outputs the entire package object on `sources_output_packages`. To map a single field into a downstream conditional/compute-variables task, use the deep form: `task_outputs.<altdataAlias>.<sourceId>.data.<fieldName>`. No intermediate compute-variables required.
+
+**Bare `<alias>.<field>` is broken** at runtime — Pydantic accepts it, but the resolver rejects `<alias>` as an unknown namespace. Always prefix `task_outputs.` for cross-task references. Compose now does this automatically when you write a ref-prefixed mapping; the rewriter outputs `task_outputs.<server-alias>.<rest>`.
+
+**CreateTaskV2 vs CreateTaskVersionV2**: the strict initial-create validator rejects multi-dot mapping values when `inputSchema` is set. The lenient version-bump validator accepts them. **Compose's two-phase create handles this**: it strips `inputMappings`/`inputSchema` from the first POST, then re-posts the full body to `/v2/tasks/{alias}` to land at version 2. The workflow node references `taskVersion: 2` automatically.
+
+#### Gotchas (v2 specific)
+
+- **Tasks first — for every node.** Even `start`/`end` need a backing `/v2/tasks` record. Hub workflows use trivial type-only tasks for those (`{"type":"start","label":"Start"}`). The API saves orphan-node bodies, but the Hub then hits `GET /v2/tasks/null` 404 on render.
+- **Field names are camelCase.** `nodeId` not `id`, `sourceNodeId` not `source`, `targetNodeId` not `target`. Snake-case will return 400.
+- **Lock first.** `update` works without a lock but races with the Hub UI. Prefer `autosave` with `--lock-token`.
+- **`lastKnownVersion`** is the antidote to silent overwrites. Always pass it on `autosave` if you fetched the workflow earlier in the session.
+- **Alias is derived from label on create.** Two workflows can't share an alias — 409 on collision. Use `duplicate --new-label` or `import --new-label` to disambiguate.
+- **`schedule preview/validate`** don't take a workflow ID. Standalone cron checkers.
+- **`execute --execution-mode async`** returns only `executionId`. Poll `executions <id>` for status.
+- **`ai suggest-mappings`** returns 503 when the tenant has no LLM configured. Treat as a soft failure.
+- **No tasks LIST endpoint.** Discover task aliases via the workflows that use them, or via the Hub UI.
+
+
+### Credit Decisioning
+
+Four entity types power the credit-decisioning v2 task surface. They live at `/v1/{evaluation-rules, mapping-tables, scorecards, rule-trees}` and are referenced by alias from v2 tasks. All four have full CRUD + `import` extras; scorecards add `usage`; evaluation-rules add `history`.
+
+> **`workflowAlias` is load-bearing — set it on every entity.**
+> The v2 builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias`. An entity created without one is invisible to that workflow, even though the entity itself is fine. Always pass `--workflow-alias <alias>` (matches the workflow's `alias`) on `create`, `update`, and `import`. The CLI prints a stderr warning on `create` if neither the flag nor a body field sets it.
+
+#### Mapping tables — `mapping-tables`
+
+```bash
+altscore mapping-tables list --filter mapping-type=numerical
+altscore mapping-tables get <id>
+altscore mapping-tables create --workflow-alias underwriting-v1 --body '{
+  "label": "Score band to risk tier",
+  "code": "score_to_tier",
+  "mappingType": "numerical",
+  "outputType": "string",
+  "buckets": [
+    {"order": 0, "label": "Excellent",  "lowerLimit": 750, "upperLimit": 999, "lowerInclusive": true,  "upperInclusive": true,  "outputValue": "A"},
+    {"order": 1, "label": "Good",       "lowerLimit": 700, "upperLimit": 749, "lowerInclusive": true,  "upperInclusive": true,  "outputValue": "B"},
+    {"order": 2, "label": "Subprime",   "lowerLimit": 0,   "upperLimit": 699, "lowerInclusive": true,  "upperInclusive": true,  "outputValue": "D"}
+  ],
+  "defaultValue": "D"
+}'
+altscore mapping-tables import --body @bundle.json --workflow-alias underwriting-v1
+```
+
+`mappingType: "categorical"` swaps `lowerLimit/upperLimit` for `values: [...]` per bucket.
+
+#### Scorecards — `scorecards`
+
+A scorecard is a list of rules; **each rule must link to a `/v1/mapping-tables` entity** (`mappingTableCode`). Buckets on the rule are NOT a substitute — the runtime reads buckets from the linked mapping table. So: create the mapping tables first, then the scorecard.
+
+```bash
+altscore scorecards usage <id>          # before deleting / refactoring -- shows workflow refs
+altscore scorecards create --workflow-alias underwriting-v1 --body '{
+  "label": "Credit base score",
+  "code": "credit_base",
+  "rules": [
+    {"order": 0, "label": "Active",
+     "field": "is_active", "fieldType": "categorical",
+     "maxPoints": 100,
+     "mappingTableCode": "active_to_points"},
+    {"order": 1, "label": "Debt",
+     "field": "firm_debt", "fieldType": "numerical",
+     "maxPoints": 200,
+     "mappingTableCode": "debt_band_to_points"}
+  ]
+}'
+```
+
+The Hub auto-slugs `code` from `label` (`label.toLowerCase().replace(/[^a-z0-9]/g,'_').slice(0,50)`); the CLI passes `code` through verbatim. If you submit a rule without a mappingTable reference, the runtime fails with `Rule '<label>' must be linked to a mapping table` — there's no inline-buckets shortcut.
+
+#### Evaluation rules — `evaluation-rules`
+
+```bash
+altscore evaluation-rules history <id>            # version history
+altscore evaluation-rules import --body @rules.json --workflow-alias underwriting-v1
+altscore evaluation-rules create --workflow-alias underwriting-v1 --body '{
+  "label": "Active SRI taxpayer required",
+  "code": "ecu_active_taxpayer",
+  "description": "Borrower must have an active RUC",
+  "conditions": {
+    "operator": "AND",
+    "items": [
+      {"field": "is_active", "operator": "eq", "value": "1", "valueType": "value"}
+    ]
+  },
+  "alertLevel":   2,
+  "alertMessage": "Borrower has an inactive RUC",
+  "decisionKey":  "reject"
+}'
+```
+
+`conditions` is a `ConditionGroup` — same shape used by v2 conditional task branches. Run `altscore workflows-v2 schema-guide conditions` for the full operator vocabulary (`eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `contains`, `startsWith`, `endsWith`, `in`, `notIn`, `between`, `isNull`, `isNotNull`, `isAltdata*`, `arrayContainsAny`, `arrayContainsAll`).
+
+**`alertLevel` and `decisionKey` are load-bearing.** They look optional in the schema, but the runtime treats absence as silent skip:
+- A rule that hits but has no `alertLevel` produces NO entry in the `evaluate-rules` task's `alerts[]` output. Set `alertLevel` (1=info, 2=warning, 3=critical) when you want the alert recorded.
+- A rule referenced from a `rule-tree` task with no `decisionKey` leaves the rule-tree's `outputVariable` null even when conditions match. Set `decisionKey` (e.g. `"approve"`, `"reject"`) to populate the decision.
+
+**`decisionKey` must match a tenant-registered decision** (case-sensitive). See the Decisions section below — `altscore decisions list` shows the valid set; `altscore decisions create --key reject --label Reject` registers a new one. Using an unregistered key (or a case mismatch like `"REJECTED"` when the tenant has lowercase `reject`) makes downstream `executions set-decision` calls fail with HTTP 400 `"key not found for entity type: decision"`, and the rule-tree's outputVariable carries a value the platform can't write back as a final decision.
+
+#### Decisions — `decisions`
+
+Decision keys (`approve`, `reject`, `manual_review`, ...) are stored as data-model records with `entityType=decision`. The CLI exposes them as their own group; under the hood it's a thin facade over `/v1/data-models?entity-type=decision` so anything you do here is interchangeable with `data-models` commands using that filter.
+
+```bash
+# Discover the tenant's decision vocabulary BEFORE writing decisionKey on rules
+altscore decisions list
+
+# Register a new decision key
+altscore decisions create --key manual-review --label "Manual review"
+
+# Inspect the decision an execution recorded
+altscore executions get-decision <execution-id>
+
+# Override or set the decision on an execution (--type defaults to "final")
+altscore executions set-decision <execution-id> --key reject --type final --label "Inactive borrower"
+
+# Admin-only clear (does NOT replay the workflow)
+altscore executions delete-decision <execution-id>
+```
+
+`decisionType` is `"preliminary"` (interim, can be overridden later in the same run) or `"final"` (default, what the rule-tree task usually emits). The endpoint records each write into a `history` array — read with `executions get-decision` to see the audit trail. Submitting a `key` not registered in the tenant's decision data-models returns HTTP 400 `"key not found for entity type: decision"`.
+
+#### Rule trees — `rule-trees`
+
+```bash
+altscore rule-trees create --workflow-alias underwriting-v1 --body '{
+  "label": "Credit decision tree",
+  "code": "credit_decision_tree",
+  "description": "Ordered evaluation of approve/reject rules",
+  "rules": [
+    {"ruleCode": "ecu_active_taxpayer", "order": 0, "isDefault": false},
+    {"ruleCode": "ecu_no_firm_debt",    "order": 1, "isDefault": false}
+  ]
+}'
+altscore rule-trees import --body @rule-trees.json --workflow-alias underwriting-v1
+```
+
+References evaluation rules by id and/or code in a specific order with an `isDefault` marker.
+
+#### Building a workflow that uses them (compose)
+
+The four matching v2 task types — `evaluate-rules`, `mapping-table`, `scorecard`, `rule-tree` — reference these entities. Compose validates references against the tenant (best-effort warnings) and pre-fills `outputSchema` with the canonical runtime fields so downstream tasks see the right available outputs.
+
+```bash
+cat > /tmp/credit-spec.json <<'EOF'
+{
+  "label": "Credit decisioning pipeline",
+  "category": "EVALUATION",
+  "inputVariables": {"borrower_id": {"type": "string", "required": true}},
+  "tasks": [
+    {"ref": "fetch", "label": "Fetch bureau", "type": "altdata-enrichment",
+     "borrowerIdField": "personId",
+     "sourcesConfig": [{"sourceId": "ECU-PUB-0002", "version": "v2"}],
+     "inputMappings": {"personId": "inputs.borrower_id"}},
+
+    {"ref": "rules", "label": "Evaluate Rules", "type": "evaluate-rules",
+     "rulesConfig": [{"ruleCode": "ecu_active_taxpayer"}, {"ruleCode": "ecu_no_firm_debt"}]},
+
+    {"ref": "score", "label": "Credit Score", "type": "scorecard",
+     "scorecardConfig": {
+       "scorecardCode":      "credit_base",
+       "totalScoreVariable": "credit_score",
+       "breakdownVariable":  "score_breakdown"
+     }},
+
+    {"ref": "tree", "label": "Decision Tree", "type": "rule-tree",
+     "ruleTreeConfig": {"ruleTreeCode": "credit_decision_tree",
+                        "outputVariable": "decision", "outputType": "string"}}
+  ],
+  "extraNodes": [
+    {"ref": "start", "type": "start", "label": "Start"},
+    {"ref": "end",   "type": "end",   "label": "End"}
+  ],
+  "edges": [
+    {"from": "start", "to": "fetch"},
+    {"from": "fetch", "to": "rules"},
+    {"from": "rules", "to": "score"},
+    {"from": "score", "to": "tree"},
+    {"from": "tree",  "to": "end"}
+  ]
+}
+EOF
+altscore workflows-v2 compose --body @/tmp/credit-spec.json --dry-run
+altscore workflows-v2 compose --body @/tmp/credit-spec.json
+```
+
+Compose auto-fills:
+- `evaluate-rules`: `outputSchema = {alerts: array, alerts_count: integer}`
+- `mapping-table`: each `entries[].outputVariable` becomes a top-level output field (string by default; refined to `number` when the referenced mapping table's `outputType` is number). **Compose also mints a UUID for each `entries[].id`** — the runtime requires it but agents typically forget.
+- `scorecard`: `outputSchema = {<totalScoreVariable>: number, <breakdownVariable>: object}` (breakdown defaults to `score_breakdown`)
+- `rule-tree`: `outputSchema = {<outputVariable>: <outputType>}`
+
+#### Common pitfalls (credit-decisioning specific)
+
+- **`workflowAlias` decides picker visibility.** The Hub builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias` matching the workflow. Entities created without it exist on the tenant but are invisible to that workflow. Always pass `--workflow-alias <alias>` (matching the workflow's `alias`) to `create`, `update`, and `import`. To re-scope an existing entity: `altscore <resource> update <id> --workflow-alias <alias>`.
+- **All four task types are reference-only.** `evaluate-rules` → `rulesConfig: [{ruleCode}]`, `mapping-table` → `mappingTableConfig.entries[].mappingTableCode`, `scorecard` → `scorecardConfig.scorecardCode`, `rule-tree` → `ruleTreeConfig.ruleTreeCode`. Inline rule/scorecard/table definitions on the task body are silently ignored at runtime; create the entity via the matching CRUD command first, then reference by code in compose.
+- **Scorecard rules require a mapping table per rule.** When you `altscore scorecards create`, every entry in `rules[]` must include `mappingTableCode` (or `mappingTableId`). Buckets on the rule are NOT a substitute — the runtime reads buckets from the linked mapping table and fails with `Rule '<label>' must be linked to a mapping table` otherwise.
+- **`alertLevel` is required to produce alerts.** A matching `evaluate-rules` rule with no `alertLevel` set produces nothing in the task's `alerts[]` output. Set `alertLevel: 1|2|3` (with optional `alertMessage`) on the rule when alerts are wanted.
+- **`decisionKey` drives `rule-tree` output.** The first matching rule's `decisionKey` becomes the rule-tree task's `outputVariable` value. Without `decisionKey` on the rule, the rule-tree's decision is null even on a hit.
+- **`decisionKey` is case-sensitive and must match a tenant-registered decision.** Run `altscore decisions list` before writing rules; case mismatches (e.g. `"REJECTED"` when the tenant has `"reject"`) compose and lint clean but fail downstream when the run tries to record the decision via `/v1/executions/{id}/decisions` ("key not found for entity type: decision").
+- **`rule-tree` `outputVariable` becomes a top-level task output.** Downstream conditionals reference `task_outputs.<rule-tree-alias>.<outputVariable>` (e.g. `task_outputs.tree.decision`). `outputType` must be `string` | `number` | `boolean`.
+- **`is-test` toggles on evaluation rules / rule trees** isolate them from production execution. Use `altscore evaluation-rules set-test <id> --enable` while iterating, then `--disable` once stable.
+
+
 ## AltData
 
 Discovery commands query Borrower Central (work in all environments). Execution commands hit the AltData module (production only).
 
-### Discovery
+### Discovery flow (canonical order)
+
+> **Use `describe` as the pre-flight.** It is the one-shot primitive: hits sources-status once, auto-resolves the latest version, and returns metadata + versions + inputFields + outputKeys in a single JSON document. Reach for `dictionary` / `sample` / `sources` only when you need something `describe` doesn't surface.
+>
+> **If `altscore altdata describe` says "unknown command"** your installed CLI is older than the describe primitive. Build and install the latest from the repo:
+> ```bash
+> cd <path-to-altscore-cli> && go build -buildvcs=false -o "$(which altscore)" .
+> ```
+> Then re-run. Until you upgrade, fall back to `altscore altdata sources --per-page 200` (filter client-side via `jq 'select(.sourceId == "<X>")'`) + `altscore altdata dictionary <X> <ver>` (latest is auto-resolved when omitted).
+
+> **Valid `--filter` keys for sources are `country`, `status`, and `search` only.** Mirrors the Hub's `useAltDataSources` hook (`altscore-ai-chat/lib/hooks/use-altdata-sources.ts`) which sends `?country=<csv>&locale=<en|es>` and nothing else. Filtering by `sourceId` doesn't work — the backend silently ignores unknown filter keys and returns the full catalog. For a single source use `altdata describe <id>` (which does its own client-side narrowing).
 
 ```bash
-# List available data sources
-altscore altdata sources --per-page 10
+# 1. Find candidates (default --per-page is 200, returns the full ~170-source catalog in one call)
+altscore altdata sources --filter search="credit"
 altscore altdata sources --filter country=USA --filter status=active
 
-# Field definitions for a source
-altscore altdata dictionary USA-PUB-0001 v1
+# 2. Pre-flight a candidate (the canonical step before composing)
+altscore altdata describe USA-PUB-0001                       # auto-resolves latest version
+altscore altdata describe USA-PUB-0001 --version v1          # pin a specific version
+altscore altdata describe USA-PUB-0001 | jq '{inputFields, outputKeys, latestVersion}'
 
-# Search field definitions across all sources
-altscore altdata search "credit score"
-altscore altdata search "address" --locale es
-
-# Sample output for a source
+# 3. Drill into specifics only if needed
+altscore altdata dictionary USA-PUB-0001                     # field defs (latest version auto-resolved)
+altscore altdata dictionary USA-PUB-0001 v1                  # pin version
+altscore altdata sample USA-PUB-0001                         # example output (latest)
 altscore altdata sample USA-PUB-0001 v1
+altscore altdata search "credit score"                       # cross-source field search
+altscore altdata search "address" --locale es
 ```
+
+**Anti-patterns (avoid):**
+- Walking pages of `altscore altdata sources` to inspect a single source — use `describe`.
+- `altscore altdata sources --filter sourceId=<X>` — silently returns the full catalog (the backend ignores unknown filter keys). Use `describe <X>` instead.
+- Calling `dictionary` or `sample` without a version — both now auto-resolve the latest, no need to chain a separate sources call first.
+- Using `workflows-v2 sources-status` for general discovery — it's the same endpoint as `altdata sources` but lives under workflows-v2 because compose-time normalization needs it; for agents browsing the catalog, prefer `altdata sources` / `altdata describe`.
 
 ### Data Requests (production only)
 

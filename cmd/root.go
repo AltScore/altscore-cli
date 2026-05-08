@@ -408,6 +408,10 @@ such as a scoring model run or data retrieval.`,
 	exGroup.AddCommand(makeExQueryOutputsCmd())
 	exGroup.AddCommand(makeExGetOutputCmd())
 	exGroup.AddCommand(makeExGetOutputAttachmentsCmd())
+	exGroup.AddCommand(makeExStateCmd())
+	exGroup.AddCommand(makeExGetDecisionCmd())
+	exGroup.AddCommand(makeExSetDecisionCmd())
+	exGroup.AddCommand(makeExDeleteDecisionCmd())
 
 	registerResource(ResourceDef{
 		Name:     "execution-batches",
@@ -541,27 +545,34 @@ score, scorecard breakdown, metrics, and rule hits.`,
 	evGroup.AddCommand(makeEvEvaluateCmd())
 	evGroup.AddCommand(makeEvEvaluateByAliasCmd())
 
-	registerResource(ResourceDef{
+	erGroup := registerResource(ResourceDef{
 		Name:     "evaluation-rules",
 		Singular: "evaluation-rule",
 		BasePath: "/v1/evaluation-rules",
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
+		WorkflowAlias: true,
 		Description: `Manage evaluation rules (individual business rules).
 
-An evaluation rule defines a single business rule with conditions and actions
-that can be composed into evaluators or used standalone.`,
-		CreateSchema: `  alias: string         [required] Unique rule identifier
-  label: string         Display name
-  description: string   Description
-  specs: object         Rule specification`,
-		UpdateSchema: `  label: string         Display name
-  description: string   Description
-  specs: object         Updated specification`,
-		ResponseSchema: `  id, alias, label, description, specs, isTest, createdAt, updatedAt`,
-		FilterHelp: `  sort-by               Field to sort by
-  sort-direction        "asc" or "desc"`,
+An evaluation rule has a label, code, and a structured 'conditions' tree
+(same ConditionGroup format used by v2 conditional task branches -- see
+'altscore workflows-v2 schema-guide conditions' for the operator vocabulary).
+Referenced by alias from v2 evaluate-rules tasks via {ruleCode: "<code>"}.`,
+		CreateSchema: `  label: string                [required] Display name
+  code: string                 [required] Stable identifier referenced from workflow tasks
+  description: string          Optional
+  conditions: ConditionGroup   [required] {operator: "AND"|"OR", items: [ConditionItem|ConditionGroup]}
+  alertLevel: integer          Optional (legacy)
+  alertMessage: string         Optional (legacy)
+  decisionKey: string          Optional decision key
+  workflowAlias: string        Workflow scope -- REQUIRED for the rule to appear in
+                                that workflow's evaluate-rules picker (CLI flag
+                                --workflow-alias <alias> is the canonical way to set this)`,
+		UpdateSchema: `  label, code, description, conditions, alertLevel, alertMessage, decisionKey, workflowAlias`,
+		ResponseSchema: `  id, label, code, description, conditions, alertLevel, alertMessage,
+  decisionKey, workflowAlias, isTest, createdAt, updatedAt`,
+		FilterHelp: `  code, workflow-alias, sort-by, sort-direction`,
 	})
 
 	registerResource(ResourceDef{
@@ -587,28 +598,93 @@ deals, or other entities when certain criteria are met.`,
   sort-direction        "asc" or "desc"`,
 	})
 
-	registerResource(ResourceDef{
+	rtGroup := registerResource(ResourceDef{
 		Name:     "rule-trees",
 		Singular: "rule-tree",
 		BasePath: "/v1/rule-trees",
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
-		Description: `Manage rule trees (hierarchical decision trees).
+		WorkflowAlias: true,
+		Description: `Manage rule trees (ordered evaluation rule sequences).
 
-A rule tree is a tree-structured set of conditions and outcomes used
-for complex decision logic with branching paths.`,
-		CreateSchema: `  alias: string         [required] Unique tree identifier
-  label: string         Display name
-  description: string   Description
-  specs: object         Tree specification`,
-		UpdateSchema: `  label: string         Display name
-  description: string   Description
-  specs: object         Updated specification`,
-		ResponseSchema: `  id, alias, label, description, specs, isTest, createdAt, updatedAt`,
-		FilterHelp: `  sort-by               Field to sort by
-  sort-direction        "asc" or "desc"`,
+A rule tree references evaluation rules by id/code in a specific order with
+an isDefault marker. Used by v2 'rule-tree' workflow tasks via
+ruleTreeConfig.ruleTreeId / ruleTreeCode.`,
+		CreateSchema: `  label: string         [required] Display name
+  code: string          [required] Stable identifier
+  description: string   Optional
+  rules: array          [{ruleId, ruleCode, order, isDefault}]
+  workflowAlias: string Workflow scope -- REQUIRED for the rule tree to appear in
+                        that workflow's rule-tree task picker (use --workflow-alias)`,
+		UpdateSchema: `  label, code, description, rules, workflowAlias`,
+		ResponseSchema: `  id, label, code, description, rules, workflowAlias, isTest, createdAt, updatedAt`,
+		FilterHelp: `  code, workflow-alias, sort-by, sort-direction`,
 	})
+
+	mtGroup := registerResource(ResourceDef{
+		Name:     "mapping-tables",
+		Singular: "mapping-table",
+		BasePath: "/v1/mapping-tables",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		WorkflowAlias: true,
+		Description: `Manage mapping tables (numerical / categorical lookups).
+
+A mapping table converts an input value into an output value via
+buckets. Used by v2 'mapping-table' workflow tasks via
+mappingTableConfig.entries[].mappingTableId.`,
+		CreateSchema: `  label: string             [required] Display name
+  code: string              [required] Stable identifier
+  mappingType: string       "numerical" | "categorical" (default "numerical")
+  outputType: string        "string" | "number" (default "string")
+  buckets: array            [{order, label, lowerLimit, upperLimit, lowerInclusive, upperInclusive, values, outputValue, includeNa}]
+  defaultValue: any         Default output value when no bucket matches
+  workflowAlias: string     Workflow scope -- REQUIRED for the table to appear in
+                             that workflow's mapping-table picker (use --workflow-alias)`,
+		UpdateSchema: `  label, code, mappingType, outputType, buckets, defaultValue, workflowAlias`,
+		ResponseSchema: `  id, label, code, mappingType, outputType, buckets, defaultValue,
+  workflowAlias, createdAt, updatedAt`,
+		FilterHelp: `  code, workflow-alias, mapping-type, output-type, sort-by, sort-direction`,
+	})
+
+	scGroup := registerResource(ResourceDef{
+		Name:     "scorecards",
+		Singular: "scorecard",
+		BasePath: "/v1/scorecards",
+		Module:   "borrower_central",
+		Actions:  []string{"list", "get", "create", "update", "delete"},
+		WorkflowAlias: true,
+		Description: `Manage scorecards (weighted scoring tables).
+
+A scorecard maps multiple input fields to points via per-field rules and
+buckets, summing them into a total score. Used by v2 'scorecard' workflow
+tasks via scorecardConfig (inline rules + totalScoreVariable).`,
+		CreateSchema: `  label: string             [required] Display name (Hub auto-slugs to code)
+  code: string              [required] Stable identifier
+  rules: array              [{order, label, field, fieldType: "numerical"|"categorical",
+                              maxPoints, mappingTableId?, mappingTableCode?,
+                              buckets: [{order, label, points, lowerLimit, upperLimit,
+                                         values, includeNa, isDefault}]}]
+  workflowAlias: string     Workflow scope -- REQUIRED for the scorecard to appear in
+                             that workflow's scorecard task picker (use --workflow-alias)`,
+		UpdateSchema: `  label, code, rules, workflowAlias`,
+		ResponseSchema: `  id, label, code, rules, workflowAlias, createdAt, updatedAt`,
+		FilterHelp: `  code, workflow-alias, sort-by, sort-direction`,
+	})
+
+	// Credit-decisioning extras (declared in cmd/credit_decisioning.go).
+	erGroup.AddCommand(makeErImportCmd())
+	erGroup.AddCommand(makeErHistoryCmd())
+	rtGroup.AddCommand(makeRtImportCmd())
+	mtGroup.AddCommand(makeMtImportCmd())
+	scGroup.AddCommand(makeScImportCmd())
+	scGroup.AddCommand(makeScUsageCmd())
+
+	// Decision keys are stored as data-model records but agents (and rule-tree
+	// task pickers) expect to find them under their own surface. cmd/decisions.go
+	// is a thin facade with entityType=decision baked in.
+	rootCmd.AddCommand(makeDecisionsGroupCmd())
 
 	// --- Workflow development resources ---
 
@@ -703,6 +779,92 @@ describes the DAG: which tasks run, how data flows between them, and retry behav
 	wfGroup.AddCommand(makeWfExecuteByAliasCmd())
 	wfGroup.AddCommand(makeWfUpdateSchemaCmd())
 	wfGroup.AddCommand(makeWfInputSchemaGuideCmd())
+
+	wfv2Group := registerResource(ResourceDef{
+		Name:          "workflows-v2",
+		Singular:      "workflow-v2",
+		BasePath:      "/v2/workflows",
+		Module:        "borrower_central",
+		Actions:       []string{"list", "get", "create", "update", "delete"},
+		BodyValidator: validateWorkflowV2Body,
+		Description: `Manage v2 workflows (visual builder graph DAGs).
+
+v2 workflows have draft/active/archived lifecycle states, version history,
+edit locks, autosave, schedules, and a graph-based structure (nodes + edges +
+input/custom variables). Use 'schema-guide' for the canonical node/edge/variable
+reference.`,
+		CreateSchema: `  label: string         [required] Display name. The alias is server-derived
+                         from this (slugified label); any "alias" key in the
+                         request body is silently dropped. Pick the label you
+                         want the alias to come from.
+  description: string   Free-form description
+  category: string      ACTION | EVALUATION | CONTACT | OTHER
+  status: string        DRAFT | ACTIVE (default DRAFT)
+  nodes: array          Graph nodes (see schema-guide nodes)
+  edges: array          Graph edges (see schema-guide edges)
+  notes: array          Canvas annotations
+  inputVariables: object  Workflow input parameter schemas
+  customVariables: object Computed variables
+  config: object        Task snapshots / scheduling defaults`,
+		UpdateSchema: `  label, description, category, status, nodes, edges, notes,
+  inputVariables, customVariables, config (any subset).
+  Note: prefer 'autosave' with --lock-token for conflict-safe edits.`,
+		ResponseSchema: `  id, tenant, alias, label, description, category, status, version,
+  isLatest, nodes, edges, notes, inputVariables, customVariables, config,
+  createdAt, updatedAt, lastModifiedBy`,
+		FilterHelp: `  search                Free-text search
+  category              ACTION | EVALUATION | CONTACT | OTHER
+  status                DRAFT | ACTIVE | ARCHIVED
+  alias                 Filter by alias
+  version               Filter by version
+  is-latest             "true" to show only latest versions
+  grouped               "true" to group by alias
+  include-archived      "true" to include archived
+  sort-by               Field to sort by
+  sort-direction        "asc" or "desc"`,
+	})
+	wfv2Group.AddCommand(makeWfv2PublishCmd())
+	wfv2Group.AddCommand(makeWfv2CreateDraftCmd())
+	wfv2Group.AddCommand(makeWfv2RevertCmd())
+	wfv2Group.AddCommand(makeWfv2ArchiveCmd())
+	wfv2Group.AddCommand(makeWfv2RestoreCmd())
+	wfv2Group.AddCommand(makeWfv2DuplicateCmd())
+	wfv2Group.AddCommand(makeWfv2LockGroupCmd())
+	wfv2Group.AddCommand(makeWfv2AutosaveCmd())
+	wfv2Group.AddCommand(makeWfv2UpdateMappingCmd())
+	wfv2Group.AddCommand(makeWfv2ResolveMappingsCmd())
+	wfv2Group.AddCommand(makeWfv2VersionsCmd())
+	wfv2Group.AddCommand(makeWfv2GetVersionCmd())
+	wfv2Group.AddCommand(makeWfv2ExecutionsCmd())
+	wfv2Group.AddCommand(makeWfv2ScheduleGroupCmd())
+	wfv2Group.AddCommand(makeWfv2ExportCmd())
+	wfv2Group.AddCommand(makeWfv2ImportCmd())
+	wfv2Group.AddCommand(makeWfv2ValidateRulesCmd())
+	wfv2Group.AddCommand(makeWfv2ExecuteCmd())
+	wfv2Group.AddCommand(makeWfv2ExecuteByAliasCmd())
+	wfv2Group.AddCommand(makeWfv2ExecuteBatchCmd())
+	wfv2Group.AddCommand(makeWfv2ExecuteBatchByAliasCmd())
+	wfv2Group.AddCommand(makeWfv2DownloadCmd())
+	wfv2Group.AddCommand(makeWfv2BatchGroupCmd())
+	wfv2Group.AddCommand(makeWfv2SourcesStatusCmd())
+	wfv2Group.AddCommand(makeWfv2ExternalSourcesStatusCmd())
+	wfv2Group.AddCommand(makeWfv2AIGroupCmd())
+	wfv2Group.AddCommand(makeWfv2SchemaGuideCmd())
+
+	// Ergonomic mutation helpers (each wraps lock + fetch + mutate + autosave + release).
+	wfv2Group.AddCommand(makeWfv2AddNodeCmd())
+	wfv2Group.AddCommand(makeWfv2RemoveNodeCmd())
+	wfv2Group.AddCommand(makeWfv2AddEdgeCmd())
+	wfv2Group.AddCommand(makeWfv2RemoveEdgeCmd())
+	wfv2Group.AddCommand(makeWfv2SetVariableCmd())
+	wfv2Group.AddCommand(makeWfv2UnsetVariableCmd())
+	wfv2Group.AddCommand(makeWfv2SetMappingCmd())
+	wfv2Group.AddCommand(makeWfv2ComposeCmd())
+	wfv2Group.AddCommand(makeWfv2LintCmd())
+
+	registerTasksV2(rootCmd)
+
+	registerExternalSourceConfigs()
 }
 
 // Execute runs the root command.
