@@ -838,6 +838,47 @@ func mappingDependencyRef(s string) string {
 	return head
 }
 
+// templateDependencyRefs returns the spec-local refs a task body's template
+// strings reference, for use by topologicalTaskOrder. Mirrors
+// mappingDependencyRef but scans {{...}} placeholders across known template
+// fields per task type. Empty when the task type has no template fields or
+// all references are reserved scopes / unknown heads.
+func templateDependencyRefs(task map[string]any) []string {
+	taskType, _ := task["type"].(string)
+	var fields []string
+	switch taskType {
+	case "http", "webhook":
+		for _, f := range []string{"url", "body", "headers"} {
+			if s, ok := task[f].(string); ok && s != "" {
+				fields = append(fields, s)
+			}
+		}
+	case "end":
+		if endCfg, ok := task["endConfig"].(map[string]any); ok {
+			if s, ok := endCfg["outputJson"].(string); ok && s != "" {
+				fields = append(fields, s)
+			}
+		}
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	out := []string{}
+	seen := map[string]bool{}
+	for _, s := range fields {
+		for _, m := range templatePlaceholderRegex.FindAllStringSubmatch(s, -1) {
+			inner := strings.TrimSpace(m[1])
+			ref := mappingDependencyRef(inner)
+			if ref == "" || seen[ref] {
+				continue
+			}
+			seen[ref] = true
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
 // rewriteRefsInMappings replaces leading spec-local refs in mapping values
 // with the server-assigned alias from refMap. Handles both forms:
 //   - canonical "<taskRef>.<outputName>" (rewritten to
@@ -906,6 +947,141 @@ func rewriteRefsInMappings(mappings map[string]any, refMap map[string]string) (m
 		out[k] = s
 	}
 	return out, nil
+}
+
+// templatePlaceholderRegex matches `{{...}}` substitutions used by the BC
+// runtime template engine in http body/headers/url and end outputJson.
+// Whitespace around the inner expression is tolerated. The captured group
+// is the inner expression (e.g. "task_outputs.fetch.tax_id" or "borrower_id").
+var templatePlaceholderRegex = regexp.MustCompile(`\{\{\s*([^{}]+?)\s*\}\}`)
+
+// rewriteRefsInTemplate rewrites every {{...}} placeholder in s whose inner
+// expression looks like a spec-local ref reference. The rewrite mirrors
+// rewriteRefsInMappings:
+//   - {{task_outputs.<ref>.<deep>}} -> {{task_outputs.<server-alias>.<deep>}}
+//   - {{<ref>.<rest>}} (bare)       -> {{task_outputs.<server-alias>.<rest>}}
+//   - {{<reserved-scope>...}}        -> unchanged (inputs/custom/system/...)
+//   - {{<server-alias>...}}          -> wrapped with task_outputs. prefix
+//
+// Returns an error if a placeholder's head is neither a reserved scope nor a
+// known spec ref nor a server alias -- a typo or stale reference would
+// otherwise silently fail at runtime when the template engine resolves
+// against an empty context.
+//
+// This is the template-string analog of rewriteRefsInMappings. Both share
+// mappingDependencyRef + topologicalTaskOrder for ordering, so a task whose
+// http url uses {{<downstream-task>.<field>}} gets ordered correctly, the
+// rewrite runs after refMap has the downstream alias, and the persisted
+// task body has the canonical form.
+func rewriteRefsInTemplate(s string, refMap map[string]string) (string, error) {
+	if !strings.Contains(s, "{{") {
+		return s, nil
+	}
+	var firstErr error
+	out := templatePlaceholderRegex.ReplaceAllStringFunc(s, func(match string) string {
+		if firstErr != nil {
+			return match
+		}
+		m := templatePlaceholderRegex.FindStringSubmatch(match)
+		if len(m) < 2 {
+			return match
+		}
+		inner := strings.TrimSpace(m[1])
+		// Only rewrite path-like inner expressions; leave plain literals alone.
+		dot := strings.Index(inner, ".")
+		if dot <= 0 {
+			return match
+		}
+		// task_outputs.<ref>.<deep>
+		if strings.HasPrefix(inner, "task_outputs.") {
+			rest := inner[len("task_outputs."):]
+			innerDot := strings.Index(rest, ".")
+			if innerDot <= 0 {
+				return match
+			}
+			ref := rest[:innerDot]
+			if alias, found := refMap[ref]; found {
+				return "{{task_outputs." + alias + rest[innerDot:] + "}}"
+			}
+			if !isServerAlias(ref) {
+				firstErr = fmt.Errorf(
+					"template references task_outputs.%s.* but %q is not a known spec ref. Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type.)",
+					ref, ref, sortedRefMapKeys(refMap))
+				return match
+			}
+			return match
+		}
+		// Reserved scope at head -> leave as-is.
+		head := inner[:dot]
+		if reservedMappingScopes[head] {
+			return match
+		}
+		// Bare <ref>.<rest> -> rewrite.
+		if alias, found := refMap[head]; found {
+			return "{{task_outputs." + alias + inner[dot:] + "}}"
+		}
+		if isServerAlias(head) {
+			return "{{task_outputs." + inner + "}}"
+		}
+		// Unknown head -- error so the user sees the typo before runtime
+		// silently substitutes nothing.
+		firstErr = fmt.Errorf(
+			"template uses {{%s.<...>}} but %q is neither a reserved namespace nor a known spec ref nor a server alias. Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type.)",
+			inner, head, sortedRefMapKeys(refMap))
+		return match
+	})
+	if firstErr != nil {
+		return s, firstErr
+	}
+	return out, nil
+}
+
+// rewriteRefsInTaskTemplates applies the template rewrite to every string
+// field on a task body that the runtime treats as a {{...}}-substituting
+// template. Today that's:
+//   - http: url, body, headers
+//   - end: endConfig.outputJson
+//
+// The function mutates `task` in place and returns an error from the first
+// failed rewrite, with the field name in the error context.
+//
+// New task types that introduce template fields should be added here AND in
+// mappingDependencyRef -- otherwise topologicalTaskOrder won't see the
+// inputMappings-style dep and a forward reference inside a template will
+// fail at rewrite time instead of being ordered correctly.
+func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) error {
+	taskType, _ := task["type"].(string)
+	rewriteField := func(fieldPath string, value string) (string, error) {
+		out, err := rewriteRefsInTemplate(value, refMap)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", fieldPath, err)
+		}
+		return out, nil
+	}
+	switch taskType {
+	case "http", "webhook":
+		for _, field := range []string{"url", "body", "headers"} {
+			if s, ok := task[field].(string); ok && s != "" {
+				out, err := rewriteField(field, s)
+				if err != nil {
+					return err
+				}
+				task[field] = out
+			}
+		}
+	case "end":
+		endCfg, _ := task["endConfig"].(map[string]any)
+		if endCfg != nil {
+			if s, ok := endCfg["outputJson"].(string); ok && s != "" {
+				out, err := rewriteField("endConfig.outputJson", s)
+				if err != nil {
+					return err
+				}
+				endCfg["outputJson"] = out
+			}
+		}
+	}
+	return nil
 }
 
 // sortedRefMapKeys returns refMap's keys sorted -- used in error messages so
@@ -977,6 +1153,13 @@ func topologicalTaskOrder(tasks []map[string]any, edges []map[string]any) ([]int
 		for _, v := range mappings {
 			s, _ := v.(string)
 			addDep(i, mappingDependencyRef(s))
+		}
+		// Template-string dependencies (http url/body/headers, end
+		// outputJson). A task whose http url uses {{<other-task>.field}}
+		// must be ordered AFTER that task so rewriteRefsInTaskTemplates
+		// resolves the ref to a server alias.
+		for _, ref := range templateDependencyRefs(t) {
+			addDep(i, ref)
 		}
 	}
 
@@ -1155,6 +1338,17 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 			task["inputMappings"] = rewritten
 		}
 
+		// Rewrite {{...}} template placeholders in known per-type fields
+		// (http url/body/headers, end outputJson). Same rules as
+		// inputMappings rewrite, just operating on substrings inside
+		// template strings. Without this, a `{{<other-task>.field}}` on
+		// an http body silently survives compose and fails at execute
+		// time -- the runtime template engine substitutes nothing because
+		// the bare ref isn't a valid runtime namespace.
+		if err := rewriteRefsInTaskTemplates(task, refMap); err != nil {
+			return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
+		}
+
 		// Type-specific normalization: enrich altdata-enrichment with inputKeys
 		// from source inputFields, validate conditional branches, etc.
 		if err := normalizeTaskBody(c, task, &composeNormalizeOpts{
@@ -1259,24 +1453,73 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 				if len(inMappings) > 0 {
 					taskBody["inputMappings"] = inMappings
 				}
-				// endConfig.pdfConfig.enabled=true is what actually flips the
-				// PDF generator on. Without it, the runtime end_activity sees
+				// Build endConfig from per-end-node spec input + auto-wired
+				// PDF sections. Caller-supplied fields under
+				// `extraNodes[].endConfig` (decisionConfig, outputJson,
+				// pdfConfig title/subtitle/brandLogo, etc.) are preserved
+				// verbatim; we only auto-fill the pieces compose has
+				// canonical knowledge of (pdfConfig.enabled +
+				// pdfConfig.sourcesConfig from upstream PDF data sources).
+				//
+				// pdfConfig.enabled=true is what actually flips the PDF
+				// generator on. Without it, the runtime end_activity sees
 				// endConfig=null and skips report rendering entirely -- the
 				// failure mode the user hit on the first compose-generated
-				// workflow ("PDF didn't come out").
-				taskBody["endConfig"] = map[string]any{
-					"decisionConfig": nil,
-					"outputJson":     "",
-					"pdfConfig": map[string]any{
-						"brandLogo":             nil,
-						"enabled":               true,
-						"filePrefix":            "",
-						"pdfGenerationRequired": false,
-						"sourcesConfig":         pdfSections,
-						"title":                 "Report",
-						"subtitle":              "",
-					},
+				// workflow ("PDF didn't come out"). Same for decisionConfig:
+				// if the spec sets `enabled: true, decisionType: "final"`,
+				// the runtime records the rule-tree decision via
+				// /v1/executions/{id}/decisions; if compose silently
+				// stripped that to null, decisions never persist.
+				userEndCfg, _ := n["endConfig"].(map[string]any)
+				if userEndCfg == nil {
+					userEndCfg = map[string]any{}
 				}
+				userPdfCfg, _ := userEndCfg["pdfConfig"].(map[string]any)
+				if userPdfCfg == nil {
+					userPdfCfg = map[string]any{}
+				}
+				// Compose-canonical PDF defaults (overridden by user when
+				// supplied via spec).
+				pdfDefaults := map[string]any{
+					"brandLogo":             nil,
+					"enabled":               true,
+					"filePrefix":            "",
+					"pdfGenerationRequired": false,
+					"sourcesConfig":         pdfSections,
+					"title":                 "Report",
+					"subtitle":              "",
+				}
+				for k, v := range userPdfCfg {
+					pdfDefaults[k] = v
+				}
+				// User-supplied sourcesConfig is APPENDED after compose's
+				// auto-wired sections; spec authors who want to swap order
+				// should override sourcesConfig wholesale (their value
+				// takes precedence above already).
+				endCfgOut := map[string]any{
+					"decisionConfig": userEndCfg["decisionConfig"], // may be nil; spec passes through
+					"outputJson":     "",
+					"pdfConfig":      pdfDefaults,
+				}
+				if oj, ok := userEndCfg["outputJson"].(string); ok {
+					endCfgOut["outputJson"] = oj
+				}
+				// Carry through any extra fields the user supplied that
+				// compose doesn't know about (forward-compat with future
+				// endConfig additions).
+				for k, v := range userEndCfg {
+					if _, handled := endCfgOut[k]; handled {
+						continue
+					}
+					if k == "pdfConfig" {
+						continue
+					}
+					endCfgOut[k] = v
+				}
+				taskBody["endConfig"] = endCfgOut
+				// Strip the spec-only `endConfig` key from the graph node
+				// so it doesn't double-write.
+				delete(n, "endConfig")
 			}
 
 			alias, version, err := postTaskWithMultiDotFallback(
@@ -1416,6 +1659,42 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 	customVars := spec.CustomVariables
 	if customVars == nil {
 		customVars = map[string]any{}
+	}
+	// Normalize customVariable expression shape so the runtime
+	// compute-variables wrapper produces a non-None value for the common
+	// authoring mistake of `expression: "640"` (bare literal). The wrapper
+	// at borrower-central/app/temporal/activities/compute_variables_activity.py
+	// is `def execute(...): inputs = input; <expression>; return <returnValue
+	// or "None">`. With a bare literal expression and no returnValue, the
+	// statement is evaluated and discarded, then None is returned.
+	//
+	// Three resolution paths:
+	//   1. expression contains `result =` AND returnValue=="result"  -> shape OK
+	//   2. expression has no assignment AND no returnValue           -> set returnValue
+	//      to the expression itself so the wrapper's `return <returnValue>`
+	//      evaluates the literal/expression directly. Idempotent under
+	//      re-compose because the second pass sees a returnValue and skips.
+	//   3. variable defined with just `{type, default}` (no expression)
+	//      -> nothing to do; BC's graph_workflow seeds custom_variables[<name>]
+	//      from `default` at workflow init.
+	for name, raw := range customVars {
+		v, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		expression, _ := v["expression"].(string)
+		returnValue, _ := v["returnValue"].(string)
+		if expression == "" || returnValue != "" {
+			continue
+		}
+		// Bare-literal / single-expression detection: no top-level
+		// assignment statement. Match the simplest case (no `=` at all).
+		// If the expression has multi-statement bodies the author should
+		// declare returnValue explicitly.
+		if !strings.Contains(expression, "=") {
+			v["returnValue"] = expression
+			customVars[name] = v
+		}
 	}
 	wf := map[string]any{
 		"label":           spec.Label,
