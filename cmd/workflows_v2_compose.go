@@ -302,31 +302,60 @@ func edgeEndpoints(e map[string]any) (from, to string) {
 	return from, to
 }
 
-// buildEndAutoWiring returns inputSchema + inputMappings for an `end` task by
-// walking ALL transitive ancestors (not just direct predecessors) and
-// emitting the per-task-type entries the Hub auto-wires. Mirrors
-// `buildSectionsFromPredecessors` in altscore-ai-chat/lib/stores/workflow-builder-v2/actions/edge/pdf-data-source-auto-mapping.ts,
-// which calls getPredecessorsSorted -- a BFS over incoming edges that yields
-// every upstream task, not just the immediate parent.
+// endNodeBilliableIDSchema is the canonical billable_id slot the Hub end-task
+// plugin adds to every end node. We mirror it byte-for-byte so compose's end
+// task matches a Hub-recreated one.
+var endNodeBilliableIDSchema = map[string]any{
+	"description": "Optional billable identifier, default Customer ID",
+	"title":       "Billable ID",
+	"type":        "string",
+}
+
+// pdfTitleByType is the section title the PDF report editor uses for each
+// supported ancestor type. Verified against a Hub-recreated end task: titles
+// are the type's display name, NOT the upstream task's label (with one
+// exception: altdata uses the literal string "AltData").
+var pdfTitleByType = map[string]string{
+	"altdata-enrichment": "AltData",
+	"scorecard":          "Scorecard",
+	"mapping-table":      "Mapping Table",
+	"rule-tree":          "Rule Tree",
+	"evaluate-rules":     "Evaluate Rules",
+}
+
+// buildEndAutoWiring returns the four end-node task fields the Hub auto-wires
+// when an end node is dropped on a canvas with credit-decisioning predecessors:
 //
-// Without this wiring, the end task's PDF report editor sees no available
-// sections (each section is keyed off `task_type_underscored_result_<alias>`
-// in inputSchema). The runtime end_activity.py also reads task outputs via
-// these mapping keys with context.get(); missing keys silently produce empty
-// values in the PDF.
+//	inputSchema   -- one entry per ancestor type, plus the canonical
+//	                 billable_id slot. Verified byte-for-byte against a
+//	                 Hub-recreated end task in production.
+//	inputMappings -- matching entries pointing at task_outputs.<alias>(.<deep>)
+//	pdfSections   -- the endConfig.pdfConfig.sourcesConfig array. WITHOUT
+//	                 this, the end task ships with endConfig:null and the
+//	                 PDF generator sees no enabled config -- the report
+//	                 silently doesn't render. This was the root cause of the
+//	                 user's "PDF didn't come out" report on the first
+//	                 compose-generated workflow.
+//	hasAltdata    -- whether at least one ancestor is altdata-enrichment.
+//	                 Triggers the two-phase create at the call site (the
+//	                 strict CreateTaskV2 validator rejects multi-dot
+//	                 inputMappings values; only altdata produces them).
 //
-// Five upstream task types are recognised (those the Hub knows how to
-// auto-wire): altdata-enrichment, scorecard, mapping-table, rule-tree,
-// evaluate-rules. Other predecessor types are skipped silently (matches Hub).
+// Mirrors `buildSectionsFromPredecessors` in
+// altscore-ai-chat/lib/stores/workflow-builder-v2/actions/edge/pdf-data-source-auto-mapping.ts.
+// Walks ALL transitive ancestors via BFS over incoming edges (matches the
+// Hub's getPredecessorsSorted), not just direct parents.
 //
-// The function falls through gracefully when:
-//   - no predecessors found (e.g. end is detached from the graph in the spec)
-//   - a predecessor's ref isn't in refMap (e.g. dry-run partial map)
-//   - a predecessor type isn't in the recognised set
-// Callers can rely on the maps always being non-nil.
-func buildEndAutoWiring(endRef string, edges []map[string]any, taskByRef map[string]map[string]any, refMap map[string]string) (inputSchema, inputMappings map[string]any) {
-	inputSchema = map[string]any{}
+// Five upstream task types are recognised: altdata-enrichment, scorecard,
+// mapping-table, rule-tree, evaluate-rules. Other predecessor types are
+// skipped silently (matches Hub). All return slices/maps are non-nil so
+// callers can use len() unconditionally.
+func buildEndAutoWiring(endRef string, edges []map[string]any, taskByRef map[string]map[string]any, refMap map[string]string) (inputSchema, inputMappings map[string]any, pdfSections []map[string]any, hasAltdata bool) {
+	inputSchema = map[string]any{
+		"billable_id": endNodeBilliableIDSchema,
+	}
 	inputMappings = map[string]any{}
+	pdfSections = []map[string]any{}
 
 	// BFS over incoming edges starting from endRef. Direct parents come first
 	// (they're at depth 1) but we accumulate every ancestor in `visited` so
@@ -365,43 +394,138 @@ func buildEndAutoWiring(endRef string, edges []map[string]any, taskByRef map[str
 			predLabel = predAlias
 		}
 
-		// One-section-per-ancestor: emit the <task-type-underscored>_result_<alias>
-		// pair (schema + mapping) the Hub also persists. The Hub source code
-		// emits more keys (alerts/alerts_count for evaluate-rules,
-		// <outputVar>_rule_code etc. for rule-tree), but those were never seen
-		// in the persisted-and-working end task observed in production -- and
-		// the strict CreateTaskV2 validator rejects any inputMappings key that
-		// isn't in inputSchema. Sticking to the minimal observed set keeps the
-		// validator happy AND matches what the Hub actually ships.
+		// section is the per-ancestor entry that lands in
+		// endConfig.pdfConfig.sourcesConfig. Title comes from pdfTitleByType
+		// (matches Hub's persisted shape -- generic display names, not the
+		// upstream task's label). Subtitle uses the upstream label so the
+		// rendered PDF is still self-describing.
+		title, ok := pdfTitleByType[predType]
+		if !ok {
+			continue // unrecognised type; skip silently like the Hub
+		}
+		var sourceInputSchema string
+		var mappingValue string
+		var components []map[string]any
+
 		switch predType {
 		case "altdata-enrichment":
-			key := "sources_output_packages_" + predAlias
-			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
-			inputMappings[key] = "task_outputs." + predAlias + ".sources_output_packages"
+			sourceInputSchema = "sources_output_packages_" + predAlias
+			// Multi-dot mapping value: triggers two-phase create at the call
+			// site so the strict CreateTaskV2 validator doesn't reject it.
+			mappingValue = "task_outputs." + predAlias + ".sources_output_packages"
+			hasAltdata = true
+			// One component per source in the upstream's sourcesConfig.
+			for _, raw := range asSlice(predTask["sourcesConfig"]) {
+				s, _ := raw.(map[string]any)
+				if s == nil {
+					continue
+				}
+				sid, _ := s["sourceId"].(string)
+				ver, _ := s["version"].(string)
+				if ver == "" {
+					ver = "v1"
+				}
+				components = append(components, map[string]any{
+					"id":             newUUIDv4(),
+					"name":           sid + "_" + ver,
+					"altdataPackage": sid,
+				})
+			}
 
 		case "scorecard":
-			key := "scorecard_result_" + predAlias
-			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
-			inputMappings[key] = "task_outputs." + predAlias
+			sourceInputSchema = "scorecard_result_" + predAlias
+			mappingValue = "task_outputs." + predAlias
+			cfg, _ := predTask["scorecardConfig"].(map[string]any)
+			totalVar := "total_score"
+			breakdownVar := "score_breakdown"
+			if cfg != nil {
+				if v, _ := cfg["totalScoreVariable"].(string); v != "" {
+					totalVar = v
+				}
+				if v, _ := cfg["breakdownVariable"].(string); v != "" {
+					breakdownVar = v
+				}
+			}
+			components = append(components, map[string]any{
+				"id":                 newUUIDv4(),
+				"name":               "scorecardResult",
+				"totalScoreVariable": totalVar,
+				"breakdownVariable":  breakdownVar,
+			})
 
 		case "mapping-table":
-			key := "mapping_table_result_" + predAlias
-			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
-			inputMappings[key] = "task_outputs." + predAlias
+			sourceInputSchema = "mapping_table_result_" + predAlias
+			mappingValue = "task_outputs." + predAlias
+			cfg, _ := predTask["mappingTableConfig"].(map[string]any)
+			outputVariables := []map[string]any{}
+			if cfg != nil {
+				for _, raw := range asSlice(cfg["entries"]) {
+					em, _ := raw.(map[string]any)
+					v, _ := em["outputVariable"].(string)
+					if v == "" {
+						continue
+					}
+					outputVariables = append(outputVariables, map[string]any{
+						"variable": v,
+						"label":    v,
+					})
+				}
+			}
+			components = append(components, map[string]any{
+				"id":              newUUIDv4(),
+				"name":            "mappingTableResult",
+				"outputVariables": outputVariables,
+			})
 
 		case "rule-tree":
-			key := "rule_tree_result_" + predAlias
-			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
-			inputMappings[key] = "task_outputs." + predAlias
+			sourceInputSchema = "rule_tree_result_" + predAlias
+			mappingValue = "task_outputs." + predAlias
+			cfg, _ := predTask["ruleTreeConfig"].(map[string]any)
+			outVar := "decision"
+			if cfg != nil {
+				if v, _ := cfg["outputVariable"].(string); v != "" {
+					outVar = v
+				}
+			}
+			components = append(components, map[string]any{
+				"id":             newUUIDv4(),
+				"name":           "ruleTreeResult",
+				"outputVariable": outVar,
+			})
 
 		case "evaluate-rules":
-			key := "evaluate_rules_result_" + predAlias
-			inputSchema[key] = map[string]any{"type": "object", "title": predLabel}
-			inputMappings[key] = "task_outputs." + predAlias
+			sourceInputSchema = "evaluate_rules_result_" + predAlias
+			mappingValue = "task_outputs." + predAlias
+			components = append(components, map[string]any{
+				"id":   newUUIDv4(),
+				"name": "evaluateRulesResult",
+			})
 		}
+
+		inputSchema[sourceInputSchema] = map[string]any{"type": "object", "title": predLabel}
+		inputMappings[sourceInputSchema] = mappingValue
+
+		// PDF section. type=altdata-enrichment maps to PDF type='altdata' (the
+		// renderer's discriminator drops the suffix). All other types pass
+		// through verbatim.
+		pdfType := predType
+		if pdfType == "altdata-enrichment" {
+			pdfType = "altdata"
+		}
+		pdfSections = append(pdfSections, map[string]any{
+			"id":                newUUIDv4(),
+			"type":              pdfType,
+			"title":             title,
+			"subtitle":          "From " + predLabel,
+			"enabled":           true,
+			"page_break":        true,
+			"sourceInputSchema": sourceInputSchema,
+			"taskAlias":         predAlias,
+			"components":        components,
+		})
 	}
 
-	return inputSchema, inputMappings
+	return inputSchema, inputMappings, pdfSections, hasAltdata
 }
 
 // reservedMappingScopes are the leading segments in a mapping value that are
@@ -710,12 +834,30 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 				"type":  nodeType,
 			}
 			if strings.ToLower(nodeType) == "end" {
-				inSchema, inMappings := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap)
+				inSchema, inMappings, pdfSections, _ := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap)
 				if len(inSchema) > 0 {
 					taskBody["inputSchema"] = inSchema
 				}
 				if len(inMappings) > 0 {
 					taskBody["inputMappings"] = inMappings
+				}
+				// endConfig.pdfConfig.enabled=true is what actually flips the
+				// PDF generator on. Without it, the runtime end_activity sees
+				// endConfig=null and skips report rendering entirely -- the
+				// failure mode the user hit on the first compose-generated
+				// workflow ("PDF didn't come out").
+				taskBody["endConfig"] = map[string]any{
+					"decisionConfig": nil,
+					"outputJson":     "",
+					"pdfConfig": map[string]any{
+						"brandLogo":             nil,
+						"enabled":               true,
+						"filePrefix":            "",
+						"pdfGenerationRequired": false,
+						"sourcesConfig":         pdfSections,
+						"title":                 "Report",
+						"subtitle":              "",
+					},
 				}
 			}
 
@@ -827,7 +969,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 			}
 			data["isEndNode"] = true
 			if _, hasMappings := data["inputMappings"]; !hasMappings {
-				if _, inMappings := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap); len(inMappings) > 0 {
+				if _, inMappings, _, _ := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap); len(inMappings) > 0 {
 					data["inputMappings"] = inMappings
 				}
 			}
