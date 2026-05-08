@@ -1761,21 +1761,23 @@ func preflightTasks(spec *composeSpec) error {
 				return fmt.Errorf("tasks[%d] (ref=%q): data-store-query task requires dataStoreQueryConfig.tableName", i, ref)
 			}
 		case "exception":
-			// BC unified the exception task on 'errorMessage' as the
-			// canonical wire name and defaults statusCode to 400 server-
-			// side, so the CLI no longer mirrors. We still tolerate legacy
-			// specs that carry the old 'message' key by promoting it to
-			// 'errorMessage' (BC also accepts the legacy form via its
-			// pre-validator; this just normalizes our outgoing body).
+			// Canonical wire name is 'errorMessage'. Both the BC API
+			// schema (CreateTaskV2 / CreateTaskVersionV2 in
+			// app/model/workflows_v2/task_schemas.py) and the runtime
+			// activity (exception_activity.py) read it. Old specs that
+			// ship 'message' are promoted to 'errorMessage' server-side
+			// by _promote_legacy_exception_message, so the CLI normalizes
+			// outgoing bodies to errorMessage-only without losing legacy
+			// specs. Strip the legacy key so the body is unambiguous.
 			em, _ := task["errorMessage"].(string)
 			m, _ := task["message"].(string)
 			if em == "" && m == "" {
 				return fmt.Errorf("tasks[%d] (ref=%q): exception task requires 'errorMessage' -- the failure message surfaced when this branch fires", i, ref)
 			}
-			if em == "" && m != "" {
+			if em == "" {
 				task["errorMessage"] = m
-				delete(task, "message")
 			}
+			delete(task, "message")
 		case "child-workflow":
 			eid, _ := task["executorId"].(string)
 			eal, _ := task["executorAlias"].(string)
