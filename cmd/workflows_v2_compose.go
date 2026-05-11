@@ -1166,12 +1166,26 @@ func topologicalTaskOrder(tasks []map[string]any, edges []map[string]any) ([]int
 	}
 
 	// inputMappings dependencies: a value pointing at task_outputs.X or X.Y
-	// makes the consumer depend on X.
+	// makes the consumer depend on X. We walk both the top-level map AND
+	// the nested scorecardConfig.inputMappings / ruleTreeConfig.inputMappings
+	// maps -- the scorecard/rule-tree activities resolve from the nested
+	// form, so unrewritten refs there cause the runtime score=0 collapse
+	// even when the top-level looks clean.
+	collectMappingDeps := func(consumer int, m map[string]any) {
+		for _, v := range m {
+			s, _ := v.(string)
+			addDep(consumer, mappingDependencyRef(s))
+		}
+	}
 	for i, t := range tasks {
 		mappings, _ := t["inputMappings"].(map[string]any)
-		for _, v := range mappings {
-			s, _ := v.(string)
-			addDep(i, mappingDependencyRef(s))
+		collectMappingDeps(i, mappings)
+		for _, nested := range []string{"scorecardConfig", "ruleTreeConfig"} {
+			if cfg, _ := t[nested].(map[string]any); cfg != nil {
+				if nm, _ := cfg["inputMappings"].(map[string]any); nm != nil {
+					collectMappingDeps(i, nm)
+				}
+			}
 		}
 		// Template-string dependencies (http url/body/headers, end
 		// outputJson). A task whose http url uses {{<other-task>.field}}
@@ -1303,6 +1317,38 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 		return nil, err
 	}
 
+	// Auto-add `persona` to the workflow's inputVariables when any
+	// customer/deal/asset task uses operation=write but the spec didn't
+	// declare it. CreateBorrower's strict Literal["individual","business"]
+	// validator fires at runtime on the new-borrower path; without this
+	// auto-add, a workflow first-time-running for a not-yet-existing
+	// borrower crashes with a Pydantic ValidationError that surfaces as
+	// statusCode=500 and an opaque error message. The default value is
+	// "individual" -- conservative, matches what the Hub UI fills in.
+	// Caller-supplied inputVariables.persona always wins (we never override).
+	for _, t := range spec.Tasks {
+		tt, _ := t["type"].(string)
+		if tt != "customer" && tt != "deal" && tt != "asset" {
+			continue
+		}
+		if op, _ := t["operation"].(string); op != "write" {
+			continue
+		}
+		if spec.InputVariables == nil {
+			spec.InputVariables = map[string]any{}
+		}
+		if _, has := spec.InputVariables["persona"]; !has {
+			spec.InputVariables["persona"] = map[string]any{
+				"type":        "string",
+				"default":     "individual",
+				"required":    false,
+				"title":       "Type of customer",
+				"description": "Borrower persona at create time. Defaults to 'individual'; pass 'business' when triggering the workflow for a corporate borrower.",
+			}
+		}
+		break // one auto-add covers all entity-write tasks in the spec
+	}
+
 	createdAliases := []string{}
 	taskNodes := []map[string]any{}
 
@@ -1355,6 +1401,33 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 				return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, rerr)
 			}
 			task["inputMappings"] = rewritten
+		}
+		// scorecard and rule-tree activities resolve their per-rule field
+		// references from a NESTED inputMappings map (scorecardConfig and
+		// ruleTreeConfig respectively -- see graph_workflow's dedicated
+		// per-task-type branches in _resolve_task_variables). Compose's
+		// rewrite was only walking the top-level map, leaving nested refs
+		// like "task_outputs.<spec-ref>.field" untouched at the server
+		// after spec-ref-to-alias translation -- so the runtime resolver
+		// looked up the spec ref (which doesn't exist in task_outputs)
+		// and every rule field came back None. Symptom: scorecard total=0
+		// for every input, rule-tree falls through to its default branch
+		// regardless of upstream values. Rewrite the nested maps too.
+		for _, nested := range []string{"scorecardConfig", "ruleTreeConfig"} {
+			cfg, _ := task[nested].(map[string]any)
+			if cfg == nil {
+				continue
+			}
+			nestedMappings, ok := cfg["inputMappings"].(map[string]any)
+			if !ok || len(nestedMappings) == 0 {
+				continue
+			}
+			rewritten, rerr := rewriteRefsInMappings(nestedMappings, refMap)
+			if rerr != nil {
+				return nil, fmt.Errorf("tasks[%d] (ref=%q) %s.inputMappings: %w", i, ref, nested, rerr)
+			}
+			cfg["inputMappings"] = rewritten
+			task[nested] = cfg
 		}
 
 		// Rewrite {{...}} template placeholders in known per-type fields
@@ -2160,6 +2233,28 @@ func preflightTasks(spec *composeSpec) error {
 			eal, _ := task["executorAlias"].(string)
 			if eid == "" && eal == "" {
 				return fmt.Errorf("tasks[%d] (ref=%q): child-workflow task requires 'executorId' or 'executorAlias'", i, ref)
+			}
+			// child-workflow auto-detects single vs batch from the resolved
+			// type of inputExpression (list -> fan-out, dict -> single). The
+			// legacy runInBatch flag and the hardcoded `input_items` context
+			// key are no longer read by the runtime. Warn so old specs that
+			// relied on the flag get migrated to inputExpression instead of
+			// silently downgrading to a single execution.
+			if rib, _ := task["runInBatch"].(bool); rib {
+				if _, hasExpr := task["inputExpression"].(string); !hasExpr {
+					fmt.Fprintf(os.Stderr,
+						"# warning: tasks[%d] (ref=%q): child-workflow has runInBatch=true but no inputExpression. "+
+							"The runtime ignores runInBatch and dispatches by the type of inputExpression "+
+							"(list -> batch, dict -> single). Without inputExpression this task runs once with the full parent context. "+
+							"To batch, set inputExpression to an expression that resolves to a list "+
+							"(e.g. \"task_outputs.fetch.rows\").\n",
+						i, ref)
+				}
+			}
+			if fp, _ := task["failurePolicy"].(string); fp != "" && fp != "fail-fast" && fp != "best-effort" {
+				return fmt.Errorf(
+					"tasks[%d] (ref=%q): child-workflow failurePolicy=%q is invalid. Must be \"fail-fast\" or \"best-effort\" (default: \"best-effort\")",
+					i, ref, fp)
 			}
 		case "compute-variables":
 			// compute-variables expressions live in the customVariables DSL

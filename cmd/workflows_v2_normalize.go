@@ -788,6 +788,49 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, predictedA
 	if len(entries) == 0 {
 		return fmt.Errorf("mapping-table task requires mappingTableConfig.entries: a non-empty array of {mappingTableId|mappingTableCode, inputVariable, outputVariable}")
 	}
+	// Detect duplicate or missing `order` across entries. The Hub UI sorts
+	// entries by `order` and collapses duplicates (or renders only the first
+	// entry per order value), so a spec with two entries both at order=0
+	// shows up as a single-entry panel even though the persisted task body
+	// has both. Auto-assign sequential orders matching array position when
+	// we detect this. Preserve caller-supplied distinct orders.
+	seenOrders := map[float64]int{}
+	hasDupOrder := false
+	for _, e := range entries {
+		em, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		ord, hasOrd := em["order"]
+		if !hasOrd {
+			hasDupOrder = true // missing order -> renumber everyone
+			break
+		}
+		var f float64
+		switch v := ord.(type) {
+		case float64:
+			f = v
+		case int:
+			f = float64(v)
+		default:
+			hasDupOrder = true
+			break
+		}
+		if _, dup := seenOrders[f]; dup {
+			hasDupOrder = true
+			break
+		}
+		seenOrders[f] = 1
+	}
+	if hasDupOrder {
+		for i, e := range entries {
+			if em, ok := e.(map[string]any); ok {
+				em["order"] = i
+				entries[i] = em
+			}
+		}
+	}
+
 	out := asMap(task["outputSchema"])
 	for i, e := range entries {
 		em, ok := e.(map[string]any)
@@ -879,7 +922,72 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, predictedA
 	cfg["entries"] = entries
 	task["mappingTableConfig"] = cfg
 	task["outputSchema"] = out
+
+	// Mirror per-entry inputVariables into the task's top-level inputMappings
+	// + inputSchema. The Hub UI's mapping-table properties panel renders from
+	// the top-level maps -- a task whose entries[].inputVariable resolves at
+	// runtime correctly but whose top-level inputSchema is empty shows up as
+	// "N entries" on the node card but expands to a blank panel. Mirroring
+	// is per-field-name extracted from inputVariable's last dotted segment.
+	mirrorEntryInputsToTopLevel(task, entries)
 	return nil
+}
+
+// mirrorEntryInputsToTopLevel ensures the task's top-level inputMappings +
+// inputSchema reflect every entry's inputVariable. The Hub UI renders the
+// mapping-table properties panel from the top-level maps (not from
+// entries[].inputVariable); without this, the panel appears empty even
+// though the runtime resolves entries correctly. Caller-supplied entries
+// in inputMappings/inputSchema are preserved.
+func mirrorEntryInputsToTopLevel(task map[string]any, entries []any) {
+	mappings := asMap(task["inputMappings"])
+	schema := asMap(task["inputSchema"])
+	for _, e := range entries {
+		em, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		inVar, _ := em["inputVariable"].(string)
+		if inVar == "" {
+			continue
+		}
+		field := inVar
+		if idx := strings.LastIndex(inVar, "."); idx >= 0 {
+			field = inVar[idx+1:]
+		}
+		if _, has := mappings[field]; !has {
+			mappings[field] = inVar
+		}
+		if _, has := schema[field]; !has {
+			schema[field] = map[string]any{
+				"type":  "number",
+				"title": field,
+			}
+		}
+	}
+	task["inputMappings"] = mappings
+	task["inputSchema"] = schema
+}
+
+// mirrorMappingsToInputSchema derives top-level inputSchema entries from a
+// task's top-level inputMappings keys. Used by scorecard + rule-tree
+// normalizers because the Hub properties panel reads inputSchema to display
+// each task's required inputs. Caller-supplied inputSchema entries win.
+func mirrorMappingsToInputSchema(task map[string]any) {
+	mappings := asMap(task["inputMappings"])
+	if len(mappings) == 0 {
+		return
+	}
+	schema := asMap(task["inputSchema"])
+	for k := range mappings {
+		if _, has := schema[k]; !has {
+			schema[k] = map[string]any{
+				"type":  "number",
+				"title": k,
+			}
+		}
+	}
+	task["inputSchema"] = schema
 }
 
 // normalizeScorecardTask validates that scorecardConfig references an existing
@@ -945,6 +1053,10 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, predictedAlia
 	// Without this every scorecard rule reads a None field and the total
 	// score is 0.
 	mirrorNestedInputMappings(task, cfg, "scorecardConfig")
+	// Derive top-level inputSchema from inputMappings keys so the Hub UI
+	// scorecard properties panel renders correctly. Without this the panel
+	// expands to nothing even though inputMappings has the right wiring.
+	mirrorMappingsToInputSchema(task)
 	return nil
 }
 
@@ -1039,29 +1151,52 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, predictedAlias
 	// this, agents have to remember to fill BOTH maps, and the rule-tree's
 	// conditions read nothing -- silently making every rule a no-op.
 	mirrorNestedInputMappings(task, cfg, "ruleTreeConfig")
+	// Derive top-level inputSchema from inputMappings keys for Hub UI
+	// rendering (see mirrorMappingsToInputSchema docstring).
+	mirrorMappingsToInputSchema(task)
 	return nil
 }
 
-// mirrorNestedInputMappings copies the task's top-level inputMappings into
-// the nested config's inputMappings when the nested map is empty. Used by
-// scorecard + rule-tree normalizers because the runtime resolves THEIR
-// inputs from the nested map, not the top-level one. No-op when the nested
-// map already has entries (caller wired explicitly, preserve intent).
+// mirrorNestedInputMappings keeps the task's top-level inputMappings and
+// the nested config's inputMappings (scorecardConfig / ruleTreeConfig) in
+// sync. The runtime requires BOTH:
+//   - top-level inputMappings -> the Hub UI properties panel renders from
+//     this; an empty top-level shows the task as a blank panel
+//   - nested config.inputMappings -> the scorecard/rule-tree activities
+//     resolve their per-rule field references from this specifically
+//     (graph_workflow._resolve_task_variables has dedicated branches that
+//     skip the top-level for these task types)
+//
+// Mirroring is symmetric and missing-only: each side fills from the other
+// if it's empty, preserving caller-supplied values on either side. Agents
+// writing inputMappings under either spelling get a working task without
+// having to remember to mirror by hand.
 func mirrorNestedInputMappings(task map[string]any, cfg map[string]any, cfgKey string) {
 	topLevel := asMap(task["inputMappings"])
-	if len(topLevel) == 0 {
+	nested := asMap(cfg["inputMappings"])
+	if len(topLevel) == 0 && len(nested) == 0 {
 		return
 	}
-	nested := asMap(cfg["inputMappings"])
-	if len(nested) > 0 {
-		return // caller-supplied nested mappings win
+	// Nested -> top-level when top-level is empty (the agent wrote
+	// inputMappings only under the nested config -- common when copying
+	// from schema-guide examples that document the nested form).
+	if len(topLevel) == 0 && len(nested) > 0 {
+		mirror := map[string]any{}
+		for k, v := range nested {
+			mirror[k] = v
+		}
+		task["inputMappings"] = mirror
 	}
-	mirror := map[string]any{}
-	for k, v := range topLevel {
-		mirror[k] = v
+	// Top-level -> nested when nested is empty (the agent wrote at the
+	// top level only -- common when treating these like any other task).
+	if len(nested) == 0 && len(topLevel) > 0 {
+		mirror := map[string]any{}
+		for k, v := range topLevel {
+			mirror[k] = v
+		}
+		cfg["inputMappings"] = mirror
+		task[cfgKey] = cfg
 	}
-	cfg["inputMappings"] = mirror
-	task[cfgKey] = cfg
 }
 
 // normalizeEntityWriteTask covers customer / deal / asset task types. Fills
@@ -1121,6 +1256,22 @@ func normalizeEntityWriteTask(task map[string]any) error {
 		}
 		inSchema["persona"] = persona
 		task["inputSchema"] = inSchema
+
+		// Wire persona from the workflow's inputs scope. compose's
+		// preflight auto-adds `inputVariables.persona` (default
+		// "individual") to the workflow when an entity write is present,
+		// so this resolves at runtime without the agent having to thread
+		// persona through the spec. Without this wiring, the runtime
+		// entity_activity reads context.get("persona") -> None and the
+		// new-borrower path crashes with a Pydantic Literal validator
+		// error -- the inputSchema above describes the *shape* of the
+		// resolved context, not the wiring that populates it. Caller-
+		// supplied inputMappings.persona always wins.
+		mappings := asMap(task["inputMappings"])
+		if _, has := mappings["persona"]; !has {
+			mappings["persona"] = "inputs.persona"
+		}
+		task["inputMappings"] = mappings
 
 		out := asMap(task["outputSchema"])
 		if _, has := out["borrower_id"]; !has {
