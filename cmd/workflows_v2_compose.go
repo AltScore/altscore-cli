@@ -1964,8 +1964,20 @@ func preflightTasks(spec *composeSpec) error {
 	type advise struct{ srcRef, tgtRef, srcType string }
 	advisories := []advise{}
 	for _, e := range spec.Edges {
+		// Mirror the canonical edge normalizer (assembleWorkflowBody at the
+		// bottom of this file): specs may use `from`/`to` as shortcuts for
+		// `sourceNodeId`/`targetNodeId`. The advisory runs in the preflight
+		// pass BEFORE normalization, so without this fallback every edge
+		// authored with the documented shortcut form is invisible and the
+		// advisory finds nothing.
 		src, _ := e["sourceNodeId"].(string)
+		if src == "" {
+			src, _ = e["from"].(string)
+		}
 		tgt, _ := e["targetNodeId"].(string)
+		if tgt == "" {
+			tgt, _ = e["to"].(string)
+		}
 		if src == "" || tgt == "" {
 			continue
 		}
