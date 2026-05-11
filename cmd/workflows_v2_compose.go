@@ -1936,6 +1936,61 @@ func preflightTasks(spec *composeSpec) error {
 			"# warning: compose spec has no 'end' node in extraNodes. Most workflows need one for the engine to know where to terminate cleanly.")
 	}
 
+	// Soft advisory: routing tasks (conditional, array-router) with branch
+	// edges targeting exception tasks usually indicate the agent is treating
+	// 'rejected'/'declined'/'manual review' as a failure when they're really
+	// valid workflow outcomes that belong on end nodes (one per branch,
+	// each with its own endConfig.decisionConfig). See the
+	// 'terminationPatterns' schema-guide section. We don't block -- some
+	// workflows legitimately fail-fast on a bad-input conditional branch --
+	// but we want the agent to see this advisory at compose time, not
+	// discover it after deploying a workflow whose executions all show up
+	// as failures in metrics.
+	refType := map[string]string{}
+	for _, t := range spec.Tasks {
+		if r := localRef(t, ""); r != "" {
+			if tt, _ := t["type"].(string); tt != "" {
+				refType[r] = tt
+			}
+		}
+	}
+	for _, n := range spec.ExtraNodes {
+		if r := localRef(n, ""); r != "" {
+			if tt, _ := n["type"].(string); tt != "" {
+				refType[r] = tt
+			}
+		}
+	}
+	type advise struct{ srcRef, tgtRef, srcType string }
+	advisories := []advise{}
+	for _, e := range spec.Edges {
+		src, _ := e["sourceNodeId"].(string)
+		tgt, _ := e["targetNodeId"].(string)
+		if src == "" || tgt == "" {
+			continue
+		}
+		st := refType[src]
+		tt := refType[tgt]
+		if (st == "conditional" || st == "array-router") && tt == "exception" {
+			advisories = append(advisories, advise{src, tgt, st})
+		}
+	}
+	if len(advisories) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"# advice: spec has %d branch edge(s) from a conditional/array-router targeting an exception task.\n"+
+				"# advice: exception tasks fail the workflow (isSuccess=false). For VALID decision outcomes\n"+
+				"# advice: like 'reject', 'manual_review', 'declined' -- which are expected business results,\n"+
+				"# advice: not errors -- prefer a separate end node per branch, each with its own\n"+
+				"# advice: endConfig.decisionConfig.enabled=true so the decision is recorded via\n"+
+				"# advice: /v1/executions/{id}/decisions. See 'workflows-v2 schema-guide terminationPatterns'.\n"+
+				"# advice: Reserve exception tasks for genuine error paths (missing required input, upstream\n"+
+				"# advice: HTTP 5xx, unrecoverable state) where the workflow truly could not complete.\n",
+			len(advisories))
+		for _, a := range advisories {
+			fmt.Fprintf(os.Stderr, "# advice:   %s (%s) -> %s (exception)\n", a.srcRef, a.srcType, a.tgtRef)
+		}
+	}
+
 	// Edge topology: every from/to must reference a known ref; reject
 	// duplicate edges and self-loops (almost always bugs). Also reject
 	// unknown edge keys -- the most common is 'branchName' (a natural-
