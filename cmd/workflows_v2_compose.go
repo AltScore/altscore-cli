@@ -127,7 +127,7 @@ Spec format (see file header for full reference):
 				return err
 			}
 
-			workflow, err := composeWorkflowBody(c, &spec, dryRun)
+			workflow, err := composeWorkflowBody(c, &spec, dryRun, publish)
 			if err != nil {
 				return err
 			}
@@ -1286,7 +1286,7 @@ func humanizeKey(key string) string {
 // nodeId + taskAlias and is used to rewrite all references downstream. If the
 // caller provided `alias` in a task body, that alias is sent to the API; if
 // absent, the server picks one and we use whatever it returns.
-func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[string]any, error) {
+func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool) (map[string]any, error) {
 	if err := validateEntityTypeVsTaskTypes(spec); err != nil {
 		return nil, err
 	}
@@ -1447,6 +1447,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 			PredictedAlias:  predictedAlias,
 			CustomVariables: spec.CustomVariables,
 			InputVariables:  spec.InputVariables,
+			Publish:         publish,
 		}, dryRun); err != nil {
 			return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}
