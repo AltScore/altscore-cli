@@ -156,6 +156,48 @@ type composeNormalizeOpts struct {
 	// Without it the bare form persists, which the runtime tolerates but
 	// the Hub picker doesn't surface as an obvious source.
 	InputVariables map[string]any
+	// Publish -- whether the caller passed --publish to compose. When true,
+	// "referenced entity missing on tenant" is promoted from a stderr
+	// warning to a hard error. A published workflow that references a
+	// missing scorecard / rule-tree / mapping-table / evaluation-rule
+	// will fail 100% of its executions at runtime ("Scorecard not found:
+	// X"), and the failure surfaces only when someone tries to actually
+	// run the workflow -- often hours or days after compose. Catching it
+	// at publish time turns a runtime mystery into a clear compose error.
+	Publish bool
+}
+
+// missingEntityHandler returns an error when --publish is set, otherwise
+// prints a stderr warning. Used by the four credit-decisioning task
+// normalizers when a referenced entity isn't on the tenant. The dryRun
+// guard means dry-runs never error or warn -- agents iterating on a spec
+// in --dry-run mode aren't expected to have created entities yet.
+func missingEntityHandler(opts *composeNormalizeOpts, dryRun bool, resourceKind, ref string) error {
+	msg := fmt.Sprintf("%s task references %q which was not found on the tenant", resourceKind, ref)
+	if opts != nil && opts.Publish {
+		// Hard error even in dry-run: agents testing the publish flow via
+		// --dry-run --publish need to see the same outcome they'd see at
+		// real-run publish time. Skipping the check in dry-run would let
+		// agents "validate" a spec that's guaranteed to fail on actual
+		// publish.
+		predicted := ""
+		if opts.PredictedAlias != "" {
+			predicted = " --workflow-alias " + opts.PredictedAlias
+		}
+		return fmt.Errorf(
+			"%s -- refusing to publish a workflow that references a missing entity. "+
+				"Create the entity first (altscore %s create%s ...) or remove the reference. "+
+				"Without --publish compose would have warned and proceeded; --publish was set so this is a hard error.",
+			msg, resourceKind, predicted)
+	}
+	// Warning path: stderr only, and only on real-run (dry-run agents
+	// iterating on spec shape haven't created entities yet, so silence the
+	// noise for them).
+	if dryRun {
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "# warning: %s\n", msg)
+	return nil
 }
 
 // validateEntityWorkflowAliasMatch returns an error when a credit-
@@ -227,13 +269,13 @@ func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNorma
 	case "customer", "deal", "asset":
 		return normalizeEntityWriteTask(task)
 	case "evaluate-rules":
-		return normalizeEvaluateRulesTask(c, task, opts.PredictedAlias, dryRun)
+		return normalizeEvaluateRulesTask(c, task, opts, dryRun)
 	case "mapping-table":
-		return normalizeMappingTableTask(c, task, opts.PredictedAlias, opts.InputVariables, dryRun)
+		return normalizeMappingTableTask(c, task, opts, dryRun)
 	case "scorecard":
-		return normalizeScorecardTask(c, task, opts.PredictedAlias, dryRun)
+		return normalizeScorecardTask(c, task, opts, dryRun)
 	case "rule-tree":
-		return normalizeRuleTreeTask(c, task, opts.PredictedAlias, dryRun)
+		return normalizeRuleTreeTask(c, task, opts, dryRun)
 	}
 	return nil
 }
@@ -753,7 +795,11 @@ func lookupEntity(c *client.Client, resource, codeOrID string, dryRun bool) (map
 // of {ruleCode, ruleId} references and pre-fills outputSchema with the
 // canonical alerts/alerts_count fields produced by the activity at
 // borrower-central/app/temporal/activities/evaluate_rules_activity.py.
-func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, predictedAlias string, dryRun bool) error {
+func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
+	predictedAlias := ""
+	if opts != nil {
+		predictedAlias = opts.PredictedAlias
+	}
 	rules := asSlice(task["rulesConfig"])
 	if len(rules) == 0 {
 		return fmt.Errorf("evaluate-rules task requires rulesConfig: a non-empty array of {ruleCode: \"<code>\"} references")
@@ -774,8 +820,10 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, predicted
 			ref = id
 		}
 		entity, _ := lookupEntity(c, "evaluation-rules", ref, dryRun)
-		if entity == nil && !dryRun && c != nil {
-			fmt.Fprintf(os.Stderr, "# warning: evaluate-rules rulesConfig[%d] references %q which was not found on the tenant\n", i, ref)
+		if entity == nil && c != nil {
+			if err := missingEntityHandler(opts, dryRun, "evaluation-rules", ref); err != nil {
+				return fmt.Errorf("rulesConfig[%d]: %w", i, err)
+			}
 		}
 		if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "evaluation-rules", ref); err != nil {
 			return fmt.Errorf("rulesConfig[%d]: %w", i, err)
@@ -805,7 +853,13 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, predicted
 // tasks see them as top-level outputs. Each entry needs a stable id (the
 // runtime MappingTableEntry pydantic model requires it); compose mints a
 // UUID v4 when the agent omits it, matching what the Hub editor does.
-func normalizeMappingTableTask(c *client.Client, task map[string]any, predictedAlias string, inputVars map[string]any, dryRun bool) error {
+func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
+	predictedAlias := ""
+	var inputVars map[string]any
+	if opts != nil {
+		predictedAlias = opts.PredictedAlias
+		inputVars = opts.InputVariables
+	}
 	cfg := asMap(task["mappingTableConfig"])
 	entries := asSlice(cfg["entries"])
 	if len(entries) == 0 {
@@ -897,8 +951,10 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, predictedA
 				outType = "number"
 			}
 		}
-		if entity == nil && !dryRun && c != nil {
-			fmt.Fprintf(os.Stderr, "# warning: mapping-table entries[%d] references %q which was not found on the tenant\n", i, ref)
+		if entity == nil && c != nil {
+			if err := missingEntityHandler(opts, dryRun, "mapping-tables", ref); err != nil {
+				return fmt.Errorf("entries[%d]: %w", i, err)
+			}
 		}
 		if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "mapping-tables", ref); err != nil {
 			return fmt.Errorf("entries[%d]: %w", i, err)
@@ -1021,7 +1077,11 @@ func mirrorMappingsToInputSchema(task map[string]any) {
 // uses the entity's rules; any inline 'rules' on the task body are ignored.
 // Compose preserves user-supplied inline rules (for legacy bodies) but never
 // requires them.
-func normalizeScorecardTask(c *client.Client, task map[string]any, predictedAlias string, dryRun bool) error {
+func normalizeScorecardTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
+	predictedAlias := ""
+	if opts != nil {
+		predictedAlias = opts.PredictedAlias
+	}
 	cfg := asMap(task["scorecardConfig"])
 	id, _ := cfg["scorecardId"].(string)
 	code, _ := cfg["scorecardCode"].(string)
@@ -1036,8 +1096,10 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, predictedAlia
 		ref = id
 	}
 	entity, _ := lookupEntity(c, "scorecards", ref, dryRun)
-	if entity == nil && !dryRun && c != nil {
-		fmt.Fprintf(os.Stderr, "# warning: scorecard task references %q which was not found on the tenant\n", ref)
+	if entity == nil && c != nil {
+		if err := missingEntityHandler(opts, dryRun, "scorecards", ref); err != nil {
+			return err
+		}
 	}
 	if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "scorecards", ref); err != nil {
 		return err
@@ -1089,7 +1151,11 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, predictedAlia
 
 // normalizeRuleTreeTask validates ruleTreeConfig and pre-fills outputSchema
 // with the configured outputVariable using the configured outputType.
-func normalizeRuleTreeTask(c *client.Client, task map[string]any, predictedAlias string, dryRun bool) error {
+func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
+	predictedAlias := ""
+	if opts != nil {
+		predictedAlias = opts.PredictedAlias
+	}
 	cfg := asMap(task["ruleTreeConfig"])
 	id, _ := cfg["ruleTreeId"].(string)
 	code, _ := cfg["ruleTreeCode"].(string)
@@ -1115,8 +1181,10 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, predictedAlias
 		ref = id
 	}
 	entity, _ := lookupEntity(c, "rule-trees", ref, dryRun)
-	if entity == nil && !dryRun && c != nil {
-		fmt.Fprintf(os.Stderr, "# warning: rule-tree task references %q which was not found on the tenant\n", ref)
+	if entity == nil && c != nil {
+		if err := missingEntityHandler(opts, dryRun, "rule-trees", ref); err != nil {
+			return err
+		}
 	}
 	if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "rule-trees", ref); err != nil {
 		return err
