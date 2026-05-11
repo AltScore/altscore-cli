@@ -158,29 +158,50 @@ type composeNormalizeOpts struct {
 	InputVariables map[string]any
 }
 
-// warnEntityWorkflowAliasMismatch prints a stderr warning when a credit-
+// validateEntityWorkflowAliasMatch returns an error when a credit-
 // decisioning entity's workflowAlias doesn't match the workflow being
-// composed. Silent when the entity has no workflowAlias (global scope) or
-// when the lookup didn't find anything (lookupEntity already warned), or
-// when we don't know the predicted alias (non-compose context).
-func warnEntityWorkflowAliasMismatch(entity map[string]any, predictedAlias, resourceKind, ref string) {
+// composed. The Hub UI's elements panel filters entities by exact
+// workflow_alias match -- an entity scoped to a DIFFERENT workflow is
+// referenceable (compose still wires it correctly and the runtime
+// resolves it), but invisible to the editor, so a human reviewing the
+// workflow in the Hub sees an unconfigured-looking task that secretly
+// pulls from another workflow's entity. That cross-workflow drift is
+// hard to undo once it spreads.
+//
+// Allowed: entity has no workflowAlias (global / shared by intent) OR
+// the lookup didn't find anything (lookupEntity already warned, no
+// scope to check) OR we don't know the predicted alias (compose context
+// missing -- non-compose callers).
+//
+// Disallowed: any other mismatch. The error message tells the caller
+// exactly which CLI command fixes it.
+func validateEntityWorkflowAliasMatch(entity map[string]any, predictedAlias, resourceKind, ref string) error {
 	if entity == nil || predictedAlias == "" {
-		return
+		return nil
 	}
 	actual, _ := entity["workflowAlias"].(string)
 	if actual == "" {
-		return
+		return nil
 	}
 	if actual == predictedAlias {
-		return
+		return nil
 	}
 	id, _ := entity["id"].(string)
 	if id == "" {
 		id = "<id>"
 	}
-	fmt.Fprintf(os.Stderr,
-		"# warning: %s %q is scoped to workflowAlias=%q, but this workflow's alias will be %q. The entity exists but won't appear in this workflow's picker. Re-scope with: altscore %s update %s --workflow-alias %s\n",
-		resourceKind, ref, actual, predictedAlias, resourceKind, id, predictedAlias)
+	return fmt.Errorf(
+		"%s %q is scoped to workflowAlias=%q, but this workflow's alias will be %q -- "+
+			"the entity won't appear in the Hub's elements panel for this workflow, so any human "+
+			"reviewing the task in the editor sees an unconfigured-looking reference. "+
+			"Pick ONE: (a) re-scope the entity to this workflow: "+
+			"`altscore %s update %s --workflow-alias %s` -- recommended when the entity is "+
+			"specific to this workflow; or (b) clear the entity's workflowAlias to make it "+
+			"globally shared across workflows: `altscore %s update %s --body '{\"workflowAlias\": null}'` "+
+			"-- pick this only if multiple workflows really should share the same entity definition; "+
+			"or (c) create a workflow-specific copy of the entity with a fresh code",
+		resourceKind, ref, actual, predictedAlias, resourceKind, id, predictedAlias,
+		resourceKind, id)
 }
 
 // normalizeTaskBody mutates the task spec in place to match the canonical
@@ -756,7 +777,9 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, predicted
 		if entity == nil && !dryRun && c != nil {
 			fmt.Fprintf(os.Stderr, "# warning: evaluate-rules rulesConfig[%d] references %q which was not found on the tenant\n", i, ref)
 		}
-		warnEntityWorkflowAliasMismatch(entity, predictedAlias, "evaluation-rules", ref)
+		if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "evaluation-rules", ref); err != nil {
+			return fmt.Errorf("rulesConfig[%d]: %w", i, err)
+		}
 	}
 	out := asMap(task["outputSchema"])
 	if _, has := out["alerts"]; !has {
@@ -877,7 +900,9 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, predictedA
 		if entity == nil && !dryRun && c != nil {
 			fmt.Fprintf(os.Stderr, "# warning: mapping-table entries[%d] references %q which was not found on the tenant\n", i, ref)
 		}
-		warnEntityWorkflowAliasMismatch(entity, predictedAlias, "mapping-tables", ref)
+		if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "mapping-tables", ref); err != nil {
+			return fmt.Errorf("entries[%d]: %w", i, err)
+		}
 		// Pre-fill the three canonical outputs mapping_table_activity emits
 		// per entry (see app/temporal/activities/mapping_table_activity.py):
 		//   <outputVariable>        -- the mapped value (typed per entity outputType)
@@ -1014,7 +1039,9 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, predictedAlia
 	if entity == nil && !dryRun && c != nil {
 		fmt.Fprintf(os.Stderr, "# warning: scorecard task references %q which was not found on the tenant\n", ref)
 	}
-	warnEntityWorkflowAliasMismatch(entity, predictedAlias, "scorecards", ref)
+	if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "scorecards", ref); err != nil {
+		return err
+	}
 	out := asMap(task["outputSchema"])
 	totalVar, _ := cfg["totalScoreVariable"].(string)
 	if totalVar == "" {
@@ -1091,7 +1118,9 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, predictedAlias
 	if entity == nil && !dryRun && c != nil {
 		fmt.Fprintf(os.Stderr, "# warning: rule-tree task references %q which was not found on the tenant\n", ref)
 	}
-	warnEntityWorkflowAliasMismatch(entity, predictedAlias, "rule-trees", ref)
+	if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "rule-trees", ref); err != nil {
+		return err
+	}
 	// Pre-fill outputSchema with EVERY canonical output rule_tree_activity
 	// emits (see app/temporal/activities/rule_tree_activity.py:172-194):
 	//   <outputVariable>                 -> the matched rule's decision_key
