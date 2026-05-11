@@ -1373,6 +1373,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 		if err := normalizeTaskBody(c, task, &composeNormalizeOpts{
 			PredictedAlias:  predictedAlias,
 			CustomVariables: spec.CustomVariables,
+			InputVariables:  spec.InputVariables,
 		}, dryRun); err != nil {
 			return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}

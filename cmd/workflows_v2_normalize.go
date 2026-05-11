@@ -150,6 +150,12 @@ func validateTaskV2BodyStructural(body json.RawMessage) error {
 type composeNormalizeOpts struct {
 	PredictedAlias  string
 	CustomVariables map[string]any
+	// InputVariables -- workflow-level inputVariables. Needed by the
+	// mapping-table normalizer to wrap bare inputVariable names (e.g.
+	// "bureau_score") into the Hub-canonical "inputs.bureau_score" form.
+	// Without it the bare form persists, which the runtime tolerates but
+	// the Hub picker doesn't surface as an obvious source.
+	InputVariables map[string]any
 }
 
 // warnEntityWorkflowAliasMismatch prints a stderr warning when a credit-
@@ -197,10 +203,12 @@ func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNorma
 		return normalizeComputeVariablesTask(task, opts.CustomVariables)
 	case "conditional":
 		return normalizeConditionalTask(task)
+	case "customer", "deal", "asset":
+		return normalizeEntityWriteTask(task)
 	case "evaluate-rules":
 		return normalizeEvaluateRulesTask(c, task, opts.PredictedAlias, dryRun)
 	case "mapping-table":
-		return normalizeMappingTableTask(c, task, opts.PredictedAlias, dryRun)
+		return normalizeMappingTableTask(c, task, opts.PredictedAlias, opts.InputVariables, dryRun)
 	case "scorecard":
 		return normalizeScorecardTask(c, task, opts.PredictedAlias, dryRun)
 	case "rule-tree":
@@ -774,7 +782,7 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, predicted
 // tasks see them as top-level outputs. Each entry needs a stable id (the
 // runtime MappingTableEntry pydantic model requires it); compose mints a
 // UUID v4 when the agent omits it, matching what the Hub editor does.
-func normalizeMappingTableTask(c *client.Client, task map[string]any, predictedAlias string, dryRun bool) error {
+func normalizeMappingTableTask(c *client.Client, task map[string]any, predictedAlias string, inputVars map[string]any, dryRun bool) error {
 	cfg := asMap(task["mappingTableConfig"])
 	entries := asSlice(cfg["entries"])
 	if len(entries) == 0 {
@@ -799,6 +807,18 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, predictedA
 		if inVar == "" || outVar == "" {
 			return fmt.Errorf("mappingTableConfig.entries[%d]: missing inputVariable or outputVariable", i)
 		}
+		// Wrap bare inputVariable names into the Hub-canonical scope form
+		// when we can recognize them. Currently we only know about workflow
+		// inputs (via spec.inputVariables); a bare name matching an input
+		// gets `inputs.<name>`. Bare names not matching anything are left
+		// alone -- they may legitimately reference a runtime-context key
+		// (e.g. an upstream task output already promoted to root) that
+		// compose can't see from this side.
+		if !strings.Contains(inVar, ".") {
+			if _, isInput := inputVars[inVar]; isInput {
+				em["inputVariable"] = "inputs." + inVar
+			}
+		}
 		ref := code
 		if ref == "" {
 			ref = id
@@ -815,10 +835,43 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, predictedA
 			fmt.Fprintf(os.Stderr, "# warning: mapping-table entries[%d] references %q which was not found on the tenant\n", i, ref)
 		}
 		warnEntityWorkflowAliasMismatch(entity, predictedAlias, "mapping-tables", ref)
+		// Pre-fill the three canonical outputs mapping_table_activity emits
+		// per entry (see app/temporal/activities/mapping_table_activity.py):
+		//   <outputVariable>        -- the mapped value (typed per entity outputType)
+		//   <outputVariable>_bucket -- label of the matched bucket
+		//   <outputVariable>_input  -- the original input value, for debugging
+		// Mirrors the Hub editor (which adds all three when wiring a new
+		// entry). Without the companion fields, downstream Hub mapping
+		// pickers only show the bare value -- agents lose the audit trail
+		// the runtime is already emitting.
 		if _, has := out[outVar]; !has {
 			out[outVar] = map[string]any{
-				"type":  outType,
-				"title": humanizeKey(outVar),
+				"type":        outType,
+				"title":       outVar,
+				"description": "Mapping table output: " + outVar,
+			}
+		}
+		if _, has := out[outVar+"_bucket"]; !has {
+			out[outVar+"_bucket"] = map[string]any{
+				"type":        "string",
+				"title":       outVar + " Bucket",
+				"description": "Label of the matched bucket",
+			}
+		}
+		if _, has := out[outVar+"_input"]; !has {
+			// Best-guess input type. If we couldn't load the entity it
+			// defaults to "string"; the Hub editor uses "number" for
+			// numerical tables but tolerates either.
+			inType := "string"
+			if entity != nil {
+				if mt, _ := entity["mappingType"].(string); mt == "numerical" {
+					inType = "number"
+				}
+			}
+			out[outVar+"_input"] = map[string]any{
+				"type":        inType,
+				"title":       outVar + " Input",
+				"description": "Original input value",
 			}
 		}
 		entries[i] = em
@@ -884,6 +937,14 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, predictedAlia
 	}
 	task["scorecardConfig"] = cfg
 	task["outputSchema"] = out
+
+	// Mirror top-level inputMappings into scorecardConfig.inputMappings when
+	// the nested map is empty -- the scorecard activity reads its inputs
+	// from the nested map specifically (see graph_workflow.py
+	// _resolve_task_variables, the "if scorecardConfig in task_logic" branch).
+	// Without this every scorecard rule reads a None field and the total
+	// score is 0.
+	mirrorNestedInputMappings(task, cfg, "scorecardConfig")
 	return nil
 }
 
@@ -967,5 +1028,124 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, predictedAlias
 		}
 	}
 	task["outputSchema"] = out
+
+	// Mirror the top-level inputMappings into ruleTreeConfig.inputMappings
+	// when the nested map is empty. The rule-tree activity reads its inputs
+	// from ruleTreeConfig.inputMappings specifically (see graph_workflow.py
+	// _resolve_task_variables -- it has dedicated handling for the nested
+	// scorecardConfig.inputMappings and ruleTreeConfig.inputMappings); a
+	// top-level entry of `{total_score: "task_outputs.scorecard.total_score"}`
+	// is invisible to the rule-tree at execute time unless mirrored. Without
+	// this, agents have to remember to fill BOTH maps, and the rule-tree's
+	// conditions read nothing -- silently making every rule a no-op.
+	mirrorNestedInputMappings(task, cfg, "ruleTreeConfig")
+	return nil
+}
+
+// mirrorNestedInputMappings copies the task's top-level inputMappings into
+// the nested config's inputMappings when the nested map is empty. Used by
+// scorecard + rule-tree normalizers because the runtime resolves THEIR
+// inputs from the nested map, not the top-level one. No-op when the nested
+// map already has entries (caller wired explicitly, preserve intent).
+func mirrorNestedInputMappings(task map[string]any, cfg map[string]any, cfgKey string) {
+	topLevel := asMap(task["inputMappings"])
+	if len(topLevel) == 0 {
+		return
+	}
+	nested := asMap(cfg["inputMappings"])
+	if len(nested) > 0 {
+		return // caller-supplied nested mappings win
+	}
+	mirror := map[string]any{}
+	for k, v := range topLevel {
+		mirror[k] = v
+	}
+	cfg["inputMappings"] = mirror
+	task[cfgKey] = cfg
+}
+
+// normalizeEntityWriteTask covers customer / deal / asset task types. Fills
+// gaps between what the canonical Hub-shaped body looks like and what an
+// agent typically writes from the schema-guide:
+//   - sourcesConfig[].type = "identity_key" -> "identity" (runtime checks
+//     `source["type"] == "identity"` literally; "identity_key" is silently
+//     dropped at runtime because the canonical entity_activity branch
+//     filter doesn't match it, so the borrower never gets the identity
+//     stamped on it)
+//   - For operation=write, pre-fill inputSchema.persona with the default
+//     ("individual") + required=true so CreateBorrower's strict Literal
+//     validator passes without the agent having to thread persona through
+//     every spec
+//   - Pre-fill outputSchema with the lookup key + borrower_id so downstream
+//     tasks see them in mapping pickers
+//
+// Symmetric for customer/deal/asset because all three share CustomerTaskData /
+// DealTaskData / AssetTaskData schemas and the same operation/lookupBy/key
+// shape.
+func normalizeEntityWriteTask(task map[string]any) error {
+	taskType, _ := task["type"].(string)
+
+	for i, s := range asSlice(task["sourcesConfig"]) {
+		sm, ok := s.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := sm["type"].(string); t == "identity_key" {
+			sm["type"] = "identity"
+			// The runtime resolves the identity value from
+			// context[<key>] (see entity_activity.handle_config_sources_key_value).
+			// A literal `value: "{{inputs.tax_id}}"` from the spec is
+			// redundant -- worse, it persists in the body and shows up in
+			// the Hub source picker as a stale template. Strip it so the
+			// persisted shape matches what the UI editor produces.
+			delete(sm, "value")
+			task["sourcesConfig"].([]any)[i] = sm
+		}
+	}
+
+	operation, _ := task["operation"].(string)
+	if operation == "write" {
+		inSchema := asMap(task["inputSchema"])
+		persona := asMap(inSchema["persona"])
+		if _, has := persona["type"]; !has {
+			persona["type"] = "string"
+		}
+		if _, has := persona["default"]; !has {
+			persona["default"] = "individual"
+		}
+		if _, has := persona["title"]; !has {
+			persona["title"] = "Type of customer"
+		}
+		if _, has := persona["required"]; !has {
+			persona["required"] = true
+		}
+		inSchema["persona"] = persona
+		task["inputSchema"] = inSchema
+
+		out := asMap(task["outputSchema"])
+		if _, has := out["borrower_id"]; !has {
+			out["borrower_id"] = map[string]any{
+				"type":        "string",
+				"description": "ID of the " + taskType,
+			}
+		}
+		// BC coalesces identityKey -> key on ingest (CreateTaskV2 pre-validator),
+		// but compose runs before ingest, so we have to honor both spellings
+		// here -- otherwise a spec using the agent-friendly `identityKey` loses
+		// the outputSchema entry for the lookup field.
+		key, _ := task["key"].(string)
+		if key == "" {
+			key, _ = task["identityKey"].(string)
+		}
+		if key != "" {
+			if _, has := out[key]; !has {
+				out[key] = map[string]any{
+					"type":        "string",
+					"description": humanizeKey(key),
+				}
+			}
+		}
+		task["outputSchema"] = out
+	}
 	return nil
 }
