@@ -859,6 +859,10 @@ func templateDependencyRefs(task map[string]any) []string {
 				fields = append(fields, s)
 			}
 		}
+	case "exception":
+		if s, ok := task["errorMessage"].(string); ok && s != "" {
+			fields = append(fields, s)
+		}
 	}
 	if len(fields) == 0 {
 		return nil
@@ -1079,6 +1083,21 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 				}
 				endCfg["outputJson"] = out
 			}
+		}
+	case "exception":
+		// errorMessage flows through graph_workflow's _resolve_dict_variables
+		// at execute time, so {{task_outputs.<alias>.<deep>}} placeholders
+		// resolve from ScopedWorkflowContext just like an http body would.
+		// Without this rewrite, a spec-local ref like {{score.total_score}}
+		// survives compose unchanged, the runtime resolver rejects `score`
+		// (not a known scope), and the persisted exception ships with the
+		// raw template literal instead of the resolved value.
+		if s, ok := task["errorMessage"].(string); ok && s != "" {
+			out, err := rewriteField("errorMessage", s)
+			if err != nil {
+				return err
+			}
+			task["errorMessage"] = out
 		}
 	}
 	return nil
@@ -1520,6 +1539,17 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool) (map[
 				// Strip the spec-only `endConfig` key from the graph node
 				// so it doesn't double-write.
 				delete(n, "endConfig")
+
+				// Rewrite spec-local refs in endConfig.outputJson so they
+				// land canonical (task_outputs.<server-alias>.<deep>). The
+				// rewrite for spec.tasks happens at line ~1348; extraNode
+				// end tasks bypass that path because they're built here, so
+				// without this call an outputJson template like
+				// `{{score.total_score}}` survives unchanged and the runtime
+				// resolver rejects `score` as an unknown scope.
+				if err := rewriteRefsInTaskTemplates(taskBody, refMap); err != nil {
+					return nil, fmt.Errorf("extraNodes[%d] (ref=%q): %w", i, ref, err)
+				}
 			}
 
 			alias, version, err := postTaskWithMultiDotFallback(
