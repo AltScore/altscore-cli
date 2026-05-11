@@ -959,6 +959,30 @@ func rewriteRefsInMappings(mappings map[string]any, refMap map[string]string) (m
 // is the inner expression (e.g. "task_outputs.fetch.tax_id" or "borrower_id").
 var templatePlaceholderRegex = regexp.MustCompile(`\{\{\s*([^{}]+?)\s*\}\}`)
 
+// rewriteTaskOutputsRefsInString rewrites `task_outputs.<spec-ref>.` substrings
+// in arbitrary strings. Used by composeWorkflowBody to rewrite customVariable
+// expressions / returnValues / dependencies arrays after task aliases have
+// been assigned. Unknown refs (not in refMap) are left alone so server-style
+// aliases and other scopes (inputs, custom, system) pass through unchanged.
+//
+// The trailing dot in the match prefix is a boundary marker: ref "a" won't
+// accidentally match "task_outputs.a-extended." because the char after "a"
+// is "-", not ".". Maps are iterated in non-deterministic order; the trailing
+// dot also prevents one ref's rewrite from feeding into another (the alias
+// "a-server" doesn't contain "task_outputs.a." after rewriting).
+func rewriteTaskOutputsRefsInString(s string, refMap map[string]string) string {
+	if s == "" || refMap == nil {
+		return s
+	}
+	for ref, alias := range refMap {
+		if ref == alias {
+			continue
+		}
+		s = strings.ReplaceAll(s, "task_outputs."+ref+".", "task_outputs."+alias+".")
+	}
+	return s
+}
+
 // rewriteRefsInTemplate rewrites every {{...}} placeholder in s whose inner
 // expression looks like a spec-local ref reference. The rewrite mirrors
 // rewriteRefsInMappings:
@@ -1790,16 +1814,46 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		expression, _ := v["expression"].(string)
 		returnValue, _ := v["returnValue"].(string)
 		if expression == "" || returnValue != "" {
-			continue
-		}
-		// Bare-literal / single-expression detection: no top-level
-		// assignment statement. Match the simplest case (no `=` at all).
-		// If the expression has multi-statement bodies the author should
-		// declare returnValue explicitly.
-		if !strings.Contains(expression, "=") {
+			// nothing to mirror, fall through to the ref-rewrite step below
+		} else if !strings.Contains(expression, "=") {
+			// Bare-literal / single-expression detection: no top-level
+			// assignment statement. Match the simplest case (no `=` at all).
+			// If the expression has multi-statement bodies the author should
+			// declare returnValue explicitly.
 			v["returnValue"] = expression
-			customVars[name] = v
 		}
+
+		// Rewrite spec-ref prefixes in customVariable strings so the runtime
+		// compute_variables_activity can resolve them against _task_outputs.
+		// The dependency list is the lookup key against _task_outputs (see
+		// borrower-central/app/temporal/activities/compute_variables_activity.py
+		// :_collect_dependencies), AND the same string is used as the dict
+		// key into `inputs` inside the expression -- so both must agree on
+		// the alias. Symptom when this rewrite is missing: every dependency
+		// resolves to None, the compute function falls back to whatever
+		// default it has (often 0 or a sentinel like -999999), and every
+		// downstream score / decision collapses. Tracked through the v10
+		// stress run (Argentine SMB workflow with refs like
+		// "task_outputs.enrich.ARG-PUB-0001..." that compose persisted
+		// without rewriting `enrich` to the server alias).
+		expression, _ = v["expression"].(string)
+		returnValue, _ = v["returnValue"].(string)
+		if expression != "" {
+			v["expression"] = rewriteTaskOutputsRefsInString(expression, refMap)
+		}
+		if returnValue != "" {
+			v["returnValue"] = rewriteTaskOutputsRefsInString(returnValue, refMap)
+		}
+		if deps, ok := v["dependencies"].([]any); ok {
+			for i, d := range deps {
+				if ds, ok := d.(string); ok {
+					deps[i] = rewriteTaskOutputsRefsInString(ds, refMap)
+				}
+			}
+			v["dependencies"] = deps
+		}
+
+		customVars[name] = v
 	}
 	wf := map[string]any{
 		"label":           spec.Label,
