@@ -1133,6 +1133,21 @@ func topologicalTaskOrder(tasks []map[string]any, edges []map[string]any) ([]int
 				}
 			}
 		}
+		// mapping-table entries store inputVariable per-entry (not under
+		// inputMappings). Mirror the topological-order coverage so a
+		// mapping-table that depends on a compute-variables task gets
+		// ordered after it.
+		if cfg, _ := t["mappingTableConfig"].(map[string]any); cfg != nil {
+			if entries, ok := cfg["entries"].([]any); ok {
+				for _, e := range entries {
+					if em, ok := e.(map[string]any); ok {
+						if s, _ := em["inputVariable"].(string); s != "" {
+							addDep(i, mappingDependencyRef(s))
+						}
+					}
+				}
+			}
+		}
 		// Template-string dependencies (http url/body/headers, end
 		// outputJson). A task whose http url uses {{<other-task>.field}}
 		// must be ordered AFTER that task so rewriteRefsInTaskTemplates
@@ -1374,6 +1389,33 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			}
 			cfg["inputMappings"] = rewritten
 			task[nested] = cfg
+		}
+		// Mapping-table tasks store their per-entry input wiring as
+		// mappingTableConfig.entries[].inputVariable -- NOT in inputMappings.
+		// The runtime mapping_table_activity resolves each entry's input
+		// against the workflow context using whatever string is in
+		// inputVariable verbatim, so a spec-local ref left as
+		// `task_outputs.compute.X` after compose doesn't resolve (the
+		// _task_outputs key is the server alias, not the spec ref). The same
+		// is true for the top-level inputMappings that
+		// normalizeMappingTableTask later mirrors from the entries -- if we
+		// rewrite the entries here, the mirror will pick up canonical
+		// (server-aliased) values too.
+		if cfg, _ := task["mappingTableConfig"].(map[string]any); cfg != nil {
+			if entries, ok := cfg["entries"].([]any); ok {
+				for idx, e := range entries {
+					em, ok := e.(map[string]any)
+					if !ok {
+						continue
+					}
+					if s, ok := em["inputVariable"].(string); ok && s != "" {
+						em["inputVariable"] = rewriteTaskOutputsRefsInString(s, refMap)
+					}
+					entries[idx] = em
+				}
+				cfg["entries"] = entries
+				task["mappingTableConfig"] = cfg
+			}
 		}
 
 		// Rewrite {{...}} template placeholders in known per-type fields
