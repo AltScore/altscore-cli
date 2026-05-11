@@ -919,12 +919,51 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, predictedAlias
 		fmt.Fprintf(os.Stderr, "# warning: rule-tree task references %q which was not found on the tenant\n", ref)
 	}
 	warnEntityWorkflowAliasMismatch(entity, predictedAlias, "rule-trees", ref)
+	// Pre-fill outputSchema with EVERY canonical output rule_tree_activity
+	// emits (see app/temporal/activities/rule_tree_activity.py:172-194):
+	//   <outputVariable>                 -> the matched rule's decision_key
+	//   <outputVariable>_rule_code       -> code of the matched rule
+	//   <outputVariable>_rule_label      -> label of the matched rule
+	//   <outputVariable>_rules           -> full results array (one entry per
+	//                                       rule with hit/value/alert metadata)
+	//   <outputVariable>_alert_created   -> whether any alert fired
+	//
+	// Without these, downstream conditional/end tasks see only the bare
+	// outputVariable in the Hub mapping picker and agents end up guessing
+	// names like `decision_key` (the field name on each rule entry, NOT a
+	// task output) -- which then doesn't resolve at runtime because
+	// task_outputs.<alias>.decision_key isn't a key the activity ever wrote.
 	out := asMap(task["outputSchema"])
-	if _, has := out[outVar]; !has {
-		out[outVar] = map[string]any{
+	canonical := map[string]map[string]any{
+		outVar: {
 			"type":        outType,
 			"title":       humanizeKey(outVar),
-			"description": "Result from the rule tree",
+			"description": "Decision key of the matched rule",
+		},
+		outVar + "_rule_code": {
+			"type":        "string",
+			"title":       humanizeKey(outVar) + " Rule Code",
+			"description": "Code of the matched rule (or 'default' if none matched)",
+		},
+		outVar + "_rule_label": {
+			"type":        "string",
+			"title":       humanizeKey(outVar) + " Rule Label",
+			"description": "Label of the matched rule",
+		},
+		outVar + "_rules": {
+			"type":        "array",
+			"title":       humanizeKey(outVar) + " Rules",
+			"description": "Per-rule evaluation results (hit, value, alert metadata)",
+		},
+		outVar + "_alert_created": {
+			"type":        "boolean",
+			"title":       humanizeKey(outVar) + " Alert Created",
+			"description": "Whether any alert was emitted by a hitting rule",
+		},
+	}
+	for k, v := range canonical {
+		if _, has := out[k]; !has {
+			out[k] = v
 		}
 	}
 	task["outputSchema"] = out
