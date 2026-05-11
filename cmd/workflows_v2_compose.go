@@ -209,34 +209,6 @@ Spec format (see file header for full reference):
 	return cmd
 }
 
-// taskHasMultiDotMapping reports whether any inputMapping value contains more
-// than one dot (i.e. uses the canonical task_outputs.<alias>.<...> form). Such
-// values are rejected by CreateTaskV2's strict Pydantic validator but accepted
-// by CreateTaskVersionV2's lenient one. The compose loop uses this to switch
-// to a two-phase create when needed.
-func taskHasMultiDotMapping(task map[string]any) bool {
-	im, ok := task["inputMappings"].(map[string]any)
-	if !ok {
-		return false
-	}
-	for _, v := range im {
-		s, _ := v.(string)
-		if strings.Count(s, ".") >= 2 {
-			return true
-		}
-	}
-	return false
-}
-
-// shallowCopy returns a top-level copy of a map. Inner values are shared with
-// the original (good enough for the strip-fields use case in compose).
-func shallowCopy(m map[string]any) map[string]any {
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
-}
 
 // localRef returns the spec-local reference for a task or extraNode entry,
 // in priority order: explicit `ref`, then `alias` (for tasks) or `nodeId`
@@ -344,9 +316,11 @@ var pdfTitleByType = map[string]string{
 //	                 user's "PDF didn't come out" report on the first
 //	                 compose-generated workflow.
 //	hasAltdata    -- whether at least one ancestor is altdata-enrichment.
-//	                 Triggers the two-phase create at the call site (the
-//	                 strict CreateTaskV2 validator rejects multi-dot
-//	                 inputMappings values; only altdata produces them).
+//	                 Returned for the call site's awareness; no longer
+//	                 needed to switch on a two-phase create (CreateTaskV2
+//	                 accepts multi-dot inputMappings since the validator
+//	                 was relaxed -- see borrower-central
+//	                 app/model/workflows_v2/task_schemas.py).
 //
 // Mirrors `buildSectionsFromPredecessors` in
 // altscore-ai-chat/lib/stores/workflow-builder-v2/actions/edge/pdf-data-source-auto-mapping.ts.
@@ -417,8 +391,6 @@ func buildEndAutoWiring(endRef string, edges []map[string]any, taskByRef map[str
 		switch predType {
 		case "altdata-enrichment":
 			sourceInputSchema = "sources_output_packages_" + predAlias
-			// Multi-dot mapping value: triggers two-phase create at the call
-			// site so the strict CreateTaskV2 validator doesn't reject it.
 			mappingValue = "task_outputs." + predAlias + ".sources_output_packages"
 			hasAltdata = true
 			// One component per source in the upstream's sourcesConfig.
@@ -697,69 +669,34 @@ func printComposeSummary(w io.Writer, workflow map[string]any) {
 	}
 }
 
-// postTaskWithMultiDotFallback posts a task body to /v2/tasks and handles the
-// strict-vs-lenient validator split that the v2 task API enforces:
+// postTask creates a task via POST /v2/tasks and returns the server-assigned
+// alias and version. Used by the tasks loop and the extraNodes loop. The
+// previous two-phase create (postTaskWithMultiDotFallback) is gone:
+// CreateTaskV2's strict-vs-lenient distinction was relaxed in the backend --
+// the input_mappings validator now just returns its argument unchanged
+// (see borrower-central/app/model/workflows_v2/task_schemas.py). Multi-dot
+// inputMappings now land at version 1 in a single POST.
 //
-//   - POST /v2/tasks runs CreateTaskV2 (strict). It rejects inputMappings
-//     values like "task_outputs.<alias>.<deep>" (multi-dot) AND any
-//     inputMappings key that isn't in inputSchema.
-//   - POST /v2/tasks/{alias} runs CreateTaskVersionV2 (lenient). It accepts
-//     both shapes and persists them verbatim.
-//
-// When the body contains multi-dot mappings, this helper does a two-phase
-// create:
-//
-//	Phase 1: POST /v2/tasks with inputMappings + inputSchema stripped so the
-//	         strict validator passes. Server returns the assigned alias and
-//	         creates v=1.
-//	Phase 2: POST /v2/tasks/{alias} with the full body. Server bumps to v=2
-//	         with the canonical mappings persisted.
-//
-// Returns the server-assigned alias and final version. In dryRun mode the
-// caller-supplied `ref` is used as the alias and version is 2 if multi-dot
-// (so downstream extraNode positioning matches what real-run produces).
-//
-// Used by both the tasks loop and the extraNodes end branch (the only
-// extraNode that ships with multi-dot mappings is `end` -- see
-// buildEndAutoWiring's altdata branch).
-func postTaskWithMultiDotFallback(c *client.Client, body map[string]any, ref string, dryRun bool, label string) (alias string, version int, err error) {
-	multiDot := taskHasMultiDotMapping(body)
-
-	var firstPhaseBytes []byte
-	if multiDot {
-		stub := shallowCopy(body)
-		delete(stub, "inputMappings")
-		delete(stub, "inputSchema")
-		firstPhaseBytes, err = json.Marshal(stub)
-	} else {
-		firstPhaseBytes, err = json.Marshal(body)
-	}
+// In dryRun mode the caller-supplied `ref` is used as the alias placeholder
+// (so downstream extraNode positioning matches what real-run produces) and
+// the version is always 1.
+func postTask(c *client.Client, body map[string]any, ref string, dryRun bool, label string) (alias string, version int, err error) {
+	bytes, err := json.Marshal(body)
 	if err != nil {
 		return "", 0, fmt.Errorf("encode %s: %w", label, err)
 	}
-	fullBytes, err := json.Marshal(body)
-	if err != nil {
-		return "", 0, fmt.Errorf("encode full %s: %w", label, err)
-	}
 
 	if dryRun {
-		fmt.Fprintf(os.Stderr, "# Would POST /v2/tasks (%s): %s\n", label, string(firstPhaseBytes))
-		if multiDot {
-			fmt.Fprintf(os.Stderr, "# Would POST /v2/tasks/{alias} (%s phase 2 -- multi-dot mappings): %s\n", label, string(fullBytes))
-		}
+		fmt.Fprintf(os.Stderr, "# Would POST /v2/tasks (%s): %s\n", label, string(bytes))
 		if a, _ := body["alias"].(string); a != "" {
 			alias = a
 		} else {
 			alias = ref
 		}
-		version = 1
-		if multiDot {
-			version = 2
-		}
-		return alias, version, nil
+		return alias, 1, nil
 	}
 
-	data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(firstPhaseBytes))
+	data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(bytes))
 	if err != nil {
 		return "", 0, err
 	}
@@ -776,21 +713,6 @@ func postTaskWithMultiDotFallback(c *client.Client, body map[string]any, ref str
 		version = int(v)
 	} else {
 		version = 1
-	}
-
-	if multiDot {
-		path := "/v2/tasks/" + alias
-		v2Data, _, err := c.Do("POST", "borrower_central", path, json.RawMessage(fullBytes))
-		if err != nil {
-			return alias, version, fmt.Errorf("%s phase 2: %w", label, err)
-		}
-		var v2created map[string]any
-		if err := json.Unmarshal(v2Data, &v2created); err != nil {
-			return alias, version, fmt.Errorf("%s phase 2 parse response: %w", label, err)
-		}
-		if v, ok := v2created["version"].(float64); ok {
-			version = int(v)
-		}
 	}
 	return alias, version, nil
 }
@@ -1476,7 +1398,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}
 
-		serverAlias, version, err := postTaskWithMultiDotFallback(
+		serverAlias, version, err := postTask(
 			c, task, ref, dryRun,
 			fmt.Sprintf("tasks[%d] ref=%q", i, ref),
 		)
@@ -1651,7 +1573,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				}
 			}
 
-			alias, version, err := postTaskWithMultiDotFallback(
+			alias, version, err := postTask(
 				c, taskBody, ref, dryRun,
 				fmt.Sprintf("extraNodes[%d] ref=%q (extra-node backing)", i, ref),
 			)
