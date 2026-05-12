@@ -388,13 +388,32 @@ func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bo
 		return err
 	}
 
-	// Caller-supplied keys win; we only fill what's missing. This matches
-	// the rest of the compose normalize contract (the Hub picker auto-syncs
-	// but lets the user override on save).
-	if existing, _ := task["inputSchema"].(map[string]any); len(existing) == 0 && len(info.inputVariables) > 0 {
+	runInBatch, _ := task["runInBatch"].(bool)
+
+	// Caller-supplied keys win on key-PRESENCE (not just non-empty).
+	// `len == 0` collapses missing and explicit `{}` to the same case,
+	// which means an agent that wants to opt out of the auto-fill by
+	// writing `"inputSchema": {}` would still get the auto-fill. Key
+	// presence respects the explicit empty opt-out.
+	_, inputSchemaProvided := task["inputSchema"]
+	_, outputSchemaProvided := task["outputSchema"]
+
+	// Skip the inputSchema fill for runInBatch tasks: BC's batch
+	// dispatcher reads `inputSchema` and treats it as a per-element
+	// validator. When the auto-filled shape inherits `required: true`
+	// fields from the child's typed variables, every dispatch fails with
+	// `Missing required input: <name>` before any child execution
+	// spawns -- even when the array elements DO contain those fields.
+	// (Surfaced by stress test v17.) Keep the fill for single-mode
+	// tasks where the parent's inputMappings populates the per-key
+	// inputs and the runtime validates against them happily.
+	if !inputSchemaProvided && !runInBatch && len(info.inputVariables) > 0 {
 		task["inputSchema"] = info.inputVariables
 	}
-	if existing, _ := task["outputSchema"].(map[string]any); len(existing) == 0 && len(info.outputSchema) > 0 {
+	// outputSchema fill is safe in both modes -- the parent's downstream
+	// tasks consume task_outputs.<this-task>.<field> regardless of how
+	// the child was dispatched, so knowing the shape is purely useful.
+	if !outputSchemaProvided && len(info.outputSchema) > 0 {
 		task["outputSchema"] = info.outputSchema
 	}
 
@@ -402,7 +421,7 @@ func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bo
 	// without a corresponding inputMappings entry will go unset at runtime.
 	// Skip when runInBatch is true -- batch dispatch reads inputs from the
 	// resolved inputExpression, not from inputMappings.
-	if rib, _ := task["runInBatch"].(bool); !rib {
+	if !runInBatch {
 		mappings := asMap(task["inputMappings"])
 		missing := make([]string, 0)
 		for name, raw := range info.inputVariables {
@@ -419,7 +438,7 @@ func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bo
 			}
 		}
 		if len(missing) > 0 {
-			ref, _ := task["__ref"].(string)
+			ref := localRef(task, "")
 			fmt.Fprintf(os.Stderr,
 				"# warning: child-workflow ref=%q executor=%q has required inputs without inputMappings: %v. "+
 					"The child execution will see these as missing at runtime.\n",
