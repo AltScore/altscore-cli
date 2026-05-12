@@ -1045,6 +1045,57 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 			}
 			task["errorMessage"] = out
 		}
+	case "conditional":
+		// Leaf ConditionItems with valueType=="variable" carry a deep ref in
+		// `value` (e.g. task_outputs.<spec-ref>.<deep>). Without this rewrite
+		// the spec-local ref survives compose, the conditional activity tries
+		// to resolve <spec-ref> as a scope, and the comparator falls through
+		// to its zero-value default -- silently mis-routing every branch.
+		branches, _ := task["branches"].([]any)
+		for _, b := range branches {
+			bm, _ := b.(map[string]any)
+			if bm == nil {
+				continue
+			}
+			if err := rewriteRefsInConditionGroup(bm["conditions"], refMap); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// rewriteRefsInConditionGroup walks a ConditionGroup tree (operator + items
+// where each item is either a leaf {field, operator, value, valueType} or
+// another nested group) and rewrites the `value` of every variable-typed
+// leaf via the spec-ref -> server-alias map. Literal-typed values are left
+// alone.
+func rewriteRefsInConditionGroup(node any, refMap map[string]string) error {
+	group, _ := node.(map[string]any)
+	if group == nil {
+		return nil
+	}
+	items, _ := group["items"].([]any)
+	for _, it := range items {
+		im, _ := it.(map[string]any)
+		if im == nil {
+			continue
+		}
+		if _, isGroup := im["items"]; isGroup {
+			if err := rewriteRefsInConditionGroup(im, refMap); err != nil {
+				return err
+			}
+			continue
+		}
+		vt, _ := im["valueType"].(string)
+		if vt != "variable" {
+			continue
+		}
+		s, _ := im["value"].(string)
+		if s == "" {
+			continue
+		}
+		im["value"] = rewriteTaskOutputsRefsInString(s, refMap)
 	}
 	return nil
 }
@@ -2253,6 +2304,16 @@ func preflightTasks(spec *composeSpec) error {
 			if eid == "" && eal == "" {
 				return fmt.Errorf("tasks[%d] (ref=%q): child-workflow task requires 'executorId' or 'executorAlias'", i, ref)
 			}
+			// Server's CreateTaskV2 only declares `executorId`. The runtime
+			// resolves it via find_latest_active_by_alias, so passing a
+			// workflow alias in executorId works. Normalize the spec-only
+			// `executorAlias` key into `executorId` so the persisted task
+			// actually carries the executor pointer (otherwise the key is
+			// silently dropped and the task body has no executor at all).
+			if eid == "" && eal != "" {
+				task["executorId"] = eal
+			}
+			delete(task, "executorAlias")
 			// child-workflow auto-detects single vs batch from the resolved
 			// type of inputExpression (list -> fan-out, dict -> single). The
 			// legacy runInBatch flag and the hardcoded `input_items` context
