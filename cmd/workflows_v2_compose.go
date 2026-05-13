@@ -806,24 +806,27 @@ func templateDependencyRefs(task map[string]any) []string {
 }
 
 // rewriteRefsInMappings replaces leading spec-local refs in mapping values
-// with the server-assigned alias from refMap. Handles both forms:
-//   - canonical "<taskRef>.<outputName>" (rewritten to
-//     "task_outputs.<server-alias>.<outputName>" so the runtime resolver's
-//     namespace check passes -- a bare ref head fails at execute time with
-//     "Unknown variable namespace")
-//   - long "task_outputs.<taskRef>.<field>" -> "task_outputs.<server-alias>.<field>"
+// with the server-assigned alias from refMap. Spec refs are the
+// human-friendly names the spec assigns to each task (`ref` / `alias` /
+// `nodeId` fallback); the server picks a slug-NNNNNN alias on create that we
+// must substitute in so downstream tasks reference the correct stored alias.
+//
+// Two shapes are recognised:
+//   - long  "task_outputs.<taskRef>.<field>" -> "task_outputs.<server-alias>.<field>"
+//   - bare  "<taskRef>.<field>"              -> "<server-alias>.<field>"
+//
+// Both forms are accepted by the BC runtime resolver -- bare form is the
+// implicit task_outputs.<alias> shortcut (PR #1269 / borrower-central feature
+// branch feat/workflows-v2-resolver-bare-alias-refs). We no longer rewrite
+// bare form to the long form; the server-side resolver expands it.
 //
 // Reserved scopes (inputs, custom, system, task_outputs, task_outputs_by_type)
 // are never treated as refs.
 //
 // Errors when a mapping value has a path-like shape whose head is neither a
-// reserved scope nor a known ref. Previously this was a silent pass-through
-// that produced runtime "Unknown variable namespace" failures on execute --
-// for example, a task whose inputMappings referenced a downstream task that
-// hadn't been created yet (typical when the spec listed tasks in non-
-// topological order). composeWorkflowBody now sorts tasks topologically
-// before this runs, so a remaining unknown ref is always either a typo or a
-// reference to a task that simply isn't in spec.tasks.
+// reserved scope nor a known ref. composeWorkflowBody sorts tasks
+// topologically before this runs, so a remaining unknown ref is always either
+// a typo or a reference to a task that simply isn't in spec.tasks.
 func rewriteRefsInMappings(mappings map[string]any, refMap map[string]string) (map[string]any, error) {
 	if len(mappings) == 0 {
 		return mappings, nil
@@ -850,23 +853,22 @@ func rewriteRefsInMappings(mappings map[string]any, refMap map[string]string) (m
 				}
 			}
 		} else if dot := strings.Index(s, "."); dot > 0 {
-			// Bare <ref>.<rest> -- rewrite to task_outputs.<alias>.<rest>.
+			// Bare <ref>.<rest> -- substitute the head with the server-assigned
+			// alias and leave the rest in bare form. BC's resolver treats bare
+			// alias.<field> as implicit task_outputs.<alias>.<field>.
 			head := s[:dot]
 			if !reservedMappingScopes[head] {
 				if alias, found := refMap[head]; found {
-					s = "task_outputs." + alias + s[dot:]
+					s = alias + s[dot:]
 				} else if isServerAlias(head) {
-					// User supplied a server-style alias directly (e.g. wired
-					// into an externally-created entity). Wrap with the
-					// task_outputs. namespace so the runtime resolves it.
-					s = "task_outputs." + s
+					// User supplied a server-style alias directly -- leave it.
+					// BC's resolver matches it against task_outputs at runtime.
 				} else {
 					return nil, fmt.Errorf(
 						"inputMappings[%q]=%q has head %q which is neither a reserved namespace "+
-							"nor a known spec ref nor a server alias (slug-NNNNNN). At execute time the "+
-							"runtime resolver fails with 'Unknown variable namespace: %s'. "+
+							"nor a known spec ref nor a server alias (slug-NNNNNN). "+
 							"Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type.)",
-						k, v, head, head, sortedRefMapKeys(refMap))
+						k, v, head, sortedRefMapKeys(refMap))
 				}
 			}
 		}
@@ -909,9 +911,9 @@ func rewriteTaskOutputsRefsInString(s string, refMap map[string]string) string {
 // expression looks like a spec-local ref reference. The rewrite mirrors
 // rewriteRefsInMappings:
 //   - {{task_outputs.<ref>.<deep>}} -> {{task_outputs.<server-alias>.<deep>}}
-//   - {{<ref>.<rest>}} (bare)       -> {{task_outputs.<server-alias>.<rest>}}
+//   - {{<ref>.<rest>}} (bare)       -> {{<server-alias>.<rest>}} (head substitution only)
 //   - {{<reserved-scope>...}}        -> unchanged (inputs/custom/system/...)
-//   - {{<server-alias>...}}          -> wrapped with task_outputs. prefix
+//   - {{<server-alias>...}}          -> unchanged (BC resolver accepts bare form)
 //
 // Returns an error if a placeholder's head is neither a reserved scope nor a
 // known spec ref nor a server alias -- a typo or stale reference would
@@ -922,7 +924,12 @@ func rewriteTaskOutputsRefsInString(s string, refMap map[string]string) string {
 // mappingDependencyRef + topologicalTaskOrder for ordering, so a task whose
 // http url uses {{<downstream-task>.<field>}} gets ordered correctly, the
 // rewrite runs after refMap has the downstream alias, and the persisted
-// task body has the canonical form.
+// task body has the (now bare-or-canonical) form.
+//
+// Bare-form output is supported by BC's variable resolver (the resolver
+// expands `{{<alias>.<field>}}` to the implicit
+// `{{task_outputs.<alias>.<field>}}` at execute time), so we no longer
+// re-wrap bare heads with the task_outputs. prefix.
 func rewriteRefsInTemplate(s string, refMap map[string]string) (string, error) {
 	if !strings.Contains(s, "{{") {
 		return s, nil
@@ -966,12 +973,15 @@ func rewriteRefsInTemplate(s string, refMap map[string]string) (string, error) {
 		if reservedMappingScopes[head] {
 			return match
 		}
-		// Bare <ref>.<rest> -> rewrite.
+		// Bare <ref>.<rest> -> substitute head, keep bare form. The BC
+		// runtime resolver expands `<alias>.<field>` to the implicit
+		// `task_outputs.<alias>.<field>`.
 		if alias, found := refMap[head]; found {
-			return "{{task_outputs." + alias + inner[dot:] + "}}"
+			return "{{" + alias + inner[dot:] + "}}"
 		}
 		if isServerAlias(head) {
-			return "{{task_outputs." + inner + "}}"
+			// Already a server alias in bare form -- BC handles it directly.
+			return match
 		}
 		// Unknown head -- error so the user sees the typo before runtime
 		// silently substitutes nothing.
