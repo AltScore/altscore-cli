@@ -374,13 +374,18 @@ func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bo
 	return nil
 }
 
+// normalizeAltdataTask normalises altdata-enrichment task bodies:
+// stamps default packageAlias / dataAge on each sourcesConfig entry and
+// fills the runtime defaults (mode, savePackages, timeout). The
+// inputKeys auto-fill has moved to BC's DerivedInputKeysService and is
+// exposed at GET /v2/tasks time via the ``derivedInputKeys`` field.
+// Authored ``inputKeys`` on the task body are still respected by the
+// runtime activity -- the derivation is a display-only fallback.
 func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) error {
 	sources := asSlice(task["sourcesConfig"])
 	if len(sources) == 0 {
 		return nil
 	}
-
-	inputKeys := asMap(task["inputKeys"])
 
 	// Default packageAlias / dataAge on each sourcesConfig entry.
 	for i, s := range sources {
@@ -399,41 +404,6 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 		sources[i] = sm
 	}
 	task["sourcesConfig"] = sources
-
-	// inputKeys auto-fill (different concern from inputSchema fill that
-	// moved to BC's DerivedSchemaService): the runtime activity reads the
-	// per-source required fields from inputKeys, and an agent that omits
-	// inputKeys ends up with an unwired source the first time someone
-	// runs the workflow. Look the source up once per id and wire one
-	// entry per required field. inputSchema is no longer touched here --
-	// it's computed server-side at GET /v2/tasks time.
-	seenInput := map[string]bool{}
-	derivedInputKeys := len(inputKeys) == 0
-	for _, s := range sources {
-		sm, ok := s.(map[string]any)
-		if !ok {
-			continue
-		}
-		sid, _ := sm["sourceId"].(string)
-		ver, _ := sm["version"].(string)
-		if sid == "" || !derivedInputKeys {
-			continue
-		}
-		fields, err := lookupAltdataSourceInputFields(c, sid, ver, dryRun)
-		if err != nil {
-			return fmt.Errorf("could not look up source %s %s: %w", sid, ver, err)
-		}
-		for _, f := range fields {
-			if seenInput[f] {
-				continue
-			}
-			seenInput[f] = true
-			inputKeys[f] = "{{" + f + "}}"
-		}
-	}
-	if derivedInputKeys && len(inputKeys) > 0 {
-		task["inputKeys"] = inputKeys
-	}
 
 	if _, has := task["mode"]; !has {
 		task["mode"] = "single"
@@ -486,65 +456,15 @@ func normalizeComputeVariablesTask(task map[string]any, customVariables map[stri
 	return nil
 }
 
-// altdataSourceInputFieldsCache memoizes /v2/workflows/sources-status
-// results within a single compose run so a multi-source task only fetches
-// once. The full per-source outputSchema is no longer consumed here --
-// derivedSchema lives on BC.
-var altdataSourceInputFieldsCache = map[string][]string{}
-
-// lookupAltdataSourceInputFields fetches a source's required input field
-// names from /v2/workflows/sources-status. Used by normalizeAltdataTask to
-// auto-populate inputKeys (a runtime wiring concern -- distinct from
-// schema derivation, which is now server-side).
-func lookupAltdataSourceInputFields(c *client.Client, sourceID, version string, dryRun bool) ([]string, error) {
-	cacheKey := sourceID + "|" + version
-	if cached, ok := altdataSourceInputFieldsCache[cacheKey]; ok {
-		return cached, nil
-	}
-	if c == nil {
-		if dryRun {
-			fmt.Fprintf(os.Stderr, "# (dry-run) skipping live source lookup for %s %s; assuming personId/taxId\n", sourceID, version)
-			return []string{"personId", "taxId"}, nil
-		}
-		return nil, fmt.Errorf("no client available for source lookup")
-	}
-	q := url.Values{}
-	q.Set("per-page", "200")
-	data, _, err := c.Do("GET", "borrower_central", "/v2/workflows/sources-status?"+q.Encode(), nil)
-	if err != nil {
-		if dryRun {
-			fmt.Fprintf(os.Stderr, "# (dry-run) source lookup failed for %s %s (%v); using stub\n", sourceID, version, err)
-			return []string{"personId", "taxId"}, nil
-		}
-		return nil, err
-	}
-	var sources []map[string]any
-	if err := json.Unmarshal(data, &sources); err != nil {
-		return nil, fmt.Errorf("parse sources-status: %w", err)
-	}
-	for _, s := range sources {
-		sid, _ := s["sourceId"].(string)
-		sver, _ := s["sourceVersion"].(string)
-		if sid != sourceID {
-			continue
-		}
-		if version != "" && sver != version {
-			continue
-		}
-		fields := asSlice(s["inputFields"])
-		fieldNames := make([]string, 0, len(fields))
-		for _, f := range fields {
-			fm, _ := f.(map[string]any)
-			if name, _ := fm["field"].(string); name != "" {
-				fieldNames = append(fieldNames, name)
-			}
-		}
-		altdataSourceInputFieldsCache[cacheKey] = fieldNames
-		return fieldNames, nil
-	}
-	return nil, fmt.Errorf("source %s %s not found in sources-status", sourceID, version)
-}
-
+// normalizeConditionalTask fills in defaults (branch ids, order, label) and
+// shuffles the isElse branch to the end of the slice. The legacy-shape
+// rejections (branch.expression, branch.is_else snake_case, missing isElse,
+// missing structured conditions) now live server-side on
+// CreateTaskV2._reject_legacy_conditional_shapes -- a direct POST to
+// /v2/tasks with any of those shapes is a 400 either way, so the CLI
+// duplicating the check stopped earning its keep. We still validate the
+// conditions object shape here so compose can surface a clear error before
+// the network call, but the legacy-rewrite branches are gone.
 func normalizeConditionalTask(task map[string]any) error {
 	branches := asSlice(task["branches"])
 	if len(branches) == 0 {
@@ -781,8 +701,11 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *com
 // MappingTableEntry pydantic model requires it). The per-entry outputSchema
 // fill (3 canonical outputs per entry) has moved to BC's
 // DerivedSchemaService and is exposed at GET /v2/tasks time via the
-// ``derivedSchema`` field. Top-level inputMappings mirroring is preserved
-// because it controls runtime wiring, not schema display.
+// ``derivedSchema`` field. Top-level inputMappings mirroring has likewise
+// moved to BC's DerivedMappingEntriesService and is exposed via the
+// ``derivedMappingEntries`` field -- the runtime activity reads
+// entries[].inputVariable directly, so the mirror was never required for
+// execution, only for the Hub's mapping picker.
 func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
 	var inputVars map[string]any
@@ -888,43 +811,13 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *comp
 	}
 	cfg["entries"] = entries
 	task["mappingTableConfig"] = cfg
-
-	// Mirror per-entry inputVariables into the task's top-level inputMappings.
-	// The runtime activity resolves entries[].inputVariable directly; the
-	// mirroring keeps a stale Hub-UI rendering quirk happy (the panel shows
-	// "N entries" but expanded properties read from top-level
-	// inputMappings). Mirroring is per-field-name extracted from
-	// inputVariable's last dotted segment.
-	mirrorEntryInputsToTopLevel(task, entries)
+	// Top-level inputMappings mirroring has moved to BC's
+	// DerivedMappingEntriesService (exposed at GET /v2/tasks via
+	// ``derivedMappingEntries``). The runtime activity reads
+	// entries[].inputVariable directly, so this mirror was always a
+	// display-only concern -- the Hub picker now consumes the derived
+	// field instead of relying on the CLI to pre-fill the persisted body.
 	return nil
-}
-
-// mirrorEntryInputsToTopLevel ensures the task's top-level inputMappings
-// reflect every entry's inputVariable. The runtime activity resolves
-// entries[].inputVariable directly, but keeping inputMappings in sync at
-// the top level matches the Hub editor's persisted shape. Caller-supplied
-// entries in inputMappings are preserved. inputSchema is no longer touched
-// here -- derived server-side at GET /v2/tasks time.
-func mirrorEntryInputsToTopLevel(task map[string]any, entries []any) {
-	mappings := asMap(task["inputMappings"])
-	for _, e := range entries {
-		em, ok := e.(map[string]any)
-		if !ok {
-			continue
-		}
-		inVar, _ := em["inputVariable"].(string)
-		if inVar == "" {
-			continue
-		}
-		field := inVar
-		if idx := strings.LastIndex(inVar, "."); idx >= 0 {
-			field = inVar[idx+1:]
-		}
-		if _, has := mappings[field]; !has {
-			mappings[field] = inVar
-		}
-	}
-	task["inputMappings"] = mappings
 }
 
 // normalizeScorecardTask validates that scorecardConfig references an
