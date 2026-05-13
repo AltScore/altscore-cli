@@ -281,231 +281,19 @@ func edgeEndpoints(e map[string]any) (from, to string) {
 	return from, to
 }
 
-// endNodeBilliableIDSchema is the canonical billable_id slot the Hub end-task
-// plugin adds to every end node. We mirror it byte-for-byte so compose's end
-// task matches a Hub-recreated one.
-var endNodeBilliableIDSchema = map[string]any{
-	"description": "Optional billable identifier, default Customer ID",
-	"title":       "Billable ID",
-	"type":        "string",
-}
-
-// pdfTitleByType is the section title the PDF report editor uses for each
-// supported ancestor type. Verified against a Hub-recreated end task: titles
-// are the type's display name, NOT the upstream task's label (with one
-// exception: altdata uses the literal string "AltData").
-var pdfTitleByType = map[string]string{
-	"altdata-enrichment": "AltData",
-	"scorecard":          "Scorecard",
-	"mapping-table":      "Mapping Table",
-	"rule-tree":          "Rule Tree",
-	"evaluate-rules":     "Evaluate Rules",
-}
-
-// buildEndAutoWiring returns the four end-node task fields the Hub auto-wires
-// when an end node is dropped on a canvas with credit-decisioning predecessors:
+// (buildEndAutoWiring + endNodeBilliableIDSchema + pdfTitleByType deleted.)
+// The compose-time PDF source pre-fill was migrated to runtime in
+// borrower-central's end_activity: when endConfig.pdfConfig.enabled=true
+// but sourcesConfig is empty, the runtime walks the workflow graph
+// upstream from the end node and auto-resolves sections from recognised
+// ancestor types (altdata-enrichment, scorecard, mapping-table,
+// rule-tree, evaluate-rules). Agents can flip pdfConfig.enabled=true
+// without needing to understand the ancestor graph.
 //
-//	inputSchema   -- one entry per ancestor type, plus the canonical
-//	                 billable_id slot. Verified byte-for-byte against a
-//	                 Hub-recreated end task in production.
-//	inputMappings -- matching entries pointing at task_outputs.<alias>(.<deep>)
-//	pdfSections   -- the endConfig.pdfConfig.sourcesConfig array. WITHOUT
-//	                 this, the end task ships with endConfig:null and the
-//	                 PDF generator sees no enabled config -- the report
-//	                 silently doesn't render. This was the root cause of the
-//	                 user's "PDF didn't come out" report on the first
-//	                 compose-generated workflow.
-//	hasAltdata    -- whether at least one ancestor is altdata-enrichment.
-//	                 Returned for the call site's awareness; no longer
-//	                 needed to switch on a two-phase create (CreateTaskV2
-//	                 accepts multi-dot inputMappings since the validator
-//	                 was relaxed -- see borrower-central
-//	                 app/model/workflows_v2/task_schemas.py).
-//
-// Mirrors `buildSectionsFromPredecessors` in
-// altscore-ai-chat/lib/stores/workflow-builder-v2/actions/edge/pdf-data-source-auto-mapping.ts.
-// Walks ALL transitive ancestors via BFS over incoming edges (matches the
-// Hub's getPredecessorsSorted), not just direct parents.
-//
-// Five upstream task types are recognised: altdata-enrichment, scorecard,
-// mapping-table, rule-tree, evaluate-rules. Other predecessor types are
-// skipped silently (matches Hub). All return slices/maps are non-nil so
-// callers can use len() unconditionally.
-func buildEndAutoWiring(endRef string, edges []map[string]any, taskByRef map[string]map[string]any, refMap map[string]string) (inputSchema, inputMappings map[string]any, pdfSections []map[string]any, hasAltdata bool) {
-	inputSchema = map[string]any{
-		"billable_id": endNodeBilliableIDSchema,
-	}
-	inputMappings = map[string]any{}
-	pdfSections = []map[string]any{}
-
-	// BFS over incoming edges starting from endRef. Direct parents come first
-	// (they're at depth 1) but we accumulate every ancestor in `visited` so
-	// the end task sees outputs from every upstream credit-decisioning task.
-	parents := map[string][]string{}
-	for _, e := range edges {
-		from, to := edgeEndpoints(e)
-		if from == "" || to == "" {
-			continue
-		}
-		parents[to] = append(parents[to], from)
-	}
-	visited := map[string]bool{endRef: true}
-	queue := append([]string{}, parents[endRef]...)
-	ancestors := []string{}
-	for len(queue) > 0 {
-		ref := queue[0]
-		queue = queue[1:]
-		if visited[ref] {
-			continue
-		}
-		visited[ref] = true
-		ancestors = append(ancestors, ref)
-		queue = append(queue, parents[ref]...)
-	}
-
-	for _, ancestorRef := range ancestors {
-		predTask, hasTask := taskByRef[ancestorRef]
-		predAlias := refMap[ancestorRef]
-		if !hasTask || predAlias == "" {
-			continue
-		}
-		predType, _ := predTask["type"].(string)
-		predLabel, _ := predTask["label"].(string)
-		if predLabel == "" {
-			predLabel = predAlias
-		}
-
-		// section is the per-ancestor entry that lands in
-		// endConfig.pdfConfig.sourcesConfig. Title comes from pdfTitleByType
-		// (matches Hub's persisted shape -- generic display names, not the
-		// upstream task's label). Subtitle uses the upstream label so the
-		// rendered PDF is still self-describing.
-		title, ok := pdfTitleByType[predType]
-		if !ok {
-			continue // unrecognised type; skip silently like the Hub
-		}
-		var sourceInputSchema string
-		var mappingValue string
-		var components []map[string]any
-
-		switch predType {
-		case "altdata-enrichment":
-			sourceInputSchema = "sources_output_packages_" + predAlias
-			mappingValue = "task_outputs." + predAlias + ".sources_output_packages"
-			hasAltdata = true
-			// One component per source in the upstream's sourcesConfig.
-			for _, raw := range asSlice(predTask["sourcesConfig"]) {
-				s, _ := raw.(map[string]any)
-				if s == nil {
-					continue
-				}
-				sid, _ := s["sourceId"].(string)
-				ver, _ := s["version"].(string)
-				if ver == "" {
-					ver = "v1"
-				}
-				components = append(components, map[string]any{
-					"id":             newUUIDv4(),
-					"name":           sid + "_" + ver,
-					"altdataPackage": sid,
-				})
-			}
-
-		case "scorecard":
-			sourceInputSchema = "scorecard_result_" + predAlias
-			mappingValue = "task_outputs." + predAlias
-			cfg, _ := predTask["scorecardConfig"].(map[string]any)
-			totalVar := "total_score"
-			breakdownVar := "score_breakdown"
-			if cfg != nil {
-				if v, _ := cfg["totalScoreVariable"].(string); v != "" {
-					totalVar = v
-				}
-				if v, _ := cfg["breakdownVariable"].(string); v != "" {
-					breakdownVar = v
-				}
-			}
-			components = append(components, map[string]any{
-				"id":                 newUUIDv4(),
-				"name":               "scorecardResult",
-				"totalScoreVariable": totalVar,
-				"breakdownVariable":  breakdownVar,
-			})
-
-		case "mapping-table":
-			sourceInputSchema = "mapping_table_result_" + predAlias
-			mappingValue = "task_outputs." + predAlias
-			cfg, _ := predTask["mappingTableConfig"].(map[string]any)
-			outputVariables := []map[string]any{}
-			if cfg != nil {
-				for _, raw := range asSlice(cfg["entries"]) {
-					em, _ := raw.(map[string]any)
-					v, _ := em["outputVariable"].(string)
-					if v == "" {
-						continue
-					}
-					outputVariables = append(outputVariables, map[string]any{
-						"variable": v,
-						"label":    v,
-					})
-				}
-			}
-			components = append(components, map[string]any{
-				"id":              newUUIDv4(),
-				"name":            "mappingTableResult",
-				"outputVariables": outputVariables,
-			})
-
-		case "rule-tree":
-			sourceInputSchema = "rule_tree_result_" + predAlias
-			mappingValue = "task_outputs." + predAlias
-			cfg, _ := predTask["ruleTreeConfig"].(map[string]any)
-			outVar := "decision"
-			if cfg != nil {
-				if v, _ := cfg["outputVariable"].(string); v != "" {
-					outVar = v
-				}
-			}
-			components = append(components, map[string]any{
-				"id":             newUUIDv4(),
-				"name":           "ruleTreeResult",
-				"outputVariable": outVar,
-			})
-
-		case "evaluate-rules":
-			sourceInputSchema = "evaluate_rules_result_" + predAlias
-			mappingValue = "task_outputs." + predAlias
-			components = append(components, map[string]any{
-				"id":   newUUIDv4(),
-				"name": "evaluateRulesResult",
-			})
-		}
-
-		inputSchema[sourceInputSchema] = map[string]any{"type": "object", "title": predLabel}
-		inputMappings[sourceInputSchema] = mappingValue
-
-		// PDF section. type=altdata-enrichment maps to PDF type='altdata' (the
-		// renderer's discriminator drops the suffix). All other types pass
-		// through verbatim.
-		pdfType := predType
-		if pdfType == "altdata-enrichment" {
-			pdfType = "altdata"
-		}
-		pdfSections = append(pdfSections, map[string]any{
-			"id":                newUUIDv4(),
-			"type":              pdfType,
-			"title":             title,
-			"subtitle":          "From " + predLabel,
-			"enabled":           true,
-			"page_break":        true,
-			"sourceInputSchema": sourceInputSchema,
-			"taskAlias":         predAlias,
-			"components":        components,
-		})
-	}
-
-	return inputSchema, inputMappings, pdfSections, hasAltdata
-}
+// inputSchema / inputMappings auto-wiring for the Hub canvas continues
+// to be derived client-side by
+// altscore-ai-chat/lib/stores/workflow-builder-v2/actions/edge/pdf-data-source-auto-mapping.ts
+// when the workflow loads.
 
 // readSpecHTMLSections extracts the spec-only `htmlSections` field from an
 // extraNode. Returns nil when the field is absent or shaped wrong (compose
@@ -1396,15 +1184,6 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 	// refMap: spec-local reference -> server-assigned alias.
 	refMap := map[string]string{}
 
-	// taskByRef: spec-local reference -> task body. Captured BEFORE the task
-	// loop strips `ref` so the end-node auto-wiring (run later from the
-	// extraNodes loop) can look up each predecessor's task body to read its
-	// type, label, and config (scorecardConfig.totalScoreVariable, etc.).
-	taskByRef := map[string]map[string]any{}
-	for i, t := range spec.Tasks {
-		taskByRef[localRef(t, fmt.Sprintf("t%d", i))] = t
-	}
-
 	// Topologically sort task creation order so cross-task inputMappings
 	// always resolve at the time we POST each task. Without this, a task
 	// listed in spec.tasks BEFORE the task it references would have a bare
@@ -1581,29 +1360,41 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				"type":  nodeType,
 			}
 			if strings.ToLower(nodeType) == "end" {
-				inSchema, inMappings, pdfSections, _ := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap)
+				// Data-source ancestors (altdata-enrichment, scorecard,
+				// mapping-table, rule-tree, evaluate-rules) used to be
+				// walked here and pre-filled into endConfig.pdfConfig
+				// .sourcesConfig (the ~180-LOC buildEndAutoWiring). That
+				// walker now lives at runtime in borrower-central's
+				// end_activity, which auto-resolves sources from the
+				// workflow graph whenever pdfConfig.enabled=true but
+				// sourcesConfig is empty. Agents can flip enabled=true
+				// without also pre-populating the array.
+				//
+				// inputSchema / inputMappings auto-wiring for the Hub
+				// canvas is similarly handled client-side by
+				// pdf-data-source-auto-mapping.ts when the workflow is
+				// loaded into the builder.
+				inSchema := map[string]any{}
+				inMappings := map[string]any{}
+				var pdfSections []map[string]any
 
 				// Spec extension: per-end-node htmlSections render as
-				// additional PDF sections at the top of the report (before
-				// the auto-wired data-source sections). Each section
-				// interpolates {var} tokens against the end task's resolved
-				// context at runtime; compose auto-wires the inputMappings
-				// for any input or custom variable referenced in the
-				// content, so safe_format finds them. Task-output references
+				// PDF sections in the report. Each section interpolates
+				// {var} tokens against the end task's resolved context
+				// at runtime; compose auto-wires the inputMappings for
+				// any input or custom variable referenced in the content
+				// so safe_format finds them. Task-output references
 				// (e.g. {credit_score}) need no wiring -- end_activity
-				// promotes upstream task outputs to root in enriched_context.
+				// promotes upstream task outputs to root in
+				// enriched_context.
 				if rawSections := readSpecHTMLSections(n); len(rawSections) > 0 {
 					built, htmlSchema, htmlMappings := buildHTMLSections(rawSections, spec.InputVariables, spec.CustomVariables)
-					pdfSections = append(built, pdfSections...)
+					pdfSections = append(pdfSections, built...)
 					for k, v := range htmlSchema {
-						if _, exists := inSchema[k]; !exists {
-							inSchema[k] = v
-						}
+						inSchema[k] = v
 					}
 					for k, v := range htmlMappings {
-						if _, exists := inMappings[k]; !exists {
-							inMappings[k] = v
-						}
+						inMappings[k] = v
 					}
 				}
 				// htmlSections is spec sugar, not part of the API node shape.
@@ -1615,21 +1406,20 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				if len(inMappings) > 0 {
 					taskBody["inputMappings"] = inMappings
 				}
-				// Build endConfig from per-end-node spec input + auto-wired
-				// PDF sections. Caller-supplied fields under
-				// `extraNodes[].endConfig` (decisionConfig, outputJson,
-				// pdfConfig title/subtitle/brandLogo, etc.) are preserved
-				// verbatim; we only auto-fill the pieces compose has
-				// canonical knowledge of (pdfConfig.enabled +
-				// pdfConfig.sourcesConfig from upstream PDF data sources).
+				// Build endConfig from per-end-node spec input. Caller-
+				// supplied fields under `extraNodes[].endConfig`
+				// (decisionConfig, outputJson, pdfConfig title/subtitle/
+				// brandLogo, etc.) are preserved verbatim; compose only
+				// auto-fills pdfConfig.enabled=true (so the runtime
+				// generator turns on) and any htmlSections-derived
+				// entries the spec asked for.
 				//
 				// pdfConfig.enabled=true is what actually flips the PDF
 				// generator on. Without it, the runtime end_activity sees
-				// endConfig=null and skips report rendering entirely -- the
-				// failure mode the user hit on the first compose-generated
-				// workflow ("PDF didn't come out"). Same for decisionConfig:
-				// if the spec sets `enabled: true, decisionType: "final"`,
-				// the runtime records the rule-tree decision via
+				// endConfig=null and skips report rendering entirely.
+				// Same for decisionConfig: if the spec sets `enabled:
+				// true, decisionType: "final"`, the runtime records the
+				// rule-tree decision via
 				// /v1/executions/{id}/decisions; if compose silently
 				// stripped that to null, decisions never persist.
 				userEndCfg, _ := n["endConfig"].(map[string]any)
@@ -1641,7 +1431,10 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 					userPdfCfg = map[string]any{}
 				}
 				// Compose-canonical PDF defaults (overridden by user when
-				// supplied via spec).
+				// supplied via spec). sourcesConfig is left empty -- the
+				// runtime auto-resolves ancestor sections when this stays
+				// empty AND pdfConfig.enabled=true. htmlSections-derived
+				// entries (if any) are added below.
 				pdfDefaults := map[string]any{
 					"brandLogo":             nil,
 					"enabled":               true,
@@ -1654,10 +1447,6 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				for k, v := range userPdfCfg {
 					pdfDefaults[k] = v
 				}
-				// User-supplied sourcesConfig is APPENDED after compose's
-				// auto-wired sections; spec authors who want to swap order
-				// should override sourcesConfig wholesale (their value
-				// takes precedence above already).
 				endCfgOut := map[string]any{
 					"decisionConfig": userEndCfg["decisionConfig"], // may be nil; spec passes through
 					"outputJson":     "",
@@ -1734,21 +1523,16 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		if _, hasData := n["data"]; !hasData {
 			n["data"] = map[string]any{}
 		}
-		// Mirror Hub: end nodes carry isEndNode + inputMappings on node.data
-		// in addition to their backing task body. Task body powers the runtime
-		// (end_activity.py reads from there); node.data powers the canvas
-		// renderer and the PDF editor's section picker.
+		// Mirror Hub: end nodes carry isEndNode on node.data so the canvas
+		// renderer flags them as terminal. inputMappings auto-wiring for the
+		// PDF editor's section picker is now derived client-side by the
+		// Hub (pdf-data-source-auto-mapping.ts) when the workflow loads.
 		if strings.ToLower(nodeType) == "end" {
 			data, _ := n["data"].(map[string]any)
 			if data == nil {
 				data = map[string]any{}
 			}
 			data["isEndNode"] = true
-			if _, hasMappings := data["inputMappings"]; !hasMappings {
-				if _, inMappings, _, _ := buildEndAutoWiring(ref, spec.Edges, taskByRef, refMap); len(inMappings) > 0 {
-					data["inputMappings"] = inMappings
-				}
-			}
 			n["data"] = data
 		}
 		allNodes = append(allNodes, n)
