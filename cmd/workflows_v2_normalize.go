@@ -294,45 +294,28 @@ func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNorma
 	return nil
 }
 
-// childWorkflowInfo carries what a child-workflow caller needs to fill the
-// parent task body: the child's typed input variables (used as the parent
-// task's inputSchema -- mirrors what the Hub picker writes via
-// applyAutoUpdate) and the end task's inputSchema (used as the parent
-// task's outputSchema, because the end task receives what the child
-// workflow emits, so its input shape is the child's output shape).
-type childWorkflowInfo struct {
-	inputVariables map[string]any
-	outputSchema   map[string]any
-}
+// childInputVariablesCache memoizes /v2/workflows/<alias>/latest within a
+// single compose run for the single remaining purpose: surfacing a stderr
+// warning when a single-mode child-workflow has required inputs that the
+// parent task's inputMappings doesn't cover. Schema fill is now done
+// server-side at GET /v2/tasks time (DerivedSchemaService) so the CLI no
+// longer mirrors child inputSchema / outputSchema into the parent body.
+var childInputVariablesCache = map[string]map[string]any{}
 
-// childWorkflowLookupCache memoizes /v2/workflows/<alias>/latest +
-// /v2/tasks/<endTaskAlias> within a single compose run so multiple
-// child-workflow tasks pointing at the same executor don't refetch.
-var childWorkflowLookupCache = map[string]*childWorkflowInfo{}
-
-func lookupChildWorkflow(c *client.Client, alias string, dryRun bool) (*childWorkflowInfo, error) {
-	if cached, ok := childWorkflowLookupCache[alias]; ok {
+func lookupChildInputVariables(c *client.Client, alias string, dryRun bool) (map[string]any, error) {
+	if cached, ok := childInputVariablesCache[alias]; ok {
 		return cached, nil
 	}
 	if c == nil {
 		if dryRun {
-			fmt.Fprintf(os.Stderr, "# (dry-run) skipping live child-workflow lookup for %q; inputSchema/outputSchema fill will be empty\n", alias)
-			return &childWorkflowInfo{
-				inputVariables: map[string]any{},
-				outputSchema:   map[string]any{},
-			}, nil
+			return map[string]any{}, nil
 		}
 		return nil, fmt.Errorf("no client available for child-workflow lookup")
 	}
-	wfPath := "/v2/workflows/" + alias + "/latest"
-	data, _, err := c.Do("GET", "borrower_central", wfPath, nil)
+	data, _, err := c.Do("GET", "borrower_central", "/v2/workflows/"+alias+"/latest", nil)
 	if err != nil {
 		if dryRun {
-			fmt.Fprintf(os.Stderr, "# (dry-run) child-workflow lookup failed for %q (%v); skipping inputSchema/outputSchema fill\n", alias, err)
-			return &childWorkflowInfo{
-				inputVariables: map[string]any{},
-				outputSchema:   map[string]any{},
-			}, nil
+			return map[string]any{}, nil
 		}
 		return nil, fmt.Errorf("look up child workflow %q: %w", alias, err)
 	}
@@ -340,124 +323,54 @@ func lookupChildWorkflow(c *client.Client, alias string, dryRun bool) (*childWor
 	if err := json.Unmarshal(data, &wf); err != nil {
 		return nil, fmt.Errorf("parse child workflow %q: %w", alias, err)
 	}
-	info := &childWorkflowInfo{
-		inputVariables: asMap(wf["inputVariables"]),
-		outputSchema:   map[string]any{},
-	}
-
-	// Find the end node -> fetch its task -> use its inputSchema as the
-	// parent's outputSchema. Matches the Hub picker behavior:
-	// selectedWorkflowDetails -> find node.type=="end" -> getTaskByAlias ->
-	// applyAutoUpdate({ outputSchema: endTask.inputSchema }).
-	nodes := asSlice(wf["nodes"])
-	var endTaskAlias string
-	for _, n := range nodes {
-		nm, _ := n.(map[string]any)
-		if nm == nil {
-			continue
-		}
-		if t, _ := nm["type"].(string); t == "end" {
-			if a, _ := nm["taskAlias"].(string); a != "" {
-				endTaskAlias = a
-				break
-			}
-		}
-	}
-	if endTaskAlias != "" {
-		taskPath := "/v2/tasks/" + endTaskAlias
-		td, _, terr := c.Do("GET", "borrower_central", taskPath, nil)
-		if terr != nil {
-			if !dryRun {
-				fmt.Fprintf(os.Stderr, "# warning: end-task lookup failed for child workflow %q end=%q (%v); skipping outputSchema fill\n", alias, endTaskAlias, terr)
-			}
-		} else {
-			var endTask map[string]any
-			if jerr := json.Unmarshal(td, &endTask); jerr == nil {
-				info.outputSchema = asMap(endTask["inputSchema"])
-			}
-		}
-	}
-
-	childWorkflowLookupCache[alias] = info
-	return info, nil
+	iv := asMap(wf["inputVariables"])
+	childInputVariablesCache[alias] = iv
+	return iv, nil
 }
 
-// normalizeChildWorkflowTask fills the parent task body's inputSchema and
-// outputSchema from the referenced child workflow (matches what the Hub
-// picker does via applyAutoUpdate) and validates batch-mode fields.
-// preflightTasks already renamed executorAlias -> executorId; by the time
-// this runs the alias lives on `executorId`.
+// normalizeChildWorkflowTask warns when a single-mode child-workflow's
+// required inputs aren't covered by the parent's inputMappings. The
+// inputSchema / outputSchema fill that this normalizer used to perform now
+// lives in BC's DerivedSchemaService and surfaces at GET /v2/tasks time as
+// ``derivedSchema``. preflightTasks already renamed executorAlias ->
+// executorId; by the time this runs the alias lives on ``executorId``.
 func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bool) error {
 	executor, _ := task["executorId"].(string)
 	if executor == "" {
 		return nil
 	}
-	info, err := lookupChildWorkflow(c, executor, dryRun)
+	runInBatch, _ := task["runInBatch"].(bool)
+	// Coverage warning only applies to single-mode dispatch; batch mode
+	// reads inputs from the resolved inputExpression, not inputMappings.
+	if runInBatch {
+		return nil
+	}
+	inputVariables, err := lookupChildInputVariables(c, executor, dryRun)
 	if err != nil {
-		// In dry-run mode lookupChildWorkflow already absorbed the error
-		// and returned a stub. For real runs we surface it; the user can
-		// fix the alias and recompose.
 		return err
 	}
-
-	runInBatch, _ := task["runInBatch"].(bool)
-
-	// Caller-supplied keys win on key-PRESENCE (not just non-empty).
-	// `len == 0` collapses missing and explicit `{}` to the same case,
-	// which means an agent that wants to opt out of the auto-fill by
-	// writing `"inputSchema": {}` would still get the auto-fill. Key
-	// presence respects the explicit empty opt-out.
-	_, inputSchemaProvided := task["inputSchema"]
-	_, outputSchemaProvided := task["outputSchema"]
-
-	// Skip the inputSchema fill for runInBatch tasks: BC's batch
-	// dispatcher reads `inputSchema` and treats it as a per-element
-	// validator. When the auto-filled shape inherits `required: true`
-	// fields from the child's typed variables, every dispatch fails with
-	// `Missing required input: <name>` before any child execution
-	// spawns -- even when the array elements DO contain those fields.
-	// (Surfaced by stress test v17.) Keep the fill for single-mode
-	// tasks where the parent's inputMappings populates the per-key
-	// inputs and the runtime validates against them happily.
-	if !inputSchemaProvided && !runInBatch && len(info.inputVariables) > 0 {
-		task["inputSchema"] = info.inputVariables
-	}
-	// outputSchema fill is safe in both modes -- the parent's downstream
-	// tasks consume task_outputs.<this-task>.<field> regardless of how
-	// the child was dispatched, so knowing the shape is purely useful.
-	if !outputSchemaProvided && len(info.outputSchema) > 0 {
-		task["outputSchema"] = info.outputSchema
-	}
-
-	// Coverage warning for single-mode specs: any required child input
-	// without a corresponding inputMappings entry will go unset at runtime.
-	// Skip when runInBatch is true -- batch dispatch reads inputs from the
-	// resolved inputExpression, not from inputMappings.
-	if !runInBatch {
-		mappings := asMap(task["inputMappings"])
-		missing := make([]string, 0)
-		for name, raw := range info.inputVariables {
-			vm, _ := raw.(map[string]any)
-			if vm == nil {
-				continue
-			}
-			required, _ := vm["required"].(bool)
-			if !required {
-				continue
-			}
-			if _, present := mappings[name]; !present {
-				missing = append(missing, name)
-			}
+	mappings := asMap(task["inputMappings"])
+	missing := make([]string, 0)
+	for name, raw := range inputVariables {
+		vm, _ := raw.(map[string]any)
+		if vm == nil {
+			continue
 		}
-		if len(missing) > 0 {
-			ref := localRef(task, "")
-			fmt.Fprintf(os.Stderr,
-				"# warning: child-workflow ref=%q executor=%q has required inputs without inputMappings: %v. "+
-					"The child execution will see these as missing at runtime.\n",
-				ref, executor, missing)
+		required, _ := vm["required"].(bool)
+		if !required {
+			continue
+		}
+		if _, present := mappings[name]; !present {
+			missing = append(missing, name)
 		}
 	}
-
+	if len(missing) > 0 {
+		ref := localRef(task, "")
+		fmt.Fprintf(os.Stderr,
+			"# warning: child-workflow ref=%q executor=%q has required inputs without inputMappings: %v. "+
+				"The child execution will see these as missing at runtime.\n",
+			ref, executor, missing)
+	}
 	return nil
 }
 
@@ -468,8 +381,6 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 	}
 
 	inputKeys := asMap(task["inputKeys"])
-	inputSchema := asMap(task["inputSchema"])
-	outputSchema := asMap(task["outputSchema"])
 
 	// Default packageAlias / dataAge on each sourcesConfig entry.
 	for i, s := range sources {
@@ -489,10 +400,13 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 	}
 	task["sourcesConfig"] = sources
 
-	// Look up each source once and use the metadata for both inputKeys
-	// (from inputFields) and outputSchema (from outputSchema). Mirrors the
-	// Hub editor at AltDataEnrichmentEditor.tsx which merges both into the
-	// task body whenever sourcesConfig changes.
+	// inputKeys auto-fill (different concern from inputSchema fill that
+	// moved to BC's DerivedSchemaService): the runtime activity reads the
+	// per-source required fields from inputKeys, and an agent that omits
+	// inputKeys ends up with an unwired source the first time someone
+	// runs the workflow. Look the source up once per id and wire one
+	// entry per required field. inputSchema is no longer touched here --
+	// it's computed server-side at GET /v2/tasks time.
 	seenInput := map[string]bool{}
 	derivedInputKeys := len(inputKeys) == 0
 	for _, s := range sources {
@@ -502,37 +416,23 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 		}
 		sid, _ := sm["sourceId"].(string)
 		ver, _ := sm["version"].(string)
-		if sid == "" {
+		if sid == "" || !derivedInputKeys {
 			continue
 		}
-		src, err := lookupAltdataSource(c, sid, ver, dryRun)
+		fields, err := lookupAltdataSourceInputFields(c, sid, ver, dryRun)
 		if err != nil {
 			return fmt.Errorf("could not look up source %s %s: %w", sid, ver, err)
 		}
-		if derivedInputKeys {
-			for _, f := range src.inputFields {
-				if seenInput[f] {
-					continue
-				}
-				seenInput[f] = true
-				inputKeys[f] = "{{" + f + "}}"
-				if _, has := inputSchema[f]; !has {
-					inputSchema[f] = map[string]any{"type": "string", "required": false}
-				}
+		for _, f := range fields {
+			if seenInput[f] {
+				continue
 			}
-		}
-		// Merge each source's outputSchema entries into the task outputSchema.
-		// Source outputSchema is keyed by sourceId, e.g. {ECU-PUB-0002: {...}}.
-		// Existing user-supplied keys win; we only fill in missing ones.
-		for k, v := range src.outputSchema {
-			if _, exists := outputSchema[k]; !exists {
-				outputSchema[k] = v
-			}
+			seenInput[f] = true
+			inputKeys[f] = "{{" + f + "}}"
 		}
 	}
 	if derivedInputKeys && len(inputKeys) > 0 {
 		task["inputKeys"] = inputKeys
-		task["inputSchema"] = inputSchema
 	}
 
 	if _, has := task["mode"]; !has {
@@ -544,17 +444,6 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 	if _, has := task["timeout"]; !has {
 		task["timeout"] = 60
 	}
-	// Always include the canonical sources_output_packages entry so the Hub's
-	// calculateAvailableOutputs surfaces a top-level output for downstream
-	// mapping dropdowns even if the per-source outputSchema is empty.
-	if _, has := outputSchema["sources_output_packages"]; !has {
-		outputSchema["sources_output_packages"] = map[string]any{
-			"type":        "object",
-			"title":       "Output Packages",
-			"description": "Enrichment results from configured sources",
-		}
-	}
-	task["outputSchema"] = outputSchema
 	return nil
 }
 
@@ -597,115 +486,35 @@ func normalizeComputeVariablesTask(task map[string]any, customVariables map[stri
 	return nil
 }
 
-// wrapAsObjectSchemaForPydantic recursively rewrites a nested schema dict so
-// every non-leaf level matches the SchemaTypes ObjectSchema variant in
-// borrower-central/app/model/workflows_v2/schemas.py:
-//
-//   {type: "object", properties: {<k>: <recursive>}, title?, description?}
-//
-// Source outputSchemas come back from /v2/workflows/sources-status in a
-// flatter shape (no `type: "object"` markers, child keys like `data` are
-// direct properties). Pydantic's discriminated union picks StringSchema as
-// the first matching variant for that flatter shape and drops every nested
-// field on the floor. Wrapping as canonical JSON Schema makes Pydantic match
-// ObjectSchema all the way down.
-//
-// Leaves (anything with an explicit `type` field) are passed through; only
-// recurse into their `properties` if present.
-func wrapAsObjectSchemaForPydantic(v any) any {
-	m, ok := v.(map[string]any)
-	if !ok {
-		return v
-	}
-	// Leaf: explicit type already set (string, integer, number, boolean, ...).
-	if _, hasType := m["type"]; hasType {
-		if props, ok := m["properties"].(map[string]any); ok {
-			rewritten := map[string]any{}
-			for k, val := range props {
-				rewritten[k] = wrapAsObjectSchemaForPydantic(val)
-			}
-			m["properties"] = rewritten
-		}
-		return m
-	}
-	// No type. Has explicit `properties` -> object whose children we recurse into.
-	if props, ok := m["properties"].(map[string]any); ok {
-		rewritten := map[string]any{}
-		for k, val := range props {
-			rewritten[k] = wrapAsObjectSchemaForPydantic(val)
-		}
-		out := map[string]any{
-			"type":       "object",
-			"properties": rewritten,
-		}
-		for _, k := range []string{"title", "description"} {
-			if val, ok := m[k]; ok {
-				out[k] = val
-			}
-		}
-		return out
-	}
-	// No type, no properties -> treat the dict's children as implicit
-	// properties of an object schema. (This handles the source's bare
-	// `{ECU-PUB-0002: {data: {properties: {...}}}}` shape.)
-	implicitProps := map[string]any{}
-	out := map[string]any{"type": "object"}
-	for k, val := range m {
-		switch k {
-		case "title", "description":
-			out[k] = val
-		default:
-			implicitProps[k] = wrapAsObjectSchemaForPydantic(val)
-		}
-	}
-	if len(implicitProps) > 0 {
-		out["properties"] = implicitProps
-	}
-	return out
-}
+// altdataSourceInputFieldsCache memoizes /v2/workflows/sources-status
+// results within a single compose run so a multi-source task only fetches
+// once. The full per-source outputSchema is no longer consumed here --
+// derivedSchema lives on BC.
+var altdataSourceInputFieldsCache = map[string][]string{}
 
-// altdataSourceInfo captures the parts of an AltData source's metadata that
-// the compose normalizer needs: required input field names (for inputKeys)
-// and the source's outputSchema (merged into the task's outputSchema).
-type altdataSourceInfo struct {
-	inputFields  []string
-	outputSchema map[string]any
-}
-
-// sourceLookupCache memoizes /v2/workflows/sources-status results within a
-// single compose run so a multi-source task only fetches once.
-var sourceLookupCache = map[string]*altdataSourceInfo{}
-
-// lookupAltdataSource fetches an AltData source from /v2/workflows/sources-status
-// and returns its inputField names and outputSchema. Used by normalizeAltdataTask
-// to auto-fill inputKeys/inputSchema (input side) and outputSchema (output side)
-// to match what the Hub's editor produces when the user adds the source.
-func lookupAltdataSource(c *client.Client, sourceID, version string, dryRun bool) (*altdataSourceInfo, error) {
+// lookupAltdataSourceInputFields fetches a source's required input field
+// names from /v2/workflows/sources-status. Used by normalizeAltdataTask to
+// auto-populate inputKeys (a runtime wiring concern -- distinct from
+// schema derivation, which is now server-side).
+func lookupAltdataSourceInputFields(c *client.Client, sourceID, version string, dryRun bool) ([]string, error) {
 	cacheKey := sourceID + "|" + version
-	if cached, ok := sourceLookupCache[cacheKey]; ok {
+	if cached, ok := altdataSourceInputFieldsCache[cacheKey]; ok {
 		return cached, nil
 	}
 	if c == nil {
 		if dryRun {
 			fmt.Fprintf(os.Stderr, "# (dry-run) skipping live source lookup for %s %s; assuming personId/taxId\n", sourceID, version)
-			return &altdataSourceInfo{
-				inputFields:  []string{"personId", "taxId"},
-				outputSchema: map[string]any{},
-			}, nil
+			return []string{"personId", "taxId"}, nil
 		}
 		return nil, fmt.Errorf("no client available for source lookup")
 	}
 	q := url.Values{}
 	q.Set("per-page", "200")
-	path := "/v2/workflows/sources-status?" + q.Encode()
-	data, _, err := c.Do("GET", "borrower_central", path, nil)
+	data, _, err := c.Do("GET", "borrower_central", "/v2/workflows/sources-status?"+q.Encode(), nil)
 	if err != nil {
 		if dryRun {
 			fmt.Fprintf(os.Stderr, "# (dry-run) source lookup failed for %s %s (%v); using stub\n", sourceID, version, err)
-			return &altdataSourceInfo{
-				inputFields:  []string{"personId", "taxId"},
-				outputSchema: map[string]any{},
-			}, nil
+			return []string{"personId", "taxId"}, nil
 		}
 		return nil, err
 	}
@@ -730,56 +539,8 @@ func lookupAltdataSource(c *client.Client, sourceID, version string, dryRun bool
 				fieldNames = append(fieldNames, name)
 			}
 		}
-		// Source's outputSchema, plus title/description on the source-keyed
-		// entry to match how the Hub annotates it.
-		outSchema := asMap(s["outputSchema"])
-		if entry, ok := outSchema[sourceID].(map[string]any); ok {
-			if name, _ := s["name"].(string); name != "" {
-				if _, has := entry["title"]; !has {
-					entry["title"] = name
-				}
-			}
-			if desc, ok := s["description"].(map[string]any); ok {
-				if en, _ := desc["en"].(string); en != "" {
-					if _, has := entry["description"]; !has {
-						entry["description"] = en
-					}
-				}
-			}
-			outSchema[sourceID] = entry
-		}
-		// Convert the source's raw outputSchema (which uses bare nested
-		// objects without `type: "object"` wrappers) into Pydantic-friendly
-		// JSON-Schema shape so the SchemaTypes discriminated union matches
-		// ObjectSchema. Without this, Pydantic falls back to StringSchema and
-		// silently drops the nested fields.
-		canonical := map[string]any{}
-		for k, v := range outSchema {
-			canonical[k] = wrapAsObjectSchemaForPydantic(v)
-		}
-		// Annotate the source-keyed entry with title/description from the
-		// source metadata so downstream picker UIs render a friendly label.
-		if entry, ok := canonical[sourceID].(map[string]any); ok {
-			if name, _ := s["name"].(string); name != "" {
-				if _, has := entry["title"]; !has {
-					entry["title"] = name
-				}
-			}
-			if desc, ok := s["description"].(map[string]any); ok {
-				if en, _ := desc["en"].(string); en != "" {
-					if _, has := entry["description"]; !has {
-						entry["description"] = en
-					}
-				}
-			}
-			canonical[sourceID] = entry
-		}
-		info := &altdataSourceInfo{
-			inputFields:  fieldNames,
-			outputSchema: canonical,
-		}
-		sourceLookupCache[cacheKey] = info
-		return info, nil
+		altdataSourceInputFieldsCache[cacheKey] = fieldNames
+		return fieldNames, nil
 	}
 	return nil, fmt.Errorf("source %s %s not found in sources-status", sourceID, version)
 }
@@ -916,23 +677,24 @@ func validateConditionGroup(v any, path string) error {
 // The four credit-decisioning task types (evaluate-rules, mapping-table,
 // scorecard, rule-tree) reference entities at /v1/{evaluation-rules,
 // mapping-tables, scorecards, rule-trees}. The Hub plugins fill canonical
-// outputSchema entries when these tasks are placed on a canvas; compose
-// mirrors that here so downstream tasks see the right available outputs.
+// outputSchema entries when these tasks are placed on a canvas. The
+// outputSchema derivation now lives server-side in BC's
+// DerivedSchemaService; compose only runs existence + workflow-scope
+// checks here.
 
-// entityCache memoizes /v1/{resource} lookups within a compose run.
-// Same idea as sourceLookupCache; one entry per (resource, codeOrId).
+// entityCache memoizes /v1/{resource} lookups within a compose run, one
+// entry per (resource, codeOrId).
 var entityCache = map[string]map[string]any{}
 
 // lookupEntity fetches /v1/{resource}?code=<codeOrId> (best-effort) and
 // returns the first matching record. Used for non-blocking warnings when
-// a task references something that doesn't exist on the tenant, and for
-// outputSchema refinement (e.g. mapping-tables outputType=number).
+// a task references something that doesn't exist on the tenant and for
+// the workflow-alias-scope check (see validateEntityWorkflowAliasMatch).
 //
 // The lookup runs in dry-run too -- skipping it makes dry-run preview a
 // different shape than real compose, defeating the purpose of dry-run.
-// Matches the lookupAltdataSource contract above. The dryRun flag is kept
-// in the signature for symmetry with sibling normalizers and so callers
-// can opt in to dry-run-only printf behavior.
+// The dryRun flag is kept in the signature for symmetry with sibling
+// normalizers and so callers can opt in to dry-run-only printf behavior.
 func lookupEntity(c *client.Client, resource, codeOrID string, dryRun bool) (map[string]any, error) {
 	_ = dryRun
 	if codeOrID == "" {
@@ -973,9 +735,10 @@ func lookupEntity(c *client.Client, resource, codeOrID string, dryRun bool) (map
 }
 
 // normalizeEvaluateRulesTask validates that rulesConfig is a non-empty array
-// of {ruleCode, ruleId} references and pre-fills outputSchema with the
-// canonical alerts/alerts_count fields produced by the activity at
-// borrower-central/app/temporal/activities/evaluate_rules_activity.py.
+// of {ruleCode, ruleId} references and verifies each referenced entity
+// exists on the tenant (warning by default, hard error with --publish).
+// The canonical alerts/alerts_count outputSchema is now derived server-side
+// at GET /v2/tasks time (see BC's DerivedSchemaService).
 func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
 	if opts != nil {
@@ -1010,30 +773,16 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *com
 			return fmt.Errorf("rulesConfig[%d]: %w", i, err)
 		}
 	}
-	out := asMap(task["outputSchema"])
-	if _, has := out["alerts"]; !has {
-		out["alerts"] = map[string]any{
-			"type":        "array",
-			"title":       "Alerts",
-			"description": "Alerts triggered by matching rules",
-		}
-	}
-	if _, has := out["alerts_count"]; !has {
-		out["alerts_count"] = map[string]any{
-			"type":        "integer",
-			"title":       "Alerts Count",
-			"description": "Number of alerts triggered",
-		}
-	}
-	task["outputSchema"] = out
 	return nil
 }
 
 // normalizeMappingTableTask validates mappingTableConfig.entries[] and
-// pre-fills outputSchema with each entry's outputVariable so downstream
-// tasks see them as top-level outputs. Each entry needs a stable id (the
-// runtime MappingTableEntry pydantic model requires it); compose mints a
-// UUID v4 when the agent omits it, matching what the Hub editor does.
+// stamps a stable UUID on entries that omit `id` (the runtime
+// MappingTableEntry pydantic model requires it). The per-entry outputSchema
+// fill (3 canonical outputs per entry) has moved to BC's
+// DerivedSchemaService and is exposed at GET /v2/tasks time via the
+// ``derivedSchema`` field. Top-level inputMappings mirroring is preserved
+// because it controls runtime wiring, not schema display.
 func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
 	var inputVars map[string]any
@@ -1089,7 +838,6 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *comp
 		}
 	}
 
-	out := asMap(task["outputSchema"])
 	for i, e := range entries {
 		em, ok := e.(map[string]any)
 		if !ok {
@@ -1124,14 +872,10 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *comp
 		if ref == "" {
 			ref = id
 		}
-		// Best-effort lookup so we can refine outputSchema type from the table's outputType.
+		// Best-effort entity existence + workflow-scope checks (the
+		// remaining purposes of lookupEntity now that schema derivation
+		// has moved server-side).
 		entity, _ := lookupEntity(c, "mapping-tables", ref, dryRun)
-		outType := "string"
-		if entity != nil {
-			if t, _ := entity["outputType"].(string); t == "number" {
-				outType = "number"
-			}
-		}
 		if entity == nil && c != nil {
 			if err := missingEntityHandler(opts, dryRun, "mapping-tables", ref); err != nil {
 				return fmt.Errorf("entries[%d]: %w", i, err)
@@ -1140,70 +884,29 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *comp
 		if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "mapping-tables", ref); err != nil {
 			return fmt.Errorf("entries[%d]: %w", i, err)
 		}
-		// Pre-fill the three canonical outputs mapping_table_activity emits
-		// per entry (see app/temporal/activities/mapping_table_activity.py):
-		//   <outputVariable>        -- the mapped value (typed per entity outputType)
-		//   <outputVariable>_bucket -- label of the matched bucket
-		//   <outputVariable>_input  -- the original input value, for debugging
-		// Mirrors the Hub editor (which adds all three when wiring a new
-		// entry). Without the companion fields, downstream Hub mapping
-		// pickers only show the bare value -- agents lose the audit trail
-		// the runtime is already emitting.
-		if _, has := out[outVar]; !has {
-			out[outVar] = map[string]any{
-				"type":        outType,
-				"title":       outVar,
-				"description": "Mapping table output: " + outVar,
-			}
-		}
-		if _, has := out[outVar+"_bucket"]; !has {
-			out[outVar+"_bucket"] = map[string]any{
-				"type":        "string",
-				"title":       outVar + " Bucket",
-				"description": "Label of the matched bucket",
-			}
-		}
-		if _, has := out[outVar+"_input"]; !has {
-			// Best-guess input type. If we couldn't load the entity it
-			// defaults to "string"; the Hub editor uses "number" for
-			// numerical tables but tolerates either.
-			inType := "string"
-			if entity != nil {
-				if mt, _ := entity["mappingType"].(string); mt == "numerical" {
-					inType = "number"
-				}
-			}
-			out[outVar+"_input"] = map[string]any{
-				"type":        inType,
-				"title":       outVar + " Input",
-				"description": "Original input value",
-			}
-		}
 		entries[i] = em
 	}
 	cfg["entries"] = entries
 	task["mappingTableConfig"] = cfg
-	task["outputSchema"] = out
 
-	// Mirror per-entry inputVariables into the task's top-level inputMappings
-	// + inputSchema. The Hub UI's mapping-table properties panel renders from
-	// the top-level maps -- a task whose entries[].inputVariable resolves at
-	// runtime correctly but whose top-level inputSchema is empty shows up as
-	// "N entries" on the node card but expands to a blank panel. Mirroring
-	// is per-field-name extracted from inputVariable's last dotted segment.
+	// Mirror per-entry inputVariables into the task's top-level inputMappings.
+	// The runtime activity resolves entries[].inputVariable directly; the
+	// mirroring keeps a stale Hub-UI rendering quirk happy (the panel shows
+	// "N entries" but expanded properties read from top-level
+	// inputMappings). Mirroring is per-field-name extracted from
+	// inputVariable's last dotted segment.
 	mirrorEntryInputsToTopLevel(task, entries)
 	return nil
 }
 
-// mirrorEntryInputsToTopLevel ensures the task's top-level inputMappings +
-// inputSchema reflect every entry's inputVariable. The Hub UI renders the
-// mapping-table properties panel from the top-level maps (not from
-// entries[].inputVariable); without this, the panel appears empty even
-// though the runtime resolves entries correctly. Caller-supplied entries
-// in inputMappings/inputSchema are preserved.
+// mirrorEntryInputsToTopLevel ensures the task's top-level inputMappings
+// reflect every entry's inputVariable. The runtime activity resolves
+// entries[].inputVariable directly, but keeping inputMappings in sync at
+// the top level matches the Hub editor's persisted shape. Caller-supplied
+// entries in inputMappings are preserved. inputSchema is no longer touched
+// here -- derived server-side at GET /v2/tasks time.
 func mirrorEntryInputsToTopLevel(task map[string]any, entries []any) {
 	mappings := asMap(task["inputMappings"])
-	schema := asMap(task["inputSchema"])
 	for _, e := range entries {
 		em, ok := e.(map[string]any)
 		if !ok {
@@ -1220,44 +923,17 @@ func mirrorEntryInputsToTopLevel(task map[string]any, entries []any) {
 		if _, has := mappings[field]; !has {
 			mappings[field] = inVar
 		}
-		if _, has := schema[field]; !has {
-			schema[field] = map[string]any{
-				"type":  "number",
-				"title": field,
-			}
-		}
 	}
 	task["inputMappings"] = mappings
-	task["inputSchema"] = schema
 }
 
-// mirrorMappingsToInputSchema derives top-level inputSchema entries from a
-// task's top-level inputMappings keys. Used by scorecard + rule-tree
-// normalizers because the Hub properties panel reads inputSchema to display
-// each task's required inputs. Caller-supplied inputSchema entries win.
-func mirrorMappingsToInputSchema(task map[string]any) {
-	mappings := asMap(task["inputMappings"])
-	if len(mappings) == 0 {
-		return
-	}
-	schema := asMap(task["inputSchema"])
-	for k := range mappings {
-		if _, has := schema[k]; !has {
-			schema[k] = map[string]any{
-				"type":  "number",
-				"title": k,
-			}
-		}
-	}
-	task["inputSchema"] = schema
-}
-
-// normalizeScorecardTask validates that scorecardConfig references an existing
-// /v1/scorecards entity and pre-fills outputSchema with totalScoreVariable +
-// breakdownVariable. The runtime activity loads the scorecard by code/id and
-// uses the entity's rules; any inline 'rules' on the task body are ignored.
-// Compose preserves user-supplied inline rules (for legacy bodies) but never
-// requires them.
+// normalizeScorecardTask validates that scorecardConfig references an
+// existing /v1/scorecards entity, defaults totalScoreVariable /
+// breakdownVariable when omitted, and mirrors top-level inputMappings into
+// the nested scorecardConfig.inputMappings (the runtime activity reads its
+// per-rule inputs from the nested map specifically). outputSchema fill has
+// moved to BC's DerivedSchemaService and is exposed at GET /v2/tasks time
+// via the ``derivedSchema`` field.
 func normalizeScorecardTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
 	if opts != nil {
@@ -1285,36 +961,17 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, opts *compose
 	if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "scorecards", ref); err != nil {
 		return err
 	}
-	out := asMap(task["outputSchema"])
-	totalVar, _ := cfg["totalScoreVariable"].(string)
-	if totalVar == "" {
-		totalVar = "total_score"
-		cfg["totalScoreVariable"] = totalVar
+	// Default totalScoreVariable / breakdownVariable when omitted so the
+	// task body is self-consistent (the runtime activity reads them from
+	// here). BC's DerivedSchemaService picks up these values to build the
+	// derivedSchema response shape.
+	if v, _ := cfg["totalScoreVariable"].(string); v == "" {
+		cfg["totalScoreVariable"] = "total_score"
 	}
-	if _, has := out[totalVar]; !has {
-		out[totalVar] = map[string]any{
-			"type":        "number",
-			"title":       humanizeKey(totalVar),
-			"description": "Total score from the scorecard",
-		}
-	}
-	// Runtime defaults breakdownVariable to 'score_breakdown'; mirror that so
-	// downstream Hub mapping pickers see the breakdown output even when the
-	// agent didn't set the field explicitly.
-	breakdown, _ := cfg["breakdownVariable"].(string)
-	if breakdown == "" {
-		breakdown = "score_breakdown"
-		cfg["breakdownVariable"] = breakdown
-	}
-	if _, has := out[breakdown]; !has {
-		out[breakdown] = map[string]any{
-			"type":        "object",
-			"title":       humanizeKey(breakdown),
-			"description": "Per-field score breakdown",
-		}
+	if v, _ := cfg["breakdownVariable"].(string); v == "" {
+		cfg["breakdownVariable"] = "score_breakdown"
 	}
 	task["scorecardConfig"] = cfg
-	task["outputSchema"] = out
 
 	// Mirror top-level inputMappings into scorecardConfig.inputMappings when
 	// the nested map is empty -- the scorecard activity reads its inputs
@@ -1323,15 +980,14 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, opts *compose
 	// Without this every scorecard rule reads a None field and the total
 	// score is 0.
 	mirrorNestedInputMappings(task, cfg, "scorecardConfig")
-	// Derive top-level inputSchema from inputMappings keys so the Hub UI
-	// scorecard properties panel renders correctly. Without this the panel
-	// expands to nothing even though inputMappings has the right wiring.
-	mirrorMappingsToInputSchema(task)
 	return nil
 }
 
-// normalizeRuleTreeTask validates ruleTreeConfig and pre-fills outputSchema
-// with the configured outputVariable using the configured outputType.
+// normalizeRuleTreeTask validates ruleTreeConfig and mirrors top-level
+// inputMappings into the nested ruleTreeConfig.inputMappings. The
+// outputSchema fill (outputVariable + 4 canonical companions) has moved to
+// BC's DerivedSchemaService and is exposed at GET /v2/tasks time via the
+// ``derivedSchema`` field.
 func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
 	if opts != nil {
@@ -1351,8 +1007,7 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeN
 	switch outType {
 	case "string", "number", "boolean":
 	case "":
-		outType = "string"
-		cfg["outputType"] = outType
+		cfg["outputType"] = "string"
 		task["ruleTreeConfig"] = cfg
 	default:
 		return fmt.Errorf("rule-tree task ruleTreeConfig.outputType must be one of: string, number, boolean")
@@ -1370,54 +1025,6 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeN
 	if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "rule-trees", ref); err != nil {
 		return err
 	}
-	// Pre-fill outputSchema with EVERY canonical output rule_tree_activity
-	// emits (see app/temporal/activities/rule_tree_activity.py:172-194):
-	//   <outputVariable>                 -> the matched rule's decision_key
-	//   <outputVariable>_rule_code       -> code of the matched rule
-	//   <outputVariable>_rule_label      -> label of the matched rule
-	//   <outputVariable>_rules           -> full results array (one entry per
-	//                                       rule with hit/value/alert metadata)
-	//   <outputVariable>_alert_created   -> whether any alert fired
-	//
-	// Without these, downstream conditional/end tasks see only the bare
-	// outputVariable in the Hub mapping picker and agents end up guessing
-	// names like `decision_key` (the field name on each rule entry, NOT a
-	// task output) -- which then doesn't resolve at runtime because
-	// task_outputs.<alias>.decision_key isn't a key the activity ever wrote.
-	out := asMap(task["outputSchema"])
-	canonical := map[string]map[string]any{
-		outVar: {
-			"type":        outType,
-			"title":       humanizeKey(outVar),
-			"description": "Decision key of the matched rule",
-		},
-		outVar + "_rule_code": {
-			"type":        "string",
-			"title":       humanizeKey(outVar) + " Rule Code",
-			"description": "Code of the matched rule (or 'default' if none matched)",
-		},
-		outVar + "_rule_label": {
-			"type":        "string",
-			"title":       humanizeKey(outVar) + " Rule Label",
-			"description": "Label of the matched rule",
-		},
-		outVar + "_rules": {
-			"type":        "array",
-			"title":       humanizeKey(outVar) + " Rules",
-			"description": "Per-rule evaluation results (hit, value, alert metadata)",
-		},
-		outVar + "_alert_created": {
-			"type":        "boolean",
-			"title":       humanizeKey(outVar) + " Alert Created",
-			"description": "Whether any alert was emitted by a hitting rule",
-		},
-	}
-	for k, v := range canonical {
-		if _, has := out[k]; !has {
-			out[k] = v
-		}
-	}
-	task["outputSchema"] = out
 
 	// Mirror the top-level inputMappings into ruleTreeConfig.inputMappings
 	// when the nested map is empty. The rule-tree activity reads its inputs
@@ -1429,9 +1036,6 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeN
 	// this, agents have to remember to fill BOTH maps, and the rule-tree's
 	// conditions read nothing -- silently making every rule a no-op.
 	mirrorNestedInputMappings(task, cfg, "ruleTreeConfig")
-	// Derive top-level inputSchema from inputMappings keys for Hub UI
-	// rendering (see mirrorMappingsToInputSchema docstring).
-	mirrorMappingsToInputSchema(task)
 	return nil
 }
 
