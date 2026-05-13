@@ -2117,16 +2117,11 @@ func preflightTasks(spec *composeSpec) error {
 			if eid == "" && eal == "" {
 				return fmt.Errorf("tasks[%d] (ref=%q): child-workflow task requires 'executorId' or 'executorAlias'", i, ref)
 			}
-			// Server's CreateTaskV2 only declares `executorId`. The runtime
-			// resolves it via find_latest_active_by_alias, so passing a
-			// workflow alias in executorId works. Normalize the spec-only
-			// `executorAlias` key into `executorId` so the persisted task
-			// actually carries the executor pointer (otherwise the key is
-			// silently dropped and the task body has no executor at all).
-			if eid == "" && eal != "" {
-				task["executorId"] = eal
-			}
-			delete(task, "executorAlias")
+			// BC's CreateTaskV2 / ChildWorkflowTaskData now coalesce
+			// `executorAlias` -> `executorId` server-side (the runtime
+			// resolves the value via find_latest_active_by_alias either
+			// way). Pass through whatever the spec carries; no CLI-side
+			// rename needed.
 			// child-workflow auto-detects single vs batch from the resolved
 			// type of inputExpression (list -> fan-out, dict -> single). The
 			// legacy runInBatch flag and the hardcoded `input_items` context

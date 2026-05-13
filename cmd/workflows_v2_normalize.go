@@ -79,8 +79,6 @@ func validateTaskV2Body(body json.RawMessage) error {
 // validateTaskV2BodyStructural runs the network-free structural checks that
 // are safe to invoke regardless of whether normalize will run afterward.
 // Catches:
-//   - conditional task with 'expression' instead of structured 'conditions'
-//   - conditional task using 'is_else' (snake_case) instead of 'isElse'
 //   - conditional task with no isElse:true default branch
 //   - conditional branch with neither 'conditions' nor 'isElse:true'
 //   - missing required fields on credit-decisioning tasks (rulesConfig
@@ -90,6 +88,11 @@ func validateTaskV2Body(body json.RawMessage) error {
 // Does NOT catch the altdata-enrichment empty-inputKeys case (see
 // validateTaskV2Body). Compose's preflight uses this so a compose spec
 // missing inputKeys is fixed by normalize, not rejected by preflight.
+//
+// The legacy conditional-shape rewrites (branch.expression rejection,
+// branch.is_else snake_case rename) used to live in normalizeConditionalTask;
+// they're now enforced server-side in CreateTaskV2 so a direct POST is
+// rejected the same way. The CLI no longer duplicates them.
 func validateTaskV2BodyStructural(body json.RawMessage) error {
 	if len(body) == 0 {
 		return nil
@@ -260,7 +263,7 @@ func validateEntityWorkflowAliasMatch(entity map[string]any, predictedAlias, res
 
 // normalizeTaskBody mutates the task spec in place to match the canonical
 // shape the Hub UI expects. Returns an error if the body is fundamentally
-// broken (missing isElse branch, expression instead of conditions, etc.).
+// broken (missing isElse branch, malformed conditions, etc.).
 //
 // opts threads the compose-time context (workflow's predicted alias for
 // cross-checking entity scopes, customVariables for compute-variables
@@ -332,10 +335,14 @@ func lookupChildInputVariables(c *client.Client, alias string, dryRun bool) (map
 // required inputs aren't covered by the parent's inputMappings. The
 // inputSchema / outputSchema fill that this normalizer used to perform now
 // lives in BC's DerivedSchemaService and surfaces at GET /v2/tasks time as
-// ``derivedSchema``. preflightTasks already renamed executorAlias ->
-// executorId; by the time this runs the alias lives on ``executorId``.
+// ``derivedSchema``. preflightTasks no longer renames executorAlias ->
+// executorId (BC coalesces server-side), so read both keys to find the
+// alias the child-workflow lookup needs.
 func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bool) error {
 	executor, _ := task["executorId"].(string)
+	if executor == "" {
+		executor, _ = task["executorAlias"].(string)
+	}
 	if executor == "" {
 		return nil
 	}
@@ -557,23 +564,6 @@ func normalizeConditionalTask(task map[string]any) error {
 		bm, ok := b.(map[string]any)
 		if !ok {
 			return fmt.Errorf("branches[%d]: not an object", i)
-		}
-
-		if expr, has := bm["expression"]; has && expr != nil && expr != "" {
-			return fmt.Errorf(
-				"branches[%d]: 'expression' is not a real branch field -- the API silently drops it. "+
-					"Use structured 'conditions' instead, e.g.\n  "+
-					`{"id": "branch_X", "label": "Approve", "isElse": false, "order": 0,`+"\n   "+
-					`"conditions": {"operator": "AND", "items": [{"field": "score", "operator": "gte", "value": "700", "valueType": "value"}]}}`,
-				i)
-		}
-		delete(bm, "expression")
-
-		if v, has := bm["is_else"]; has {
-			if _, hasCamel := bm["isElse"]; !hasCamel {
-				bm["isElse"] = v
-			}
-			delete(bm, "is_else")
 		}
 
 		isElse, _ := bm["isElse"].(bool)
