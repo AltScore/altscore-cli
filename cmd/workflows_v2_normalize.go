@@ -276,7 +276,176 @@ func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNorma
 		return normalizeScorecardTask(c, task, opts, dryRun)
 	case "rule-tree":
 		return normalizeRuleTreeTask(c, task, opts, dryRun)
+	case "child-workflow":
+		return normalizeChildWorkflowTask(c, task, dryRun)
 	}
+	return nil
+}
+
+// childWorkflowInfo carries what a child-workflow caller needs to fill the
+// parent task body: the child's typed input variables (used as the parent
+// task's inputSchema -- mirrors what the Hub picker writes via
+// applyAutoUpdate) and the end task's inputSchema (used as the parent
+// task's outputSchema, because the end task receives what the child
+// workflow emits, so its input shape is the child's output shape).
+type childWorkflowInfo struct {
+	inputVariables map[string]any
+	outputSchema   map[string]any
+}
+
+// childWorkflowLookupCache memoizes /v2/workflows/<alias>/latest +
+// /v2/tasks/<endTaskAlias> within a single compose run so multiple
+// child-workflow tasks pointing at the same executor don't refetch.
+var childWorkflowLookupCache = map[string]*childWorkflowInfo{}
+
+func lookupChildWorkflow(c *client.Client, alias string, dryRun bool) (*childWorkflowInfo, error) {
+	if cached, ok := childWorkflowLookupCache[alias]; ok {
+		return cached, nil
+	}
+	if c == nil {
+		if dryRun {
+			fmt.Fprintf(os.Stderr, "# (dry-run) skipping live child-workflow lookup for %q; inputSchema/outputSchema fill will be empty\n", alias)
+			return &childWorkflowInfo{
+				inputVariables: map[string]any{},
+				outputSchema:   map[string]any{},
+			}, nil
+		}
+		return nil, fmt.Errorf("no client available for child-workflow lookup")
+	}
+	wfPath := "/v2/workflows/" + alias + "/latest"
+	data, _, err := c.Do("GET", "borrower_central", wfPath, nil)
+	if err != nil {
+		if dryRun {
+			fmt.Fprintf(os.Stderr, "# (dry-run) child-workflow lookup failed for %q (%v); skipping inputSchema/outputSchema fill\n", alias, err)
+			return &childWorkflowInfo{
+				inputVariables: map[string]any{},
+				outputSchema:   map[string]any{},
+			}, nil
+		}
+		return nil, fmt.Errorf("look up child workflow %q: %w", alias, err)
+	}
+	var wf map[string]any
+	if err := json.Unmarshal(data, &wf); err != nil {
+		return nil, fmt.Errorf("parse child workflow %q: %w", alias, err)
+	}
+	info := &childWorkflowInfo{
+		inputVariables: asMap(wf["inputVariables"]),
+		outputSchema:   map[string]any{},
+	}
+
+	// Find the end node -> fetch its task -> use its inputSchema as the
+	// parent's outputSchema. Matches the Hub picker behavior:
+	// selectedWorkflowDetails -> find node.type=="end" -> getTaskByAlias ->
+	// applyAutoUpdate({ outputSchema: endTask.inputSchema }).
+	nodes := asSlice(wf["nodes"])
+	var endTaskAlias string
+	for _, n := range nodes {
+		nm, _ := n.(map[string]any)
+		if nm == nil {
+			continue
+		}
+		if t, _ := nm["type"].(string); t == "end" {
+			if a, _ := nm["taskAlias"].(string); a != "" {
+				endTaskAlias = a
+				break
+			}
+		}
+	}
+	if endTaskAlias != "" {
+		taskPath := "/v2/tasks/" + endTaskAlias
+		td, _, terr := c.Do("GET", "borrower_central", taskPath, nil)
+		if terr != nil {
+			if !dryRun {
+				fmt.Fprintf(os.Stderr, "# warning: end-task lookup failed for child workflow %q end=%q (%v); skipping outputSchema fill\n", alias, endTaskAlias, terr)
+			}
+		} else {
+			var endTask map[string]any
+			if jerr := json.Unmarshal(td, &endTask); jerr == nil {
+				info.outputSchema = asMap(endTask["inputSchema"])
+			}
+		}
+	}
+
+	childWorkflowLookupCache[alias] = info
+	return info, nil
+}
+
+// normalizeChildWorkflowTask fills the parent task body's inputSchema and
+// outputSchema from the referenced child workflow (matches what the Hub
+// picker does via applyAutoUpdate) and validates batch-mode fields.
+// preflightTasks already renamed executorAlias -> executorId; by the time
+// this runs the alias lives on `executorId`.
+func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bool) error {
+	executor, _ := task["executorId"].(string)
+	if executor == "" {
+		return nil
+	}
+	info, err := lookupChildWorkflow(c, executor, dryRun)
+	if err != nil {
+		// In dry-run mode lookupChildWorkflow already absorbed the error
+		// and returned a stub. For real runs we surface it; the user can
+		// fix the alias and recompose.
+		return err
+	}
+
+	runInBatch, _ := task["runInBatch"].(bool)
+
+	// Caller-supplied keys win on key-PRESENCE (not just non-empty).
+	// `len == 0` collapses missing and explicit `{}` to the same case,
+	// which means an agent that wants to opt out of the auto-fill by
+	// writing `"inputSchema": {}` would still get the auto-fill. Key
+	// presence respects the explicit empty opt-out.
+	_, inputSchemaProvided := task["inputSchema"]
+	_, outputSchemaProvided := task["outputSchema"]
+
+	// Skip the inputSchema fill for runInBatch tasks: BC's batch
+	// dispatcher reads `inputSchema` and treats it as a per-element
+	// validator. When the auto-filled shape inherits `required: true`
+	// fields from the child's typed variables, every dispatch fails with
+	// `Missing required input: <name>` before any child execution
+	// spawns -- even when the array elements DO contain those fields.
+	// (Surfaced by stress test v17.) Keep the fill for single-mode
+	// tasks where the parent's inputMappings populates the per-key
+	// inputs and the runtime validates against them happily.
+	if !inputSchemaProvided && !runInBatch && len(info.inputVariables) > 0 {
+		task["inputSchema"] = info.inputVariables
+	}
+	// outputSchema fill is safe in both modes -- the parent's downstream
+	// tasks consume task_outputs.<this-task>.<field> regardless of how
+	// the child was dispatched, so knowing the shape is purely useful.
+	if !outputSchemaProvided && len(info.outputSchema) > 0 {
+		task["outputSchema"] = info.outputSchema
+	}
+
+	// Coverage warning for single-mode specs: any required child input
+	// without a corresponding inputMappings entry will go unset at runtime.
+	// Skip when runInBatch is true -- batch dispatch reads inputs from the
+	// resolved inputExpression, not from inputMappings.
+	if !runInBatch {
+		mappings := asMap(task["inputMappings"])
+		missing := make([]string, 0)
+		for name, raw := range info.inputVariables {
+			vm, _ := raw.(map[string]any)
+			if vm == nil {
+				continue
+			}
+			required, _ := vm["required"].(bool)
+			if !required {
+				continue
+			}
+			if _, present := mappings[name]; !present {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			ref := localRef(task, "")
+			fmt.Fprintf(os.Stderr,
+				"# warning: child-workflow ref=%q executor=%q has required inputs without inputMappings: %v. "+
+					"The child execution will see these as missing at runtime.\n",
+				ref, executor, missing)
+		}
+	}
+
 	return nil
 }
 

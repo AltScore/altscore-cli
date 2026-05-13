@@ -1061,6 +1061,17 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 				return err
 			}
 		}
+	case "child-workflow":
+		// inputExpression carries the dispatch expression for batch mode
+		// (BC #1247) -- the runtime resolves it against the parent's
+		// task_outputs scope at execute time. A spec-local ref like
+		// `task_outputs.fetch.cuit_list` survives compose unchanged
+		// otherwise, the runtime can't find `fetch` in the scope, and the
+		// expression collapses to a single execution with the full parent
+		// context. Walk the same rewriter we use on other deep-ref fields.
+		if s, ok := task["inputExpression"].(string); ok && s != "" {
+			task["inputExpression"] = rewriteTaskOutputsRefsInString(s, refMap)
+		}
 	}
 	return nil
 }
@@ -1198,6 +1209,14 @@ func topologicalTaskOrder(tasks []map[string]any, edges []map[string]any) ([]int
 					}
 				}
 			}
+		}
+		// child-workflow's inputExpression is a bare path (e.g.
+		// `task_outputs.fetch.cuit_list`) the runtime resolves at execute
+		// time -- without a topo-dep entry the rewrite pass would fire
+		// before refMap knew about <fetch>, leaving the spec-local ref
+		// to leak into the persisted task.
+		if s, _ := t["inputExpression"].(string); s != "" {
+			addDep(i, mappingDependencyRef(s))
 		}
 		// Template-string dependencies (http url/body/headers, end
 		// outputJson). A task whose http url uses {{<other-task>.field}}
