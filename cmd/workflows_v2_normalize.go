@@ -134,6 +134,18 @@ func validateTaskV2BodyStructural(body json.RawMessage) error {
 		if outVar, _ := cfg["outputVariable"].(string); outVar == "" {
 			return fmt.Errorf("rule-tree task requires ruleTreeConfig.outputVariable")
 		}
+	case "child-workflow":
+		// Batch mode supplies per-element inputs by resolving inputExpression
+		// (e.g. "inputs.cuit_list") to a list. Without it the BC runtime has
+		// nothing to fan out over and the parent fails on first dispatch.
+		// Single mode uses inputMappings instead and is fine with no
+		// inputExpression. Mirrors the Hub workflow-selector plugin validator.
+		if runInBatch, _ := task["runInBatch"].(bool); runInBatch {
+			if expr, _ := task["inputExpression"].(string); strings.TrimSpace(expr) == "" {
+				return fmt.Errorf("child-workflow task with runInBatch=true requires inputExpression " +
+					"(an expression resolving to a list, e.g. \"inputs.cuit_list\"); without it BC's batch dispatcher has nothing to fan out over")
+			}
+		}
 	}
 	return nil
 }
