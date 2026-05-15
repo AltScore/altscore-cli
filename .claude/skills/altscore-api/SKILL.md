@@ -628,6 +628,14 @@ Per-type config (full reference: `schema-guide tasks`):
 | `compute-variables` | `selectedVariables` |
 | `data-store` | `dataStoreWriteConfig` or `dataStoreQueryConfig` |
 | `pdf-report` / `end` | `endConfig: {title, subtitle, brand_logo}` |
+| `customer` / `deal` / `asset` | `operation` (`write`/`read`), `lookupBy`, `key`/`identityKey`, `inputSchema`, `inputMappings`, `sourcesConfig` |
+
+For `customer` / `deal` / `asset` write tasks the `sourcesConfig` entries map each persisted attribute to a context key. Common entry shapes:
+
+- `{type: "deal_field", key: "<context_key>", label: "..."}` — write one deal_field record per entry.
+- `{type: "deal_contact", key: "<context_key>", label: "..."}` — write a single DealContact row from `context[<key>]` (one contact dict).
+- `{type: "deal_contacts", key: "<context_key>", label: "..."}` — **plural** form: `context[<key>]` is a list of contact dicts and one DealContact row is created per item. Same idempotency rules apply (see Gotchas).
+- `{type: "identity", key: "<identity_key>"}` / `{type: "borrower_field", key: "..."}` for customer/asset writes.
 
 #### Workflow CRUD
 
@@ -1017,6 +1025,43 @@ Compose auto-fills:
 - **`decisionKey` is case-sensitive and must match a tenant-registered decision.** Run `altscore decisions list` before writing rules; case mismatches (e.g. `"REJECTED"` when the tenant has `"reject"`) compose and lint clean but fail downstream when the run tries to record the decision via `/v1/executions/{id}/decisions` ("key not found for entity type: decision").
 - **`rule-tree` `outputVariable` becomes a top-level task output.** Downstream conditionals reference `task_outputs.<rule-tree-alias>.<outputVariable>` (e.g. `task_outputs.tree.decision`). `outputType` must be `string` | `number` | `boolean`.
 - **`is-test` toggles on evaluation rules / rule trees** isolate them from production execution. Use `altscore evaluation-rules set-test <id> --enable` while iterating, then `--disable` once stable.
+
+#### Atomic deal write with customer + N guarantors
+
+A single `deal` task can attach the customer plus an arbitrary number of guarantors atomically. Pattern: a single-mode child-workflow KYCs the customer, a batch child-workflow KYCs the guarantors, a `compute-variables` task assembles the full contacts list, and one `deal` task with a `deal_contacts` (plural) source entry writes them all in one shot.
+
+```jsonc
+"tasks": [
+  {"ref": "verify-customer",   "type": "child-workflow", "executorId": "kyc-individual-ar",
+   "inputMappings": {"tax_id": "inputs.customer_tax_id"}},
+
+  {"ref": "verify-guarantors", "type": "child-workflow", "runInBatch": true,
+   "inputExpression": "inputs.guarantors", "executorId": "kyc-individual-ar"},
+
+  {"ref": "build-contacts",    "type": "compute-variables",
+   "selectedVariables": ["all_contacts"]},
+
+  {"ref": "deal", "type": "deal", "operation": "write",
+   "lookupBy": "external_id", "key": "external_id",
+   "inputSchema": {
+     "external_id": {"type": "string", "required": true},
+     "label":       {"type": "string"},
+     "contacts":    {"type": "object"}
+   },
+   "inputMappings": {
+     "external_id": "task_outputs.verify-customer.borrower_id",
+     "label":       "inputs.customer_legal_name",
+     "contacts":    "task_outputs.build-contacts.all_contacts"
+   },
+   "sourcesConfig": [
+     {"type": "deal_field",    "key": "label",    "label": "Label"},
+     {"type": "deal_contacts", "key": "contacts", "label": "Contacts"}
+   ]
+  }
+]
+```
+
+Re-running the deal task with the same `(deal_id, borrower_id, role_key)` triples is idempotent — no duplicate DealContact rows are created.
 
 
 ## AltData
@@ -1945,3 +1990,6 @@ The slug convention is `AD_{sourceId}_{version}`, e.g. `AD_ECU-PUB-0002_v1`.
 - **`identities.create` body needs camelCase `borrowerId`**: The Pydantic alias is `borrowerId`, not `borrower_id`. Write `{"borrowerId": bid, "key": "email", "value": "..."}`.
 - **Query kwargs use snake_case**: `bc.identities.query(borrower_id=bid)` auto-converts to `?borrower-id=...`. Don't pass dash-case.
 - **Sentinel values**: `-999999` and `-999997` in metrics/fields mean missing data. Always check before using in calculations.
+- **Batch `child-workflow` `inputExpression` accepts deep paths.** `inputExpression: "task_outputs.<alias>.<deep>.<path>"` resolves correctly — you don't need to pre-flatten into a top-level task output or an `inputs.*` variable. A typo that references an unknown alias raises a clear `ValidationError` at compose/dispatch time rather than silently fanning out over an empty list.
+- **`customVariables` with `type: "object"` is the safe choice for lists.** Arrays now flow through too, but the underlying eval service preserves lists when the variable is typed `object`; the historical `type: "array"` form returned `[]` in some paths. Use `type: "object"` when you're building a list-valued custom variable that downstream tasks consume.
+- **`deal` task writes are idempotent on `(deal_id, borrower_id, role_key)`.** Re-running the deal task with the same triple won't duplicate a DealContact row — safe to re-execute workflows that include a `deal` task with `sourcesConfig` entries of type `deal_contact` or `deal_contacts`.
