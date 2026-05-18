@@ -63,16 +63,25 @@ import (
 
 type composeSpec struct {
 	Label           string                 `json:"label"`
+	Alias           string                 `json:"alias,omitempty"`
 	Category        string                 `json:"category"`
 	Description     string                 `json:"description,omitempty"`
 	Status          string                 `json:"status,omitempty"`
 	InputVariables  map[string]any         `json:"inputVariables,omitempty"`
 	CustomVariables map[string]any         `json:"customVariables,omitempty"`
 	Config          map[string]any         `json:"config,omitempty"`
-	Tasks           []map[string]any       `json:"tasks"`
-	ExtraNodes      []map[string]any       `json:"extraNodes,omitempty"`
-	Edges           []map[string]any       `json:"edges"`
-	Notes           []map[string]any       `json:"notes,omitempty"`
+	// Tasks + ExtraNodes are the legacy two-bucket shape. ExtraNodes only
+	// accepts trivial type-only graph nodes (start/end); everything else
+	// belongs in Tasks. Both are still accepted for back-compat.
+	Tasks      []map[string]any `json:"tasks,omitempty"`
+	ExtraNodes []map[string]any `json:"extraNodes,omitempty"`
+	// Nodes is the flat alternative shape: a single list where each entry
+	// is dispatched at parse time -- type=="start" goes to ExtraNodes,
+	// everything else (including end) goes to Tasks. Prefer this for new
+	// specs; the split is an internal-only concern.
+	Nodes []map[string]any `json:"nodes,omitempty"`
+	Edges []map[string]any `json:"edges"`
+	Notes []map[string]any `json:"notes,omitempty"`
 }
 
 func makeWfv2ComposeCmd() *cobra.Command {
@@ -98,10 +107,13 @@ typically what you want when composing from the CLI.
 Use --dry-run to print what would be sent without making any API calls.
 
 Spec format (see file header for full reference):
-  - label, category, description, status (DRAFT default)
+  - label, alias?, category, description, status (DRAFT default)
   - inputVariables, customVariables
-  - tasks: list of CreateTaskV2 objects (alias, label, type, type-specific fields)
-  - extraNodes: list of pure graph nodes (start, end, etc. -- no task backing)
+  - nodes (preferred): flat list of every graph node. Compose dispatches each
+    entry by type at parse time -- 'start' nodes are graph-only, everything
+    else (including 'end') gets a backing task created.
+  - tasks + extraNodes (legacy two-bucket shape): still accepted. Tasks are
+    every node except start; extraNodes is only start/end. Prefer 'nodes'.
   - edges: list of {sourceNodeId, targetNodeId, sourceHandle?, label?}`,
 		Example: `  altscore workflows-v2 compose --body @scoring-pipeline.json
   altscore workflows-v2 compose --body @spec.json --publish        # ready to execute
@@ -118,8 +130,22 @@ Spec format (see file header for full reference):
 			if spec.Label == "" {
 				return fmt.Errorf("spec.label is required")
 			}
+			// Flat nodes[] alternative: split into Tasks/ExtraNodes by type so
+			// the rest of compose treats them uniformly. Each flat entry
+			// counts as either a graph-only node (start) or a task-backed
+			// node (everything else, including end).
+			for i, n := range spec.Nodes {
+				t, _ := n["type"].(string)
+				if t == "start" {
+					spec.ExtraNodes = append(spec.ExtraNodes, n)
+				} else {
+					spec.Tasks = append(spec.Tasks, n)
+				}
+				_ = i
+			}
+			spec.Nodes = nil
 			if len(spec.Tasks) == 0 && len(spec.ExtraNodes) == 0 {
-				return fmt.Errorf("spec must include at least one of: tasks, extraNodes")
+				return fmt.Errorf("spec must include at least one of: tasks, extraNodes, nodes")
 			}
 
 			c, err := loadClient()
@@ -1884,12 +1910,21 @@ func preflightTasks(spec *composeSpec) error {
 			startCount,
 		)
 	}
-	if endCount == 0 {
+	// End nodes can live in either ExtraNodes (trivial type-only) or Tasks
+	// (the common pattern -- end nodes need an endConfig to emit output, so
+	// they go through the full task creation path). Count both.
+	endInTasks := 0
+	for _, t := range spec.Tasks {
+		if tt, _ := t["type"].(string); tt == "end" {
+			endInTasks++
+		}
+	}
+	if endCount+endInTasks == 0 {
 		// 'end' is conventional but not strictly required; warn-only via
 		// stderr, never block. Keep this open for niche use cases (e.g.
 		// workflows that terminate via 'exception' branches).
 		fmt.Fprintln(os.Stderr,
-			"# warning: compose spec has no 'end' node in extraNodes. Most workflows need one for the engine to know where to terminate cleanly.")
+			"# warning: compose spec has no 'end' node. Most workflows need one for the engine to know where to terminate cleanly.")
 	}
 
 	// Soft advisory: routing tasks (conditional, array-router) with branch

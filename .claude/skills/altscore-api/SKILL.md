@@ -566,6 +566,25 @@ cat > /tmp/spec.json <<'EOF'
   ]
 }
 EOF
+```
+
+**Flat `nodes[]` shape (preferred for new specs).** Instead of splitting `tasks[]` + `extraNodes[]`, put every node in a single `nodes[]` array; compose dispatches each entry by `type` (start nodes are graph-only, everything else gets a backing task created). The legacy two-bucket shape still works for back-compat.
+
+```bash
+cat > /tmp/spec-flat.json <<'EOF'
+{
+  "label": "Score and Route",
+  "alias": "score-and-route",
+  "category": "EVALUATION",
+  "inputVariables": {"borrower_id": {"type": "string", "required": true}},
+  "nodes": [
+    {"ref": "start", "type": "start", "label": "Start"},
+    {"ref": "fetch", "type": "altdata-enrichment", "...": "..."},
+    {"ref": "end",   "type": "end", "endConfig": {"...": "..."}}
+  ],
+  "edges": [{"from": "start", "to": "fetch"}, {"from": "fetch", "to": "end"}]
+}
+EOF
 
 altscore workflows-v2 compose --body @/tmp/spec.json --dry-run   # inspect first
 altscore workflows-v2 compose --body @/tmp/spec.json --publish   # create + publish (the one you usually want)
