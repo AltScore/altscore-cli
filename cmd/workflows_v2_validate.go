@@ -3,7 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/output"
@@ -33,21 +32,12 @@ func validateWorkflowV2Body(body json.RawMessage) error {
 		return nil
 	}
 
-	// Warn (don't block) when the body has an `alias` field. The server
-	// derives the workflow's alias from `label` and silently drops any alias
-	// supplied in the body -- both on create and on update. Surfacing this
-	// here saves the trap where a caller stamps entities with the alias they
-	// THOUGHT the workflow would have, only to find the slugifier picked a
-	// different one. The compose dry-run preview also shows the slug, but
-	// users go through `workflows-v2 update` after compose for ad-hoc edits
-	// and hit the same drop silently.
-	if v, has := wf["alias"]; has {
-		if s, _ := v.(string); s != "" {
-			fmt.Fprintf(os.Stderr,
-				"# warning: body has \"alias\": %q -- the API will silently drop it. The workflow's alias is server-derived from `label` (slugified). Use `compose --dry-run` to preview the slug.\n",
-				s)
-		}
-	}
+	// As of BC #1291, the create endpoint honors an explicit `alias` field
+	// when provided (and falls back to slugifying `label` when absent). No
+	// warning is needed -- caller intent is respected. We keep this block
+	// intentionally empty so the historical comment trail is searchable;
+	// the prior "silently drops alias" warning was removed once the BC
+	// contract changed.
 
 	var problems []string
 
