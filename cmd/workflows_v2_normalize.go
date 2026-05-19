@@ -169,15 +169,22 @@ type composeNormalizeOpts struct {
 	// Without it the bare form persists, which the runtime tolerates but
 	// the Hub picker doesn't surface as an obvious source.
 	InputVariables map[string]any
-	// Publish -- whether the caller passed --publish to compose. When true,
+	// Publish -- whether the caller passed --publish. When true,
 	// "referenced entity missing on tenant" is promoted from a stderr
 	// warning to a hard error. A published workflow that references a
 	// missing scorecard / rule-tree / mapping-table / evaluation-rule
 	// will fail 100% of its executions at runtime ("Scorecard not found:
 	// X"), and the failure surfaces only when someone tries to actually
-	// run the workflow -- often hours or days after compose. Catching it
-	// at publish time turns a runtime mystery into a clear compose error.
+	// run the workflow -- often hours or days after apply. Catching it
+	// at publish time turns a runtime mystery into a clear apply error.
 	Publish bool
+	// AutoRescopeEntities -- when true, validateEntityWorkflowAliasMatch
+	// downgrades to a stderr warning (so the per-entity rescope loop in
+	// apply can re-stamp the entity after task creation). When false (the
+	// default, matching legacy compose behavior), the mismatch is a hard
+	// error so the agent fixes it explicitly. Apply sets this true unless
+	// --skip-rescope is passed; non-apply callers leave it false.
+	AutoRescopeEntities bool
 }
 
 // missingEntityHandler returns an error when --publish is set, otherwise
@@ -217,20 +224,24 @@ func missingEntityHandler(opts *composeNormalizeOpts, dryRun bool, resourceKind,
 // decisioning entity's workflowAlias doesn't match the workflow being
 // composed. The Hub UI's elements panel filters entities by exact
 // workflow_alias match -- an entity scoped to a DIFFERENT workflow is
-// referenceable (compose still wires it correctly and the runtime
-// resolves it), but invisible to the editor, so a human reviewing the
-// workflow in the Hub sees an unconfigured-looking task that secretly
-// pulls from another workflow's entity. That cross-workflow drift is
-// hard to undo once it spreads.
+// referenceable (the apply pipeline still wires it correctly and the
+// runtime resolves it), but invisible to the editor, so a human
+// reviewing the workflow in the Hub sees an unconfigured-looking task
+// that secretly pulls from another workflow's entity. That cross-workflow
+// drift is hard to undo once it spreads.
 //
 // Allowed: entity has no workflowAlias (global / shared by intent) OR
 // the lookup didn't find anything (lookupEntity already warned, no
 // scope to check) OR we don't know the predicted alias (compose context
-// missing -- non-compose callers).
+// missing -- non-apply callers).
 //
-// Disallowed: any other mismatch. The error message tells the caller
-// exactly which CLI command fixes it.
-func validateEntityWorkflowAliasMatch(entity map[string]any, predictedAlias, resourceKind, ref string) error {
+// When opts.AutoRescopeEntities is true (apply's default), the mismatch
+// is downgraded from a hard error to a stderr warning -- the apply
+// reconciler will re-stamp the entity after task creation succeeds, so
+// blocking here would prevent the reconciliation from ever running.
+// When false (legacy compose behavior, --skip-rescope), the mismatch is
+// a hard error and the agent has to fix it explicitly.
+func validateEntityWorkflowAliasMatch(opts *composeNormalizeOpts, entity map[string]any, predictedAlias, resourceKind, ref string) error {
 	if entity == nil || predictedAlias == "" {
 		return nil
 	}
@@ -245,6 +256,12 @@ func validateEntityWorkflowAliasMatch(entity map[string]any, predictedAlias, res
 	if id == "" {
 		id = "<id>"
 	}
+	if opts != nil && opts.AutoRescopeEntities {
+		fmt.Fprintf(os.Stderr,
+			"# warning: %s %q is scoped to workflowAlias=%q but this workflow's alias is %q -- apply will re-scope it after task creation (auto-rescope)\n",
+			resourceKind, ref, actual, predictedAlias)
+		return nil
+	}
 	return fmt.Errorf(
 		"%s %q is scoped to workflowAlias=%q, but this workflow's alias will be %q -- "+
 			"the entity won't appear in the Hub's elements panel for this workflow, so any human "+
@@ -254,7 +271,8 @@ func validateEntityWorkflowAliasMatch(entity map[string]any, predictedAlias, res
 			"specific to this workflow; or (b) clear the entity's workflowAlias to make it "+
 			"globally shared across workflows: `altscore %s update %s --body '{\"workflowAlias\": null}'` "+
 			"-- pick this only if multiple workflows really should share the same entity definition; "+
-			"or (c) create a workflow-specific copy of the entity with a fresh code",
+			"or (c) create a workflow-specific copy of the entity with a fresh code; or (d) re-run "+
+			"`apply` without `--skip-rescope` to auto-stamp the entity to this workflow",
 		resourceKind, ref, actual, predictedAlias, resourceKind, id, predictedAlias,
 		resourceKind, id)
 }
@@ -899,7 +917,7 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *com
 				return fmt.Errorf("rulesConfig[%d]: %w", i, err)
 			}
 		}
-		if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "evaluation-rules", ref); err != nil {
+		if err := validateEntityWorkflowAliasMatch(opts, entity, predictedAlias, "evaluation-rules", ref); err != nil {
 			return fmt.Errorf("rulesConfig[%d]: %w", i, err)
 		}
 		// Cross-check the rule's decisionKey against the tenant's
@@ -1019,7 +1037,7 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *comp
 				return fmt.Errorf("entries[%d]: %w", i, err)
 			}
 		}
-		if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "mapping-tables", ref); err != nil {
+		if err := validateEntityWorkflowAliasMatch(opts, entity, predictedAlias, "mapping-tables", ref); err != nil {
 			return fmt.Errorf("entries[%d]: %w", i, err)
 		}
 		entries[i] = em
@@ -1096,7 +1114,7 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, opts *compose
 			return err
 		}
 	}
-	if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "scorecards", ref); err != nil {
+	if err := validateEntityWorkflowAliasMatch(opts, entity, predictedAlias, "scorecards", ref); err != nil {
 		return err
 	}
 	// Default totalScoreVariable / breakdownVariable when omitted so the
@@ -1160,7 +1178,7 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeN
 			return err
 		}
 	}
-	if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "rule-trees", ref); err != nil {
+	if err := validateEntityWorkflowAliasMatch(opts, entity, predictedAlias, "rule-trees", ref); err != nil {
 		return err
 	}
 	// Cross-check the decisionKey on every rule the tree references. The

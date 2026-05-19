@@ -456,9 +456,11 @@ task_B sees workflow input fields merged with task_A's output. task_A's output w
 
 > **⚠️ STOP — read this before doing anything.**
 >
-> If the user asks "create a v2 workflow that does X", run **`altscore workflows-v2 compose`** with a single spec file. Do not call `workflows-v2 create` directly with hand-built nodes — that path produces orphan nodes (no `taskAlias`) that save successfully but break the Hub UI (`GET /v2/tasks/null` 404 for every node). The CLI now rejects orphan-node bodies at write time with an error pointing at compose; if you see that error, you're on the wrong path — switch to compose.
+> If the user asks "create a v2 workflow that does X" — or "update workflow Y to do Z" — run **`altscore workflows-v2 apply`** with a single spec file. `apply` is declarative: it reconciles the spec against the tenant. If no workflow shares the spec's alias, it creates one (POST tasks + POST workflow); if one already exists, it updates in place (fresh tasks + create-draft + lock + autosave + publish, same workflow id and alias retained). One verb, one validation pipeline, no fork-vs-update branch for the agent.
 >
-> Compose is the **only** recommended greenfield path. Direct `create` is for special cases where you've already created the tasks via `tasks-v2 create` and assembled a body with proper `taskAlias` references on every non-start/non-end node.
+> Do not call `workflows-v2 create` directly with hand-built nodes — that path produces orphan nodes (no `taskAlias`) that save successfully but break the Hub UI (`GET /v2/tasks/null` 404 for every node). The CLI rejects orphan-node bodies at write time with an error pointing at apply; if you see that error, you're on the wrong path — switch to apply.
+>
+> `apply` is the **only** recommended path for both greenfield and update. Direct `create` is for special cases where you've already created the tasks via `tasks-v2 create` and assembled a body with proper `taskAlias` references on every non-start/non-end node.
 >
 > **Two more silent traps the API doesn't reject** (the CLI now rejects both, but agents must understand the canonical shape):
 >
@@ -473,7 +475,7 @@ task_B sees workflow input fields merged with task_A's output. task_A's output w
 >    ```
 >    Operators: `eq, neq, gt, gte, lt, lte, contains, startsWith, endsWith, in, notIn, between, isNull, isNotNull, arrayContainsAny, arrayContainsAll, isAltdataEmpty, isAltdataNotCalculated, isAltdataError, isAltdataNull, isNotAltdataNull`. `valueType` is `"value"` (literal) or `"variable"` (reference to another inputSchema field). Field is `isElse` (camelCase), not `is_else`.
 >
-> 2. **`altdata-enrichment` tasks need `inputKeys` to wire source-required fields.** Each source (e.g. `ECU-PUB-0002`) declares `inputFields` like `personId`, `taxId`. The task must include `inputKeys: {"personId": "{{personId}}", "taxId": "{{taxId}}"}` matched against an `inputSchema` that declares those keys, plus `dataAge` (cache TTL minutes, default 30) and `packageAlias` (where to store results) on each `sourcesConfig` entry. Compose auto-derives `inputKeys` by querying `sources-status` for each source's `inputFields` — use it.
+> 2. **`altdata-enrichment` tasks need `inputKeys` to wire source-required fields.** Each source (e.g. `ECU-PUB-0002`) declares `inputFields` like `personId`, `taxId`. The task must include `inputKeys: {"personId": "{{personId}}", "taxId": "{{taxId}}"}` matched against an `inputSchema` that declares those keys, plus `dataAge` (cache TTL minutes, default 30) and `packageAlias` (where to store results) on each `sourcesConfig` entry. `apply` auto-derives `inputKeys` by querying `sources-status` for each source's `inputFields` — use it.
 >
 > Run `altscore workflows-v2 schema-guide conditions` and `... schema-guide tasks` for the canonical reference.
 
@@ -486,7 +488,7 @@ Workflows V2 is the API surface for the visual graph builder in the Hub. It uses
 
 This is **not** v1 (`/v1/workflows`). Use v2 for anything created in the visual editor.
 
-**Key insight: tasks first, then workflow.** **Every** graph node — including `start`, `end`, and `conditional` — needs a `taskAlias`. The Hub creates trivial backing tasks (just `type` + `label`) for start/end so it can render them. Verified by inspecting working tenant workflows: every node has a non-null `taskAlias`. Use `compose`, which creates a backing task for every node automatically.
+**Key insight: tasks first, then workflow.** **Every** graph node — including `start`, `end`, and `conditional` — needs a `taskAlias`. The Hub creates trivial backing tasks (just `type` + `label`) for start/end so it can render them. Verified by inspecting working tenant workflows: every node has a non-null `taskAlias`. Use `apply`, which creates a backing task for every node automatically.
 
 After creating a workflow, run `altscore workflows-v2 lint <id>` to verify there are no orphan nodes, dangling edges, or duplicate ids. The lint command also runs the same checks as the create-time validator and is the fastest way to triage a misbehaving workflow.
 
@@ -501,11 +503,28 @@ altscore workflows-v2 schema-guide tasks         # task shape + per-type config 
 altscore workflows-v2 schema-guide examples      # full scoring_pipeline template
 ```
 
-#### Recommended path: `compose` (one-shot greenfield)
+#### Recommended path: `apply` (declarative create-or-update)
 
-For "Create a workflow that does X", use `workflows-v2 compose`. It takes a single spec, calls `/v2/tasks` for each task (server picks the alias), then creates the workflow with nodes auto-wired to those server-assigned aliases. Use `--dry-run` first to inspect what will be sent.
+For "Create a workflow that does X" — or "Update workflow Y to do Z" — use `workflows-v2 apply`. It takes a single spec and reconciles it against the tenant. Use `--dry-run` first to inspect what will be sent (the dry-run output also tells you which branch will fire: CREATE or UPDATE).
 
-**Refs vs aliases.** The spec uses `ref` as a stable spec-local key. Edges and inputMappings reference tasks by `ref`, and compose rewrites them with the server-assigned aliases at create time. You can also still pass an explicit `alias` if you need a specific name (e.g. for cross-workflow reuse) — compose passes that through. Edges use `from`/`to` as shortcuts for `sourceNodeId`/`targetNodeId`.
+**Create vs update semantics.** apply resolves the target by alias:
+
+- `spec.alias` if set, otherwise `slugifyWorkflowLabel(spec.label)`.
+- If **no** ACTIVE workflow has that alias → **CREATE path**: POST `/v2/tasks` for every task (server picks each task's alias), POST `/v2/workflows`, optional publish (DRAFT by default unless `--publish`).
+- If exactly **one** ACTIVE workflow has that alias → **UPDATE path**: POST `/v2/tasks` for every task in the spec (old tasks orphan, accepted), `create-draft --force-recreate`, acquire a lock (`client-id=apply-<ts>`), autosave the new nodes/edges/variables/config/notes/category/status, then publish. Same workflow id, same alias, version increments, schedules and downstream consumers survive.
+
+Both paths share the same validation + normalize pipeline (`preflightTasks`, per-type normalize, `validateEntityWorkflowAliasMatch`, etc.) so a spec that passes against a fresh tenant also passes when re-applied later.
+
+**Entity-scope reconciliation (auto-restamp).** After apply succeeds, it walks the spec's referenced credit-decisioning entities and stamps each one's `workflowAlias` to the workflow's alias via `PATCH /v1/{resource}/{id}`. Walked:
+
+- `scorecard` task → scorecard entity → each `rules[*].mappingTableCode` mapping table.
+- `rule-tree` task → rule-tree entity → each `rules[*].ruleCode` evaluation rule.
+- `evaluate-rules` task → each `rulesConfig[*].ruleCode` evaluation rule.
+- `mapping-table` task → each `mappingTableConfig.entries[*].mappingTableCode` mapping table.
+
+Each successful stamp logs to stderr (`# scoped <resource> <code> to <alias>`). This is the fix for the "four -v2 sibling workflows all share a scorecard scoped to the original alias" bug — apply makes the workflow→entity scope mapping reflect the spec, automatically. Pass `--skip-rescope` to opt out (then a stale scope shows as a hard error in normalize and the agent has to fix it manually).
+
+**Refs vs aliases.** The spec uses `ref` as a stable spec-local key. Edges and inputMappings reference tasks by `ref`, and apply rewrites them with the server-assigned aliases at task-create time. You can also pass an explicit `alias` on the workflow itself (`spec.alias`) — apply uses it both to resolve the target and to keep `workflowAlias` stable across re-applies. Edges use `from`/`to` as shortcuts for `sourceNodeId`/`targetNodeId`.
 
 ```bash
 cat > /tmp/spec.json <<'EOF'
@@ -568,7 +587,7 @@ cat > /tmp/spec.json <<'EOF'
 EOF
 ```
 
-**Flat `nodes[]` shape (preferred for new specs).** Instead of splitting `tasks[]` + `extraNodes[]`, put every node in a single `nodes[]` array; compose dispatches each entry by `type` (start nodes are graph-only, everything else gets a backing task created). The legacy two-bucket shape still works for back-compat.
+**Flat `nodes[]` shape (preferred for new specs).** Instead of splitting `tasks[]` + `extraNodes[]`, put every node in a single `nodes[]` array; apply dispatches each entry by `type` (start nodes are graph-only, everything else gets a backing task created). The legacy two-bucket shape still works for back-compat.
 
 ```bash
 cat > /tmp/spec-flat.json <<'EOF'
@@ -586,15 +605,16 @@ cat > /tmp/spec-flat.json <<'EOF'
 }
 EOF
 
-altscore workflows-v2 compose --body @/tmp/spec.json --dry-run   # inspect first
-altscore workflows-v2 compose --body @/tmp/spec.json --publish   # create + publish (the one you usually want)
-altscore workflows-v2 compose --body @/tmp/spec.json             # create only -- leaves workflow in DRAFT
-altscore workflows-v2 publish <id>                                # standalone publish step
+altscore workflows-v2 apply --body @/tmp/spec.json --dry-run   # inspect first (prints CREATE vs UPDATE branch)
+altscore workflows-v2 apply --body @/tmp/spec.json --publish   # create+publish OR update+publish (the one you usually want)
+altscore workflows-v2 apply --body @/tmp/spec.json             # create-only -- leaves workflow in DRAFT (CREATE path); UPDATE path always publishes
+altscore workflows-v2 apply --body @/tmp/spec.json --skip-rescope  # do not auto-stamp referenced entities
+altscore workflows-v2 publish <id>                              # standalone publish step
 ```
 
-> **DRAFT trap.** Compose creates workflows in `status: "DRAFT"` by default — mirrors the Hub's "save-then-publish" editor flow. **A DRAFT workflow executes successfully but the engine skips every node**: `executions get` returns `status: complete, isSuccess: true`, the envelope output is `null`, and per-task outputs (`executions state <id> | jq '.state.data_flow.task_outputs'`) is `{}`. This looks like the workflow ran when nothing actually happened. Always pass `--publish` (or run `altscore workflows-v2 publish <id>` after) before executing. The CLI's `workflows-v2 execute` now does a pre-flight check and warns to stderr if the workflow isn't `ACTIVE`; pass `--skip-status-check` to suppress.
+> **DRAFT trap.** apply's CREATE path saves workflows in `status: "DRAFT"` by default — mirrors the Hub's "save-then-publish" editor flow. **A DRAFT workflow executes successfully but the engine skips every node**: `executions get` returns `status: complete, isSuccess: true`, the envelope output is `null`, and per-task outputs (`executions state <id> | jq '.state.data_flow.task_outputs'`) is `{}`. This looks like the workflow ran when nothing actually happened. Always pass `--publish` (or run `altscore workflows-v2 publish <id>` after) before executing. The UPDATE path always publishes — apply treats the spec as desired state. The CLI's `workflows-v2 execute` now does a pre-flight check and warns to stderr if the workflow isn't `ACTIVE`; pass `--skip-status-check` to suppress.
 
-If the agent asks for help building a workflow, default to compose. Other paths exist for special cases:
+If the agent asks for help building or updating a workflow, default to apply. Other paths exist for special cases:
 
 - **Clone-and-modify** (highest success when a similar workflow exists): `export <similar-id>` → edit JSON → `validate-rules` → `import --new-label "..."`
 - **Incremental edit on an existing workflow**: hold a lock + use `add-node`/`add-edge`/`set-mapping`/`set-variable` helpers (see Helpers section below)
@@ -665,7 +685,7 @@ altscore workflows-v2 lint <id>                                    # check for o
 altscore workflows-v2 update <id> --body '{"label":"Renamed"}'     # prefer autosave for graph edits
 altscore workflows-v2 delete <id>
 
-# Direct create is gated by client-side validation -- prefer compose for greenfield.
+# Direct create is gated by client-side validation -- prefer apply for greenfield and updates.
 # If you really need to create from a hand-built body (and have already created
 # all referenced /v2/tasks), the body must use camelCase (nodeId, sourceNodeId,
 # targetNodeId) and every non-start/non-end node must have taskAlias or taskId.
@@ -780,7 +800,7 @@ altscore workflows-v2 ai suggest-mappings --body '{
 
 #### Ergonomic builder helpers (for INCREMENTAL EDIT path)
 
-These mutate an existing workflow in place. Each handles fetch + lock + autosave internally. **Do not use these for greenfield** — use `compose` instead.
+These mutate an existing workflow in place. Each handles fetch + lock + autosave internally. **Prefer `apply` for any non-trivial change** — apply is declarative, re-runs the full validation pipeline, and reconciles entity scopes; these helpers are best used for one-off tweaks or interactive exploration where you don't want to maintain a spec file.
 
 ```bash
 TOKEN=$(altscore workflows-v2 lock acquire my-wf --client-id "agent-$$" | jq -r .lockToken)
@@ -840,9 +860,9 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 
 **Deep paths into altdata output**: an `altdata-enrichment` task outputs the entire package object on `sources_output_packages`. To map a single field into a downstream conditional/compute-variables task, use the deep form: `task_outputs.<altdataAlias>.<sourceId>.data.<fieldName>`. No intermediate compute-variables required.
 
-**Bare `<alias>.<field>` is broken** at runtime — Pydantic accepts it, but the resolver rejects `<alias>` as an unknown namespace. Always prefix `task_outputs.` for cross-task references. Compose now does this automatically when you write a ref-prefixed mapping; the rewriter outputs `task_outputs.<server-alias>.<rest>`.
+**Bare `<alias>.<field>` is broken** at runtime — Pydantic accepts it, but the resolver rejects `<alias>` as an unknown namespace. Always prefix `task_outputs.` for cross-task references. `apply` does this automatically when you write a ref-prefixed mapping; the rewriter outputs `task_outputs.<server-alias>.<rest>`.
 
-**CreateTaskV2 vs CreateTaskVersionV2**: the strict initial-create validator rejects multi-dot mapping values when `inputSchema` is set. The lenient version-bump validator accepts them. **Compose's two-phase create handles this**: it strips `inputMappings`/`inputSchema` from the first POST, then re-posts the full body to `/v2/tasks/{alias}` to land at version 2. The workflow node references `taskVersion: 2` automatically.
+**CreateTaskV2 vs CreateTaskVersionV2**: the strict initial-create validator rejects multi-dot mapping values when `inputSchema` is set. The lenient version-bump validator accepts them. **`apply`'s two-phase create handles this**: it strips `inputMappings`/`inputSchema` from the first POST, then re-posts the full body to `/v2/tasks/{alias}` to land at version 2. The workflow node references `taskVersion: 2` automatically.
 
 #### Gotchas (v2 specific)
 
@@ -864,7 +884,7 @@ Four entity types power the credit-decisioning v2 task surface. They live at `/v
 > **`workflowAlias` is load-bearing — set it on every entity.**
 > The v2 builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias`. An entity created without one is invisible to that workflow, even though the entity itself is fine. Always pass `--workflow-alias <alias>` (matches the workflow's `alias`) on `create`, `update`, and `import`. The CLI prints a stderr warning on `create` if neither the flag nor a body field sets it.
 >
-> **The workflow's alias is server-derived from its label** — `"Customer Onboarding"` slugifies to `customer-onboarding`, `"All 5 types"` to `all-5-types`. The body's `alias` field is silently dropped on `workflows-v2 create`. A common trap: stamping entities with a guess like `customer-onboarding-v1` when the workflow's actual alias becomes `customer-onboarding-v-1`. Run `altscore workflows-v2 compose --body @spec.json --dry-run` first — it prints the predicted alias up front and tells you what to pass to `--workflow-alias` on entity creates. Or compute it locally: lowercase, replace non-`[a-z0-9]+` with `-`, collapse repeated `-`, trim, cap at 100 chars.
+> **The workflow's alias is server-derived from its label** — `"Customer Onboarding"` slugifies to `customer-onboarding`, `"All 5 types"` to `all-5-types`. The body's `alias` field is silently dropped on `workflows-v2 create` (but `apply` honors `spec.alias` explicitly). A common trap: stamping entities with a guess like `customer-onboarding-v1` when the workflow's actual alias becomes `customer-onboarding-v-1`. Run `altscore workflows-v2 apply --body @spec.json --dry-run` first — it prints the predicted alias up front and tells you what to pass to `--workflow-alias` on entity creates. Better: skip the manual --workflow-alias stamping entirely and rely on `apply`'s auto-rescope to fix it post-create. Or compute it locally: lowercase, replace non-`[a-z0-9]+` with `-`, collapse repeated `-`, trim, cap at 100 chars.
 
 #### Mapping tables — `mapping-tables`
 
@@ -981,9 +1001,9 @@ altscore rule-trees import --body @rule-trees.json --workflow-alias underwriting
 
 References evaluation rules by id and/or code in a specific order with an `isDefault` marker.
 
-#### Building a workflow that uses them (compose)
+#### Building a workflow that uses them (apply)
 
-The four matching v2 task types — `evaluate-rules`, `mapping-table`, `scorecard`, `rule-tree` — reference these entities. Compose validates references against the tenant (best-effort warnings) and pre-fills `outputSchema` with the canonical runtime fields so downstream tasks see the right available outputs.
+The four matching v2 task types — `evaluate-rules`, `mapping-table`, `scorecard`, `rule-tree` — reference these entities. `apply` validates references against the tenant (best-effort warnings) and pre-fills `outputSchema` with the canonical runtime fields so downstream tasks see the right available outputs.
 
 ```bash
 cat > /tmp/credit-spec.json <<'EOF'
@@ -1024,24 +1044,24 @@ cat > /tmp/credit-spec.json <<'EOF'
   ]
 }
 EOF
-altscore workflows-v2 compose --body @/tmp/credit-spec.json --dry-run
-altscore workflows-v2 compose --body @/tmp/credit-spec.json
+altscore workflows-v2 apply --body @/tmp/credit-spec.json --dry-run
+altscore workflows-v2 apply --body @/tmp/credit-spec.json --publish
 ```
 
-Compose auto-fills:
+`apply` auto-fills:
 - `evaluate-rules`: `outputSchema = {alerts: array, alerts_count: integer}`
-- `mapping-table`: each `entries[].outputVariable` becomes a top-level output field (string by default; refined to `number` when the referenced mapping table's `outputType` is number). **Compose also mints a UUID for each `entries[].id`** — the runtime requires it but agents typically forget.
+- `mapping-table`: each `entries[].outputVariable` becomes a top-level output field (string by default; refined to `number` when the referenced mapping table's `outputType` is number). **`apply` also mints a UUID for each `entries[].id`** — the runtime requires it but agents typically forget.
 - `scorecard`: `outputSchema = {<totalScoreVariable>: number, <breakdownVariable>: object}` (breakdown defaults to `score_breakdown`)
 - `rule-tree`: `outputSchema = {<outputVariable>: <outputType>}`
 
 #### Common pitfalls (credit-decisioning specific)
 
-- **`workflowAlias` decides picker visibility.** The Hub builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias` matching the workflow. Entities created without it exist on the tenant but are invisible to that workflow. Always pass `--workflow-alias <alias>` (matching the workflow's `alias`) to `create`, `update`, and `import`. To re-scope an existing entity: `altscore <resource> update <id> --workflow-alias <alias>`.
-- **All four task types are reference-only.** `evaluate-rules` → `rulesConfig: [{ruleCode}]`, `mapping-table` → `mappingTableConfig.entries[].mappingTableCode`, `scorecard` → `scorecardConfig.scorecardCode`, `rule-tree` → `ruleTreeConfig.ruleTreeCode`. Inline rule/scorecard/table definitions on the task body are silently ignored at runtime; create the entity via the matching CRUD command first, then reference by code in compose.
+- **`workflowAlias` decides picker visibility.** The Hub builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias` matching the workflow. Entities created without it exist on the tenant but are invisible to that workflow. **`apply` handles this automatically** via the entity-scope reconciler — after a successful apply, every referenced entity (and the rules/mapping-tables nested under scorecards and rule-trees) is stamped to the workflow's alias. If you're scripting outside apply, pass `--workflow-alias <alias>` to `create`, `update`, and `import`. To re-scope an existing entity manually: `altscore <resource> update <id> --workflow-alias <alias>`.
+- **All four task types are reference-only.** `evaluate-rules` → `rulesConfig: [{ruleCode}]`, `mapping-table` → `mappingTableConfig.entries[].mappingTableCode`, `scorecard` → `scorecardConfig.scorecardCode`, `rule-tree` → `ruleTreeConfig.ruleTreeCode`. Inline rule/scorecard/table definitions on the task body are silently ignored at runtime; create the entity via the matching CRUD command first, then reference by code in apply.
 - **Scorecard rules require a mapping table per rule.** When you `altscore scorecards create`, every entry in `rules[]` must include `mappingTableCode` (or `mappingTableId`). Buckets on the rule are NOT a substitute — the runtime reads buckets from the linked mapping table and fails with `Rule '<label>' must be linked to a mapping table` otherwise.
 - **`alertLevel` is required to produce alerts.** A matching `evaluate-rules` rule with no `alertLevel` set produces nothing in the task's `alerts[]` output. Set `alertLevel: 1|2|3` (with optional `alertMessage`) on the rule when alerts are wanted.
 - **`decisionKey` drives `rule-tree` output.** The first matching rule's `decisionKey` becomes the rule-tree task's `outputVariable` value. Without `decisionKey` on the rule, the rule-tree's decision is null even on a hit.
-- **`decisionKey` is case-sensitive and must match a tenant-registered decision.** Run `altscore decisions list` before writing rules; case mismatches (e.g. `"REJECTED"` when the tenant has `"reject"`) compose and lint clean but fail downstream when the run tries to record the decision via `/v1/executions/{id}/decisions` ("key not found for entity type: decision").
+- **`decisionKey` is case-sensitive and must match a tenant-registered decision.** Run `altscore decisions list` before writing rules; case mismatches (e.g. `"REJECTED"` when the tenant has `"reject"`) apply and lint clean but fail downstream when the run tries to record the decision via `/v1/executions/{id}/decisions` ("key not found for entity type: decision").
 - **`rule-tree` `outputVariable` becomes a top-level task output.** Downstream conditionals reference `task_outputs.<rule-tree-alias>.<outputVariable>` (e.g. `task_outputs.tree.decision`). `outputType` must be `string` | `number` | `boolean`.
 - **`is-test` toggles on evaluation rules / rule trees** isolate them from production execution. Use `altscore evaluation-rules set-test <id> --enable` while iterating, then `--disable` once stable.
 
@@ -1122,7 +1142,7 @@ altscore altdata search "address" --locale es
 - Walking pages of `altscore altdata sources` to inspect a single source — use `describe`.
 - `altscore altdata sources --filter sourceId=<X>` — silently returns the full catalog (the backend ignores unknown filter keys). Use `describe <X>` instead.
 - Calling `dictionary` or `sample` without a version — both now auto-resolve the latest, no need to chain a separate sources call first.
-- Using `workflows-v2 sources-status` for general discovery — it's the same endpoint as `altdata sources` but lives under workflows-v2 because compose-time normalization needs it; for agents browsing the catalog, prefer `altdata sources` / `altdata describe`.
+- Using `workflows-v2 sources-status` for general discovery — it's the same endpoint as `altdata sources` but lives under workflows-v2 because apply-time normalization needs it; for agents browsing the catalog, prefer `altdata sources` / `altdata describe`.
 
 ### Data Requests (production only)
 
@@ -2009,6 +2029,6 @@ The slug convention is `AD_{sourceId}_{version}`, e.g. `AD_ECU-PUB-0002_v1`.
 - **`identities.create` body needs camelCase `borrowerId`**: The Pydantic alias is `borrowerId`, not `borrower_id`. Write `{"borrowerId": bid, "key": "email", "value": "..."}`.
 - **Query kwargs use snake_case**: `bc.identities.query(borrower_id=bid)` auto-converts to `?borrower-id=...`. Don't pass dash-case.
 - **Sentinel values**: `-999999` and `-999997` in metrics/fields mean missing data. Always check before using in calculations.
-- **Batch `child-workflow` `inputExpression` accepts deep paths.** `inputExpression: "task_outputs.<alias>.<deep>.<path>"` resolves correctly — you don't need to pre-flatten into a top-level task output or an `inputs.*` variable. A typo that references an unknown alias raises a clear `ValidationError` at compose/dispatch time rather than silently fanning out over an empty list.
+- **Batch `child-workflow` `inputExpression` accepts deep paths.** `inputExpression: "task_outputs.<alias>.<deep>.<path>"` resolves correctly — you don't need to pre-flatten into a top-level task output or an `inputs.*` variable. A typo that references an unknown alias raises a clear `ValidationError` at apply/dispatch time rather than silently fanning out over an empty list.
 - **`customVariables` with `type: "object"` is the safe choice for lists.** Arrays now flow through too, but the underlying eval service preserves lists when the variable is typed `object`; the historical `type: "array"` form returned `[]` in some paths. Use `type: "object"` when you're building a list-valued custom variable that downstream tasks consume.
 - **`deal` task writes are idempotent on `(deal_id, borrower_id, role_key)`.** Re-running the deal task with the same triple won't duplicate a DealContact row — safe to re-execute workflows that include a `deal` task with `sourcesConfig` entries of type `deal_contact` or `deal_contacts`.

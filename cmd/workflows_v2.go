@@ -1153,7 +1153,7 @@ func warnIfNotActive(stderr io.Writer, c *client.Client, idOrAlias string) {
 	}
 	switch status {
 	case "DRAFT":
-		fmt.Fprintf(stderr, "# warning: workflow %s is in DRAFT status -- the engine will skip every node and return an empty output. Run 'altscore workflows-v2 publish %s' (or recompose with --publish) to make it executable.\n", idOrAlias, idOrAlias)
+		fmt.Fprintf(stderr, "# warning: workflow %s is in DRAFT status -- the engine will skip every node and return an empty output. Run 'altscore workflows-v2 publish %s' (or re-apply with --publish) to make it executable.\n", idOrAlias, idOrAlias)
 	case "ARCHIVED":
 		fmt.Fprintf(stderr, "# warning: workflow %s is ARCHIVED -- restore it via 'altscore workflows-v2 restore %s' before expecting useful output.\n", idOrAlias, idOrAlias)
 	default:
@@ -1471,13 +1471,13 @@ Available sections (run with no arg to see the full structure):
   variables                             input/custom/system/task_outputs scopes
   mappings                              inputMappings rules + multi-dot syntax
   tasks                                 per-type config (perType + deprecatedTypes)
-  composeSpec                           the spec format used by 'workflows-v2 compose'
+  composeSpec                           the spec format used by 'workflows-v2 apply'
   conditions                            ConditionGroup operator vocabulary
   creditDecisioningEntities             /v1/{evaluation-rules,mapping-tables,scorecards,rule-trees}
   examples                              full minimal_shell + scoring_pipeline templates
-  gotchas                               common compose mistakes + fixes
+  gotchas                               common apply mistakes + fixes
   gotchas_about_branches_and_inputkeys  conditional pitfalls
-  preflightChecks                       validation order before compose persists`,
+  preflightChecks                       validation order before apply persists`,
 		Example: `  altscore workflows-v2 schema-guide
   altscore workflows-v2 schema-guide tasks
   altscore workflows-v2 schema-guide composeSpec

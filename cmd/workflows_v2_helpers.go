@@ -188,7 +188,7 @@ custom UI hints, etc.). Do not put task config in --data.`,
 					"every node needs --task-alias (or --task-id) -- including start/end/conditional. "+
 						"The Hub creates a backing task for every node, including trivial ones. "+
 						"Create the task first with 'altscore tasks-v2 create' OR scaffold the whole workflow with "+
-						"'altscore workflows-v2 compose --body @spec.json'.")
+						"'altscore workflows-v2 apply --body @spec.json'.")
 			}
 			c, err := loadClient()
 			if err != nil {

@@ -73,7 +73,7 @@ func validateWorkflowV2Body(body json.RawMessage) error {
 			if taskAlias == "" && taskID == "" {
 				problems = append(problems, fmt.Sprintf(
 					"nodes[%d] (%q, type=%q): no taskAlias/taskId -- every node (incl. start/end/conditional) needs a backing task. "+
-						"Use 'altscore workflows-v2 compose' which creates tasks for all nodes atomically.",
+						"Use 'altscore workflows-v2 apply' which creates tasks for all nodes atomically.",
 					i, label, nodeType))
 			}
 		}
@@ -102,7 +102,7 @@ func validateWorkflowV2Body(body json.RawMessage) error {
 	if len(problems) == 0 {
 		return nil
 	}
-	return fmt.Errorf("workflow body validation failed:\n  - %s\n\nFor greenfield workflows prefer:\n  altscore workflows-v2 compose --body @spec.json --dry-run\nwhich creates the underlying /v2/tasks records and wires nodes to them automatically.",
+	return fmt.Errorf("workflow body validation failed:\n  - %s\n\nPrefer the declarative path:\n  altscore workflows-v2 apply --body @spec.json --dry-run\nwhich creates the underlying /v2/tasks records, wires nodes to them, and detects create-vs-update automatically.",
 		strings.Join(problems, "\n  - "))
 }
 
@@ -266,7 +266,7 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 	// incoming-edge requirement; end nodes are exempt from outgoing. Comment
 	// nodes are decorative -- the Hub allows them anywhere -- but a fully
 	// disconnected comment is dead weight; flag it as a 'warning' (not error)
-	// so agents see it but it doesn't block compose.
+	// so agents see it but it doesn't block apply.
 	for _, n := range nodes {
 		nm, _ := n.(map[string]any)
 		id, _ := nm["nodeId"].(string)
