@@ -534,6 +534,68 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 		task["inputKeys"] = inputKeys
 	}
 
+	// Populate outputSchema from each source's declared output metadata.
+	// BC's DerivedSchemaService computes a parallel derivedSchema.output at
+	// GET time, but the Hub UI's variable-mapping pickers only read the
+	// persisted outputSchema field -- CLI-created altdata tasks otherwise
+	// show "no outputs" in downstream task editors until the user re-saves
+	// in the Hub. Match the EXACT wrap the Hub itself applies when it falls
+	// back from outputSchema to derivedSchema (see
+	// altscore-ai-chat/lib/workflow-outputs/calculate-available-outputs.ts):
+	//
+	//   outputSchema[sourceId] = {
+	//     type: "object",
+	//     title: sourceId,
+	//     properties: <catalog[sourceId]>,   // the {data, sourceData} blob
+	//   }
+	//
+	// This shape satisfies BC's Task.outputSchema validator
+	// (Dict[str, SchemaTypes] -> ObjectSchema for each source entry) AND
+	// yields the same downstream variable paths the Hub generates from its
+	// derivedSchema fallback, so users who already mapped against derived
+	// paths don't see surprising differences once outputSchema is persisted.
+	// User-supplied entries on the task body win on collision.
+	outputSchema := asMap(task["outputSchema"])
+	for _, s := range sources {
+		sm, ok := s.(map[string]any)
+		if !ok {
+			continue
+		}
+		sid, _ := sm["sourceId"].(string)
+		ver, _ := sm["version"].(string)
+		if sid == "" {
+			continue
+		}
+		if _, has := outputSchema[sid]; has {
+			// User-supplied entry wins.
+			continue
+		}
+		catalogOutput, err := lookupAltdataSourceOutputSchema(c, sid, ver, dryRun)
+		if err != nil {
+			// Best-effort: warn and skip; don't block apply on a single
+			// failed source lookup (network blip, unknown source id).
+			fmt.Fprintf(os.Stderr,
+				"# warning: could not populate outputSchema for source %s %s (%v); the Hub will fall back to derivedSchema\n",
+				sid, ver, err)
+			continue
+		}
+		entry := asMap(catalogOutput[sid])
+		if len(entry) == 0 {
+			// Catalog didn't declare an outputSchema for this source --
+			// nothing useful to mirror. Skip; derivedSchema fallback will
+			// kick in at the Hub layer if BC computes anything later.
+			continue
+		}
+		outputSchema[sid] = map[string]any{
+			"type":       "object",
+			"title":      sid,
+			"properties": entry,
+		}
+	}
+	if len(outputSchema) > 0 {
+		task["outputSchema"] = outputSchema
+	}
+
 	if _, has := task["mode"]; !has {
 		task["mode"] = "single"
 	}
@@ -585,25 +647,29 @@ func normalizeComputeVariablesTask(task map[string]any, customVariables map[stri
 	return nil
 }
 
-// altdataSourceInputFieldsCache memoizes /v2/workflows/sources-status
-// results within a single compose run so a multi-source task only fetches
-// once. The full per-source outputSchema is no longer consumed here --
-// derivedSchema lives on BC.
-var altdataSourceInputFieldsCache = map[string][]string{}
+// altdataSourceStatusCache memoizes /v2/workflows/sources-status entries
+// within a single compose run so a multi-source task only fetches once.
+// Both inputFields (for inputKeys auto-fill) and outputSchema (mirrored
+// onto the task body for the Hub's variable-mapping pickers) come from
+// the same entry. nil cache value = lookup attempted and failed; we
+// store it to short-circuit retries within the same run.
+var altdataSourceStatusCache = map[string]map[string]any{}
 
-// lookupAltdataSourceInputFields fetches a source's required input field
-// names from /v2/workflows/sources-status. Used by normalizeAltdataTask to
-// auto-populate inputKeys (a runtime wiring concern -- distinct from
-// schema derivation, which is now server-side).
-func lookupAltdataSourceInputFields(c *client.Client, sourceID, version string, dryRun bool) ([]string, error) {
+// lookupAltdataSourceStatus fetches a single source-version's status entry
+// from /v2/workflows/sources-status (the canonical altdata catalog). One
+// fetch per (sourceID, version) per compose run.
+func lookupAltdataSourceStatus(c *client.Client, sourceID, version string, dryRun bool) (map[string]any, error) {
 	cacheKey := sourceID + "|" + version
-	if cached, ok := altdataSourceInputFieldsCache[cacheKey]; ok {
+	if cached, ok := altdataSourceStatusCache[cacheKey]; ok {
+		if cached == nil {
+			return nil, fmt.Errorf("source %s %s not found in sources-status", sourceID, version)
+		}
 		return cached, nil
 	}
 	if c == nil {
 		if dryRun {
-			fmt.Fprintf(os.Stderr, "# (dry-run) skipping live source lookup for %s %s; assuming personId/taxId\n", sourceID, version)
-			return []string{"personId", "taxId"}, nil
+			fmt.Fprintf(os.Stderr, "# (dry-run) skipping live source lookup for %s %s\n", sourceID, version)
+			return nil, fmt.Errorf("dry-run: no client for source lookup")
 		}
 		return nil, fmt.Errorf("no client available for source lookup")
 	}
@@ -612,8 +678,7 @@ func lookupAltdataSourceInputFields(c *client.Client, sourceID, version string, 
 	data, _, err := c.Do("GET", "borrower_central", "/v2/workflows/sources-status?"+q.Encode(), nil)
 	if err != nil {
 		if dryRun {
-			fmt.Fprintf(os.Stderr, "# (dry-run) source lookup failed for %s %s (%v); using stub\n", sourceID, version, err)
-			return []string{"personId", "taxId"}, nil
+			fmt.Fprintf(os.Stderr, "# (dry-run) source lookup failed for %s %s (%v)\n", sourceID, version, err)
 		}
 		return nil, err
 	}
@@ -630,18 +695,54 @@ func lookupAltdataSourceInputFields(c *client.Client, sourceID, version string, 
 		if version != "" && sver != version {
 			continue
 		}
-		fields := asSlice(s["inputFields"])
-		fieldNames := make([]string, 0, len(fields))
-		for _, f := range fields {
-			fm, _ := f.(map[string]any)
-			if name, _ := fm["field"].(string); name != "" {
-				fieldNames = append(fieldNames, name)
-			}
-		}
-		altdataSourceInputFieldsCache[cacheKey] = fieldNames
-		return fieldNames, nil
+		altdataSourceStatusCache[cacheKey] = s
+		return s, nil
 	}
+	altdataSourceStatusCache[cacheKey] = nil
 	return nil, fmt.Errorf("source %s %s not found in sources-status", sourceID, version)
+}
+
+// lookupAltdataSourceInputFields returns the required input field names for
+// a source. Used by normalizeAltdataTask to auto-populate inputKeys (a
+// runtime wiring concern -- distinct from schema derivation).
+func lookupAltdataSourceInputFields(c *client.Client, sourceID, version string, dryRun bool) ([]string, error) {
+	s, err := lookupAltdataSourceStatus(c, sourceID, version, dryRun)
+	if err != nil {
+		// Preserve the existing dry-run stub behavior so compose without
+		// network connectivity can still validate inputKeys plumbing.
+		if dryRun && c == nil {
+			return []string{"personId", "taxId"}, nil
+		}
+		if dryRun {
+			fmt.Fprintf(os.Stderr, "# (dry-run) using stub inputFields for %s %s after lookup error\n", sourceID, version)
+			return []string{"personId", "taxId"}, nil
+		}
+		return nil, err
+	}
+	fields := asSlice(s["inputFields"])
+	fieldNames := make([]string, 0, len(fields))
+	for _, f := range fields {
+		fm, _ := f.(map[string]any)
+		if name, _ := fm["field"].(string); name != "" {
+			fieldNames = append(fieldNames, name)
+		}
+	}
+	return fieldNames, nil
+}
+
+// lookupAltdataSourceOutputSchema returns the per-source JSON-Schema-shaped
+// output map declared by the altdata catalog. The catalog already returns
+// outputSchema in the BC DerivedSchemaService-compatible shape, namely
+// {<sourceId>: {properties: {<key>: {type, title, ...}}, type: "object",
+// title: ...}}, so this passes it through verbatim and the caller merges
+// into task["outputSchema"]. Returns nil (not an error) if the catalog
+// entry has no outputSchema -- some sources just don't declare one.
+func lookupAltdataSourceOutputSchema(c *client.Client, sourceID, version string, dryRun bool) (map[string]any, error) {
+	s, err := lookupAltdataSourceStatus(c, sourceID, version, dryRun)
+	if err != nil {
+		return nil, err
+	}
+	return asMap(s["outputSchema"]), nil
 }
 
 func normalizeConditionalTask(task map[string]any) error {
