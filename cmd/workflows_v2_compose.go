@@ -1156,15 +1156,21 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		return nil, err
 	}
 
-	// Surface the predicted workflow alias up-front. The server slugifies
-	// `label` and ignores any `alias` key in the body, so callers can't
-	// influence it after the fact. Credit-decisioning entities scoped via
-	// --workflow-alias on create only show up in pickers when their
-	// workflowAlias matches THIS slug, so tell the caller exactly what to
-	// stamp before they create entities -- not after, when the workflow's
-	// pickers come up empty and they have to re-stamp.
-	predictedAlias := slugifyWorkflowLabel(spec.Label)
-	fmt.Fprintf(os.Stderr, "# Workflow alias will be: %q (server-derived from label %q).\n", predictedAlias, spec.Label)
+	// Surface the predicted workflow alias up-front. When the spec sets
+	// `alias` explicitly, BC (#1291) honors it verbatim and compose (#32)
+	// threads it through; otherwise the server slugifies `label`.
+	// Credit-decisioning entities scoped via --workflow-alias on create
+	// only show up in pickers when their workflowAlias matches THIS alias,
+	// so tell the caller exactly what to stamp before they create
+	// entities -- not after, when the workflow's pickers come up empty
+	// and they have to re-stamp.
+	predictedAlias := spec.Alias
+	aliasSource := "explicit `alias` in spec"
+	if predictedAlias == "" {
+		predictedAlias = slugifyWorkflowLabel(spec.Label)
+		aliasSource = fmt.Sprintf("server-derived from label %q", spec.Label)
+	}
+	fmt.Fprintf(os.Stderr, "# Workflow alias will be: %q (%s).\n", predictedAlias, aliasSource)
 	fmt.Fprintf(os.Stderr, "# Stamp entities with this alias on create:\n")
 	fmt.Fprintf(os.Stderr, "#   altscore evaluation-rules create --workflow-alias %s ...\n", predictedAlias)
 	fmt.Fprintf(os.Stderr, "#   altscore rule-trees       create --workflow-alias %s ...\n", predictedAlias)
@@ -1478,6 +1484,16 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				// runtime auto-resolves ancestor sections when this stays
 				// empty AND pdfConfig.enabled=true. htmlSections-derived
 				// entries (if any) are added below.
+				//
+				// Guard against nil here: a Go []map[string]any{} that
+				// was never appended-to marshals as JSON null, and BC's
+				// Pydantic validator rejects null with
+				// "none is not an allowed value". Always emit [] so the
+				// payload is valid even when the spec didn't request
+				// any pdfConfig.
+				if pdfSections == nil {
+					pdfSections = []map[string]any{}
+				}
 				pdfDefaults := map[string]any{
 					"brandLogo":             nil,
 					"enabled":               true,
