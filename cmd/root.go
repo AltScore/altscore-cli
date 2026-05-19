@@ -868,7 +868,7 @@ reference.`,
 	wfv2Group.AddCommand(makeWfv2SetVariableCmd())
 	wfv2Group.AddCommand(makeWfv2UnsetVariableCmd())
 	wfv2Group.AddCommand(makeWfv2SetMappingCmd())
-	wfv2Group.AddCommand(makeWfv2ComposeCmd())
+	wfv2Group.AddCommand(makeWfv2ApplyCmd())
 	wfv2Group.AddCommand(makeWfv2LintCmd())
 
 	registerTasksV2(rootCmd)

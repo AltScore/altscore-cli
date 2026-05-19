@@ -4,19 +4,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/AltScore/altscore-cli/internal/client"
 	"github.com/AltScore/altscore-cli/internal/output"
 	"github.com/spf13/cobra"
 )
 
-// compose takes a single agent-friendly spec and creates the underlying
-// /v2/tasks records plus the workflow with nodes referencing them. This
-// is the one-shot path agents should take for greenfield workflows.
+// apply takes a single agent-friendly spec and reconciles it against the
+// tenant: if no ACTIVE workflow shares the spec's alias, it creates one
+// (POST /v2/tasks per task + POST /v2/workflows + optional publish); if a
+// match exists, it updates in place (fresh /v2/tasks + create-draft +
+// lock + autosave + publish, same workflow id and alias retained). After
+// either path, every referenced credit-decisioning entity (scorecards,
+// rule-trees, evaluation-rules, mapping-tables, and their nested rules)
+// is re-stamped to the workflow's alias so the Hub elements panel stays
+// in sync. One verb, one validation pipeline, no fork-vs-update branch
+// for the caller.
 //
 // Spec shape (any field omitted falls through to API defaults):
 //
@@ -84,40 +93,61 @@ type composeSpec struct {
 	Notes []map[string]any `json:"notes,omitempty"`
 }
 
-func makeWfv2ComposeCmd() *cobra.Command {
+func makeWfv2ApplyCmd() *cobra.Command {
 	var bodyFlag string
 	var dryRun bool
 	var publish bool
 	var skipLintOnPublish bool
+	var skipRescope bool
 
 	cmd := &cobra.Command{
-		Use:   "compose",
-		Short: "Create tasks + workflow from a single spec (greenfield one-shot)",
-		Long: `Take a single JSON spec describing tasks and graph topology, create the
-underlying /v2/tasks records, then create the workflow with nodes
-referencing those tasks by alias.
+		Use:   "apply",
+		Short: "Declaratively create-or-update a v2 workflow from a single spec",
+		Long: `Declarative reconciliation of a v2 workflow against the spec. One verb
+covers both greenfield create and update-in-place. Same validation pipeline
+for both paths -- specs that pass apply against a fresh tenant also pass
+when re-applied against a tenant that already has the workflow.
 
-The created workflow is in DRAFT status by default -- mirrors how the Hub's
-visual editor saves drafts. DRAFT workflows can be executed but the engine
-silently skips every node, so 'workflows-v2 execute' will return an empty
-output and look successful while doing nothing useful. Pass --publish to
-publish immediately after create (POST /v2/workflows/{id}/publish), which is
-typically what you want when composing from the CLI.
+The target workflow is resolved by alias:
+  - spec.alias if set, otherwise slugifyWorkflowLabel(spec.label).
+  - If no ACTIVE workflow has that alias -> create path:
+    POST /v2/tasks for every task, POST /v2/workflows, optional publish.
+  - If exactly one ACTIVE workflow has that alias -> update path:
+    Create fresh tasks (old tasks orphan, that's accepted), open a clean
+    draft via create-draft --force-recreate, acquire the lock, autosave the
+    new nodes/edges/variables/config, then publish. Same workflow id, same
+    alias, version increments, schedules / entity-scope survive.
+
+After either path apply walks the spec's dependency graph and stamps every
+referenced credit-decisioning entity (scorecards, rule-trees, evaluation-
+rules, mapping-tables, and nested rules within them) to the workflow's
+alias. This prevents the orphan-scope bug where four -v2 sibling workflows
+end up sharing a scorecard still labeled with the original alias. Pass
+--skip-rescope to opt out (the alias mismatch warning will still fire from
+normalize, just not auto-resolved).
+
+DRAFT trap: the create path saves the workflow in DRAFT by default, mirror
+of the Hub editor's save-then-publish flow. DRAFT workflows execute but the
+engine skips every node. Pass --publish to publish immediately; that's the
+common case when applying from the CLI. The update path always publishes
+(autosave -> publish), because the underlying assumption of "apply" is the
+spec is the desired state.
 
 Use --dry-run to print what would be sent without making any API calls.
 
 Spec format (see file header for full reference):
   - label, alias?, category, description, status (DRAFT default)
   - inputVariables, customVariables
-  - nodes (preferred): flat list of every graph node. Compose dispatches each
+  - nodes (preferred): flat list of every graph node. Apply dispatches each
     entry by type at parse time -- 'start' nodes are graph-only, everything
     else (including 'end') gets a backing task created.
   - tasks + extraNodes (legacy two-bucket shape): still accepted. Tasks are
     every node except start; extraNodes is only start/end. Prefer 'nodes'.
   - edges: list of {sourceNodeId, targetNodeId, sourceHandle?, label?}`,
-		Example: `  altscore workflows-v2 compose --body @scoring-pipeline.json
-  altscore workflows-v2 compose --body @spec.json --publish        # ready to execute
-  altscore workflows-v2 compose --body @spec.json --dry-run`,
+		Example: `  altscore workflows-v2 apply --body @scoring-pipeline.json
+  altscore workflows-v2 apply --body @spec.json --publish          # create+publish OR update+publish
+  altscore workflows-v2 apply --body @spec.json --dry-run
+  altscore workflows-v2 apply --body @spec.json --skip-rescope     # leave entity scopes alone`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			body, err := readBody(bodyFlag)
 			if err != nil {
@@ -131,9 +161,9 @@ Spec format (see file header for full reference):
 				return fmt.Errorf("spec.label is required")
 			}
 			// Flat nodes[] alternative: split into Tasks/ExtraNodes by type so
-			// the rest of compose treats them uniformly. Each flat entry
-			// counts as either a graph-only node (start) or a task-backed
-			// node (everything else, including end).
+			// the rest of the build pipeline treats them uniformly. Each
+			// flat entry counts as either a graph-only node (start) or a
+			// task-backed node (everything else, including end).
 			for i, n := range spec.Nodes {
 				t, _ := n["type"].(string)
 				if t == "start" {
@@ -163,7 +193,25 @@ Spec format (see file header for full reference):
 				return err
 			}
 
-			workflow, err := composeWorkflowBody(c, &spec, dryRun, publish)
+			// Determine target alias (predicted before any API call).
+			targetAlias := spec.Alias
+			if targetAlias == "" {
+				targetAlias = slugifyWorkflowLabel(spec.Label)
+			}
+
+			// Lookup: is there an ACTIVE workflow with this alias on the tenant?
+			// dry-run still does the lookup so the agent sees which branch will
+			// fire when they un-dry the run.
+			existing, lookupErr := findActiveWorkflowByAlias(c, targetAlias)
+			if lookupErr != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "# warning: alias lookup for %q failed (%v); falling back to create path\n", targetAlias, lookupErr)
+			}
+
+			// Build the workflow body. composeWorkflowBody POSTs new tasks
+			// for every node (create AND update paths use fresh tasks; the
+			// old tasks orphan on the update path, that's accepted -- no
+			// /v2/tasks DELETE exists today).
+			workflow, err := composeWorkflowBody(c, &spec, dryRun, publish, !skipRescope)
 			if err != nil {
 				return err
 			}
@@ -174,75 +222,437 @@ Spec format (see file header for full reference):
 			}
 
 			if dryRun {
-				fmt.Fprintln(cmd.OutOrStderr(), "# DRY RUN -- the above POSTs were skipped; final POST /v2/workflows body:")
+				if existing != nil {
+					existingID, _ := existing["id"].(string)
+					fmt.Fprintf(cmd.OutOrStderr(), "# DRY RUN -- apply UPDATE path: would draft + autosave + publish workflow id=%s alias=%s\n", existingID, targetAlias)
+				} else {
+					fmt.Fprintln(cmd.OutOrStderr(), "# DRY RUN -- apply CREATE path: would POST /v2/workflows with the body below")
+				}
 				return output.RawJSON(json.RawMessage(wfBody))
 			}
 
-			data, _, err := c.Do("POST", "borrower_central", "/v2/workflows", json.RawMessage(wfBody))
-			if err != nil {
-				return fmt.Errorf("create workflow: %w", err)
-			}
+			var resultJSON []byte
+			var wfID string
 
-			// Summary on stderr: list every server-assigned task alias keyed by
-			// its node type. Saves a follow-up `workflows-v2 get | jq` to learn
-			// what compose just created. Skipped on dry-run since nothing was
-			// actually created.
-			printComposeSummary(cmd.ErrOrStderr(), workflow)
+			if existing == nil {
+				// === CREATE path ===
+				data, _, err := c.Do("POST", "borrower_central", "/v2/workflows", json.RawMessage(wfBody))
+				if err != nil {
+					return fmt.Errorf("create workflow: %w", err)
+				}
+				printComposeSummary(cmd.ErrOrStderr(), workflow)
 
-			if publish {
 				var created map[string]any
 				if err := json.Unmarshal(data, &created); err != nil {
 					return fmt.Errorf("parse created workflow response: %w", err)
 				}
-				wfID, _ := created["id"].(string)
+				wfID, _ = created["id"].(string)
 				if wfID == "" {
-					return fmt.Errorf("compose succeeded but response had no 'id' field; cannot publish")
+					return fmt.Errorf("apply create: response had no 'id' field")
 				}
-				// Pre-publish lint: refuse to publish a workflow with topology
-				// errors (orphan nodes, dangling edges, missing start/end). The
-				// engine would silently no-op on most of those; better to surface
-				// before the workflow goes ACTIVE. Always run lint even with
-				// --skip-lint-on-publish so we can WARN about the override
-				// rather than ship a broken workflow silently.
-				lintData, _, lerr := c.Do("GET", "borrower_central", "/v2/workflows/"+wfID, nil)
-				if lerr == nil {
-					var wfFull map[string]any
-					if err := json.Unmarshal(lintData, &wfFull); err == nil {
-						report := lintWorkflowV2(wfFull)
-						errs := []string{}
-						for _, issue := range report.Issues {
-							if issue.Severity == "error" {
-								errs = append(errs, "  - "+issue.Message)
-							}
-						}
-						if len(errs) > 0 {
-							if skipLintOnPublish {
-								fmt.Fprintf(cmd.OutOrStderr(),
-									"# WARNING: pre-publish lint found %d topology error(s) but --skip-lint-on-publish was set; publishing anyway:\n%s\n",
-									len(errs), strings.Join(errs, "\n"))
-							} else {
-								return fmt.Errorf(
-									"workflow %s created but pre-publish lint found %d topology error(s); refusing to publish:\n%s\n"+
-										"Fix the spec, run 'altscore workflows-v2 publish %s' manually after editing, or pass --skip-lint-on-publish.",
-									wfID, len(errs), strings.Join(errs, "\n"), wfID,
-								)
-							}
-						}
+				resultJSON = data
+
+				if publish {
+					if err := lintAndPublish(c, cmd, wfID, skipLintOnPublish); err != nil {
+						return err
 					}
 				}
-				if _, _, err := c.Do("POST", "borrower_central", "/v2/workflows/"+wfID+"/publish", nil); err != nil {
-					return fmt.Errorf("workflow %s created but publish failed: %w", wfID, err)
+			} else {
+				// === UPDATE path ===
+				existingID, _ := existing["id"].(string)
+				if existingID == "" {
+					return fmt.Errorf("apply update: existing workflow %q has no id field", targetAlias)
 				}
-				fmt.Fprintf(cmd.OutOrStderr(), "# published workflow %s\n", wfID)
+				wfID = existingID
+
+				// Pull last-known-version BEFORE creating the draft so the
+				// autosave can pass it for optimistic concurrency. Drafting
+				// bumps the version; we want the pre-draft number.
+				lastKnownVersion := 0
+				if v, ok := existing["version"].(float64); ok {
+					lastKnownVersion = int(v)
+				}
+
+				fmt.Fprintf(cmd.ErrOrStderr(), "# apply UPDATE path: workflow id=%s alias=%s lastKnownVersion=%d\n", wfID, targetAlias, lastKnownVersion)
+				printComposeSummary(cmd.ErrOrStderr(), workflow)
+
+				// 1) create-draft --force-recreate (clean draft regardless
+				//    of whether one already exists). The response is wrapped:
+				//    {created, message, workflow: {id, ...}}.
+				draftBody, _ := json.Marshal(map[string]any{"forceRecreate": true})
+				draftResp, _, err := c.Do("POST", "borrower_central", "/v2/workflows/"+wfID+"/create-draft", json.RawMessage(draftBody))
+				if err != nil {
+					return fmt.Errorf("create draft for %s: %w", wfID, err)
+				}
+				var draftWrap map[string]any
+				if err := json.Unmarshal(draftResp, &draftWrap); err != nil {
+					return fmt.Errorf("parse create-draft response: %w", err)
+				}
+				draft, _ := draftWrap["workflow"].(map[string]any)
+				if draft == nil {
+					// Fallback for an unwrapped shape.
+					draft = draftWrap
+				}
+				draftID, _ := draft["id"].(string)
+				if draftID == "" {
+					return fmt.Errorf("create-draft for %s returned no workflow.id", wfID)
+				}
+				draftVersion := lastKnownVersion
+				if v, ok := draft["version"].(float64); ok {
+					draftVersion = int(v)
+				}
+				fmt.Fprintf(cmd.ErrOrStderr(), "# created draft %s (version %d)\n", draftID, draftVersion)
+
+				// 2) lock acquire (alias-keyed endpoint)
+				clientID := fmt.Sprintf("apply-%d", time.Now().UnixNano())
+				lockBody, _ := json.Marshal(map[string]string{"clientId": clientID})
+				lockResp, _, err := c.Do("POST", "borrower_central", "/v2/workflows/"+targetAlias+"/lock", json.RawMessage(lockBody))
+				if err != nil {
+					return fmt.Errorf("acquire lock on %s: %w", targetAlias, err)
+				}
+				var lock map[string]any
+				if err := json.Unmarshal(lockResp, &lock); err != nil {
+					return fmt.Errorf("parse lock acquire response: %w", err)
+				}
+				lockToken, _ := lock["lockToken"].(string)
+				if lockToken == "" {
+					return fmt.Errorf("lock acquire for %s returned no lockToken", targetAlias)
+				}
+				fmt.Fprintf(cmd.ErrOrStderr(), "# acquired lock client-id=%s\n", clientID)
+
+				// 3) autosave the assembled body onto the draft
+				autosavePayload := map[string]any{
+					"label":           workflow["label"],
+					"category":        workflow["category"],
+					"status":          "DRAFT", // remain DRAFT until publish
+					"inputVariables":  workflow["inputVariables"],
+					"customVariables": workflow["customVariables"],
+					"nodes":           workflow["nodes"],
+					"edges":           workflow["edges"],
+					"lockToken":       lockToken,
+				}
+				if draftVersion > 0 {
+					autosavePayload["lastKnownVersion"] = draftVersion
+				}
+				if v, ok := workflow["alias"]; ok {
+					autosavePayload["alias"] = v
+				}
+				if v, ok := workflow["description"]; ok {
+					autosavePayload["description"] = v
+				}
+				if v, ok := workflow["config"]; ok {
+					autosavePayload["config"] = v
+				}
+				if v, ok := workflow["notes"]; ok {
+					autosavePayload["notes"] = v
+				}
+				autosaveRaw, _ := json.Marshal(autosavePayload)
+				if err := validateWorkflowV2Body(autosaveRaw); err != nil {
+					return fmt.Errorf("autosave body validation failed: %w", err)
+				}
+				autoResp, _, err := c.Do("PUT", "borrower_central", "/v2/workflows/"+draftID+"/autosave", json.RawMessage(autosaveRaw))
+				if err != nil {
+					return fmt.Errorf("autosave draft %s: %w", draftID, err)
+				}
+				resultJSON = autoResp
+				fmt.Fprintf(cmd.ErrOrStderr(), "# autosaved draft %s\n", draftID)
+
+				// 4) publish the draft (apply's contract is the spec is
+				//    desired state -- so we always publish on the update
+				//    path, regardless of --publish). The pre-publish lint
+				//    still runs, same gating as the create path.
+				if err := lintAndPublish(c, cmd, draftID, skipLintOnPublish); err != nil {
+					return err
+				}
 			}
-			return output.RawJSON(data)
+
+			// === Entity-scope reconciliation ===
+			// After either path, walk the spec's referenced credit-decisioning
+			// entities and stamp them to targetAlias. Without this, an update
+			// from workflow A to workflow A-v2 (or a fresh create that pulls
+			// a scorecard scoped to a sibling) leaves nested entities pointing
+			// at the old alias and the Hub's elements panel goes empty.
+			if !skipRescope {
+				if err := reconcileEntityScopes(c, &spec, targetAlias, cmd.ErrOrStderr()); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "# warning: entity-scope reconciliation hit an issue: %v (workflow itself is fine; re-scope failed entities manually with `altscore <resource> update <id> --workflow-alias %s`)\n", err, targetAlias)
+				}
+			}
+
+			if wfID != "" && publish {
+				fmt.Fprintf(cmd.OutOrStderr(), "# applied workflow %s (alias=%s)\n", wfID, targetAlias)
+			}
+			return output.RawJSON(resultJSON)
 		},
 	}
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON spec (or pipe via stdin)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the assembled workflow body without making API calls")
-	cmd.Flags().BoolVar(&publish, "publish", false, "publish the workflow after creation (DRAFT workflows execute but skip every node)")
+	cmd.Flags().BoolVar(&publish, "publish", false, "publish the workflow after creation (CREATE path only; UPDATE path always publishes the draft it produced)")
 	cmd.Flags().BoolVar(&skipLintOnPublish, "skip-lint-on-publish", false, "skip the pre-publish topology lint that refuses to publish on errors")
+	cmd.Flags().BoolVar(&skipRescope, "skip-rescope", false, "do not stamp referenced credit-decisioning entities (scorecards, rule-trees, etc.) to the workflow's alias after apply")
 	return cmd
+}
+
+// lintAndPublish runs the pre-publish topology lint on a workflow and then
+// publishes it. Shared by both the create path (creates workflow + optional
+// publish) and the update path (always publishes after autosave). Mirrors
+// what compose used to do inline for create + publish.
+func lintAndPublish(c *client.Client, cmd *cobra.Command, wfID string, skipLintOnPublish bool) error {
+	lintData, _, lerr := c.Do("GET", "borrower_central", "/v2/workflows/"+wfID, nil)
+	if lerr == nil {
+		var wfFull map[string]any
+		if err := json.Unmarshal(lintData, &wfFull); err == nil {
+			report := lintWorkflowV2(wfFull)
+			errs := []string{}
+			for _, issue := range report.Issues {
+				if issue.Severity == "error" {
+					errs = append(errs, "  - "+issue.Message)
+				}
+			}
+			if len(errs) > 0 {
+				if skipLintOnPublish {
+					fmt.Fprintf(cmd.OutOrStderr(),
+						"# WARNING: pre-publish lint found %d topology error(s) but --skip-lint-on-publish was set; publishing anyway:\n%s\n",
+						len(errs), strings.Join(errs, "\n"))
+				} else {
+					return fmt.Errorf(
+						"workflow %s created but pre-publish lint found %d topology error(s); refusing to publish:\n%s\n"+
+							"Fix the spec, run 'altscore workflows-v2 publish %s' manually after editing, or pass --skip-lint-on-publish.",
+						wfID, len(errs), strings.Join(errs, "\n"), wfID,
+					)
+				}
+			}
+		}
+	}
+	if _, _, err := c.Do("POST", "borrower_central", "/v2/workflows/"+wfID+"/publish", nil); err != nil {
+		return fmt.Errorf("workflow %s created but publish failed: %w", wfID, err)
+	}
+	fmt.Fprintf(cmd.OutOrStderr(), "# published workflow %s\n", wfID)
+	return nil
+}
+
+// findActiveWorkflowByAlias returns the (single) ACTIVE workflow with the
+// given alias on the tenant, or nil when nothing matches. Used by apply to
+// decide between CREATE and UPDATE paths.
+//
+// Calls /v2/workflows?alias=<x>&status=ACTIVE&is-latest=true. The generic
+// filter has historically been ignored silently by some BC handlers, so we
+// also filter client-side after parsing. If the API returns multiple ACTIVE
+// versions sharing the alias (shouldn't happen post-publish, but possible
+// during a half-broken state), we return the highest-version one and warn.
+func findActiveWorkflowByAlias(c *client.Client, alias string) (map[string]any, error) {
+	if alias == "" {
+		return nil, nil
+	}
+	q := url.Values{}
+	q.Set("alias", alias)
+	q.Set("status", "ACTIVE")
+	q.Set("is-latest", "true")
+	q.Set("per-page", "10")
+	path := "/v2/workflows?" + q.Encode()
+	data, _, err := c.Do("GET", "borrower_central", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	// BC list endpoints return a JSON array at top level.
+	var arr []map[string]any
+	if jerr := json.Unmarshal(data, &arr); jerr != nil {
+		// Some endpoints wrap in {items: [...], total: ...}; tolerate both.
+		var wrapped struct {
+			Items []map[string]any `json:"items"`
+		}
+		if werr := json.Unmarshal(data, &wrapped); werr != nil {
+			return nil, fmt.Errorf("parse list response: %w", jerr)
+		}
+		arr = wrapped.Items
+	}
+	matches := []map[string]any{}
+	for _, w := range arr {
+		wa, _ := w["alias"].(string)
+		if wa == "" {
+			wa, _ = w["workflowAlias"].(string)
+		}
+		status, _ := w["status"].(string)
+		if wa == alias && status == "ACTIVE" {
+			matches = append(matches, w)
+		}
+	}
+	if len(matches) == 0 {
+		return nil, nil
+	}
+	if len(matches) > 1 {
+		// Pick the highest version, warn so the caller knows the tenant is
+		// in a weird state.
+		best := matches[0]
+		bestV := 0
+		if v, ok := best["version"].(float64); ok {
+			bestV = int(v)
+		}
+		for _, m := range matches[1:] {
+			if v, ok := m["version"].(float64); ok && int(v) > bestV {
+				best = m
+				bestV = int(v)
+			}
+		}
+		return best, nil
+	}
+	return matches[0], nil
+}
+
+// reconcileEntityScopes walks every credit-decisioning entity reachable from
+// the spec's tasks and stamps its `workflowAlias` to targetAlias. This is
+// the "auto-restamp on conflict" design decision: if a scorecard the spec
+// references is currently scoped to a sibling workflow, we re-scope it
+// rather than erroring -- the assumption is the spec is the source of truth
+// for what entities belong to this workflow.
+//
+// Walks:
+//   - scorecard task -> scorecard entity -> nested rules[*].mappingTableCode
+//   - rule-tree task -> rule-tree entity -> nested rules[*].ruleCode
+//   - evaluate-rules task -> rulesConfig[*].ruleCode
+//   - mapping-table task -> mappingTableConfig.entries[*].mappingTableCode
+//
+// All stamps are PATCH /v1/{resource}/{id} with {"workflowAlias": "<alias>"}.
+// Errors are surfaced per-entity to stderr (one log line each) and the rest
+// of the walk continues -- partial reconciliation is better than nothing.
+func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias string, errOut io.Writer) error {
+	if c == nil || targetAlias == "" {
+		return nil
+	}
+	// Local memo to avoid re-stamping the same entity twice when multiple
+	// tasks reference it (e.g. two scorecard tasks sharing a mapping table).
+	stamped := map[string]bool{}
+
+	stamp := func(resource, ref string) {
+		if ref == "" {
+			return
+		}
+		entity, _ := lookupEntity(c, resource, ref, false)
+		if entity == nil {
+			// Best-effort: missing entity already warned by normalize.
+			return
+		}
+		id, _ := entity["id"].(string)
+		if id == "" {
+			return
+		}
+		key := resource + "|" + id
+		if stamped[key] {
+			return
+		}
+		stamped[key] = true
+		actual, _ := entity["workflowAlias"].(string)
+		if actual == targetAlias {
+			return
+		}
+		patch, _ := json.Marshal(map[string]any{"workflowAlias": targetAlias})
+		_, _, err := c.Do("PATCH", "borrower_central", "/v1/"+resource+"/"+id, json.RawMessage(patch))
+		if err != nil {
+			fmt.Fprintf(errOut, "# warning: could not re-scope %s %s (%s -> %s): %v\n", resource, ref, actual, targetAlias, err)
+			return
+		}
+		fmt.Fprintf(errOut, "# scoped %s %s to %s\n", resource, ref, targetAlias)
+		// Refresh memoized entity in lookupEntity's cache so a subsequent
+		// validator (or a follow-on apply run) sees the new scope. lookupEntity
+		// caches the entity map itself; mutate in place.
+		entity["workflowAlias"] = targetAlias
+	}
+
+	// Walk tasks in the spec (also covers ExtraNodes-end if the end task
+	// somehow ends up holding a credit-decisioning reference, which the
+	// schema doesn't allow today but the walk is cheap).
+	walkTasks := func(tasks []map[string]any) {
+		for _, t := range tasks {
+			tt, _ := t["type"].(string)
+			switch tt {
+			case "scorecard":
+				cfg, _ := t["scorecardConfig"].(map[string]any)
+				if cfg == nil {
+					continue
+				}
+				code, _ := cfg["scorecardCode"].(string)
+				if code == "" {
+					code, _ = cfg["scorecardId"].(string)
+				}
+				stamp("scorecards", code)
+				// Nested mapping tables on every rule.
+				entity, _ := lookupEntity(c, "scorecards", code, false)
+				if entity != nil {
+					if rules, ok := entity["rules"].([]any); ok {
+						for _, rraw := range rules {
+							rm, ok := rraw.(map[string]any)
+							if !ok {
+								continue
+							}
+							mt, _ := rm["mappingTableCode"].(string)
+							if mt == "" {
+								mt, _ = rm["mappingTableId"].(string)
+							}
+							stamp("mapping-tables", mt)
+						}
+					}
+				}
+			case "rule-tree":
+				cfg, _ := t["ruleTreeConfig"].(map[string]any)
+				if cfg == nil {
+					continue
+				}
+				code, _ := cfg["ruleTreeCode"].(string)
+				if code == "" {
+					code, _ = cfg["ruleTreeId"].(string)
+				}
+				stamp("rule-trees", code)
+				entity, _ := lookupEntity(c, "rule-trees", code, false)
+				if entity != nil {
+					if rules, ok := entity["rules"].([]any); ok {
+						for _, rraw := range rules {
+							rm, ok := rraw.(map[string]any)
+							if !ok {
+								continue
+							}
+							rc, _ := rm["ruleCode"].(string)
+							if rc == "" {
+								rc, _ = rm["ruleId"].(string)
+							}
+							stamp("evaluation-rules", rc)
+						}
+					}
+				}
+			case "evaluate-rules":
+				rules, _ := t["rulesConfig"].([]any)
+				for _, rraw := range rules {
+					rm, ok := rraw.(map[string]any)
+					if !ok {
+						continue
+					}
+					rc, _ := rm["ruleCode"].(string)
+					if rc == "" {
+						rc, _ = rm["ruleId"].(string)
+					}
+					stamp("evaluation-rules", rc)
+				}
+			case "mapping-table":
+				cfg, _ := t["mappingTableConfig"].(map[string]any)
+				if cfg == nil {
+					continue
+				}
+				entries, _ := cfg["entries"].([]any)
+				for _, eraw := range entries {
+					em, ok := eraw.(map[string]any)
+					if !ok {
+						continue
+					}
+					mt, _ := em["mappingTableCode"].(string)
+					if mt == "" {
+						mt, _ = em["mappingTableId"].(string)
+					}
+					stamp("mapping-tables", mt)
+				}
+			}
+		}
+	}
+	walkTasks(spec.Tasks)
+	walkTasks(spec.ExtraNodes)
+	return nil
 }
 
 
@@ -1151,7 +1561,7 @@ func humanizeKey(key string) string {
 // nodeId + taskAlias and is used to rewrite all references downstream. If the
 // caller provided `alias` in a task body, that alias is sent to the API; if
 // absent, the server picks one and we use whatever it returns.
-func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool) (map[string]any, error) {
+func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool) (map[string]any, error) {
 	if err := validateEntityTypeVsTaskTypes(spec); err != nil {
 		return nil, err
 	}
@@ -1340,10 +1750,11 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		// Type-specific normalization: enrich altdata-enrichment with inputKeys
 		// from source inputFields, validate conditional branches, etc.
 		if err := normalizeTaskBody(c, task, &composeNormalizeOpts{
-			PredictedAlias:  predictedAlias,
-			CustomVariables: spec.CustomVariables,
-			InputVariables:  spec.InputVariables,
-			Publish:         publish,
+			PredictedAlias:      predictedAlias,
+			CustomVariables:     spec.CustomVariables,
+			InputVariables:      spec.InputVariables,
+			Publish:             publish,
+			AutoRescopeEntities: autoRescopeEntities,
 		}, dryRun); err != nil {
 			return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}
