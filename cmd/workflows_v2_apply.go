@@ -1605,6 +1605,16 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 	// error surfaced. See the la-fabril spike report for the original sighting.
 	lintOutputJsonObjectRefs(spec)
 
+	// Warn when a spec contains both a rule-tree task and an end task that
+	// isn't wired in the canonical "single end node" shape. The canonical
+	// pattern collapses conditional + N parallel end nodes into ONE end node
+	// fed directly by the rule-tree, with decision_key tracked through
+	// inputMappings -- BC's end_activity then auto-records the per-run
+	// decision and renders the PDF. Skipping any field is legal (some
+	// workflows want multiple ends per branch, no PDF, or no decision
+	// recording), so this lint is advisory only.
+	lintCanonicalEndNode(spec)
+
 	// Auto-add `persona` to the workflow's inputVariables when any
 	// customer/deal/asset task uses operation=write but the spec didn't
 	// declare it. CreateBorrower's strict Literal["individual","business"]
@@ -3074,6 +3084,107 @@ func lintOutputJsonObjectRefs(spec *composeSpec) {
 				endRef, refAlias, field, refType, refAlias, field,
 			)
 		}
+	}
+}
+
+// lintCanonicalEndNode warns (stderr, non-blocking) when a spec contains
+// both a rule-tree task and an end task but the end node isn't wired in the
+// canonical "single end node" shape: inputMapping `decision_key` pulled from
+// the rule-tree, `decisionConfig.enabled=true`, and `pdfConfig.enabled=true`.
+//
+// The canonical pattern collapses what used to be a conditional + N parallel
+// end nodes (one per outcome) into ONE end node whose `decision_key` tracks
+// the rule-tree's own output -- BC's end_activity records the per-run
+// decision against the execution and renders the PDF without duplicating
+// logic per branch. Skipping any of these three fields is legal (some
+// workflows really do want multiple ends per branch, or no PDF, or no
+// decision recording), so this lint is advisory only.
+func lintCanonicalEndNode(spec *composeSpec) {
+	// Collect rule-tree task refs so the warning can name the upstream alias
+	// the end node should pull decision_key from.
+	var ruleTreeRefs []string
+	for _, t := range spec.Tasks {
+		if ty, _ := t["type"].(string); ty == "rule-tree" {
+			if r := localRef(t, ""); r != "" {
+				ruleTreeRefs = append(ruleTreeRefs, r)
+			}
+		}
+	}
+	if len(ruleTreeRefs) == 0 {
+		return
+	}
+
+	for _, t := range spec.Tasks {
+		ty, _ := t["type"].(string)
+		if ty != "end" {
+			continue
+		}
+		endRef := localRef(t, "<unnamed-end>")
+
+		// 1. inputMappings.decision_key wired (from a rule-tree, ideally)
+		inputMappings, _ := t["inputMappings"].(map[string]any)
+		hasDecisionKeyMapping := false
+		if inputMappings != nil {
+			if src, ok := inputMappings["decision_key"].(string); ok && src != "" {
+				hasDecisionKeyMapping = true
+			}
+		}
+
+		// 2. endConfig.decisionConfig.enabled = true
+		// 3. endConfig.pdfConfig.enabled = true
+		endCfg, _ := t["endConfig"].(map[string]any)
+		decisionEnabled := false
+		pdfEnabled := false
+		if endCfg != nil {
+			if dc, ok := endCfg["decisionConfig"].(map[string]any); ok {
+				if en, ok := dc["enabled"].(bool); ok && en {
+					decisionEnabled = true
+				}
+			}
+			if pc, ok := endCfg["pdfConfig"].(map[string]any); ok {
+				if en, ok := pc["enabled"].(bool); ok && en {
+					pdfEnabled = true
+				}
+			}
+		}
+
+		if hasDecisionKeyMapping && decisionEnabled && pdfEnabled {
+			continue
+		}
+
+		var missing []string
+		if !hasDecisionKeyMapping {
+			missing = append(missing, "inputMappings.decision_key")
+		}
+		if !decisionEnabled {
+			missing = append(missing, "endConfig.decisionConfig.enabled=true")
+		}
+		if !pdfEnabled {
+			missing = append(missing, "endConfig.pdfConfig.enabled=true")
+		}
+
+		// Show the first rule-tree as the suggested source. If multiple exist
+		// the agent likely knows which one matters; the message lists all so
+		// they don't pick blindly.
+		sourceHint := fmt.Sprintf("task_outputs.%s.decision_key", ruleTreeRefs[0])
+		if len(ruleTreeRefs) > 1 {
+			sourceHint = fmt.Sprintf("task_outputs.<one-of:%s>.decision_key", strings.Join(ruleTreeRefs, ","))
+		}
+
+		fmt.Fprintf(os.Stderr,
+			"# warning: end task %q is not wired as a canonical single-end node "+
+				"-- missing: %s. The canonical pattern collapses conditional+N-ends into ONE "+
+				"end node fed directly by the rule-tree, where decision_key tracks the "+
+				"rule-tree's own output. BC's end_activity then auto-records the per-run "+
+				"decision (currentDecision.key) and renders the PDF, so you don't have to "+
+				"duplicate outputJson/htmlSections across approve/reject/manual branches. "+
+				"Wire it like:\n"+
+				"#   inputMappings: { ..., \"decision_key\": %q }\n"+
+				"#   endConfig.decisionConfig: { \"enabled\": true, \"decisionType\": \"final\" }\n"+
+				"#   endConfig.pdfConfig: { \"enabled\": true, ... }\n"+
+				"# (advisory; multiple ends + no-PDF + no-decision shapes are still legal).\n",
+			endRef, strings.Join(missing, ", "), sourceHint,
+		)
 	}
 }
 

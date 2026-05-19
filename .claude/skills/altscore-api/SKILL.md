@@ -612,6 +612,48 @@ altscore workflows-v2 apply --body @/tmp/spec.json --skip-rescope  # do not auto
 altscore workflows-v2 publish <id>                              # standalone publish step
 ```
 
+#### Canonical end-node pattern (single end, not N parallel ends)
+
+When a spec contains a `rule-tree` task, the recommended end-node shape is **one** end node fed directly by the rule-tree -- not N parallel ends behind a `conditional` router. BC's `end_activity` already promotes four fields from the end task's resolved input context onto the execution record automatically (see `borrower-central/app/temporal/activities/end_activity.py:339-360`):
+
+| Context key | Execution-record field | Source |
+|---|---|---|
+| `borrower_id` | `borrowerId` (the customer id) | upstream customer task output, or `inputs.borrower_id` |
+| `billable_id` | `billableId` (defaults to `borrowerId`) | upstream customer/deal task output |
+| `deal_id` | `dealId` | upstream deal task output |
+| `decision_key` | `currentDecision.key` (when `decisionConfig.enabled=true`) | upstream rule-tree task output (`task_outputs.<rule-tree-ref>.decision_key`) |
+
+Wired this way, the rule-tree's per-run decision string flows through to BC's decision recorder, the PDF generates once, and there's no per-branch hand-maintained `outputJson` to drift. Apply ships a non-blocking lint (`lintCanonicalEndNode`) that warns when a spec has both a rule-tree and an end node but the end node is missing any of: `inputMappings.decision_key`, `endConfig.decisionConfig.enabled=true`, `endConfig.pdfConfig.enabled=true`.
+
+Canonical shape:
+
+```json
+{
+  "ref": "end",
+  "type": "end",
+  "label": "End",
+  "inputSchema": {
+    "borrower_id":  {"type": "string"},
+    "deal_id":      {"type": "string"},
+    "decision_key": {"type": "string"}
+  },
+  "inputMappings": {
+    "borrower_id":  "task_outputs.<customer-task-ref>.borrower_id",
+    "deal_id":      "task_outputs.<deal-task-ref>.deal_id",
+    "decision_key": "task_outputs.<rule-tree-ref>.decision_key"
+  },
+  "endConfig": {
+    "decisionConfig": {"enabled": true, "decisionType": "final"},
+    "pdfConfig":      {"enabled": true, "title": "Credit Decision Report", "filePrefix": "credit-decision", "sourcesConfig": []},
+    "outputJson":     "{\"customer_id\":\"{{inputs.<borrower-input-ref>}}\",\"decision\":\"{{task_outputs.<rule-tree-ref>.decision_key}}\"}"
+  }
+}
+```
+
+> **outputJson template syntax.** Bare placeholders like `{{borrower_id}}` and `{{decision_key}}` do NOT resolve in BC's `VariableResolver` -- only `{{inputs.X}}`, `{{task_outputs.X.Y}}`, `{{custom.X}}`, `{{system.X}}`, and bare-alias `{{<alias>.<field>}}` (with a dot). A bare key stays literal, corrupts the rendered JSON, and the runtime silently falls back to the promoted-scope dump (your custom envelope vanishes with no error). The `inputMappings` short-name keys (`borrower_id`, `decision_key`) drive BC's per-context promotion (`result['decision_key']`, `result['borrower_id']` on the execution record) and PDF section enrichment -- but NOT outputJson substitution. Always use the long form (`{{task_outputs.<ref>.decision_key}}`) in outputJson, even when the same key is also in `inputMappings`.
+
+**When multiple end nodes are correct.** Rare, but legal: post-decision tasks differ per branch (one branch hits an external webhook the other doesn't), or per-branch `htmlSections` that aren't expressible as `{decision_key}` substitutions. In those cases keep the conditional + N ends, but still wire `decision_key` on every end's `inputMappings`.
+
 > **DRAFT trap.** apply's CREATE path saves workflows in `status: "DRAFT"` by default — mirrors the Hub's "save-then-publish" editor flow. **A DRAFT workflow executes successfully but the engine skips every node**: `executions get` returns `status: complete, isSuccess: true`, the envelope output is `null`, and per-task outputs (`executions state <id> | jq '.state.data_flow.task_outputs'`) is `{}`. This looks like the workflow ran when nothing actually happened. Always pass `--publish` (or run `altscore workflows-v2 publish <id>` after) before executing. The UPDATE path always publishes — apply treats the spec as desired state. The CLI's `workflows-v2 execute` now does a pre-flight check and warns to stderr if the workflow isn't `ACTIVE`; pass `--skip-status-check` to suppress.
 
 If the agent asks for help building or updating a workflow, default to apply. Other paths exist for special cases:
