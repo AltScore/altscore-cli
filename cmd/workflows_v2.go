@@ -1476,7 +1476,7 @@ Available sections (run with no arg to see the full structure):
   creditDecisioningEntities             /v1/{evaluation-rules,mapping-tables,scorecards,rule-trees}
   examples                              full minimal_shell + scoring_pipeline templates
   gotchas                               common compose mistakes + fixes
-  gotchas_about_branches_and_inputkeys  conditional/array-router pitfalls
+  gotchas_about_branches_and_inputkeys  conditional pitfalls
   preflightChecks                       validation order before compose persists`,
 		Example: `  altscore workflows-v2 schema-guide
   altscore workflows-v2 schema-guide tasks

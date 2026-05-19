@@ -1777,9 +1777,8 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 // Hub editor, so a CLI-composed workflow that uses them would render as a
 // non-editable graph -- catch it at compose time instead.
 var customerHiddenTypes = map[string]bool{
-	"deal":         true,
-	"asset":        true,
-	"array-router": true,
+	"deal":  true,
+	"asset": true,
 }
 var dealHiddenTypes = map[string]bool{
 	"customer":         true,
@@ -1802,7 +1801,7 @@ var validTaskTypes = map[string]bool{
 	"mapping-table": true, "scorecard": true, "rule-tree": true,
 	"compute-variables": true, "data-store-write": true, "data-store-query": true,
 	"customer": true, "deal": true, "credit-line": true,
-	"list-of-similars": true, "array-router": true, "asset": true,
+	"list-of-similars": true, "asset": true,
 }
 
 // preflightTasks runs cheap, local-only validation across every task in the
@@ -1979,7 +1978,7 @@ func preflightTasks(spec *composeSpec) error {
 			"# warning: compose spec has no 'end' node. Most workflows need one for the engine to know where to terminate cleanly.")
 	}
 
-	// Soft advisory: routing tasks (conditional, array-router) with branch
+	// Soft advisory: routing tasks (conditional) with branch
 	// edges targeting exception tasks usually indicate the agent is treating
 	// 'rejected'/'declined'/'manual review' as a failure when they're really
 	// valid workflow outcomes that belong on end nodes (one per branch,
@@ -2026,13 +2025,13 @@ func preflightTasks(spec *composeSpec) error {
 		}
 		st := refType[src]
 		tt := refType[tgt]
-		if (st == "conditional" || st == "array-router") && tt == "exception" {
+		if st == "conditional" && tt == "exception" {
 			advisories = append(advisories, advise{src, tgt, st})
 		}
 	}
 	if len(advisories) > 0 {
 		fmt.Fprintf(os.Stderr,
-			"# advice: spec has %d branch edge(s) from a conditional/array-router targeting an exception task.\n"+
+			"# advice: spec has %d branch edge(s) from a conditional targeting an exception task.\n"+
 				"# advice: exception tasks fail the workflow (isSuccess=false). For VALID decision outcomes\n"+
 				"# advice: like 'reject', 'manual_review', 'declined' -- which are expected business results,\n"+
 				"# advice: not errors -- prefer a separate end node per branch, each with its own\n"+
@@ -2250,25 +2249,6 @@ func preflightTasks(spec *composeSpec) error {
 						"The DSL evaluates against the workflow's customVariables dict; reference values via the customVariable names directly. "+
 						"Wire upstream values into customVariables via the workflow body, not into this task's inputMappings.\n",
 					i, ref)
-			}
-		case "array-router":
-			// The runtime activity reads the source array via
-			// inputMappings.source_array, NOT the top-level
-			// sourceArrayPath field documented on the task body. Mirror
-			// the value into inputMappings (and inputSchema) at
-			// serialize time so the schema-guide contract still works
-			// without forcing every spec to declare the wiring twice.
-			if sap, _ := task["sourceArrayPath"].(string); sap != "" {
-				im := asMap(task["inputMappings"])
-				if _, exists := im["source_array"]; !exists {
-					im["source_array"] = sap
-					task["inputMappings"] = im
-				}
-				is := asMap(task["inputSchema"])
-				if _, exists := is["source_array"]; !exists {
-					is["source_array"] = map[string]any{"type": "array"}
-					task["inputSchema"] = is
-				}
 			}
 		case "customer", "deal", "asset":
 			// sourcesConfig entries control which fields are written/read.
@@ -2577,7 +2557,7 @@ func buildAncestors(spec *composeSpec) map[string]map[string]bool {
 
 // validEdgeKeys is the whitelist for edge object keys in the compose spec.
 // 'from'/'to' are spec-local conveniences; 'sourceNodeId'/'targetNodeId' are
-// the canonical API names. 'sourceHandle' wires conditional + array-router
+// the canonical API names. 'sourceHandle' wires conditional
 // branches by handle id; 'branchName' was a common typo that silently
 // dropped and broke conditionals at runtime, so we reject it explicitly.
 var validEdgeKeys = map[string]bool{
