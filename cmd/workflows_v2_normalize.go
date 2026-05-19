@@ -184,7 +184,26 @@ type composeNormalizeOpts struct {
 	// default, matching legacy compose behavior), the mismatch is a hard
 	// error so the agent fixes it explicitly. Apply sets this true unless
 	// --skip-rescope is passed; non-apply callers leave it false.
+	//
+	// IMPORTANT: AutoRescopeEntities only governs the case where the
+	// entity's current workflowAlias is EMPTY (unscoped) or already MATCHES
+	// the target. When the entity is currently owned by a DIFFERENT
+	// workflow, validateEntityWorkflowAliasMatch always returns a hard
+	// error unless AllowStealOwnership is also set -- each v2 workflow
+	// owns its credit-decisioning entities 1:1, and silently re-stamping
+	// would steal ownership from the previous workflow and break its Hub
+	// element panel.
 	AutoRescopeEntities bool
+	// AllowStealOwnership -- opt-in escape hatch for the rare case where
+	// the user really does want apply to transfer an entity's ownership
+	// from another workflow to this one (workflow rename / identity
+	// migration / decommissioning the old owner). When false (default),
+	// apply refuses to re-stamp an entity whose workflowAlias points at
+	// another workflow and instructs the spec author to clone the entity
+	// with a new code instead. When true, the legacy "silently re-stamp"
+	// behavior is restored. Only apply's --allow-steal-ownership flag
+	// sets this; non-apply callers leave it false.
+	AllowStealOwnership bool
 }
 
 // missingEntityHandler returns an error when --publish is set, otherwise
@@ -235,12 +254,22 @@ func missingEntityHandler(opts *composeNormalizeOpts, dryRun bool, resourceKind,
 // scope to check) OR we don't know the predicted alias (compose context
 // missing -- non-apply callers).
 //
-// When opts.AutoRescopeEntities is true (apply's default), the mismatch
-// is downgraded from a hard error to a stderr warning -- the apply
-// reconciler will re-stamp the entity after task creation succeeds, so
-// blocking here would prevent the reconciliation from ever running.
-// When false (legacy compose behavior, --skip-rescope), the mismatch is
-// a hard error and the agent has to fix it explicitly.
+// Cross-ownership doctrine: each v2 workflow owns its credit-decisioning
+// entities 1:1. When an entity's current workflowAlias is non-empty and
+// belongs to ANOTHER workflow, apply refuses to re-stamp it -- silently
+// stealing ownership would break the previous owner's Hub element panel
+// (entities only appear in the panel when their workflowAlias matches).
+// The only paths forward are (a) clone the entity with a new code so each
+// workflow has its own copy, or (b) pass --allow-steal-ownership when
+// the user truly wants to transfer ownership (rare: workflow rename /
+// identity migration / decommissioning the old owner).
+//
+// Decision matrix:
+//   - actual == ""             -> OK (entity is unscoped, apply will claim it)
+//   - actual == predictedAlias -> OK (entity already belongs here)
+//   - actual != predictedAlias AND AllowStealOwnership=true   -> warning + auto-rescope
+//   - actual != predictedAlias AND AutoRescopeEntities=true   -> hard error (steal refused)
+//   - actual != predictedAlias AND AutoRescopeEntities=false  -> hard error (legacy)
 func validateEntityWorkflowAliasMatch(opts *composeNormalizeOpts, entity map[string]any, predictedAlias, resourceKind, ref string) error {
 	if entity == nil || predictedAlias == "" {
 		return nil
@@ -256,25 +285,32 @@ func validateEntityWorkflowAliasMatch(opts *composeNormalizeOpts, entity map[str
 	if id == "" {
 		id = "<id>"
 	}
-	if opts != nil && opts.AutoRescopeEntities {
+	// Cross-owned: another workflow owns this entity. Refuse to re-stamp
+	// unless the user explicitly opted in via --allow-steal-ownership.
+	if opts != nil && opts.AllowStealOwnership {
 		fmt.Fprintf(os.Stderr,
-			"# warning: %s %q is scoped to workflowAlias=%q but this workflow's alias is %q -- apply will re-scope it after task creation (auto-rescope)\n",
+			"# warning: %s %q is owned by workflowAlias=%q -- --allow-steal-ownership was set, apply will transfer ownership to %q after task creation\n",
 			resourceKind, ref, actual, predictedAlias)
 		return nil
 	}
 	return fmt.Errorf(
-		"%s %q is scoped to workflowAlias=%q, but this workflow's alias will be %q -- "+
-			"the entity won't appear in the Hub's elements panel for this workflow, so any human "+
-			"reviewing the task in the editor sees an unconfigured-looking reference. "+
-			"Pick ONE: (a) re-scope the entity to this workflow: "+
-			"`altscore %s update %s --workflow-alias %s` -- recommended when the entity is "+
-			"specific to this workflow; or (b) clear the entity's workflowAlias to make it "+
-			"globally shared across workflows: `altscore %s update %s --body '{\"workflowAlias\": null}'` "+
-			"-- pick this only if multiple workflows really should share the same entity definition; "+
-			"or (c) create a workflow-specific copy of the entity with a fresh code; or (d) re-run "+
-			"`apply` without `--skip-rescope` to auto-stamp the entity to this workflow",
-		resourceKind, ref, actual, predictedAlias, resourceKind, id, predictedAlias,
-		resourceKind, id)
+		"%s %q (code=%q) is currently owned by workflow %q, but this apply targets workflow %q. "+
+			"Each v2 workflow owns its credit-decisioning entities 1:1 -- silently re-stamping would "+
+			"steal ownership from %q and make the entity disappear from its Hub elements panel. "+
+			"Fix: clone the entity with a new code dedicated to %q, then update your spec to reference "+
+			"the new code. Example:\n"+
+			"    altscore %s get %s > /tmp/clone.json\n"+
+			"    # edit /tmp/clone.json: set \"code\" to a fresh value (e.g. %q) and \"workflowAlias\" to %q\n"+
+			"    altscore %s create --body @/tmp/clone.json\n"+
+			"If you really do want to transfer ownership of %q from %q to %q (rare: workflow rename, "+
+			"identity migration, decommissioning the old owner), re-run apply with --allow-steal-ownership.",
+		resourceKind, ref, ref, actual, predictedAlias,
+		actual,
+		predictedAlias,
+		resourceKind, id,
+		predictedAlias+"-"+ref, predictedAlias,
+		resourceKind,
+		ref, actual, predictedAlias)
 }
 
 // normalizeTaskBody mutates the task spec in place to match the canonical

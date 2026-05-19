@@ -524,6 +524,8 @@ Both paths share the same validation + normalize pipeline (`preflightTasks`, per
 
 Each successful stamp logs to stderr (`# scoped <resource> <code> to <alias>`). This is the fix for the "four -v2 sibling workflows all share a scorecard scoped to the original alias" bug — apply makes the workflow→entity scope mapping reflect the spec, automatically. Pass `--skip-rescope` to opt out (then a stale scope shows as a hard error in normalize and the agent has to fix it manually).
 
+**Entity ownership rule.** Each v2 workflow owns its credit-decisioning entities 1:1. A workflow's spec must NOT reference an entity whose `workflowAlias` is currently another workflow's alias. If you want the same logic in two workflows, **clone the entity** with a new code (e.g. `kyc-sc` and `kyb-sc` instead of one shared `scoring-sc`). Apply now refuses to silently steal ownership; pass `--allow-steal-ownership` if you really do want to transfer.
+
 **Refs vs aliases.** The spec uses `ref` as a stable spec-local key. Edges and inputMappings reference tasks by `ref`, and apply rewrites them with the server-assigned aliases at task-create time. You can also pass an explicit `alias` on the workflow itself (`spec.alias`) — apply uses it both to resolve the target and to keep `workflowAlias` stable across re-applies. Edges use `from`/`to` as shortcuts for `sourceNodeId`/`targetNodeId`.
 
 ```bash

@@ -99,6 +99,7 @@ func makeWfv2ApplyCmd() *cobra.Command {
 	var publish bool
 	var skipLintOnPublish bool
 	var skipRescope bool
+	var allowStealOwnership bool
 
 	cmd := &cobra.Command{
 		Use:   "apply",
@@ -121,10 +122,16 @@ The target workflow is resolved by alias:
 After either path apply walks the spec's dependency graph and stamps every
 referenced credit-decisioning entity (scorecards, rule-trees, evaluation-
 rules, mapping-tables, and nested rules within them) to the workflow's
-alias. This prevents the orphan-scope bug where four -v2 sibling workflows
-end up sharing a scorecard still labeled with the original alias. Pass
---skip-rescope to opt out (the alias mismatch warning will still fire from
-normalize, just not auto-resolved).
+alias -- but only when the entity is currently UNSCOPED or ALREADY scoped
+to this workflow. If an entity is owned by ANOTHER workflow, apply refuses
+to silently transfer ownership and errors out with a clone-the-entity
+suggestion. Each v2 workflow owns its credit-decisioning entities 1:1;
+silently re-stamping a cross-owned entity makes it disappear from the
+previous owner's Hub element panel. Pass --allow-steal-ownership to
+override (rare: workflow rename / identity migration / decommissioning the
+old owner). Pass --skip-rescope to disable the entire rescope step (then
+a stale scope shows as a hard error in normalize and the agent has to fix
+it manually).
 
 DRAFT trap: the create path saves the workflow in DRAFT by default, mirror
 of the Hub editor's save-then-publish flow. DRAFT workflows execute but the
@@ -211,7 +218,7 @@ Spec format (see file header for full reference):
 			// for every node (create AND update paths use fresh tasks; the
 			// old tasks orphan on the update path, that's accepted -- no
 			// /v2/tasks DELETE exists today).
-			workflow, err := composeWorkflowBody(c, &spec, dryRun, publish, !skipRescope)
+			workflow, err := composeWorkflowBody(c, &spec, dryRun, publish, !skipRescope, allowStealOwnership)
 			if err != nil {
 				return err
 			}
@@ -373,7 +380,7 @@ Spec format (see file header for full reference):
 			// a scorecard scoped to a sibling) leaves nested entities pointing
 			// at the old alias and the Hub's elements panel goes empty.
 			if !skipRescope {
-				if err := reconcileEntityScopes(c, &spec, targetAlias, cmd.ErrOrStderr()); err != nil {
+				if err := reconcileEntityScopes(c, &spec, targetAlias, allowStealOwnership, cmd.ErrOrStderr()); err != nil {
 					fmt.Fprintf(cmd.ErrOrStderr(), "# warning: entity-scope reconciliation hit an issue: %v (workflow itself is fine; re-scope failed entities manually with `altscore <resource> update <id> --workflow-alias %s`)\n", err, targetAlias)
 				}
 			}
@@ -389,6 +396,7 @@ Spec format (see file header for full reference):
 	cmd.Flags().BoolVar(&publish, "publish", false, "publish the workflow after creation (CREATE path only; UPDATE path always publishes the draft it produced)")
 	cmd.Flags().BoolVar(&skipLintOnPublish, "skip-lint-on-publish", false, "skip the pre-publish topology lint that refuses to publish on errors")
 	cmd.Flags().BoolVar(&skipRescope, "skip-rescope", false, "do not stamp referenced credit-decisioning entities (scorecards, rule-trees, etc.) to the workflow's alias after apply")
+	cmd.Flags().BoolVar(&allowStealOwnership, "allow-steal-ownership", false, "permit apply to transfer a credit-decisioning entity's workflowAlias when it is currently owned by ANOTHER workflow. Default: refuse and instruct the spec author to clone the entity with a new code. Use only for rare workflow rename / identity migration / decommissioning scenarios")
 	return cmd
 }
 
@@ -499,11 +507,19 @@ func findActiveWorkflowByAlias(c *client.Client, alias string) (map[string]any, 
 }
 
 // reconcileEntityScopes walks every credit-decisioning entity reachable from
-// the spec's tasks and stamps its `workflowAlias` to targetAlias. This is
-// the "auto-restamp on conflict" design decision: if a scorecard the spec
-// references is currently scoped to a sibling workflow, we re-scope it
-// rather than erroring -- the assumption is the spec is the source of truth
-// for what entities belong to this workflow.
+// the spec's tasks and stamps its `workflowAlias` to targetAlias when the
+// entity is currently UNSCOPED (workflowAlias is empty) or ALREADY matches
+// the target. When the entity is CROSS-OWNED -- its workflowAlias points at
+// a different workflow -- the reconciler refuses to re-stamp unless the
+// caller passed --allow-steal-ownership. Each v2 workflow owns its credit-
+// decisioning entities 1:1; silently transferring ownership breaks the
+// previous owner's Hub element panel (entities only appear in the panel
+// when their workflowAlias matches the workflow's alias).
+//
+// The preflight check in validateEntityWorkflowAliasMatch catches cross-
+// ownership before any mutation happens, so this second guard exists only
+// for the narrow window where the entity's owner changes between preflight
+// and reconcile (concurrent apply on the same tenant, manual update, etc.).
 //
 // Walks:
 //   - scorecard task -> scorecard entity -> nested rules[*].mappingTableCode
@@ -514,7 +530,7 @@ func findActiveWorkflowByAlias(c *client.Client, alias string) (map[string]any, 
 // All stamps are PATCH /v1/{resource}/{id} with {"workflowAlias": "<alias>"}.
 // Errors are surfaced per-entity to stderr (one log line each) and the rest
 // of the walk continues -- partial reconciliation is better than nothing.
-func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias string, errOut io.Writer) error {
+func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias string, allowStealOwnership bool, errOut io.Writer) error {
 	if c == nil || targetAlias == "" {
 		return nil
 	}
@@ -542,6 +558,19 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 		stamped[key] = true
 		actual, _ := entity["workflowAlias"].(string)
 		if actual == targetAlias {
+			return
+		}
+		// Cross-owned guard: refuse to steal ownership from another
+		// workflow unless the user explicitly opted in. Preflight has
+		// already raised this as a hard error in the normal path; this
+		// branch only fires if the entity's owner changed between
+		// preflight and reconcile.
+		if actual != "" && !allowStealOwnership {
+			fmt.Fprintf(errOut,
+				"# REFUSED to re-scope %s %q (id=%s): currently owned by workflow %q, "+
+					"target was %q. Clone the entity with a new code dedicated to %q, or "+
+					"re-run apply with --allow-steal-ownership to transfer ownership.\n",
+				resource, ref, id, actual, targetAlias, targetAlias)
 			return
 		}
 		patch, _ := json.Marshal(map[string]any{"workflowAlias": targetAlias})
@@ -1561,7 +1590,7 @@ func humanizeKey(key string) string {
 // nodeId + taskAlias and is used to rewrite all references downstream. If the
 // caller provided `alias` in a task body, that alias is sent to the API; if
 // absent, the server picks one and we use whatever it returns.
-func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool) (map[string]any, error) {
+func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool, allowStealOwnership bool) (map[string]any, error) {
 	if err := validateEntityTypeVsTaskTypes(spec); err != nil {
 		return nil, err
 	}
@@ -1765,6 +1794,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			InputVariables:      spec.InputVariables,
 			Publish:             publish,
 			AutoRescopeEntities: autoRescopeEntities,
+			AllowStealOwnership: allowStealOwnership,
 		}, dryRun); err != nil {
 			return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}
