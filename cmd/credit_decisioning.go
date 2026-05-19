@@ -79,13 +79,16 @@ func makeErImportCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "import",
 		Short: "Bulk-import evaluation rules from a JSON bundle",
-		Long: `POST /v1/evaluation-rules/import. Body should be the array of rule
-definitions as produced by an export.
+		Long: `POST /v1/evaluation-rules/import. Body must be a top-level JSON
+ARRAY of rule definitions -- NOT an object wrapper. e.g.
+  [{"label": "Approve", "code": "approve", "conditions": {...}, ...}, ...]
+A bundle-shaped body like {"rules": [...]} or {"items": [...]} is rejected
+by the endpoint with an opaque parse error.
 
 Use --workflow-alias <alias> to stamp every imported rule with the same
 workflowAlias. Without it the imports will not appear in the workflow's
 evaluate-rules picker.`,
-		Example: `  altscore evaluation-rules import --body @rules-bundle.json --workflow-alias underwriting-v1`,
+		Example: `  altscore evaluation-rules import --body @rules-array.json --workflow-alias underwriting-v1`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
 			if err != nil {

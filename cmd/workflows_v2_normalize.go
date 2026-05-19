@@ -344,6 +344,50 @@ func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bo
 	// Coverage warning only applies to single-mode dispatch; batch mode
 	// reads inputs from the resolved inputExpression, not inputMappings.
 	if runInBatch {
+		// In batch mode, every item in the upstream array auto-binds
+		// to the child workflow's input variables by field name (no
+		// inputMappings needed). A common trap is writing a mapping
+		// like {"borrower_id": "borrower_id"} -- the runtime's
+		// resolver treats the value as a path expression, fails the
+		// path-separator check, and 400s with a cryptic error. Auto-
+		// clear bare-name mappings here with a stderr warning so the
+		// spec ships clean.
+		mappings := asMap(task["inputMappings"])
+		if len(mappings) == 0 {
+			return nil
+		}
+		bareNames := make([]string, 0)
+		validMappings := map[string]any{}
+		for name, raw := range mappings {
+			val, _ := raw.(string)
+			// A valid mapping value is either a task-output path or an
+			// inputs.* reference (both have a dot). Bare field names
+			// (no dot) are the trap case.
+			if val != "" && !strings.Contains(val, ".") {
+				bareNames = append(bareNames, name)
+				continue
+			}
+			validMappings[name] = raw
+		}
+		if len(bareNames) > 0 {
+			// Prefer the alias when ref was stripped by the dispatcher;
+			// fall back to executor so the warning always names something
+			// the user can grep for.
+			label := localRef(task, "")
+			if label == "" {
+				label, _ = task["alias"].(string)
+			}
+			if label == "" {
+				label = executor
+			}
+			fmt.Fprintf(os.Stderr,
+				"# warning: child-workflow %q runInBatch=true has bare-name inputMappings %v. "+
+					"In batch mode, every item dict's fields auto-bind to the child's inputs by name; "+
+					"a mapping like {\"x\": \"x\"} fails at runtime with a path-separator error. "+
+					"Dropping the bare entries; ensure your item dicts carry these fields directly.\n",
+				label, bareNames)
+			task["inputMappings"] = validMappings
+		}
 		return nil
 	}
 	inputVariables, err := lookupChildInputVariables(c, executor, dryRun)
