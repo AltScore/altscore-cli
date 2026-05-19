@@ -507,6 +507,8 @@ altscore workflows-v2 schema-guide examples      # full scoring_pipeline templat
 
 For "Create a workflow that does X" — or "Update workflow Y to do Z" — use `workflows-v2 apply`. It takes a single spec and reconciles it against the tenant. Use `--dry-run` first to inspect what will be sent (the dry-run output also tells you which branch will fire: CREATE or UPDATE).
 
+Use `--diff` to preview changes against the current tenant state before mutating. Pairs well with the UPDATE path — see exactly what version-bump will change before pulling the trigger. The diff renders structural deltas on metadata, nodes (added/removed/changed by stable slugified-label identity), edges, input/customVariables, and any entity-scope conflicts the apply would touch. Read-only: no `/v2/tasks` POSTs, no `/v2/workflows` mutations, no entity PATCHes. Mutually exclusive with `--dry-run` and `--publish`.
+
 **Create vs update semantics.** apply resolves the target by alias:
 
 - `spec.alias` if set, otherwise `slugifyWorkflowLabel(spec.label)`.
@@ -694,9 +696,31 @@ altscore tasks-v2 create-version fetch-ecu --body '{
 
 # Inspect (returns latest + version history)
 altscore tasks-v2 get fetch-ecu
+
+# List tasks (paginated; defaults to one row per alias, the latest version)
+altscore tasks-v2 list --per-page 50
+altscore tasks-v2 list --alias-prefix co2- --per-page 50           # cleanup residue
+altscore tasks-v2 list --type http,conditional                      # filter by type
+altscore tasks-v2 list --workflow-alias kyc-lite                    # tasks referenced by a workflow
+altscore tasks-v2 list --include-all                                # every historical version
+
+# Delete every version of a task (refused with 409 if any non-archived
+# workflow's latest version still references it -- error message lists
+# {workflowAlias, nodeId} pairs so you know what to detach)
+altscore tasks-v2 delete co2-orphan-task
 ```
 
-There is **no LIST endpoint** for tasks today. Discover task aliases via the workflows that use them.
+**Cleanup-after-failed-apply flow:** when `workflows-v2 apply` leaves orphan tasks behind (typical symptom: agents rotating alias prefixes like `co2- -> co2v- -> co2x-` to dodge their own residue), run:
+
+```bash
+# 1. enumerate orphan tasks by the alias prefix the failed apply used
+altscore tasks-v2 list --alias-prefix co2- --per-page 100 | jq -r '.[].alias' > /tmp/orphans.txt
+
+# 2. delete each. 409 means the task is still referenced -- the error
+#    message tells you which workflow+node still pin it. Detach those
+#    nodes (autosave) before retrying the delete.
+xargs -n1 altscore tasks-v2 delete < /tmp/orphans.txt
+```
 
 Per-type config (full reference: `schema-guide tasks`):
 

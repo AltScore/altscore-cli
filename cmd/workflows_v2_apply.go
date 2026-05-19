@@ -96,6 +96,7 @@ type composeSpec struct {
 func makeWfv2ApplyCmd() *cobra.Command {
 	var bodyFlag string
 	var dryRun bool
+	var diffFlag bool
 	var publish bool
 	var skipLintOnPublish bool
 	var skipRescope bool
@@ -141,6 +142,11 @@ common case when applying from the CLI. The update path always publishes
 spec is the desired state.
 
 Use --dry-run to print what would be sent without making any API calls.
+Use --diff to preview structural changes against the current tenant state:
+apply fetches the existing workflow (if any) and prints a per-section diff
+of metadata, tasks, edges, inputVariables, customVariables, and any entity-
+scope conflicts. No API mutations. Pairs well with the UPDATE path -- see
+exactly what version-bump will change before pulling the trigger.
 
 Spec format (see file header for full reference):
   - label, alias?, category, description, status (DRAFT default)
@@ -154,8 +160,26 @@ Spec format (see file header for full reference):
 		Example: `  altscore workflows-v2 apply --body @scoring-pipeline.json
   altscore workflows-v2 apply --body @spec.json --publish          # create+publish OR update+publish
   altscore workflows-v2 apply --body @spec.json --dry-run
+  altscore workflows-v2 apply --body @spec.json --diff              # preview changes vs current tenant state
   altscore workflows-v2 apply --body @spec.json --skip-rescope     # leave entity scopes alone`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Mutually exclusive: --diff, --dry-run, --publish. --diff is a
+			// read-only preview; --dry-run prints the assembled body without
+			// hitting the API; --publish mutates. Pick one.
+			modes := 0
+			if diffFlag {
+				modes++
+			}
+			if dryRun {
+				modes++
+			}
+			if publish {
+				modes++
+			}
+			if modes > 1 {
+				return fmt.Errorf("--diff, --dry-run, and --publish are mutually exclusive; pick one")
+			}
+
 			body, err := readBody(bodyFlag)
 			if err != nil {
 				return err
@@ -217,8 +241,18 @@ Spec format (see file header for full reference):
 			// Build the workflow body. composeWorkflowBody POSTs new tasks
 			// for every node (create AND update paths use fresh tasks; the
 			// old tasks orphan on the update path, that's accepted -- no
-			// /v2/tasks DELETE exists today).
-			workflow, err := composeWorkflowBody(c, &spec, dryRun, publish, !skipRescope, allowStealOwnership)
+			// /v2/tasks DELETE exists today). In diff mode, we run compose
+			// in dryRun=true so no /v2/tasks POSTs happen; the assembled body
+			// is purely for shape-comparison against the current tenant.
+			// We also force allowStealOwnership=true in diff mode so cross-
+			// owned entities don't abort compose -- they're surfaced in the
+			// diff output as "would RE-STAMP" instead, which is the whole
+			// point of a preview tool.
+			composeAllowSteal := allowStealOwnership
+			if diffFlag {
+				composeAllowSteal = true
+			}
+			workflow, err := composeWorkflowBody(c, &spec, dryRun || diffFlag, publish, !skipRescope, composeAllowSteal)
 			if err != nil {
 				return err
 			}
@@ -226,6 +260,10 @@ Spec format (see file header for full reference):
 			wfBody, err := json.Marshal(workflow)
 			if err != nil {
 				return err
+			}
+
+			if diffFlag {
+				return diffWorkflow(c, cmd, &spec, workflow, existing, targetAlias)
 			}
 
 			if dryRun {
@@ -393,6 +431,7 @@ Spec format (see file header for full reference):
 	}
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON spec (or pipe via stdin)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the assembled workflow body without making API calls")
+	cmd.Flags().BoolVar(&diffFlag, "diff", false, "preview structural changes against the current tenant state. Fetches the existing workflow (if any), assembles the spec body in memory, and prints a human-readable diff. No API mutations. Mutually exclusive with --dry-run and --publish")
 	cmd.Flags().BoolVar(&publish, "publish", false, "publish the workflow after creation (CREATE path only; UPDATE path always publishes the draft it produced)")
 	cmd.Flags().BoolVar(&skipLintOnPublish, "skip-lint-on-publish", false, "skip the pre-publish topology lint that refuses to publish on errors")
 	cmd.Flags().BoolVar(&skipRescope, "skip-rescope", false, "do not stamp referenced credit-decisioning entities (scorecards, rule-trees, etc.) to the workflow's alias after apply")
