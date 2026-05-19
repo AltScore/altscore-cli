@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/client"
@@ -686,6 +687,91 @@ func validateConditionGroup(v any, path string) error {
 // entry per (resource, codeOrId).
 var entityCache = map[string]map[string]any{}
 
+// tenantDecisionKeysCache memoizes the GET /v1/decisions result for the
+// active client. A nil value after `Fetched=true` means we tried and
+// failed; callers should skip the warning quietly in that case.
+var tenantDecisionKeysCache map[string]bool
+var tenantDecisionKeysFetched bool
+
+// fetchTenantDecisionKeys pulls the tenant's decision-key catalog so we
+// can compare a rule's decisionKey against the canonical case-sensitive
+// set. Decisions are stored as data-model records under
+// /v1/data-models?entity-type=decision; the user-facing case-sensitive
+// key is in each record's `key` field. Best-effort: returns nil on any
+// error so callers can skip the warning quietly.
+func fetchTenantDecisionKeys(c *client.Client) map[string]bool {
+	if tenantDecisionKeysFetched {
+		return tenantDecisionKeysCache
+	}
+	tenantDecisionKeysFetched = true
+	if c == nil {
+		return nil
+	}
+	data, _, err := c.Do("GET", "borrower_central", "/v1/data-models?entity-type=decision&per-page=200", nil)
+	if err != nil {
+		return nil
+	}
+	var arr []map[string]any
+	if err := json.Unmarshal(data, &arr); err != nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, d := range arr {
+		if k, ok := d["key"].(string); ok && k != "" {
+			out[k] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	tenantDecisionKeysCache = out
+	return out
+}
+
+// warnIfDecisionKeyUnknown checks whether a rule's `decisionKey` matches
+// any case-sensitive entry on the tenant's /v1/decisions catalog. Prints
+// a stderr warning (non-blocking) on mismatch so compose can finish and
+// the user can fix the case before the rule tree fires at run time.
+// `context` is a short label (e.g. "rulesConfig[0]") for the warning.
+func warnIfDecisionKeyUnknown(c *client.Client, decisionKey, ruleCode, context string) {
+	if decisionKey == "" {
+		return
+	}
+	known := fetchTenantDecisionKeys(c)
+	if known == nil || known[decisionKey] {
+		return
+	}
+	// Heuristic: detect case-only mismatches so the warning can suggest
+	// the exact fix instead of just listing every known key.
+	suggestion := ""
+	for k := range known {
+		if strings.EqualFold(k, decisionKey) {
+			suggestion = k
+			break
+		}
+	}
+	if suggestion != "" {
+		fmt.Fprintf(os.Stderr,
+			"# warning: %s rule %q has decisionKey=%q -- tenant /v1/decisions has %q (case differs). "+
+				"BC accepts the mismatch on create but the rule tree FAILS at execute time when recording the decision. "+
+				"Update the rule: `altscore evaluation-rules update <id> --body '{\"decisionKey\": \"%s\"}'`.\n",
+			context, ruleCode, decisionKey, suggestion, suggestion,
+		)
+		return
+	}
+	keys := []string{}
+	for k := range known {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	fmt.Fprintf(os.Stderr,
+		"# warning: %s rule %q has decisionKey=%q -- not in the tenant's /v1/decisions catalog. "+
+			"BC accepts the mismatch on create but the rule tree FAILS at execute time when recording the decision. "+
+			"Valid keys: %v. Run `altscore decisions list` to confirm.\n",
+		context, ruleCode, decisionKey, keys,
+	)
+}
+
 // lookupEntity fetches /v1/{resource}?code=<codeOrId> (best-effort) and
 // returns the first matching record. Used for non-blocking warnings when
 // a task references something that doesn't exist on the tenant and for
@@ -771,6 +857,14 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *com
 		}
 		if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "evaluation-rules", ref); err != nil {
 			return fmt.Errorf("rulesConfig[%d]: %w", i, err)
+		}
+		// Cross-check the rule's decisionKey against the tenant's
+		// /v1/decisions catalog. Case mismatches pass create cleanly but
+		// blow up at run time -- warn now (non-blocking) so the user can
+		// fix the entity before the workflow executes.
+		if entity != nil {
+			dk, _ := entity["decisionKey"].(string)
+			warnIfDecisionKeyUnknown(c, dk, ref, fmt.Sprintf("rulesConfig[%d]", i))
 		}
 	}
 	return nil
@@ -1024,6 +1118,36 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeN
 	}
 	if err := validateEntityWorkflowAliasMatch(entity, predictedAlias, "rule-trees", ref); err != nil {
 		return err
+	}
+	// Cross-check the decisionKey on every rule the tree references. The
+	// rule tree's runtime contract is: pick the first matching rule and
+	// record its decisionKey on the execution. A case-mismatched key
+	// blows up at that recording step -- warn here so the agent can fix
+	// the rule entity before the workflow ever fires.
+	if entity != nil {
+		if rules, ok := entity["rules"].([]any); ok {
+			for i, raw := range rules {
+				rm, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				rcode, _ := rm["ruleCode"].(string)
+				rid, _ := rm["ruleId"].(string)
+				rref := rcode
+				if rref == "" {
+					rref = rid
+				}
+				if rref == "" {
+					continue
+				}
+				ruleEntity, _ := lookupEntity(c, "evaluation-rules", rref, dryRun)
+				if ruleEntity == nil {
+					continue
+				}
+				dk, _ := ruleEntity["decisionKey"].(string)
+				warnIfDecisionKeyUnknown(c, dk, rref, fmt.Sprintf("rule-tree %q rules[%d]", ref, i))
+			}
+		}
 	}
 
 	// Mirror the top-level inputMappings into ruleTreeConfig.inputMappings

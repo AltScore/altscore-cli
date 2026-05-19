@@ -565,7 +565,13 @@ Referenced by alias from v2 evaluate-rules tasks via {ruleCode: "<code>"}.`,
   conditions: ConditionGroup   [required] {operator: "AND"|"OR", items: [ConditionItem|ConditionGroup]}
   alertLevel: integer          Optional (legacy)
   alertMessage: string         Optional (legacy)
-  decisionKey: string          Optional decision key
+  decisionKey: string          Optional decision key. CASE-SENSITIVE and must match
+                                exactly a key registered on the tenant's /v1/decisions.
+                                A mismatch (e.g. "REJECT" when the tenant has "reject")
+                                passes create/lint clean but the rule tree fails at
+                                run time when recording the decision. Run
+                                'altscore decisions list' before stamping rules to
+                                verify the exact case.
   workflowAlias: string        Workflow scope -- REQUIRED for the rule to appear in
                                 that workflow's evaluate-rules picker (CLI flag
                                 --workflow-alias <alias> is the canonical way to set this)`,

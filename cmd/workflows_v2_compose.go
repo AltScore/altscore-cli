@@ -144,6 +144,16 @@ Spec format (see file header for full reference):
 				_ = i
 			}
 			spec.Nodes = nil
+			// BC's category enum is uppercase (ACTION / EVALUATION / CONTACT /
+			// OTHER). Help text / dry-run accept any case, then BC rejects
+			// lowercase with a 400. Normalize here so users don't have to
+			// shout. Status mirrors the same convention (DRAFT/ACTIVE).
+			if spec.Category != "" {
+				spec.Category = strings.ToUpper(spec.Category)
+			}
+			if spec.Status != "" {
+				spec.Status = strings.ToUpper(spec.Status)
+			}
 			if len(spec.Tasks) == 0 && len(spec.ExtraNodes) == 0 {
 				return fmt.Errorf("spec must include at least one of: tasks, extraNodes, nodes")
 			}
@@ -1172,6 +1182,13 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		return nil, err
 	}
 
+	// Warn when end-task outputJson templates inline known-object-typed
+	// upstream outputs. The runtime template engine substitutes those refs
+	// raw, which produces invalid JSON; BC silently falls back to a
+	// promoted-scope dump and the user's custom envelope is lost with no
+	// error surfaced. See the la-fabril spike report for the original sighting.
+	lintOutputJsonObjectRefs(spec)
+
 	// Auto-add `persona` to the workflow's inputVariables when any
 	// customer/deal/asset task uses operation=write but the spec didn't
 	// declare it. CreateBorrower's strict Literal["individual","business"]
@@ -1718,6 +1735,13 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		"nodes":           allNodes,
 		"edges":           allEdges,
 	}
+	// Honor an explicit `alias` from the spec (BC #1291 made the create
+	// endpoint accept it). Without this, BC slugifies `label` -- which is
+	// fine, but specs that set alias explicitly were silently ignored by
+	// compose for several releases. Threaded as a plain pass-through.
+	if spec.Alias != "" {
+		wf["alias"] = spec.Alias
+	}
 	if spec.Description != "" {
 		wf["description"] = spec.Description
 	}
@@ -1831,7 +1855,7 @@ func preflightTasks(spec *composeSpec) error {
 			return fmt.Errorf(
 				"tasks[%d]: ref %q has invalid characters. Refs become server-assigned aliases (and nodeIds), "+
 					"so must be lowercase alphanumeric with internal dashes only "+
-					"(regex: ^[a-z0-9][a-z0-9-]*$). Don't use spaces, slashes, uppercase, or punctuation.",
+					"(regex: ^[a-z0-9][a-z0-9-]*$). Don't use spaces, underscores, slashes, uppercase, or other punctuation.",
 				i, ref,
 			)
 		}
@@ -1868,6 +1892,18 @@ func preflightTasks(spec *composeSpec) error {
 	startCount, endCount := 0, 0
 	for i, node := range spec.ExtraNodes {
 		ref := localRef(node, fmt.Sprintf("n%d", i))
+		// Same URL-safety constraint as tasks: refs become server-assigned
+		// aliases (and thus nodeIds). Reject upper-case / underscores /
+		// spaces / punctuation upfront so the spec fails fast instead of
+		// 400'ing at the per-node POST.
+		if !validAliasPattern.MatchString(ref) {
+			return fmt.Errorf(
+				"extraNodes[%d]: ref %q has invalid characters. Refs become server-assigned aliases (and nodeIds), "+
+					"so must be lowercase alphanumeric with internal dashes only "+
+					"(regex: ^[a-z0-9][a-z0-9-]*$). Don't use spaces, underscores, slashes, uppercase, or other punctuation.",
+				i, ref,
+			)
+		}
 		if knownRefs[ref] {
 			return fmt.Errorf(
 				"extraNodes[%d]: duplicate ref %q -- collides with a task or another extraNode. "+
@@ -2554,6 +2590,85 @@ var validWorkflowCategories = map[string]bool{
 // length/uniqueness checks but at minimum aliases must match this shape so
 // they round-trip through path parameters.
 var validAliasPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+// objectTypedOutputsByTaskType lists task-type → field-names whose values
+// are objects or arrays at runtime. Template substitution that inlines one
+// of these into an outputJson string field produces invalid JSON; BC's
+// renderer silently falls back to a promoted-scope dump. Lint these so the
+// agent isn't surprised when their custom envelope vanishes.
+//
+// Surveyed from the v2 task type Pydantic models + activity output shapes.
+// Conservative -- list only fields confirmed to produce object/array values.
+var objectTypedOutputsByTaskType = map[string]map[string]bool{
+	"scorecard":           {"score_breakdown": true},
+	"evaluate-rules":      {"alerts": true},
+	"altdata-enrichment":  {},
+	"mapping-table":       {},
+}
+
+// outputJsonTemplateRefRegex extracts {{task_outputs.<alias>.<field>}} refs
+// from an outputJson template string. The first capture group is the alias,
+// the second is the immediate field name (we only check the top-level
+// field; deeper paths into nested objects are typically string/scalar leaves).
+var outputJsonTemplateRefRegex = regexp.MustCompile(`\{\{\s*task_outputs\.([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_]+)`)
+
+// lintOutputJsonObjectRefs walks every end task's outputJson and warns
+// (stderr, non-blocking) when a {{task_outputs.X.Y}} placeholder maps to
+// an object/array Y. This catches the bug where a scorecard's
+// `score_breakdown` (or evaluate-rules `alerts`) gets inlined into a JSON
+// template and silently corrupts the rendered output.
+func lintOutputJsonObjectRefs(spec *composeSpec) {
+	// Build an alias -> task-type lookup across both Tasks and ExtraNodes
+	// so we can resolve each {{task_outputs.X.*}} ref to a type.
+	aliasToType := map[string]string{}
+	for _, t := range spec.Tasks {
+		alias := localRef(t, "")
+		ty, _ := t["type"].(string)
+		if alias != "" && ty != "" {
+			aliasToType[alias] = ty
+		}
+	}
+	for _, t := range spec.ExtraNodes {
+		alias := localRef(t, "")
+		ty, _ := t["type"].(string)
+		if alias != "" && ty != "" {
+			aliasToType[alias] = ty
+		}
+	}
+
+	for _, t := range spec.Tasks {
+		ty, _ := t["type"].(string)
+		if ty != "end" {
+			continue
+		}
+		endCfg, _ := t["endConfig"].(map[string]any)
+		if endCfg == nil {
+			continue
+		}
+		oj, _ := endCfg["outputJson"].(string)
+		if oj == "" {
+			continue
+		}
+		for _, m := range outputJsonTemplateRefRegex.FindAllStringSubmatch(oj, -1) {
+			refAlias, field := m[1], m[2]
+			refType := aliasToType[refAlias]
+			objectFields := objectTypedOutputsByTaskType[refType]
+			if objectFields == nil || !objectFields[field] {
+				continue
+			}
+			endRef := localRef(t, "<unnamed-end>")
+			fmt.Fprintf(os.Stderr,
+				"# warning: end task %q outputJson references {{task_outputs.%s.%s}} -- "+
+					"that field is an %s output and substituting it inline produces invalid JSON. "+
+					"The runtime template engine silently falls back to a promoted-scope dump "+
+					"(your custom keys are lost). Two fixes today: (a) drop %s.%s from outputJson and "+
+					"rely on the promoted dump, or (b) project the field into a scalar via an upstream "+
+					"compute-variables task before the end node references it.\n",
+				endRef, refAlias, field, refType, refAlias, field,
+			)
+		}
+	}
+}
 
 // validInputSchemaTypes mirrors the SchemaTypes Pydantic discriminated union
 // in borrower-central. The backend's error message lies ("permitted:
