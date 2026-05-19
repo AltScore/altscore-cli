@@ -857,6 +857,72 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 - **No tasks LIST endpoint.** Discover task aliases via the workflows that use them, or via the Hub UI.
 
 
+#### Canonical end-node pattern (single end, not N parallel ends)
+
+> **Wire the rule-tree directly into ONE end node — don't fan out through a `conditional` into 3-5 hand-maintained `end` tasks.** Compose now ships a non-blocking warning (`lintCanonicalEndNode`) that flags spec missing this pattern.
+
+BC's `end_activity` (`borrower-central/app/temporal/activities/end_activity.py:339-360`) already promotes four fields from the end task's resolved input `context` onto the execution record automatically — you don't write them, you just wire the inputMappings:
+
+| context key | execution record field | source |
+|---|---|---|
+| `borrower_id` | `borrowerId` | upstream customer task output (or `inputs.borrower_id` for non-NC workflows) |
+| `billable_id` | `billableId` (defaults to `borrowerId` if omitted) | upstream customer/deal task output |
+| `deal_id` | `dealId` | upstream deal task output |
+| `decision_key` | `currentDecision.key` (when `decisionConfig.enabled=true`) | upstream rule-tree task output |
+
+The rule-tree's own output field (default `decision_key`, configurable via `ruleTreeConfig.outputVariable`) carries the per-run decision. You feed that into the end node's `inputMappings.decision_key`, set `decisionConfig.enabled=true`, and BC writes the right `currentDecision.key` per run — no conditional needed.
+
+**Why this beats N parallel ends.**
+
+- **One outputJson to maintain.** Multi-end workflows hand-write one outputJson per branch. The la-fabril `scoring-kyc` spike shipped with `monto_recomendado` on the `approved` branch only — reject and manual_review had a drifted envelope that silently omitted the field. Single end = one template = no drift.
+- **No conditional task.** The branching is structural (rule-tree decides which key, end records it). Drop the `conditional` task and its 3-5 outbound edges entirely.
+- **One PDF config.** htmlBlock content interpolates from the resolved context including `decision_key`, so a single PDF template with `<b>Decision:</b> {decision_key}` renders correctly for every branch.
+- **Fewer alias-collision pitfalls.** N end tasks = N aliases = N inputMappings to keep in sync with upstream. Single end = one mapping table.
+
+**Canonical compose spec snippet.**
+
+```json
+{
+  "ref": "end",
+  "type": "end",
+  "label": "End",
+  "inputMappings": {
+    "borrower_id":   "task_outputs.<customer-task-ref>.borrower_id",
+    "deal_id":       "task_outputs.<deal-task-ref>.deal_id",
+    "decision_key":  "task_outputs.<rule-tree-ref>.decision_key",
+    "total_score":   "task_outputs.<scorecard-ref>.total_score"
+  },
+  "inputSchema": {
+    "borrower_id":  {"type": "string"},
+    "deal_id":      {"type": "string"},
+    "decision_key": {"type": "string"},
+    "total_score":  {"type": "number"}
+  },
+  "endConfig": {
+    "decisionConfig": { "enabled": true, "decisionType": "final" },
+    "pdfConfig": {
+      "enabled": true,
+      "title": "Credit Decision Report",
+      "filePrefix": "credit-decision",
+      "sourcesConfig": []
+    },
+    "outputJson": "{\"customer_id\":\"{{task_outputs.<customer-task-ref>.borrower_id}}\",\"decision\":\"{{task_outputs.<rule-tree-ref>.decision_key}}\",\"total_score\":{{task_outputs.<scorecard-ref>.total_score}}}"
+  }
+}
+```
+
+The edges are just `rule-tree -> end`. Replace `<customer-task-ref>`, `<rule-tree-ref>`, `<scorecard-ref>` with the spec-local `ref` values from the upstream tasks; compose rewrites them to server-assigned aliases at create time.
+
+> **outputJson template syntax.** `{{decision_key}}` and `{{borrower_id}}` are NOT resolved — the variable resolver only matches `{{inputs.X}}`, `{{task_outputs.X.Y}}`, `{{custom.X}}`, `{{system.X}}`, and bare alias `{{<alias>.<path>}}`. A bare key inside `{{}}` stays literal and corrupts the JSON, which sends BC down the promoted-scope dump fallback and silently drops your custom envelope. Always use the long form in outputJson, even when the same key is also in `inputMappings` (inputMappings exist for the per-end-node context that drives `result['decision_key']` and PDF section enrichment — NOT for outputJson substitution).
+
+**When multiple end nodes are correct.** Rare, but legal:
+
+- Post-decision tasks differ per branch — e.g. one branch hits an external "send to underwriter" webhook, another doesn't. The branching has to happen before the end so the side-effect node only runs on the right branch.
+- Per-branch htmlSections that aren't expressible as `{decision_key}` template substitutions in a single PDF (e.g. completely different report layouts per outcome).
+
+In those cases, keep the `conditional` + N ends, but still wire `decision_key` on every end's `inputMappings` so `currentDecision.key` records correctly per branch.
+
+
 ### Credit Decisioning
 
 Four entity types power the credit-decisioning v2 task surface. They live at `/v1/{evaluation-rules, mapping-tables, scorecards, rule-trees}` and are referenced by alias from v2 tasks. All four have full CRUD + `import` extras; scorecards add `usage`; evaluation-rules add `history`.
