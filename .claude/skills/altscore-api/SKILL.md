@@ -742,6 +742,7 @@ For `customer` / `deal` / `asset` write tasks the `sourcesConfig` entries map ea
 - `{type: "deal_field", key: "<context_key>", label: "..."}` — write one deal_field record per entry.
 - `{type: "deal_contact", key: "<context_key>", label: "..."}` — write a single DealContact row from `context[<key>]` (one contact dict).
 - `{type: "deal_contacts", key: "<context_key>", label: "..."}` — **plural** form: `context[<key>]` is a list of contact dicts and one DealContact row is created per item. Same idempotency rules apply (see Gotchas).
+- `{type: "deal_contacts", key: "<context_key>", label: "...", upsertBorrowers: true}` — **plural-with-upsert** form. Each item without `borrower_id` is resolved by looking up `(identity_key, identity_value, tenant)`; if no identity exists, a new borrower is created (`persona` REQUIRED on the item — `"individual"` or `"business"`) and the identity row is written. Accepted item shapes: `{borrower_id, role_key?, is_primary?}` (existing-borrower path), `{tax_id, persona, label?, role_key?, is_primary?}` (shorthand: `tax_id` field doubles as identity_key+identity_value), or `{identity_key, identity_value, persona, label?, role_key?, is_primary?}` (explicit identity). Items with `borrower_id` short-circuit and bypass the upsert. Items with neither `borrower_id` nor a resolvable identity are silently skipped. Use when the deal task should own borrower creation (lets a single deal write upsert the customer + N guarantors atomically — eliminates the per-party customer-write child workflow before the deal).
 - `{type: "identity", key: "<identity_key>"}` / `{type: "borrower_field", key: "..."}` for customer/asset writes.
 
 #### Workflow CRUD
@@ -1169,6 +1170,45 @@ A single `deal` task can attach the customer plus an arbitrary number of guarant
 ```
 
 Re-running the deal task with the same `(deal_id, borrower_id, role_key)` triples is idempotent — no duplicate DealContact rows are created.
+
+#### Atomic deal write with borrower upsert (no per-party child needed)
+
+When the deal task should own borrower creation, set `upsertBorrowers: true` on the `deal_contacts` entry. The deal write becomes the single source of truth for the deal record, its contacts, AND the borrowers being attached. KYC/KYB can run AFTER the deal exists as pure scoring (no longer a hard dependency for contact attachment — a failed KYC no longer drops a contact).
+
+```jsonc
+"tasks": [
+  {"ref": "build-contacts", "type": "compute-variables",
+   "selectedVariables": ["contacts"]},
+  // customVariables.contacts emits a list like:
+  //   [{tax_id: "30-71234567-1", persona: "business", label: "Acme SRL",
+  //     role_key: "customer", is_primary: true},
+  //    {tax_id: "20-25678901-3", persona: "individual",
+  //     role_key: "guarantor", is_primary: false}]
+
+  {"ref": "create-deal", "type": "deal", "operation": "write",
+   "lookupBy": "external_id", "key": "external_id",
+   "inputSchema": {
+     "external_id": {"type": "string", "required": true},
+     "contacts":    {"type": "array"}
+   },
+   "inputMappings": {
+     "external_id": "inputs.deal.dealId",
+     "contacts":    "task_outputs.build-contacts.contacts"
+   },
+   "sourcesConfig": [
+     {"type": "deal_contacts", "key": "contacts", "label": "Contacts",
+      "upsertBorrowers": true}
+   ]
+  },
+
+  // Optional: KYC/KYB scoring AFTER the deal exists. Children take borrower_id
+  // from the freshly-written contacts, so a failed child no longer drops a
+  // contact -- it just leaves that party unscored.
+  {"ref": "kyc-fan-out", "type": "child-workflow", "runInBatch": true,
+   "inputExpression": "inputs.deal.parties[entityType=natural]",
+   "executorAlias": "deal-kyc-scoring-v1", "continueOnFailure": true}
+]
+```
 
 
 ## AltData
