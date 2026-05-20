@@ -694,9 +694,31 @@ altscore tasks-v2 create-version fetch-ecu --body '{
 
 # Inspect (returns latest + version history)
 altscore tasks-v2 get fetch-ecu
+
+# List tasks (paginated; defaults to one row per alias, the latest version)
+altscore tasks-v2 list --per-page 50
+altscore tasks-v2 list --alias-prefix co2- --per-page 50           # cleanup residue
+altscore tasks-v2 list --type http,conditional                      # filter by type
+altscore tasks-v2 list --workflow-alias kyc-lite                    # tasks referenced by a workflow
+altscore tasks-v2 list --include-all                                # every historical version
+
+# Delete every version of a task (refused with 409 if any non-archived
+# workflow's latest version still references it -- error message lists
+# {workflowAlias, nodeId} pairs so you know what to detach)
+altscore tasks-v2 delete co2-orphan-task
 ```
 
-There is **no LIST endpoint** for tasks today. Discover task aliases via the workflows that use them.
+**Cleanup-after-failed-apply flow:** when `workflows-v2 apply` leaves orphan tasks behind (typical symptom: agents rotating alias prefixes like `co2- -> co2v- -> co2x-` to dodge their own residue), run:
+
+```bash
+# 1. enumerate orphan tasks by the alias prefix the failed apply used
+altscore tasks-v2 list --alias-prefix co2- --per-page 100 | jq -r '.[].alias' > /tmp/orphans.txt
+
+# 2. delete each. 409 means the task is still referenced -- the error
+#    message tells you which workflow+node still pin it. Detach those
+#    nodes (autosave) before retrying the delete.
+xargs -n1 altscore tasks-v2 delete < /tmp/orphans.txt
+```
 
 Per-type config (full reference: `schema-guide tasks`):
 
