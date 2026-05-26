@@ -832,6 +832,27 @@ reference.`,
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
 	})
+	// Deprecate the raw `create` subcommand: it POSTs a pre-wired graph body
+	// verbatim and is easy to get wrong (snake-case keys, missing backing
+	// tasks). Hide it and point advanced callers at it; everyone else should
+	// use `apply`, which creates tasks, wires nodes, and detects
+	// create-vs-update atomically. Functionality is retained, just unlisted.
+	for _, sub := range wfv2Group.Commands() {
+		if sub.Name() == "create" {
+			sub.Hidden = true
+			sub.Short = "Create a v2 workflow from a fully pre-wired body (advanced)"
+			sub.Long = `Advanced/low-level: POST a complete, pre-wired workflow body to
+/v2/workflows verbatim. You are responsible for camelCase node/edge keys
+(nodeId/sourceNodeId/targetNodeId) and a backing /v2/tasks record per node.
+
+Recommended path: 'altscore workflows-v2 apply --body @spec.json', which
+creates the underlying tasks, wires nodes to them, and detects
+create-vs-update automatically. Use this 'create' command only when you
+already have a hand-assembled body and know exactly what you are sending.`
+			break
+		}
+	}
+
 	wfv2Group.AddCommand(makeWfv2PublishCmd())
 	wfv2Group.AddCommand(makeWfv2CreateDraftCmd())
 	wfv2Group.AddCommand(makeWfv2RevertCmd())

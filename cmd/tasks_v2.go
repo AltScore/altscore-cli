@@ -106,6 +106,9 @@ Returns the created task DTO including its id, alias, and version=1.`,
 			if err := validateTaskV2Body(body); err != nil {
 				return err
 			}
+			if err := deriveAltdataInputKeysForCreate(c, &body); err != nil {
+				return err
+			}
 			data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", body)
 			if err != nil {
 				return err
@@ -142,6 +145,9 @@ minus the alias.`,
 				return err
 			}
 			if err := validateTaskV2Body(body); err != nil {
+				return err
+			}
+			if err := deriveAltdataInputKeysForCreate(c, &body); err != nil {
 				return err
 			}
 			path := fmt.Sprintf("/v2/tasks/%s", args[0])

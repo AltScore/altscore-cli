@@ -395,11 +395,12 @@ Spec format (see file header for full reference):
 				if v, ok := workflow["notes"]; ok {
 					autosavePayload["notes"] = v
 				}
-				autosaveRaw, _ := json.Marshal(autosavePayload)
-				if err := validateWorkflowV2Body(autosaveRaw); err != nil {
+				autosaveBytes, _ := json.Marshal(autosavePayload)
+				autosaveRaw := json.RawMessage(autosaveBytes)
+				if err := validateWorkflowV2Body(&autosaveRaw); err != nil {
 					return fmt.Errorf("autosave body validation failed: %w", err)
 				}
-				autoResp, _, err := c.Do("PUT", "borrower_central", "/v2/workflows/"+draftID+"/autosave", json.RawMessage(autosaveRaw))
+				autoResp, _, err := c.Do("PUT", "borrower_central", "/v2/workflows/"+draftID+"/autosave", autosaveRaw)
 				if err != nil {
 					return fmt.Errorf("autosave draft %s: %w", draftID, err)
 				}
@@ -1236,7 +1237,7 @@ func rewriteTaskOutputsRefsInString(s string, refMap map[string]string) string {
 // expands `{{<alias>.<field>}}` to the implicit
 // `{{task_outputs.<alias>.<field>}}` at execute time), so we no longer
 // re-wrap bare heads with the task_outputs. prefix.
-func rewriteRefsInTemplate(s string, refMap map[string]string) (string, error) {
+func rewriteRefsInTemplate(s string, refMap map[string]string, localMappings map[string]any) (string, error) {
 	if !strings.Contains(s, "{{") {
 		return s, nil
 	}
@@ -1253,6 +1254,16 @@ func rewriteRefsInTemplate(s string, refMap map[string]string) (string, error) {
 		// Only rewrite path-like inner expressions; leave plain literals alone.
 		dot := strings.Index(inner, ".")
 		if dot <= 0 {
+			// Bare single-token placeholder, e.g. {{borrower_id}}. By itself
+			// the runtime template engine has no scope to resolve it against,
+			// so it renders literally and corrupts the JSON. If the task's
+			// inputMappings maps this token to a resolvable expression (e.g.
+			// "inputs.borrower_id" or "task_outputs.fetch.tax_id"), rewrite to
+			// that long form. When the token isn't a known mapping, leave it
+			// untouched -- we only rewrite when we can confidently resolve it.
+			if resolved, ok := localMappings[inner].(string); ok && resolved != "" {
+				return "{{" + resolved + "}}"
+			}
 			return match
 		}
 		// task_outputs.<ref>.<deep>
@@ -1317,8 +1328,14 @@ func rewriteRefsInTemplate(s string, refMap map[string]string) (string, error) {
 // fail at rewrite time instead of being ordered correctly.
 func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) error {
 	taskType, _ := task["type"].(string)
+	// The task's inputMappings map short tokens (e.g. "borrower_id") to
+	// resolvable expressions (e.g. "inputs.borrower_id"). Bare single-token
+	// placeholders in a template are rewritten to their mapped long form when
+	// a mapping exists. By the time this runs the inputMappings values are
+	// already in resolved/server-alias form (rewriteRefsInMappings ran first).
+	localMappings, _ := task["inputMappings"].(map[string]any)
 	rewriteField := func(fieldPath string, value string) (string, error) {
-		out, err := rewriteRefsInTemplate(value, refMap)
+		out, err := rewriteRefsInTemplate(value, refMap, localMappings)
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", fieldPath, err)
 		}

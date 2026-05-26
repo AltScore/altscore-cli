@@ -9,10 +9,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// validateWorkflowV2Body checks a workflow create/autosave/update body for
-// the two failure modes that produce silent garbage:
-//  1. Snake-case node/edge field names (id/source/target) -- API requires
-//     camelCase aliases (nodeId/sourceNodeId/targetNodeId).
+// validateWorkflowV2Body normalizes a workflow create/autosave/update body
+// and checks for the failure modes that produce silent garbage:
+//  1. Snake-case / short node-edge field names (id/source/target) are RENAMED
+//     in place to the camelCase aliases the API expects (nodeId/sourceNodeId/
+//     targetNodeId) rather than rejected. We only error when both forms are
+//     present with conflicting values.
 //  2. Orphan nodes (any type without taskAlias/taskId).
 //
 // EVERY node -- including start, end, and conditional -- must have a
@@ -20,14 +22,15 @@ import (
 // no other config) so it can render them. A node without a taskAlias produces
 // GET /v2/tasks/null -> 404 in the Hub UI.
 //
-// Returns a single error aggregating every problem found so the agent can
-// fix everything at once instead of round-tripping per issue.
-func validateWorkflowV2Body(body json.RawMessage) error {
-	if len(body) == 0 {
+// The body is mutated in place when a rename happens. Returns a single error
+// aggregating every remaining problem so the agent can fix everything at once
+// instead of round-tripping per issue.
+func validateWorkflowV2Body(body *json.RawMessage) error {
+	if body == nil || len(*body) == 0 {
 		return nil
 	}
 	var wf map[string]any
-	if err := json.Unmarshal(body, &wf); err != nil {
+	if err := json.Unmarshal(*body, &wf); err != nil {
 		// Not our problem -- the API will reject with a clear parse error.
 		return nil
 	}
@@ -40,6 +43,7 @@ func validateWorkflowV2Body(body json.RawMessage) error {
 	// contract changed.
 
 	var problems []string
+	mutated := false
 
 	if rawNodes, ok := wf["nodes"]; ok && rawNodes != nil {
 		nodes, _ := rawNodes.([]any)
@@ -49,11 +53,13 @@ func validateWorkflowV2Body(body json.RawMessage) error {
 				continue
 			}
 
-			// Old field-name pitfalls
-			if _, hasID := nm["id"]; hasID {
-				if _, hasNodeID := nm["nodeId"]; !hasNodeID {
-					problems = append(problems, fmt.Sprintf("nodes[%d]: uses 'id' -- the API requires 'nodeId'", i))
-				}
+			// Old field-name pitfall: 'id' is the short/snake form; the API
+			// requires the camelCase 'nodeId'. Rename in place rather than
+			// reject. Only error when both are present with conflicting values.
+			if renamed, err := renameToCamel(nm, "id", "nodeId", fmt.Sprintf("nodes[%d]", i)); err != nil {
+				problems = append(problems, err.Error())
+			} else if renamed {
+				mutated = true
 			}
 
 			nodeID, _ := nm["nodeId"].(string)
@@ -86,24 +92,61 @@ func validateWorkflowV2Body(body json.RawMessage) error {
 			if !ok {
 				continue
 			}
-			if _, hasSrc := em["source"]; hasSrc {
-				if _, ok := em["sourceNodeId"]; !ok {
-					problems = append(problems, fmt.Sprintf("edges[%d]: uses 'source' -- the API requires 'sourceNodeId'", i))
-				}
+			// 'source'/'target' are the short forms; the API requires
+			// 'sourceNodeId'/'targetNodeId'. Rename in place rather than reject.
+			if renamed, err := renameToCamel(em, "source", "sourceNodeId", fmt.Sprintf("edges[%d]", i)); err != nil {
+				problems = append(problems, err.Error())
+			} else if renamed {
+				mutated = true
 			}
-			if _, hasTgt := em["target"]; hasTgt {
-				if _, ok := em["targetNodeId"]; !ok {
-					problems = append(problems, fmt.Sprintf("edges[%d]: uses 'target' -- the API requires 'targetNodeId'", i))
-				}
+			if renamed, err := renameToCamel(em, "target", "targetNodeId", fmt.Sprintf("edges[%d]", i)); err != nil {
+				problems = append(problems, err.Error())
+			} else if renamed {
+				mutated = true
 			}
 		}
 	}
 
-	if len(problems) == 0 {
-		return nil
+	if len(problems) > 0 {
+		return fmt.Errorf("workflow body validation failed:\n  - %s\n\nPrefer the declarative path:\n  altscore workflows-v2 apply --body @spec.json --dry-run\nwhich creates the underlying /v2/tasks records, wires nodes to them, and detects create-vs-update automatically.",
+			strings.Join(problems, "\n  - "))
 	}
-	return fmt.Errorf("workflow body validation failed:\n  - %s\n\nPrefer the declarative path:\n  altscore workflows-v2 apply --body @spec.json --dry-run\nwhich creates the underlying /v2/tasks records, wires nodes to them, and detects create-vs-update automatically.",
-		strings.Join(problems, "\n  - "))
+
+	// Persist any in-place renames back to the caller's body.
+	if mutated {
+		rewritten, err := json.Marshal(wf)
+		if err != nil {
+			return fmt.Errorf("re-encode normalized workflow body: %w", err)
+		}
+		*body = json.RawMessage(rewritten)
+	}
+	return nil
+}
+
+// renameToCamel moves the value at the short key (e.g. "id") to the canonical
+// camelCase key (e.g. "nodeId") and drops the short key. It returns true when
+// a rename happened. If both keys are present with conflicting values it
+// returns an error instead of guessing; equal values (or an absent short key)
+// are a no-op rename. context is a short label like "nodes[2]" for the error.
+func renameToCamel(m map[string]any, shortKey, camelKey, context string) (bool, error) {
+	shortVal, hasShort := m[shortKey]
+	if !hasShort {
+		return false, nil
+	}
+	camelVal, hasCamel := m[camelKey]
+	if hasCamel {
+		if fmt.Sprint(shortVal) != fmt.Sprint(camelVal) {
+			return false, fmt.Errorf(
+				"%s: both %q and %q are present with conflicting values (%v vs %v) -- keep only %q",
+				context, shortKey, camelKey, shortVal, camelVal, camelKey)
+		}
+		// Same value on both keys: just drop the redundant short form.
+		delete(m, shortKey)
+		return true, nil
+	}
+	m[camelKey] = shortVal
+	delete(m, shortKey)
+	return true, nil
 }
 
 // makeWfv2LintCmd inspects an existing workflow for the same set of issues
