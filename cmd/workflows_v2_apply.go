@@ -1341,6 +1341,37 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 				}
 				endCfg["outputJson"] = out
 			}
+			// pdfConfig.sourcesConfig[].taskAlias carries a spec-local ref to
+			// the data-producing upstream task whose output gets rendered as
+			// a PDF section (scorecard, rule-tree, altdata-enrichment, etc.).
+			// The runtime end_activity looks the alias up directly against
+			// the workflow's task list -- so a spec-local ref like "score"
+			// that survives compose persists on the server, the renderer
+			// can't find a task with that alias, and the section falls
+			// through to an empty render or hits the auto-resolver fallback.
+			// Symptom matches the la-fabril / kyc-pf-mx spike: apply needs a
+			// manual post-publish fix-up (fetch end task, rewrite section
+			// aliases, bump task version, re-publish) for every PDF report
+			// the spec defines section entries for.
+			if pdfCfg, _ := endCfg["pdfConfig"].(map[string]any); pdfCfg != nil {
+				if sources, ok := pdfCfg["sourcesConfig"].([]any); ok {
+					for idx, src := range sources {
+						sm, _ := src.(map[string]any)
+						if sm == nil {
+							continue
+						}
+						alias, _ := sm["taskAlias"].(string)
+						if alias == "" {
+							continue
+						}
+						if server, found := refMap[alias]; found {
+							sm["taskAlias"] = server
+							sources[idx] = sm
+						}
+					}
+					pdfCfg["sourcesConfig"] = sources
+				}
+			}
 		}
 	case "exception":
 		// errorMessage flows through graph_workflow's _resolve_dict_variables
@@ -1386,6 +1417,112 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 		}
 	}
 	return nil
+}
+
+// residualSpecRefExcludedFields is the set of task-body field names where a
+// string value is allowed to coincidentally equal a spec-local ref without
+// it being a missed rewrite. These are user-facing text fields (labels,
+// descriptions) and authored literal slots (mapping-table outputs, condition
+// literal values, input-variable defaults) -- a word like "score" landing
+// there is a normal user choice, not a compose bug.
+//
+// The list is intentionally conservative: it shouldn't grow much. The point
+// of validateNoResidualSpecRefs is to surface unknown ref-bearing paths;
+// excluding too much defeats that. New entries here should be cross-checked
+// against whether the field is also walked by rewriteRefsInTaskTemplates.
+var residualSpecRefExcludedFields = map[string]bool{
+	"label":         true,
+	"description":   true,
+	"title":         true,
+	"subtitle":      true,
+	"name":          true,
+	"code":          true,
+	"comment":       true,
+	"errorMessage":  true, // template, rewritten elsewhere; value may match a ref legitimately
+	"outputJson":    true, // template, rewritten elsewhere
+	"filePrefix":    true, // PDF metadata
+	"brandLogo":     true, // PDF metadata
+	"value":         true, // condition literals, mapping entry literals
+	"outputValue":   true, // mapping table literals
+	"defaultValue":  true, // mapping table fallback literals
+	"default":       true, // input-variable defaults
+	"placeholder":   true,
+	"helpText":      true,
+	"hint":          true,
+	"tooltip":       true,
+}
+
+// validateNoResidualSpecRefs walks a composed task body and returns an error
+// if any string value at a non-excluded path exactly equals a key in refMap
+// whose server-assigned alias is different. A surviving spec-local ref means
+// some ref-bearing field on this task type isn't covered by
+// rewriteRefsInTaskTemplates -- the existing rewriter is a hardcoded
+// per-type switch, so adding a new ref-bearing field (e.g.
+// endConfig.pdfConfig.sourcesConfig[].taskAlias, which silently shipped as
+// a bug for some time) requires touching the switch. This validator is the
+// safety net: when the next ref-bearing field is added to the API but the
+// rewriter isn't updated, compose fails loudly with the offending JSON path
+// instead of letting the bad task body ship to the server.
+//
+// Exact-string-match (not substring) keeps the check high-signal:
+// "score" inside a label "Final score breakdown" doesn't match the key
+// "score". When a legitimate user literal collides with a ref name, the
+// agent can either rename the ref or add the field to
+// residualSpecRefExcludedFields -- the error message names the field, so
+// the remediation is obvious.
+func validateNoResidualSpecRefs(body map[string]any, refMap map[string]string, ctx string) error {
+	if len(refMap) == 0 {
+		return nil
+	}
+	var walk func(node any, path string) error
+	walk = func(node any, path string) error {
+		switch v := node.(type) {
+		case map[string]any:
+			for k, sub := range v {
+				childPath := k
+				if path != "" {
+					childPath = path + "." + k
+				}
+				if err := walk(sub, childPath); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for i, sub := range v {
+				if err := walk(sub, fmt.Sprintf("%s[%d]", path, i)); err != nil {
+					return err
+				}
+			}
+		case string:
+			if v == "" {
+				return nil
+			}
+			// Last segment of the dotted path is the field name.
+			last := path
+			if idx := strings.LastIndexByte(path, '.'); idx >= 0 {
+				last = path[idx+1:]
+			}
+			// Strip a trailing array index "[N]" so the field-name check
+			// matches whether the value is at parent.field or
+			// parent.field[3].
+			if bracket := strings.IndexByte(last, '['); bracket >= 0 {
+				last = last[:bracket]
+			}
+			if residualSpecRefExcludedFields[last] {
+				return nil
+			}
+			if server, found := refMap[v]; found && server != v {
+				return fmt.Errorf(
+					"%s: residual spec-local ref %q at path %q (expected server-assigned alias %q). "+
+						"This means rewriteRefsInTaskTemplates doesn't yet walk this field for the task type. "+
+						"Add the field to the rewriter (or add %q to residualSpecRefExcludedFields if the "+
+						"literal is genuinely user-authored text).",
+					ctx, v, path, server, last)
+			}
+		}
+		return nil
+	}
+	return walk(body, "")
 }
 
 // rewriteRefsInConditionGroup walks a ConditionGroup tree (operator + items
@@ -1745,6 +1882,18 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			return nil, fmt.Errorf("tasks[%d] (ref=%q): label and type are required", i, ref)
 		}
 
+		// Carry the spec-local ref as `specRef` on the task body so the
+		// server's stable-alias path (BC's CreateTaskV2UC) can look this
+		// task up on subsequent applies and version-bump it instead of
+		// minting a fresh slug-XXXXXX. predictedAlias scopes the lookup
+		// to this workflow: the same ref "score" is legitimately used
+		// across many workflows, so (workflowAlias, specRef) is the
+		// identity. The fields are advisory on the server side -- a BC
+		// without the stable-alias path silently ignores them, so older
+		// CLI/server combos keep working.
+		task["specRef"] = ref
+		task["workflowAlias"] = predictedAlias
+
 		// Strip the spec-only `ref` field before posting; it's not part of the API.
 		delete(task, "ref")
 
@@ -1825,6 +1974,17 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
 		}
 
+		// Safety net: after all known rewriters have run, scan the task body
+		// for any string value that still exactly equals a spec-local ref.
+		// Such a residue means a ref-bearing field exists somewhere in the
+		// task schema that no rewriter knows about -- the same class of bug
+		// as endConfig.pdfConfig.sourcesConfig[].taskAlias before it was
+		// added to the per-type switch above. Failing here surfaces the path
+		// before postTask ships a broken body.
+		if err := validateNoResidualSpecRefs(task, refMap, fmt.Sprintf("tasks[%d] (ref=%q)", i, ref)); err != nil {
+			return nil, err
+		}
+
 		// Type-specific normalization: enrich altdata-enrichment with inputKeys
 		// from source inputFields, validate conditional branches, etc.
 		if err := normalizeTaskBody(c, task, &composeNormalizeOpts{
@@ -1894,9 +2054,17 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			// the end task ships with empty schemas and the PDF picker shows
 			// nothing -- matching the bug the user hit before manually
 			// recreating the end node in the Hub UI.
+			//
+			// specRef + workflowAlias enable the server's stable-alias path
+			// (BC's CreateTaskV2UC.find_by_spec_ref) so successive applies
+			// of the same spec version-bump THIS task instead of minting a
+			// fresh fin-XXXXXX / start-XXXXXX alias. Same rationale as the
+			// spec.Tasks loop above.
 			taskBody := map[string]any{
-				"label": label,
-				"type":  nodeType,
+				"label":         label,
+				"type":          nodeType,
+				"specRef":       ref,
+				"workflowAlias": predictedAlias,
 			}
 			if strings.ToLower(nodeType) == "end" {
 				// Data-source ancestors (altdata-enrichment, scorecard,
@@ -2030,6 +2198,13 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				// resolver rejects `score` as an unknown scope.
 				if err := rewriteRefsInTaskTemplates(taskBody, refMap); err != nil {
 					return nil, fmt.Errorf("extraNodes[%d] (ref=%q): %w", i, ref, err)
+				}
+				// Same safety net as the spec.Tasks loop above -- see comment
+				// there. extraNode end tasks build their body inline, so any
+				// rewrite gap in pdfConfig (or future end-task fields) would
+				// otherwise ship verbatim.
+				if err := validateNoResidualSpecRefs(taskBody, refMap, fmt.Sprintf("extraNodes[%d] (ref=%q)", i, ref)); err != nil {
+					return nil, err
 				}
 			}
 
