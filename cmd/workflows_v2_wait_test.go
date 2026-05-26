@@ -172,18 +172,20 @@ func TestPollExecutionWait_TransientErrorThenSucceeds(t *testing.T) {
 	}
 }
 
-// TestExtractExecutionAndWorkflowIDs sanity-checks the submit-response parsing
-// for both the flat shape (current async response) and a nested "data" shape.
-func TestExtractExecutionAndWorkflowIDs(t *testing.T) {
-	flat := json.RawMessage(`{"executionId":"e1","workflowId":"w1"}`)
-	exec, wf := extractExecutionAndWorkflowIDs(flat)
-	if exec != "e1" || wf != "w1" {
-		t.Errorf("flat: got exec=%q wf=%q, want e1/w1", exec, wf)
+// TestExtractExecutionID sanity-checks the submit-response parsing for both
+// the flat shape (current async response) and a nested "data" wrapper.
+func TestExtractExecutionID(t *testing.T) {
+	flat := json.RawMessage(`{"executionId":"e1"}`)
+	if id := extractExecutionID(flat); id != "e1" {
+		t.Errorf("flat: got %q, want e1", id)
 	}
-	nested := json.RawMessage(`{"data":{"executionId":"e2","workflowId":"w2"}}`)
-	exec, wf = extractExecutionAndWorkflowIDs(nested)
-	if exec != "e2" || wf != "w2" {
-		t.Errorf("nested: got exec=%q wf=%q, want e2/w2", exec, wf)
+	nested := json.RawMessage(`{"data":{"executionId":"e2"}}`)
+	if id := extractExecutionID(nested); id != "e2" {
+		t.Errorf("nested: got %q, want e2", id)
+	}
+	missing := json.RawMessage(`{"foo":"bar"}`)
+	if id := extractExecutionID(missing); id != "" {
+		t.Errorf("missing: got %q, want empty", id)
 	}
 }
 
