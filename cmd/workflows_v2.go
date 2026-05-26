@@ -6,12 +6,31 @@ import (
 	"io"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
+	"time"
 
 	"github.com/AltScore/altscore-cli/internal/client"
 	"github.com/AltScore/altscore-cli/internal/output"
 	"github.com/spf13/cobra"
 )
+
+// ExitCodeError lets a RunE bubble an explicit process exit code up to main().
+// Cobra still prints the wrapped error via its default Error handling; we just
+// surface a non-default code for callers (e.g. 2 for poll timeout).
+type ExitCodeError struct {
+	Code int
+	Err  error
+}
+
+func (e *ExitCodeError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("exit %d", e.Code)
+	}
+	return e.Err.Error()
+}
+
+func (e *ExitCodeError) Unwrap() error { return e.Err }
 
 // uuidPattern matches RFC 4122 UUIDs (8-4-4-4-12 hex). Used by helpers that
 // need to distinguish a workflow UUID from a workflow alias before calling
@@ -1086,10 +1105,315 @@ func bindExecHeaderFlags(cmd *cobra.Command, h *wfv2ExecHeaders) {
 	cmd.Flags().StringVar(&h.executionMode, "execution-mode", "", `X-Execution-Mode ("sync"/"async")`)
 }
 
+// wfv2WaitFlags holds the polling configuration shared by execute and
+// execute-by-alias. Defaults are 5m total deadline and 2s between polls,
+// matching the partner spec.
+type wfv2WaitFlags struct {
+	wait         bool
+	timeout      time.Duration
+	pollInterval time.Duration
+}
+
+func bindWaitFlags(cmd *cobra.Command, w *wfv2WaitFlags) {
+	cmd.Flags().BoolVar(&w.wait, "wait", false, "submit async, then poll until the execution reaches a terminal state")
+	cmd.Flags().DurationVar(&w.timeout, "timeout", 5*time.Minute, "total deadline for --wait polling")
+	cmd.Flags().DurationVar(&w.pollInterval, "poll-interval", 2*time.Second, "interval between poll calls when --wait is set")
+}
+
+// terminalExecutionStatuses are the workflow-execution statuses that end the
+// poll loop. Source of truth: ExecutionStatus in
+// borrower-central/app/model/workflows_v2/workflow_execution.py.
+var terminalExecutionStatuses = map[string]bool{
+	"completed": true,
+	"failed":    true,
+	"cancelled": true,
+	"timed_out": true,
+}
+
+// failureExecutionStatuses are the subset of terminal statuses that should
+// cause the CLI to exit non-zero.
+var failureExecutionStatuses = map[string]bool{
+	"failed":    true,
+	"cancelled": true,
+	"timed_out": true,
+}
+
+// pollExecutionWait runs the --wait poll loop against
+// GET /v2/workflows/{workflowId}/executions/{executionId} until the execution
+// reaches a terminal state or the timeout fires.
+//
+// On --verbose, prints per-node status transitions to stderr as
+// "[<ts>] <node_id> <prev_status> -> <new_status>". Returns the final raw
+// execution JSON so the caller can pretty-print it to stdout, together with
+// the terminal status string. A timeout returns (nil, "", *ExitCodeError{2}).
+func pollExecutionWait(c *client.Client, workflowID, executionID string, w wfv2WaitFlags, verbose bool, stderr io.Writer) (json.RawMessage, string, error) {
+	if w.pollInterval <= 0 {
+		w.pollInterval = 2 * time.Second
+	}
+	if w.timeout <= 0 {
+		w.timeout = 5 * time.Minute
+	}
+
+	path := fmt.Sprintf("/v2/workflows/%s/executions/%s", workflowID, executionID)
+	ticker := time.NewTicker(w.pollInterval)
+	defer ticker.Stop()
+	deadline := time.After(w.timeout)
+	prevNodeStatuses := map[string]string{}
+	transientFailures := 0
+
+	// Do an immediate first poll so very-short runs don't burn pollInterval.
+	for {
+		data, _, err := c.Do("GET", "borrower_central", path, nil)
+		if err != nil {
+			// Be defensive about transient HTTP errors -- one retry, then fail.
+			transientFailures++
+			if transientFailures > 1 {
+				return nil, "", fmt.Errorf("poll %s failed: %w", path, err)
+			}
+			if verbose {
+				fmt.Fprintf(stderr, "# poll error (transient, will retry once): %v\n", err)
+			}
+		} else {
+			transientFailures = 0
+			status := extractExecutionStatus(data)
+			if verbose {
+				printNodeStatusTransitions(stderr, data, prevNodeStatuses)
+			}
+			if terminalExecutionStatuses[status] {
+				return data, status, nil
+			}
+		}
+
+		select {
+		case <-deadline:
+			return nil, "", &ExitCodeError{
+				Code: 2,
+				Err:  fmt.Errorf("timed out after %s waiting for execution %s", w.timeout, executionID),
+			}
+		case <-ticker.C:
+		}
+	}
+}
+
+// extractExecutionStatus pulls the lowercase status string out of a workflow
+// execution JSON. Returns "" when the field is missing or not a string so the
+// loop keeps polling instead of crashing.
+func extractExecutionStatus(data json.RawMessage) string {
+	var env map[string]any
+	if err := json.Unmarshal(data, &env); err != nil {
+		return ""
+	}
+	if s, ok := env["status"].(string); ok {
+		return s
+	}
+	// Some wrappers nest the payload under "data".
+	if inner, ok := env["data"].(map[string]any); ok {
+		if s, ok := inner["status"].(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// extractNodeStatuses walks the execution JSON and returns a map of
+// node_id -> status. Looks at common shapes:
+//   - top-level "nodes": [{id|nodeId, status}, ...]
+//   - top-level "taskExecutions": [{taskId|nodeId, status}, ...]
+//   - "data.nodes" / "data.taskExecutions" for wrapped payloads
+//
+// Missing or differently-shaped data is silently ignored.
+func extractNodeStatuses(data json.RawMessage) map[string]string {
+	out := map[string]string{}
+	var env map[string]any
+	if err := json.Unmarshal(data, &env); err != nil {
+		return out
+	}
+	collect := func(root map[string]any) {
+		for _, key := range []string{"nodes", "taskExecutions", "tasks", "nodeExecutions"} {
+			raw, ok := root[key]
+			if !ok {
+				continue
+			}
+			arr, ok := raw.([]any)
+			if !ok {
+				continue
+			}
+			for _, item := range arr {
+				node, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				id := ""
+				for _, idKey := range []string{"nodeId", "id", "taskId", "taskAlias"} {
+					if v, ok := node[idKey].(string); ok && v != "" {
+						id = v
+						break
+					}
+				}
+				if id == "" {
+					continue
+				}
+				status, _ := node["status"].(string)
+				out[id] = status
+			}
+		}
+	}
+	collect(env)
+	if inner, ok := env["data"].(map[string]any); ok {
+		collect(inner)
+	}
+	return out
+}
+
+func printNodeStatusTransitions(stderr io.Writer, data json.RawMessage, prev map[string]string) {
+	curr := extractNodeStatuses(data)
+	if len(curr) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(curr))
+	for id := range curr {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	ts := time.Now().Format(time.RFC3339)
+	for _, id := range ids {
+		newStatus := curr[id]
+		oldStatus, seen := prev[id]
+		if !seen {
+			oldStatus = "-"
+		}
+		if oldStatus != newStatus {
+			fmt.Fprintf(stderr, "[%s] %s %s -> %s\n", ts, id, oldStatus, newStatus)
+		}
+	}
+	for id, status := range curr {
+		prev[id] = status
+	}
+}
+
+// extractFailureDetail pulls failedNodeId + a best-effort failure reason out
+// of the execution payload. PR1 may be adding "failureReason" as a top-level
+// field; until then we also fall back to error.message / error.details.
+func extractFailureDetail(data json.RawMessage) (failedNodeID, reason string) {
+	var env map[string]any
+	if err := json.Unmarshal(data, &env); err != nil {
+		return "", ""
+	}
+	pick := func(root map[string]any) {
+		if failedNodeID == "" {
+			if v, ok := root["failedNodeId"].(string); ok {
+				failedNodeID = v
+			}
+		}
+		if reason == "" {
+			if v, ok := root["failureReason"].(string); ok {
+				reason = v
+			}
+		}
+		if reason == "" {
+			if errObj, ok := root["error"].(map[string]any); ok {
+				if m, ok := errObj["message"].(string); ok {
+					reason = m
+				}
+			}
+		}
+	}
+	pick(env)
+	if inner, ok := env["data"].(map[string]any); ok {
+		pick(inner)
+	}
+	return failedNodeID, reason
+}
+
+// runExecuteWithOptionalWait centralises the post-submit flow shared by
+// execute and execute-by-alias. When wait is set it polls; otherwise it just
+// prints the submit response (existing behavior).
+func runExecuteWithOptionalWait(
+	c *client.Client,
+	stdout, stderr io.Writer,
+	submitResp json.RawMessage,
+	wait wfv2WaitFlags,
+	verbose bool,
+) error {
+	if !wait.wait {
+		return output.RawJSON(submitResp)
+	}
+
+	executionID, workflowID := extractExecutionAndWorkflowIDs(submitResp)
+	if executionID == "" || workflowID == "" {
+		return fmt.Errorf("--wait: could not find executionId/workflowId in submit response (got %d bytes)", len(submitResp))
+	}
+
+	if verbose {
+		fmt.Fprintf(stderr, "# polling /v2/workflows/%s/executions/%s every %s (timeout %s)\n",
+			workflowID, executionID, wait.pollInterval, wait.timeout)
+	}
+
+	finalData, status, err := pollExecutionWait(c, workflowID, executionID, wait, verbose, stderr)
+	if err != nil {
+		return err
+	}
+
+	if err := output.RawJSON(finalData); err != nil {
+		return err
+	}
+
+	if failureExecutionStatuses[status] {
+		failedNode, reason := extractFailureDetail(finalData)
+		if failedNode != "" || reason != "" {
+			fmt.Fprintf(stderr, "execution %s ended in %s", executionID, status)
+			if failedNode != "" {
+				fmt.Fprintf(stderr, " at node %s", failedNode)
+			}
+			if reason != "" {
+				fmt.Fprintf(stderr, ": %s", reason)
+			}
+			fmt.Fprintln(stderr)
+		}
+		return &ExitCodeError{Code: 1, Err: fmt.Errorf("execution %s ended with status %s", executionID, status)}
+	}
+	return nil
+}
+
+// extractExecutionAndWorkflowIDs digs the executionId + workflowId out of an
+// async-submit response. Tolerates both flat ({executionId, workflowId}) and
+// nested-under-"data" shapes.
+func extractExecutionAndWorkflowIDs(data json.RawMessage) (string, string) {
+	var env map[string]any
+	if err := json.Unmarshal(data, &env); err != nil {
+		return "", ""
+	}
+	exec, wf := "", ""
+	pull := func(root map[string]any) {
+		if exec == "" {
+			for _, k := range []string{"executionId", "execution_id", "id"} {
+				if v, ok := root[k].(string); ok && v != "" {
+					exec = v
+					break
+				}
+			}
+		}
+		if wf == "" {
+			for _, k := range []string{"workflowId", "workflow_id"} {
+				if v, ok := root[k].(string); ok && v != "" {
+					wf = v
+					break
+				}
+			}
+		}
+	}
+	pull(env)
+	if inner, ok := env["data"].(map[string]any); ok {
+		pull(inner)
+	}
+	return exec, wf
+}
+
 func makeWfv2ExecuteCmd() *cobra.Command {
 	var bodyFlag string
 	var skipStatusCheck bool
 	headers := wfv2ExecHeaders{}
+	wait := wfv2WaitFlags{}
 
 	cmd := &cobra.Command{
 		Use:   "execute <id>",
@@ -1102,9 +1426,15 @@ output is empty and the run looks successful while doing nothing useful).
 Pass --skip-status-check to opt out of the warning if you're intentionally
 exercising a draft.
 
-Use --execution-mode sync (default) or async.`,
+Use --execution-mode sync (default) or async.
+
+Pass --wait to submit async and poll until the execution reaches a terminal
+state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
+--verbose prints per-node status transitions to stderr. Exits 0 on completed,
+1 on failed/cancelled/timed_out, 2 on the local --timeout firing.`,
 		Example: `  altscore workflows-v2 execute <id> --body '{"borrower_id":"abc"}'
-  altscore workflows-v2 execute <id> --body '{...}' --execution-mode async --tags smoke`,
+  altscore workflows-v2 execute <id> --body '{...}' --execution-mode async --tags smoke
+  altscore workflows-v2 execute <id> --body '{...}' --wait --timeout 10m`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
@@ -1118,18 +1448,25 @@ Use --execution-mode sync (default) or async.`,
 			if !skipStatusCheck {
 				warnIfNotActive(cmd.OutOrStderr(), c, args[0])
 			}
+			// --wait implies async submit -- otherwise the sync header would
+			// fight the poll loop and we'd race the HTTP timeout. Only flip
+			// the mode when the user hasn't explicitly passed one.
+			if wait.wait && !cmd.Flags().Changed("execution-mode") {
+				headers.executionMode = "async"
+			}
 			path := fmt.Sprintf("/v2/workflows/%s/execute", args[0])
 			data, _, err := c.DoWithHeaders("POST", "borrower_central", path, body, headers.asMap())
 			if err != nil {
 				return err
 			}
-			return output.RawJSON(data)
+			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, wait, flagVerbose)
 		},
 	}
 
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON body (or pipe via stdin)")
 	cmd.Flags().BoolVar(&skipStatusCheck, "skip-status-check", false, "skip the pre-flight ACTIVE-status check")
 	bindExecHeaderFlags(cmd, &headers)
+	bindWaitFlags(cmd, &wait)
 	return cmd
 }
 
@@ -1164,13 +1501,20 @@ func warnIfNotActive(stderr io.Writer, c *client.Client, idOrAlias string) {
 func makeWfv2ExecuteByAliasCmd() *cobra.Command {
 	var bodyFlag string
 	headers := wfv2ExecHeaders{}
+	wait := wfv2WaitFlags{}
 
 	cmd := &cobra.Command{
-		Use:     "execute-by-alias <alias> <version>",
-		Short:   "Execute a v2 workflow by alias and version",
-		Long:    `Pass "latest" as <version> to execute the most recent published version.`,
-		Args:    cobra.ExactArgs(2),
-		Example: `  altscore workflows-v2 execute-by-alias my-wf latest --body '{...}'`,
+		Use:   "execute-by-alias <alias> <version>",
+		Short: "Execute a v2 workflow by alias and version",
+		Long: `Pass "latest" as <version> to execute the most recent published version.
+
+Pass --wait to submit async and poll until the execution reaches a terminal
+state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
+--verbose prints per-node status transitions to stderr. Exits 0 on completed,
+1 on failed/cancelled/timed_out, 2 on the local --timeout firing.`,
+		Args: cobra.ExactArgs(2),
+		Example: `  altscore workflows-v2 execute-by-alias my-wf latest --body '{...}'
+  altscore workflows-v2 execute-by-alias my-wf latest --body '{...}' --wait`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
 			if err != nil {
@@ -1180,17 +1524,21 @@ func makeWfv2ExecuteByAliasCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if wait.wait && !cmd.Flags().Changed("execution-mode") {
+				headers.executionMode = "async"
+			}
 			path := fmt.Sprintf("/v2/workflows/%s/%s/execute", args[0], args[1])
 			data, _, err := c.DoWithHeaders("POST", "borrower_central", path, body, headers.asMap())
 			if err != nil {
 				return err
 			}
-			return output.RawJSON(data)
+			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, wait, flagVerbose)
 		},
 	}
 
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON body (or pipe via stdin)")
 	bindExecHeaderFlags(cmd, &headers)
+	bindWaitFlags(cmd, &wait)
 	return cmd
 }
 

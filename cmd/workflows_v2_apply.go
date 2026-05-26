@@ -103,12 +103,16 @@ func makeWfv2ApplyCmd() *cobra.Command {
 	var allowStealOwnership bool
 
 	cmd := &cobra.Command{
-		Use:   "apply",
-		Short: "Declaratively create-or-update a v2 workflow from a single spec",
+		Use:     "apply",
+		Aliases: []string{"compose"},
+		Short:   "Declaratively create-or-update a v2 workflow from a single spec (alias: compose). Use --dry-run or --diff to preview changes before mutating.",
 		Long: `Declarative reconciliation of a v2 workflow against the spec. One verb
 covers both greenfield create and update-in-place. Same validation pipeline
 for both paths -- specs that pass apply against a fresh tenant also pass
-when re-applied against a tenant that already has the workflow.
+when re-applied against a tenant that already has the workflow. Also available
+as 'compose' (alias) -- both invocations are identical. Preview changes before
+mutating with --dry-run (prints the assembled body) or --diff (shows a per-
+section diff against the current tenant state).
 
 The target workflow is resolved by alias:
   - spec.alias if set, otherwise slugifyWorkflowLabel(spec.label).
