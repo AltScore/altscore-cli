@@ -929,9 +929,9 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 
 **Deep paths into altdata output**: an `altdata-enrichment` task outputs the entire package object on `sources_output_packages`. To map a single field into a downstream conditional/compute-variables task, use the deep form: `task_outputs.<altdataAlias>.<sourceId>.data.<fieldName>`. No intermediate compute-variables required.
 
-**Bare `<alias>.<field>` is broken** at runtime — Pydantic accepts it, but the resolver rejects `<alias>` as an unknown namespace. Always prefix `task_outputs.` for cross-task references. `apply` does this automatically when you write a ref-prefixed mapping; the rewriter outputs `task_outputs.<server-alias>.<rest>`.
+**Bare `<alias>.<field>` resolves fine** at runtime — the backend resolver accepts the bare-alias form (WITH a dot), and `apply` deliberately emits it for cross-task references. Both `task_outputs.<server-alias>.<rest>` and the bare `<alias>.<rest>` form are valid.
 
-**CreateTaskV2 vs CreateTaskVersionV2**: the strict initial-create validator rejects multi-dot mapping values when `inputSchema` is set. The lenient version-bump validator accepts them. **`apply`'s two-phase create handles this**: it strips `inputMappings`/`inputSchema` from the first POST, then re-posts the full body to `/v2/tasks/{alias}` to land at version 2. The workflow node references `taskVersion: 2` automatically.
+**Multi-dot inputMappings are accepted on create**: a single POST lands the task at version 1, and the workflow node references version 1.
 
 #### Gotchas (v2 specific)
 

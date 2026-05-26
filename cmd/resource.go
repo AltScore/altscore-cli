@@ -43,7 +43,7 @@ type ResourceDef struct {
 	HasTestMode    bool                                  // adds set-test command + --include-tests/--test-only on list + --is-test on create
 	HasTestFilter  bool                                  // adds only --include-tests/--test-only on list (no set-test, no create flag)
 	WorkflowAlias  bool                                  // adds --workflow-alias <alias> on create/update; injects "workflowAlias" into the body. Without it the entity will not appear in the workflow builder's pickers.
-	BodyValidator  func(body json.RawMessage) error      // optional hook called before POST/PATCH; aborts the request if it returns an error
+	BodyValidator  func(body *json.RawMessage) error     // optional hook called before POST/PATCH; may normalize the body in place; aborts the request if it returns an error
 }
 
 // registerResource creates a Cobra command group for the resource and adds
@@ -297,7 +297,7 @@ This allows piping JSON: echo '{"key":"value"}' | altscore %s create`, def.Singu
 			}
 
 			if def.BodyValidator != nil {
-				if err := def.BodyValidator(body); err != nil {
+				if err := def.BodyValidator(&body); err != nil {
 					return err
 				}
 			}
@@ -376,7 +376,7 @@ When --body is omitted and stdin is not a terminal, the body is read from stdin.
 			}
 
 			if def.BodyValidator != nil {
-				if err := def.BodyValidator(body); err != nil {
+				if err := def.BodyValidator(&body); err != nil {
 					return err
 				}
 			}

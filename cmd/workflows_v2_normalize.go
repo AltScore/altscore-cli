@@ -60,20 +60,88 @@ func validateTaskV2Body(body json.RawMessage) error {
 	if err := json.Unmarshal(body, &task); err != nil {
 		return nil
 	}
-	if t, _ := task["type"].(string); t == "altdata-enrichment" {
-		sources := asSlice(task["sourcesConfig"])
-		if len(sources) == 0 {
-			return nil
+	// Note: the altdata-enrichment empty-inputKeys case is no longer rejected
+	// here. The create path (deriveAltdataInputKeysForCreate) synthesizes
+	// inputKeys from each source's required inputFields, and only falls back to
+	// errAltdataMissingInputKeys when that derivation fails.
+	return nil
+}
+
+// errAltdataMissingInputKeys is the fallback error surfaced when an
+// altdata-enrichment create body has sources but no inputKeys AND the CLI
+// could not derive them (e.g. a source lookup network error). The happy path
+// derives inputKeys automatically; this only fires when derivation is
+// impossible.
+func errAltdataMissingInputKeys(cause error) error {
+	return fmt.Errorf(
+		"altdata-enrichment task with non-empty sourcesConfig but empty inputKeys, and the CLI could not derive them (%w) -- "+
+			"the Hub UI will show an unwired source. Run 'altscore workflows-v2 sources-status --filter id=<SOURCE_ID>' "+
+			"to see the source's required inputFields, then add an inputKeys entry per field, "+
+			`e.g. inputKeys: {"personId": "{{personId}}"}.`, cause)
+}
+
+// deriveAltdataInputKeysForCreate auto-fills inputKeys on an altdata-enrichment
+// `tasks-v2 create` / `create-version` body that supplies sourcesConfig but
+// omits inputKeys. It reuses the same per-source inputFields lookup the apply
+// path uses (lookupAltdataSourceInputFields) and writes one inputKeys entry per
+// required field. The body is normalized in place. Non-altdata bodies, bodies
+// without sources, and bodies that already carry inputKeys are left untouched.
+// On a source-lookup failure it returns errAltdataMissingInputKeys so the
+// caller surfaces the clear "add inputKeys" guidance instead of shipping an
+// unwired task.
+func deriveAltdataInputKeysForCreate(c *client.Client, body *json.RawMessage) error {
+	if body == nil || len(*body) == 0 {
+		return nil
+	}
+	var task map[string]any
+	if err := json.Unmarshal(*body, &task); err != nil {
+		return nil
+	}
+	if t, _ := task["type"].(string); t != "altdata-enrichment" {
+		return nil
+	}
+	sources := asSlice(task["sourcesConfig"])
+	if len(sources) == 0 {
+		return nil
+	}
+	if len(asMap(task["inputKeys"])) > 0 {
+		return nil
+	}
+
+	inputKeys := map[string]any{}
+	seen := map[string]bool{}
+	for _, s := range sources {
+		sm, ok := s.(map[string]any)
+		if !ok {
+			continue
 		}
-		inputKeys := asMap(task["inputKeys"])
-		if len(inputKeys) == 0 {
-			return fmt.Errorf(
-				"altdata-enrichment task with non-empty sourcesConfig but empty inputKeys -- " +
-					"the Hub UI will show an unwired source. Run 'altscore workflows-v2 sources-status --filter id=<SOURCE_ID>' " +
-					"to see the source's required inputFields, then add an inputKeys entry per field, " +
-					`e.g. inputKeys: {"personId": "{{personId}}"}. Compose does this automatically.`)
+		sid, _ := sm["sourceId"].(string)
+		ver, _ := sm["version"].(string)
+		if sid == "" {
+			continue
+		}
+		fields, err := lookupAltdataSourceInputFields(c, sid, ver, false)
+		if err != nil {
+			return errAltdataMissingInputKeys(fmt.Errorf("source %s %s lookup failed: %w", sid, ver, err))
+		}
+		for _, f := range fields {
+			if seen[f] {
+				continue
+			}
+			seen[f] = true
+			inputKeys[f] = "{{" + f + "}}"
 		}
 	}
+	if len(inputKeys) == 0 {
+		return errAltdataMissingInputKeys(fmt.Errorf("no required inputFields found on the configured source(s)"))
+	}
+	task["inputKeys"] = inputKeys
+	rewritten, err := json.Marshal(task)
+	if err != nil {
+		return fmt.Errorf("re-encode task body with derived inputKeys: %w", err)
+	}
+	*body = json.RawMessage(rewritten)
+	fmt.Fprintf(os.Stderr, "# derived inputKeys from source inputFields: %v\n", sortedKeys(seen))
 	return nil
 }
 

@@ -470,7 +470,7 @@ The API returns 409 if lastKnownVersion is stale.`,
 					return fmt.Errorf("re-encode body: %w", err)
 				}
 			}
-			if err := validateWorkflowV2Body(body); err != nil {
+			if err := validateWorkflowV2Body(&body); err != nil {
 				return err
 			}
 			path := fmt.Sprintf("/v2/workflows/%s/autosave", args[0])
@@ -1497,17 +1497,20 @@ func makeWfv2ExecuteByAliasCmd() *cobra.Command {
 	wait := wfv2WaitFlags{}
 
 	cmd := &cobra.Command{
-		Use:   "execute-by-alias <alias> <version>",
-		Short: "Execute a v2 workflow by alias and version",
-		Long: `Pass "latest" as <version> to execute the most recent published version.
+		Use:   "execute-by-alias <alias> [version]",
+		Short: "Execute a v2 workflow by alias (version defaults to latest)",
+		Long: `The <version> argument is optional and defaults to "latest" (the most
+recent published version), consistent with how 'altdata describe' and
+'dictionary' auto-resolve. Pass an explicit version to pin one.
 
 Pass --wait to submit async and poll until the execution reaches a terminal
 state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 --verbose prints per-node status transitions to stderr. Exits 0 on completed,
 1 on failed/cancelled/timed_out, 2 on the local --timeout firing.`,
-		Args: cobra.ExactArgs(2),
-		Example: `  altscore workflows-v2 execute-by-alias my-wf latest --body '{...}'
-  altscore workflows-v2 execute-by-alias my-wf latest --body '{...}' --wait`,
+		Args: cobra.RangeArgs(1, 2),
+		Example: `  altscore workflows-v2 execute-by-alias my-wf --body '{...}'
+  altscore workflows-v2 execute-by-alias my-wf latest --body '{...}'
+  altscore workflows-v2 execute-by-alias my-wf v3 --body '{...}' --wait`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
 			if err != nil {
@@ -1520,9 +1523,13 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 			if wait.wait && !cmd.Flags().Changed("execution-mode") {
 				headers.executionMode = "async"
 			}
+			version := "latest"
+			if len(args) == 2 {
+				version = args[1]
+			}
 			workflowID := ""
 			if wait.wait {
-				if wf, _, gerr := c.Do("GET", "borrower_central", fmt.Sprintf("/v2/workflows/%s/%s", args[0], args[1]), nil); gerr == nil {
+				if wf, _, gerr := c.Do("GET", "borrower_central", fmt.Sprintf("/v2/workflows/%s/%s", args[0], version), nil); gerr == nil {
 					var parsed map[string]any
 					if json.Unmarshal(wf, &parsed) == nil {
 						if id, ok := parsed["id"].(string); ok {
@@ -1531,10 +1538,10 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 					}
 				}
 				if workflowID == "" {
-					return fmt.Errorf("--wait: could not resolve workflow id for alias=%s version=%s", args[0], args[1])
+					return fmt.Errorf("--wait: could not resolve workflow id for alias=%s version=%s", args[0], version)
 				}
 			}
-			path := fmt.Sprintf("/v2/workflows/%s/%s/execute", args[0], args[1])
+			path := fmt.Sprintf("/v2/workflows/%s/%s/execute", args[0], version)
 			data, _, err := c.DoWithHeaders("POST", "borrower_central", path, body, headers.asMap())
 			if err != nil {
 				return err
@@ -1558,10 +1565,10 @@ func makeWfv2ExecuteBatchCmd() *cobra.Command {
 businessPriority (0-10), parallelExecutions (default 50), maxRetryAttempts
 (default 3), continueOnFailures (default true), testMode + testTaskId.
 
-Body shape note: 'inputs' MUST be an array of objects, one per execution.
-A flat sync-shape body like '{"borrower_id":"abc"}' is the wrong shape
-for batch -- it'll create an empty/zombie batch that never executes.
-Use 'workflows-v2 execute' for single sync runs.`,
+Body shape note: 'inputs' is an array of objects, one per execution. A flat
+sync-shape body like '{"borrower_id":"abc"}' (no top-level 'inputs') is
+auto-wrapped as '{"inputs":[{"borrower_id":"abc"}]}' so it runs as a
+single-element batch. Use 'workflows-v2 execute' for true single sync runs.`,
 		Args:    cobra.ExactArgs(1),
 		Example: `  altscore workflows-v2 execute-batch <id> --body '{"inputs":[{"borrower_id":"a"},{"borrower_id":"b"}],"label":"smoke"}'`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1575,23 +1582,16 @@ Use 'workflows-v2 execute' for single sync runs.`,
 			}
 			// Preflight: batch needs inputs:[...]. Without it the API
 			// happily creates a no-op batch ID; agents copy-pasting from
-			// 'execute' get a silent zombie.
-			var parsed map[string]any
-			if jerr := json.Unmarshal(body, &parsed); jerr == nil {
-				rawInputs, present := parsed["inputs"]
-				if !present {
-					return fmt.Errorf(
-						"execute-batch body has no 'inputs' field. " +
-							"Batch executions require inputs:[{...}, {...}], one object per execution. " +
-							"For a single sync run, use 'altscore workflows-v2 execute' (which takes a flat body).")
-				}
-				inputs, ok := rawInputs.([]any)
-				if !ok {
-					return fmt.Errorf("execute-batch body 'inputs' must be an array of objects, got %T", rawInputs)
-				}
-				if len(inputs) == 0 {
-					return fmt.Errorf("execute-batch body 'inputs' is empty -- nothing to execute")
-				}
+			// 'execute' get a silent zombie. A flat single-input body is
+			// auto-wrapped as {"inputs":[<body>]}.
+			normalized, wrapped, err := normalizeBatchBody(body)
+			if err != nil {
+				return err
+			}
+			body = normalized
+			if wrapped {
+				fmt.Fprintf(cmd.OutOrStderr(),
+					"# wrapped flat body as {\"inputs\":[<body>]} -- execute-batch needs an inputs[] array, one object per execution.\n")
 			}
 			path := fmt.Sprintf("/v2/workflows/%s/execute-batch", args[0])
 			data, _, err := c.Do("POST", "borrower_central", path, body)
@@ -1603,6 +1603,34 @@ Use 'workflows-v2 execute' for single sync runs.`,
 	}
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON body (or pipe via stdin)")
 	return cmd
+}
+
+// normalizeBatchBody prepares an execute-batch body. When the body is a flat
+// JSON object with no top-level 'inputs' key (the shape 'execute' takes), it
+// is wrapped as {"inputs":[<body>]} and the second return value is true. When
+// 'inputs' is present it must be a non-empty array, else an error is returned.
+// Non-object bodies are passed through untouched (the API will reject them).
+func normalizeBatchBody(body json.RawMessage) (json.RawMessage, bool, error) {
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return body, false, nil
+	}
+	rawInputs, present := parsed["inputs"]
+	if !present {
+		wrapped, err := json.Marshal(map[string]any{"inputs": []any{parsed}})
+		if err != nil {
+			return body, false, fmt.Errorf("wrap flat execute-batch body: %w", err)
+		}
+		return json.RawMessage(wrapped), true, nil
+	}
+	inputs, ok := rawInputs.([]any)
+	if !ok {
+		return body, false, fmt.Errorf("execute-batch body 'inputs' must be an array of objects, got %T", rawInputs)
+	}
+	if len(inputs) == 0 {
+		return body, false, fmt.Errorf("execute-batch body 'inputs' is empty -- nothing to execute")
+	}
+	return body, false, nil
 }
 
 func makeWfv2ExecuteBatchByAliasCmd() *cobra.Command {
