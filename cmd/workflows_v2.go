@@ -1332,6 +1332,7 @@ func runExecuteWithOptionalWait(
 	c *client.Client,
 	stdout, stderr io.Writer,
 	submitResp json.RawMessage,
+	workflowID string,
 	wait wfv2WaitFlags,
 	verbose bool,
 ) error {
@@ -1339,9 +1340,9 @@ func runExecuteWithOptionalWait(
 		return output.RawJSON(submitResp)
 	}
 
-	executionID, workflowID := extractExecutionAndWorkflowIDs(submitResp)
-	if executionID == "" || workflowID == "" {
-		return fmt.Errorf("--wait: could not find executionId/workflowId in submit response (got %d bytes)", len(submitResp))
+	executionID := extractExecutionID(submitResp)
+	if executionID == "" {
+		return fmt.Errorf("--wait: could not find executionId in submit response (got %d bytes)", len(submitResp))
 	}
 
 	if verbose {
@@ -1375,38 +1376,30 @@ func runExecuteWithOptionalWait(
 	return nil
 }
 
-// extractExecutionAndWorkflowIDs digs the executionId + workflowId out of an
-// async-submit response. Tolerates both flat ({executionId, workflowId}) and
-// nested-under-"data" shapes.
-func extractExecutionAndWorkflowIDs(data json.RawMessage) (string, string) {
+// extractExecutionID digs the executionId out of an async-submit response.
+// Tolerates both the flat shape ({executionId}) and a nested-under-"data"
+// wrapper. The workflow id is not parsed here -- the CLI command already has
+// it from its arg list and passes it through.
+func extractExecutionID(data json.RawMessage) string {
 	var env map[string]any
 	if err := json.Unmarshal(data, &env); err != nil {
-		return "", ""
+		return ""
 	}
-	exec, wf := "", ""
-	pull := func(root map[string]any) {
-		if exec == "" {
-			for _, k := range []string{"executionId", "execution_id", "id"} {
-				if v, ok := root[k].(string); ok && v != "" {
-					exec = v
-					break
-				}
+	pull := func(root map[string]any) string {
+		for _, k := range []string{"executionId", "execution_id", "id"} {
+			if v, ok := root[k].(string); ok && v != "" {
+				return v
 			}
 		}
-		if wf == "" {
-			for _, k := range []string{"workflowId", "workflow_id"} {
-				if v, ok := root[k].(string); ok && v != "" {
-					wf = v
-					break
-				}
-			}
-		}
+		return ""
 	}
-	pull(env)
+	if id := pull(env); id != "" {
+		return id
+	}
 	if inner, ok := env["data"].(map[string]any); ok {
-		pull(inner)
+		return pull(inner)
 	}
-	return exec, wf
+	return ""
 }
 
 func makeWfv2ExecuteCmd() *cobra.Command {
@@ -1459,7 +1452,7 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 			if err != nil {
 				return err
 			}
-			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, wait, flagVerbose)
+			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, args[0], wait, flagVerbose)
 		},
 	}
 
@@ -1527,12 +1520,26 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 			if wait.wait && !cmd.Flags().Changed("execution-mode") {
 				headers.executionMode = "async"
 			}
+			workflowID := ""
+			if wait.wait {
+				if wf, _, gerr := c.Do("GET", "borrower_central", fmt.Sprintf("/v2/workflows/%s/%s", args[0], args[1]), nil); gerr == nil {
+					var parsed map[string]any
+					if json.Unmarshal(wf, &parsed) == nil {
+						if id, ok := parsed["id"].(string); ok {
+							workflowID = id
+						}
+					}
+				}
+				if workflowID == "" {
+					return fmt.Errorf("--wait: could not resolve workflow id for alias=%s version=%s", args[0], args[1])
+				}
+			}
 			path := fmt.Sprintf("/v2/workflows/%s/%s/execute", args[0], args[1])
 			data, _, err := c.DoWithHeaders("POST", "borrower_central", path, body, headers.asMap())
 			if err != nil {
 				return err
 			}
-			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, wait, flagVerbose)
+			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, workflowID, wait, flagVerbose)
 		},
 	}
 
