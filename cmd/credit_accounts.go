@@ -53,7 +53,7 @@ aggregate breakdowns the backend reports.`,
 			if err != nil {
 				return err
 			}
-			data, _, err := c.Do("GET", "borrower_central", "/credit-accounts/commands/limits-summary", nil)
+			data, _, err := c.Do("GET", "borrower_central", "/v1/credit-accounts/commands/limits-summary", nil)
 			if err != nil {
 				return err
 			}
@@ -83,7 +83,7 @@ the client-ids filter that STP and CMS endpoints accept.`,
 			if err != nil {
 				return err
 			}
-			path := "/credit-accounts/commands/search-borrowers?search=" + url.QueryEscape(search)
+			path := "/v1/credit-accounts/commands/search-borrowers?search=" + url.QueryEscape(search)
 			data, _, err := c.Do("GET", "borrower_central", path, nil)
 			if err != nil {
 				return err
@@ -150,7 +150,7 @@ kebab-case flags and maps them.`,
 			if timezoneOffset != 0 {
 				params = append(params, fmt.Sprintf("timezoneOffset=%d", timezoneOffset))
 			}
-			path := "/credit-accounts/commands/limits-history"
+			path := "/v1/credit-accounts/commands/limits-history"
 			if len(params) > 0 {
 				path += "?" + strings.Join(params, "&")
 			}
