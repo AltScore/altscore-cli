@@ -3,6 +3,7 @@ package cmd
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -583,12 +584,28 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 		}
 		sid, _ := sm["sourceId"].(string)
 		ver, _ := sm["version"].(string)
-		if sid == "" || !derivedInputKeys {
+		if sid == "" {
 			continue
 		}
+
+		// Validate every referenced source against the union of source
+		// catalogs, regardless of whether inputKeys were hand-supplied --
+		// the runtime can only serve sources present in one of them, so a
+		// definitive miss is a hard error (usually a typo). Transient/dry-run
+		// lookup failures are tolerated; the backend revalidates on save.
 		fields, err := lookupAltdataSourceInputFields(c, sid, ver, dryRun)
 		if err != nil {
-			return fmt.Errorf("could not look up source %s %s: %w", sid, ver, err)
+			if errors.Is(err, errSourceNotFound) {
+				return fmt.Errorf("source %s %s not found in sources-status or external-sources-status "+
+					"(verify with 'altscore workflows-v2 sources-status' / 'external-sources-status')", sid, ver)
+			}
+			fmt.Fprintf(os.Stderr,
+				"# warning: could not validate source %s %s (%v); proceeding -- the backend revalidates on save\n",
+				sid, ver, err)
+			continue
+		}
+		if !derivedInputKeys {
+			continue
 		}
 		for _, f := range fields {
 			if seenInput[f] {
@@ -715,22 +732,44 @@ func normalizeComputeVariablesTask(task map[string]any, customVariables map[stri
 	return nil
 }
 
-// altdataSourceStatusCache memoizes /v2/workflows/sources-status entries
-// within a single compose run so a multi-source task only fetches once.
-// Both inputFields (for inputKeys auto-fill) and outputSchema (mirrored
-// onto the task body for the Hub's variable-mapping pickers) come from
-// the same entry. nil cache value = lookup attempted and failed; we
-// store it to short-circuit retries within the same run.
+// errSourceNotFound is the sentinel returned when a source-version is absent
+// from every source catalog (as opposed to a transport/parse failure). Callers
+// use errors.Is to hard-fail on a genuine bad reference while tolerating a
+// transient blip.
+var errSourceNotFound = errors.New("source not found in any catalog")
+
+// sourceStatusCatalogs are the endpoints whose UNION defines every source an
+// altdata-enrichment node may reference. The runtime serves both: a source
+// routes to ConfigurableHttpGateway when an ExternalSourceConfig exists
+// (surfaced by external-sources-status), otherwise to the AltData microservice
+// (sources-status). Microservice is listed first so its entry wins on the rare
+// chance an id exists in both catalogs.
+var sourceStatusCatalogs = []string{
+	"/v2/workflows/sources-status?per-page=200",
+	"/v2/workflows/external-sources-status",
+}
+
+// sourceCatalogListCache memoizes each catalog endpoint's full response within
+// a single compose run, so resolving N sources hits each endpoint at most once.
+var sourceCatalogListCache = map[string][]map[string]any{}
+
+// altdataSourceStatusCache memoizes resolved per-source-version entries within
+// a single compose run. Both inputFields (for inputKeys auto-fill) and
+// outputSchema (mirrored onto the task body for the Hub's variable-mapping
+// pickers) come from the same entry. A nil value means "looked up and
+// definitively absent from every catalog"; stored to short-circuit retries.
 var altdataSourceStatusCache = map[string]map[string]any{}
 
-// lookupAltdataSourceStatus fetches a single source-version's status entry
-// from /v2/workflows/sources-status (the canonical altdata catalog). One
-// fetch per (sourceID, version) per compose run.
+// lookupAltdataSourceStatus resolves a single source-version's status entry
+// against the union of the source catalogs (see sourceStatusCatalogs). One
+// resolution per (sourceID, version) per compose run. Returns errSourceNotFound
+// when the source is absent from every catalog that responded cleanly; surfaces
+// the transport error instead if a catalog could not be fetched.
 func lookupAltdataSourceStatus(c *client.Client, sourceID, version string, dryRun bool) (map[string]any, error) {
 	cacheKey := sourceID + "|" + version
 	if cached, ok := altdataSourceStatusCache[cacheKey]; ok {
 		if cached == nil {
-			return nil, fmt.Errorf("source %s %s not found in sources-status", sourceID, version)
+			return nil, errSourceNotFound
 		}
 		return cached, nil
 	}
@@ -741,33 +780,58 @@ func lookupAltdataSourceStatus(c *client.Client, sourceID, version string, dryRu
 		}
 		return nil, fmt.Errorf("no client available for source lookup")
 	}
-	q := url.Values{}
-	q.Set("per-page", "200")
-	data, _, err := c.Do("GET", "borrower_central", "/v2/workflows/sources-status?"+q.Encode(), nil)
-	if err != nil {
-		if dryRun {
-			fmt.Fprintf(os.Stderr, "# (dry-run) source lookup failed for %s %s (%v)\n", sourceID, version, err)
+
+	var transportErr error
+	for _, path := range sourceStatusCatalogs {
+		sources, err := fetchSourceCatalog(c, path)
+		if err != nil {
+			transportErr = err
+			if dryRun {
+				fmt.Fprintf(os.Stderr, "# (dry-run) source catalog fetch failed (%s): %v\n", path, err)
+			}
+			continue
 		}
+		for _, s := range sources {
+			if sid, _ := s["sourceId"].(string); sid != sourceID {
+				continue
+			}
+			if version != "" {
+				if sver, _ := s["sourceVersion"].(string); sver != version {
+					continue
+				}
+			}
+			altdataSourceStatusCache[cacheKey] = s
+			return s, nil
+		}
+	}
+
+	// A transport error means we never got a clean "absent" answer from at
+	// least one catalog -- don't poison the cache or report a false
+	// not-found; surface the real error so the caller can tolerate it.
+	if transportErr != nil {
+		return nil, transportErr
+	}
+	altdataSourceStatusCache[cacheKey] = nil
+	return nil, errSourceNotFound
+}
+
+// fetchSourceCatalog GETs one catalog endpoint and parses it into a list,
+// memoized per run. Both catalogs return the same entry shape (sourceId,
+// sourceVersion, inputFields, outputSchema).
+func fetchSourceCatalog(c *client.Client, path string) ([]map[string]any, error) {
+	if cached, ok := sourceCatalogListCache[path]; ok {
+		return cached, nil
+	}
+	data, _, err := c.Do("GET", "borrower_central", path, nil)
+	if err != nil {
 		return nil, err
 	}
 	var sources []map[string]any
 	if err := json.Unmarshal(data, &sources); err != nil {
-		return nil, fmt.Errorf("parse sources-status: %w", err)
+		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	for _, s := range sources {
-		sid, _ := s["sourceId"].(string)
-		sver, _ := s["sourceVersion"].(string)
-		if sid != sourceID {
-			continue
-		}
-		if version != "" && sver != version {
-			continue
-		}
-		altdataSourceStatusCache[cacheKey] = s
-		return s, nil
-	}
-	altdataSourceStatusCache[cacheKey] = nil
-	return nil, fmt.Errorf("source %s %s not found in sources-status", sourceID, version)
+	sourceCatalogListCache[path] = sources
+	return sources, nil
 }
 
 // lookupAltdataSourceInputFields returns the required input field names for
