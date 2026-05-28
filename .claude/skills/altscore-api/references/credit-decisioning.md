@@ -132,7 +132,9 @@ cat > /tmp/credit-spec.json <<'EOF'
   "label": "Credit decisioning pipeline",
   "category": "EVALUATION",
   "inputVariables": {"borrower_id": {"type": "string", "required": true}},
-  "tasks": [
+  "nodes": [
+    {"ref": "start", "type": "start", "label": "Start"},
+
     {"ref": "fetch", "label": "Fetch bureau", "type": "altdata-enrichment",
      "borrowerIdField": "personId",
      "sourcesConfig": [{"sourceId": "ECU-PUB-0002", "version": "v2"}],
@@ -150,11 +152,9 @@ cat > /tmp/credit-spec.json <<'EOF'
 
     {"ref": "tree", "label": "Decision Tree", "type": "rule-tree",
      "ruleTreeConfig": {"ruleTreeCode": "credit_decision_tree",
-                        "outputVariable": "decision", "outputType": "string"}}
-  ],
-  "extraNodes": [
-    {"ref": "start", "type": "start", "label": "Start"},
-    {"ref": "end",   "type": "end",   "label": "End"}
+                        "outputVariable": "decision", "outputType": "string"}},
+
+    {"ref": "end", "type": "end", "label": "End"}
   ],
   "edges": [
     {"from": "start", "to": "fetch"},

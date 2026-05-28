@@ -86,7 +86,8 @@ cat > /tmp/spec.json <<'EOF'
     "borrower_id": {"type": "string", "required": true},
     "min_score":   {"type": "integer", "default": 700}
   },
-  "tasks": [
+  "nodes": [
+    {"ref": "start", "type": "start", "label": "Start"},
     {
       "ref": "fetch",
       "label": "Fetch ECU bureau",
@@ -121,11 +122,8 @@ cat > /tmp/spec.json <<'EOF'
            "items": [{"field": "score", "operator": "gte", "value": "min_score", "valueType": "variable"}]}},
         {"label": "Reject", "isElse": true}
       ]
-    }
-  ],
-  "extraNodes": [
-    {"ref": "start", "type": "start", "label": "Start"},
-    {"ref": "end",   "type": "end",   "label": "End"}
+    },
+    {"ref": "end", "type": "end", "label": "End"}
   ],
   "edges": [
     {"from": "start", "to": "fetch"},
@@ -137,10 +135,10 @@ cat > /tmp/spec.json <<'EOF'
 EOF
 ```
 
-**Flat `nodes[]` shape (preferred for new specs).** Instead of splitting `tasks[]` + `extraNodes[]`, put every node in a single `nodes[]` array; apply dispatches each entry by `type` (start nodes are graph-only, everything else gets a backing task created). The legacy two-bucket shape still works for back-compat.
+**Spec shape.** `nodes[]` is the one accepted input — a flat list with one entry per graph node (start, end, every task type). Apply dispatches each entry by `type` at parse time: `start` is graph-only, everything else (including `end`) gets a backing task created. The legacy `tasks[]` + `extraNodes[]` two-bucket shape was removed; apply rejects it with an inline rewrite suggestion.
 
 ```bash
-cat > /tmp/spec-flat.json <<'EOF'
+cat > /tmp/spec-minimal.json <<'EOF'
 {
   "label": "Score and Route",
   "alias": "score-and-route",
@@ -498,7 +496,8 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 A single `deal` task can attach the customer plus an arbitrary number of guarantors atomically. Pattern: a single-mode child-workflow KYCs the customer, a batch child-workflow KYCs the guarantors, a `compute-variables` task assembles the full contacts list, and one `deal` task with a `deal_contacts` (plural) source entry writes them all in one shot.
 
 ```jsonc
-"tasks": [
+"nodes": [
+  // ... start node + any upstream tasks ...
   {"ref": "verify-customer",   "type": "child-workflow", "executorId": "kyc-individual-ar",
    "inputMappings": {"tax_id": "inputs.customer_tax_id"}},
 
@@ -525,6 +524,7 @@ A single `deal` task can attach the customer plus an arbitrary number of guarant
      {"type": "deal_contacts", "key": "contacts", "label": "Contacts"}
    ]
   }
+  // ... end node ...
 ]
 ```
 
@@ -535,7 +535,8 @@ Re-running the deal task with the same `(deal_id, borrower_id, role_key)` triple
 When the deal task should own borrower creation, set `upsertBorrowers: true` on the `deal_contacts` entry. The deal write becomes the single source of truth for the deal record, its contacts, AND the borrowers being attached. KYC/KYB can run AFTER the deal exists as pure scoring (no longer a hard dependency for contact attachment — a failed KYC no longer drops a contact).
 
 ```jsonc
-"tasks": [
+"nodes": [
+  // ... start node ...
   {"ref": "build-contacts", "type": "compute-variables",
    "selectedVariables": ["contacts"]},
   // customVariables.contacts emits a list like:
@@ -566,6 +567,7 @@ When the deal task should own borrower creation, set `upsertBorrowers: true` on 
   {"ref": "kyc-fan-out", "type": "child-workflow", "runInBatch": true,
    "inputExpression": "inputs.deal.parties[entityType=natural]",
    "executorAlias": "deal-kyc-scoring-v1", "continueOnFailure": true}
+  // ... end node ...
 ]
 ```
 
