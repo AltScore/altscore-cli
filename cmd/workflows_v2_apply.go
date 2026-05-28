@@ -2988,6 +2988,12 @@ func preflightTasks(spec *composeSpec) error {
 					i, ref,
 				)
 			}
+			// upsertContacts lets items omit contact_id and resolve via identity
+			// (mirrors deal_contacts upsertBorrowers). When on, every item still
+			// needs SOMETHING to identify the contact -- either contact_id or
+			// an identity_value (or tax_id / <defaultIdentityKey> as shorthand).
+			upsertContacts, _ := cfg["upsertContacts"].(bool)
+			defaultIdentityKey, _ := cfg["defaultIdentityKey"].(string)
 			validRelKinds := map[string]bool{
 				"shareholder": true, "employee": true, "family": true,
 				"other": true, "unspecified": true,
@@ -2998,8 +3004,38 @@ func preflightTasks(spec *composeSpec) error {
 				if !ok {
 					return fmt.Errorf("tasks[%d] (ref=%q): relationshipsConfig.items[%d] must be an object", i, ref, ii)
 				}
-				if c, _ := im["contact_id"].(string); c == "" {
-					return fmt.Errorf("tasks[%d] (ref=%q): relationshipsConfig.items[%d] missing contact_id", i, ref, ii)
+				contactID, _ := im["contact_id"].(string)
+				if contactID == "" {
+					if !upsertContacts {
+						return fmt.Errorf(
+							"tasks[%d] (ref=%q): relationshipsConfig.items[%d] missing contact_id "+
+								"(set relationshipsConfig.upsertContacts=true to allow identity-based upsert)",
+							i, ref, ii,
+						)
+					}
+					// upsert path: item must carry an identity to resolve.
+					identityField := "tax_id"
+					if k, _ := im["identity_key"].(string); k != "" {
+						identityField = k
+					} else if defaultIdentityKey != "" {
+						identityField = defaultIdentityKey
+					}
+					identityValue, _ := im["identity_value"].(string)
+					if identityValue == "" {
+						if v, ok := im[identityField].(string); ok {
+							identityValue = v
+						}
+					}
+					if identityValue == "" {
+						return fmt.Errorf(
+							"tasks[%d] (ref=%q): relationshipsConfig.items[%d] missing contact_id AND missing "+
+								"identity_value (or %q shorthand). Provide one so the activity can resolve "+
+								"or create the contact.",
+							i, ref, ii, identityField,
+						)
+					}
+					// persona presence is checked at runtime (only required if
+					// identity doesn't resolve to an existing borrower).
 				}
 				if kind, ok := im["relationship"].(string); ok && kind != "" && !validRelKinds[kind] {
 					return fmt.Errorf(
