@@ -2487,7 +2487,7 @@ var validTaskTypes = map[string]bool{
 	"mapping-table": true, "scorecard": true, "rule-tree": true,
 	"compute-variables": true, "data-store-write": true, "data-store-query": true,
 	"customer": true, "deal": true, "credit-line": true,
-	"list-of-similars": true, "asset": true,
+	"list-of-similars": true, "asset": true, "relationships": true,
 }
 
 // preflightTasks runs cheap, local-only validation across every task in the
@@ -2959,6 +2959,67 @@ func preflightTasks(spec *composeSpec) error {
 						i, ref, taskType, sci,
 					)
 				}
+			}
+		case "relationships":
+			// Bulk-create N borrower<->contact links in one activity.
+			// borrower_id and items must each come from either inline
+			// relationshipsConfig or inputMappings -- empty/missing on both
+			// sides would silently create zero rows at runtime.
+			cfg := asMap(task["relationshipsConfig"])
+			mappings, _ := task["inputMappings"].(map[string]any)
+			if mappings == nil {
+				mappings = map[string]any{}
+			}
+			_, hasBorrowerMapping := mappings["borrower_id"]
+			if _, hasInlineBorrower := cfg["borrower_id"].(string); !hasInlineBorrower && !hasBorrowerMapping {
+				return fmt.Errorf(
+					"tasks[%d] (ref=%q): relationships task requires borrower_id "+
+						"via relationshipsConfig.borrower_id (inline) or inputMappings.borrower_id (variable)",
+					i, ref,
+				)
+			}
+			inlineItems := asSlice(cfg["items"])
+			_, hasItemsMapping := mappings["items"]
+			if len(inlineItems) == 0 && !hasItemsMapping {
+				return fmt.Errorf(
+					"tasks[%d] (ref=%q): relationships task requires either "+
+						"relationshipsConfig.items (inline list) or inputMappings.items "+
+						"(variable). Both empty would silently create zero relationships.",
+					i, ref,
+				)
+			}
+			validRelKinds := map[string]bool{
+				"shareholder": true, "employee": true, "family": true,
+				"other": true, "unspecified": true,
+			}
+			legalRepCount := 0
+			for ii, item := range inlineItems {
+				im, ok := item.(map[string]any)
+				if !ok {
+					return fmt.Errorf("tasks[%d] (ref=%q): relationshipsConfig.items[%d] must be an object", i, ref, ii)
+				}
+				if c, _ := im["contact_id"].(string); c == "" {
+					return fmt.Errorf("tasks[%d] (ref=%q): relationshipsConfig.items[%d] missing contact_id", i, ref, ii)
+				}
+				if kind, ok := im["relationship"].(string); ok && kind != "" && !validRelKinds[kind] {
+					return fmt.Errorf(
+						"tasks[%d] (ref=%q): relationshipsConfig.items[%d].relationship=%q not in "+
+							"shareholder/employee/family/other/unspecified",
+						i, ref, ii, kind,
+					)
+				}
+				if lr, _ := im["is_legal_representative"].(bool); lr {
+					legalRepCount++
+				}
+			}
+			if legalRepCount > 1 {
+				return fmt.Errorf(
+					"tasks[%d] (ref=%q): relationshipsConfig.items has %d entries with "+
+						"is_legal_representative=true. The runtime saves them sequentially and each "+
+						"True flag flips all others on the same borrower to false -- only one item "+
+						"may be the legal representative per batch.",
+					i, ref, legalRepCount,
+				)
 			}
 		}
 
