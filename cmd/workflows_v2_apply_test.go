@@ -147,3 +147,89 @@ func TestValidateNoResidualSpecRefs(t *testing.T) {
 		}
 	})
 }
+
+// TestDetectLegacySpecShape_RejectsTasksKey: a spec using the removed
+// `tasks[]` two-bucket shape is rejected with a migration error that
+// names the offending key and shows the rewrite.
+func TestDetectLegacySpecShape_RejectsTasksKey(t *testing.T) {
+	body := []byte(`{
+		"label": "x",
+		"category": "EVALUATION",
+		"tasks": [{"ref":"fetch","type":"altdata-enrichment"}]
+	}`)
+	err := detectLegacySpecShape(body)
+	if err == nil {
+		t.Fatal("expected error rejecting tasks[] input; got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{"tasks[] (1 entries)", "nodes[]", "before:", "after:"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error missing %q; got: %s", want, msg)
+		}
+	}
+}
+
+// TestDetectLegacySpecShape_RejectsExtraNodesKey: same for an extraNodes-only spec.
+func TestDetectLegacySpecShape_RejectsExtraNodesKey(t *testing.T) {
+	body := []byte(`{
+		"label": "x",
+		"extraNodes": [{"ref":"start","type":"start"},{"ref":"end","type":"end"}]
+	}`)
+	err := detectLegacySpecShape(body)
+	if err == nil {
+		t.Fatal("expected error rejecting extraNodes[] input; got nil")
+	}
+	if !strings.Contains(err.Error(), "extraNodes[] (2 entries)") {
+		t.Errorf("expected entry count in error; got: %s", err.Error())
+	}
+}
+
+// TestDetectLegacySpecShape_RejectsBoth: both keys present cited together.
+func TestDetectLegacySpecShape_RejectsBoth(t *testing.T) {
+	body := []byte(`{
+		"tasks":      [{"ref":"a","type":"altdata-enrichment"}],
+		"extraNodes": [{"ref":"start","type":"start"}]
+	}`)
+	err := detectLegacySpecShape(body)
+	if err == nil {
+		t.Fatal("expected error; got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "tasks[] (1 entries) and extraNodes[] (1 entries)") {
+		t.Errorf("expected combined citation; got: %s", msg)
+	}
+}
+
+// TestDetectLegacySpecShape_PassesNodesShape: a spec using only nodes[] is
+// not flagged by the legacy detector.
+func TestDetectLegacySpecShape_PassesNodesShape(t *testing.T) {
+	body := []byte(`{
+		"label": "x",
+		"nodes": [
+			{"ref":"start","type":"start"},
+			{"ref":"fetch","type":"altdata-enrichment"},
+			{"ref":"end","type":"end"}
+		]
+	}`)
+	if err := detectLegacySpecShape(body); err != nil {
+		t.Fatalf("nodes[] spec should pass detector; got: %v", err)
+	}
+}
+
+// TestDetectLegacySpecShape_IgnoresEmptyLegacyArrays: empty `tasks: []` or
+// `extraNodes: []` keys are tolerated (treated as absent) so callers can
+// emit either omit-or-empty without spurious errors.
+func TestDetectLegacySpecShape_IgnoresEmptyLegacyArrays(t *testing.T) {
+	body := []byte(`{"tasks": [], "extraNodes": [], "nodes": [{"ref":"start","type":"start"}]}`)
+	if err := detectLegacySpecShape(body); err != nil {
+		t.Fatalf("empty legacy arrays should be tolerated; got: %v", err)
+	}
+}
+
+// TestDetectLegacySpecShape_IgnoresMalformedJSON: detector defers to the
+// main unmarshal for parse errors -- doesn't return its own.
+func TestDetectLegacySpecShape_IgnoresMalformedJSON(t *testing.T) {
+	if err := detectLegacySpecShape([]byte("not json")); err != nil {
+		t.Errorf("malformed JSON should defer to caller's unmarshal; got: %v", err)
+	}
+}

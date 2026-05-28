@@ -30,38 +30,38 @@ import (
 // Spec shape (any field omitted falls through to API defaults):
 //
 //	{
-//	  "label":             "Scoring pipeline",
-//	  "category":          "EVALUATION",
-//	  "description":       "...",
-//	  "inputVariables":    {"borrower_id": {"type": "string", "required": true}},
-//	  "customVariables":   {},
-//	  "tasks": [
+//	  "label":           "Scoring pipeline",
+//	  "category":        "EVALUATION",
+//	  "description":     "...",
+//	  "inputVariables":  {"borrower_id": {"type": "string", "required": true}},
+//	  "customVariables": {},
+//	  "nodes": [
+//	    {"ref": "start", "type": "start", "label": "Start"},
 //	    {
-//	      "alias":          "fetch",
-//	      "label":          "Fetch ECU bureau",
-//	      "type":           "altdata-enrichment",
-//	      "sourcesConfig":  [{"sourceId":"ECU-PUB-0002","version":"v1"}],
-//	      "borrowerIdField":"borrower_id",
-//	      "inputMappings":  {"borrower_id": "inputs.borrower_id"}
+//	      "ref":             "fetch",
+//	      "label":           "Fetch ECU bureau",
+//	      "type":            "altdata-enrichment",
+//	      "sourcesConfig":   [{"sourceId":"ECU-PUB-0002","version":"v1"}],
+//	      "borrowerIdField": "borrower_id",
+//	      "inputMappings":   {"borrower_id": "inputs.borrower_id"}
 //	      // ... any other CreateTaskV2 field
-//	    }
-//	  ],
-//	  "extraNodes": [
-//	    {"nodeId": "start", "type": "start", "label": "Start"},
-//	    {"nodeId": "end",   "type": "end",   "label": "End"}
+//	    },
+//	    {"ref": "end", "type": "end", "label": "End"}
 //	  ],
 //	  "edges": [
-//	    {"sourceNodeId":"start","targetNodeId":"fetch"},
-//	    {"sourceNodeId":"fetch","targetNodeId":"end"}
+//	    {"from": "start", "to": "fetch"},
+//	    {"from": "fetch", "to": "end"}
 //	  ]
 //	}
 //
 // Behavior:
-//  1. POST /v2/tasks for each entry in spec.tasks, capturing the returned alias.
-//  2. Build graph nodes: one node per task (nodeId = task alias, taskAlias =
-//     alias, taskVersion = returned version), plus any extraNodes.
-//  3. Auto-position nodes left-to-right (extraNodes first, then tasks in
-//     spec order); the Hub UI re-lays them out anyway.
+//  1. POST /v2/tasks for each task-bearing entry in spec.nodes (everything
+//     except type=="start"), capturing the returned alias.
+//  2. Build the graph: one node per spec.nodes entry (nodeId = ref, taskAlias
+//     = server-assigned alias for task-bearing nodes; start nodes are
+//     graph-only with no backing task).
+//  3. Auto-position nodes left-to-right (start first, then task-bearing
+//     nodes in spec order); the Hub UI re-lays them out anyway.
 //  4. POST /v2/workflows with label, category, description, inputVariables,
 //     customVariables, nodes, edges, status (default DRAFT).
 //
@@ -79,18 +79,90 @@ type composeSpec struct {
 	InputVariables  map[string]any         `json:"inputVariables,omitempty"`
 	CustomVariables map[string]any         `json:"customVariables,omitempty"`
 	Config          map[string]any         `json:"config,omitempty"`
-	// Tasks + ExtraNodes are the legacy two-bucket shape. ExtraNodes only
-	// accepts trivial type-only graph nodes (start/end); everything else
-	// belongs in Tasks. Both are still accepted for back-compat.
-	Tasks      []map[string]any `json:"tasks,omitempty"`
-	ExtraNodes []map[string]any `json:"extraNodes,omitempty"`
-	// Nodes is the flat alternative shape: a single list where each entry
-	// is dispatched at parse time -- type=="start" goes to ExtraNodes,
-	// everything else (including end) goes to Tasks. Prefer this for new
-	// specs; the split is an internal-only concern.
+	// Nodes is the workflow's graph -- one flat list, one entry per node
+	// (start, end, every task type). Apply dispatches each entry by `type`
+	// at parse time. This is the only accepted input shape.
+	//
+	// The legacy two-bucket shape (`tasks[]` + `extraNodes[]`) was removed:
+	// it half-worked, with fields like inputMappings / endConfig /
+	// htmlSections on extraNodes entries getting silently stripped or only
+	// partially honored depending on the field. detectLegacySpecShape()
+	// catches that input early and emits a one-shot rewrite suggestion.
 	Nodes []map[string]any `json:"nodes,omitempty"`
 	Edges []map[string]any `json:"edges"`
 	Notes []map[string]any `json:"notes,omitempty"`
+
+	// Tasks and ExtraNodes are INTERNAL buckets used by the downstream
+	// build pipeline -- populated by splitting Nodes at parse time.
+	// No JSON tags: never read from user input. The internal split is
+	// type=="start" -> ExtraNodes (graph-only); everything else
+	// (including end) -> Tasks (backing task created). Renaming these
+	// to taskNodes/graphOnlyNodes is a future cleanup; the user-facing
+	// contract (Nodes) is what matters here.
+	Tasks      []map[string]any `json:"-"`
+	ExtraNodes []map[string]any `json:"-"`
+}
+
+// detectLegacySpecShape rejects specs that use the removed
+// `tasks[]` + `extraNodes[]` two-bucket shape. Returns an error with a
+// concrete `nodes[]` rewrite when either key is present and non-empty.
+// Called pre-unmarshal so the message can cite the user's input verbatim.
+func detectLegacySpecShape(body []byte) error {
+	var peek map[string]json.RawMessage
+	if err := json.Unmarshal(body, &peek); err != nil {
+		// Let the caller's main Unmarshal produce the proper parse error.
+		return nil
+	}
+	countArray := func(key string) int {
+		raw, ok := peek[key]
+		if !ok {
+			return 0
+		}
+		var arr []json.RawMessage
+		if err := json.Unmarshal(raw, &arr); err != nil {
+			return 0
+		}
+		return len(arr)
+	}
+	nTasks := countArray("tasks")
+	nExtra := countArray("extraNodes")
+	if nTasks == 0 && nExtra == 0 {
+		return nil
+	}
+	var got []string
+	if nTasks > 0 {
+		got = append(got, fmt.Sprintf("tasks[] (%d entries)", nTasks))
+	}
+	if nExtra > 0 {
+		got = append(got, fmt.Sprintf("extraNodes[] (%d entries)", nExtra))
+	}
+	return fmt.Errorf(`spec uses the removed two-bucket shape: %s.
+the `+"`tasks[]`"+` and `+"`extraNodes[]`"+` keys were removed -- use the flat `+"`nodes[]`"+` shape instead.
+
+how to migrate (per-entry bodies are unchanged, only the wrapping key changes):
+
+  before:
+    {
+      "tasks":      [{"ref":"fetch","type":"altdata-enrichment","...":"..."},
+                     {"ref":"score","type":"scorecard","...":"..."}],
+      "extraNodes": [{"ref":"start","type":"start","label":"Start"},
+                     {"ref":"end","type":"end","endConfig":{"...":"..."}}]
+    }
+
+  after:
+    {
+      "nodes": [
+        {"ref":"start","type":"start","label":"Start"},
+        {"ref":"fetch","type":"altdata-enrichment","...":"..."},
+        {"ref":"score","type":"scorecard","...":"..."},
+        {"ref":"end","type":"end","endConfig":{"...":"..."}}
+      ]
+    }
+
+order inside nodes[] is cosmetic; edges still drive execution order.
+move every entry verbatim -- ref, type, label, inputMappings, endConfig,
+htmlSections, sourcesConfig, every field carries over unchanged`,
+		strings.Join(got, " and "))
 }
 
 func makeWfv2ApplyCmd() *cobra.Command {
@@ -155,12 +227,12 @@ exactly what version-bump will change before pulling the trigger.
 Spec format (see file header for full reference):
   - label, alias?, category, description, status (DRAFT default)
   - inputVariables, customVariables
-  - nodes (preferred): flat list of every graph node. Apply dispatches each
-    entry by type at parse time -- 'start' nodes are graph-only, everything
-    else (including 'end') gets a backing task created.
-  - tasks + extraNodes (legacy two-bucket shape): still accepted. Tasks are
-    every node except start; extraNodes is only start/end. Prefer 'nodes'.
-  - edges: list of {sourceNodeId, targetNodeId, sourceHandle?, label?}`,
+  - nodes: flat list of every graph node. Apply dispatches each entry by
+    type at parse time -- 'start' nodes are graph-only, everything else
+    (including 'end') gets a backing task created. This is the only
+    accepted shape; the legacy 'tasks[]' + 'extraNodes[]' two-bucket
+    shape was removed -- apply rejects it with an inline rewrite.
+  - edges: list of {from, to, sourceHandle?, label?}`,
 		Example: `  altscore workflows-v2 apply --body @scoring-pipeline.json
   altscore workflows-v2 apply --body @spec.json --publish          # create+publish OR update+publish
   altscore workflows-v2 apply --body @spec.json --dry-run
@@ -188,6 +260,12 @@ Spec format (see file header for full reference):
 			if err != nil {
 				return err
 			}
+			// Reject the legacy `tasks[]` + `extraNodes[]` two-bucket shape with
+			// an inline rewrite suggestion before parsing into the spec struct.
+			// Doing it pre-unmarshal lets us cite the original keys verbatim.
+			if err := detectLegacySpecShape(body); err != nil {
+				return err
+			}
 			var spec composeSpec
 			if err := json.Unmarshal(body, &spec); err != nil {
 				return fmt.Errorf("invalid spec JSON: %w", err)
@@ -195,18 +273,20 @@ Spec format (see file header for full reference):
 			if spec.Label == "" {
 				return fmt.Errorf("spec.label is required")
 			}
-			// Flat nodes[] alternative: split into Tasks/ExtraNodes by type so
-			// the rest of the build pipeline treats them uniformly. Each
-			// flat entry counts as either a graph-only node (start) or a
-			// task-backed node (everything else, including end).
-			for i, n := range spec.Nodes {
+			if len(spec.Nodes) == 0 {
+				return fmt.Errorf("spec.nodes is required and must contain at least one node (start + at least one task-bearing node)")
+			}
+			// Split spec.Nodes into the internal Tasks / ExtraNodes buckets
+			// the rest of the build pipeline expects. type=="start" is graph-
+			// only (ExtraNodes); everything else (including end) gets a
+			// backing task created (Tasks).
+			for _, n := range spec.Nodes {
 				t, _ := n["type"].(string)
 				if t == "start" {
 					spec.ExtraNodes = append(spec.ExtraNodes, n)
 				} else {
 					spec.Tasks = append(spec.Tasks, n)
 				}
-				_ = i
 			}
 			spec.Nodes = nil
 			// BC's category enum is uppercase (ACTION / EVALUATION / CONTACT /
@@ -218,9 +298,6 @@ Spec format (see file header for full reference):
 			}
 			if spec.Status != "" {
 				spec.Status = strings.ToUpper(spec.Status)
-			}
-			if len(spec.Tasks) == 0 && len(spec.ExtraNodes) == 0 {
-				return fmt.Errorf("spec must include at least one of: tasks, extraNodes, nodes")
 			}
 
 			c, err := loadClient()
@@ -1900,7 +1977,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		label, _ := task["label"].(string)
 		taskType, _ := task["type"].(string)
 		if label == "" || taskType == "" {
-			return nil, fmt.Errorf("tasks[%d] (ref=%q): label and type are required", i, ref)
+			return nil, fmt.Errorf("node ref=%q: label and type are required", ref)
 		}
 
 		// Carry the spec-local ref as `specRef` on the task body so the
@@ -1925,7 +2002,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		if mappings, ok := task["inputMappings"].(map[string]any); ok {
 			rewritten, rerr := rewriteRefsInMappings(mappings, refMap)
 			if rerr != nil {
-				return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, rerr)
+				return nil, fmt.Errorf("node ref=%q: %w", ref, rerr)
 			}
 			task["inputMappings"] = rewritten
 		}
@@ -1951,7 +2028,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			}
 			rewritten, rerr := rewriteRefsInMappings(nestedMappings, refMap)
 			if rerr != nil {
-				return nil, fmt.Errorf("tasks[%d] (ref=%q) %s.inputMappings: %w", i, ref, nested, rerr)
+				return nil, fmt.Errorf("node ref=%q %s.inputMappings: %w", ref, nested, rerr)
 			}
 			cfg["inputMappings"] = rewritten
 			task[nested] = cfg
@@ -1992,7 +2069,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		// time -- the runtime template engine substitutes nothing because
 		// the bare ref isn't a valid runtime namespace.
 		if err := rewriteRefsInTaskTemplates(task, refMap); err != nil {
-			return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
+			return nil, fmt.Errorf("node ref=%q: %w", ref, err)
 		}
 
 		// Safety net: after all known rewriters have run, scan the task body
@@ -2002,7 +2079,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		// as endConfig.pdfConfig.sourcesConfig[].taskAlias before it was
 		// added to the per-type switch above. Failing here surfaces the path
 		// before postTask ships a broken body.
-		if err := validateNoResidualSpecRefs(task, refMap, fmt.Sprintf("tasks[%d] (ref=%q)", i, ref)); err != nil {
+		if err := validateNoResidualSpecRefs(task, refMap, fmt.Sprintf("node ref=%q", ref)); err != nil {
 			return nil, err
 		}
 
@@ -2016,12 +2093,12 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			AutoRescopeEntities: autoRescopeEntities,
 			AllowStealOwnership: allowStealOwnership,
 		}, dryRun); err != nil {
-			return nil, fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
+			return nil, fmt.Errorf("node ref=%q: %w", ref, err)
 		}
 
 		serverAlias, version, err := postTask(
 			c, task, ref, dryRun,
-			fmt.Sprintf("tasks[%d] ref=%q", i, ref),
+			fmt.Sprintf("node ref=%q", ref),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("%w (created so far: %v)", err, createdAliases)
@@ -2059,7 +2136,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		nodeType, _ := n["type"].(string)
 		label, _ := n["label"].(string)
 		if nodeType == "" || label == "" {
-			return nil, fmt.Errorf("extraNodes[%d] (ref=%q): type and label are required", i, ref)
+			return nil, fmt.Errorf("node ref=%q: type and label are required", ref)
 		}
 
 		// Strip the spec-only `ref` field; nodes use `nodeId` (canonical).
@@ -2218,20 +2295,20 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				// `{{score.total_score}}` survives unchanged and the runtime
 				// resolver rejects `score` as an unknown scope.
 				if err := rewriteRefsInTaskTemplates(taskBody, refMap); err != nil {
-					return nil, fmt.Errorf("extraNodes[%d] (ref=%q): %w", i, ref, err)
+					return nil, fmt.Errorf("node ref=%q: %w", ref, err)
 				}
 				// Same safety net as the spec.Tasks loop above -- see comment
 				// there. extraNode end tasks build their body inline, so any
 				// rewrite gap in pdfConfig (or future end-task fields) would
 				// otherwise ship verbatim.
-				if err := validateNoResidualSpecRefs(taskBody, refMap, fmt.Sprintf("extraNodes[%d] (ref=%q)", i, ref)); err != nil {
+				if err := validateNoResidualSpecRefs(taskBody, refMap, fmt.Sprintf("node ref=%q", ref)); err != nil {
 					return nil, err
 				}
 			}
 
 			alias, version, err := postTask(
 				c, taskBody, ref, dryRun,
-				fmt.Sprintf("extraNodes[%d] ref=%q (extra-node backing)", i, ref),
+				fmt.Sprintf("node ref=%q (extra-node backing)", ref),
 			)
 			if err != nil {
 				return nil, err
@@ -2554,43 +2631,43 @@ func preflightTasks(spec *composeSpec) error {
 		// downstream cmds (set-mapping --node-id, lock acquire by alias).
 		if !validAliasPattern.MatchString(ref) {
 			return fmt.Errorf(
-				"tasks[%d]: ref %q has invalid characters. Refs become server-assigned aliases (and nodeIds), "+
+				"node ref %q has invalid characters. Refs become server-assigned aliases (and nodeIds), "+
 					"so must be lowercase alphanumeric with internal dashes only "+
 					"(regex: ^[a-z0-9][a-z0-9-]*$). Don't use spaces, underscores, slashes, uppercase, or other punctuation.",
-				i, ref,
+				ref,
 			)
 		}
 		if knownRefs[ref] {
 			return fmt.Errorf(
-				"tasks[%d]: duplicate ref %q -- two tasks share the same spec-local key. "+
+				"node duplicate ref %q -- two tasks share the same spec-local key. "+
 					"Compose's edge rewriter only records the LAST ref-to-alias mapping, so the earlier "+
 					"task ends up with no incident edges (silent orphan). Give each task a unique 'ref'.",
-				i, ref,
+				ref,
 			)
 		}
 		knownRefs[ref] = true
 		if alias, _ := task["alias"].(string); alias != "" {
 			if !validAliasPattern.MatchString(alias) {
 				return fmt.Errorf(
-					"tasks[%d] (ref=%q): alias %q has invalid characters. Aliases end up in URL paths "+
+					"node ref=%q: alias %q has invalid characters. Aliases end up in URL paths "+
 						"so must be lowercase alphanumeric with internal dashes only "+
 						"(regex: ^[a-z0-9][a-z0-9-]*$). "+
 						"Don't use spaces, slashes, uppercase, or punctuation.",
-					i, ref, alias,
+					ref, alias,
 				)
 			}
 			if knownAliases[alias] {
 				return fmt.Errorf(
-					"tasks[%d] (ref=%q): duplicate explicit alias %q -- two tasks declare the same alias. "+
+					"node ref=%q: duplicate explicit alias %q -- two tasks declare the same alias. "+
 						"The second create either version-bumps the first or 409s. "+
 						"Either drop the alias on one (compose will pick a unique one) or pick distinct aliases.",
-					i, ref, alias,
+					ref, alias,
 				)
 			}
 			knownAliases[alias] = true
 		}
 	}
-	startCount, endCount := 0, 0
+	startCount := 0
 	for i, node := range spec.ExtraNodes {
 		ref := localRef(node, fmt.Sprintf("n%d", i))
 		// Same URL-safety constraint as tasks: refs become server-assigned
@@ -2599,64 +2676,52 @@ func preflightTasks(spec *composeSpec) error {
 		// 400'ing at the per-node POST.
 		if !validAliasPattern.MatchString(ref) {
 			return fmt.Errorf(
-				"extraNodes[%d]: ref %q has invalid characters. Refs become server-assigned aliases (and nodeIds), "+
+				"node ref %q has invalid characters. Refs become server-assigned aliases (and nodeIds), "+
 					"so must be lowercase alphanumeric with internal dashes only "+
 					"(regex: ^[a-z0-9][a-z0-9-]*$). Don't use spaces, underscores, slashes, uppercase, or other punctuation.",
-				i, ref,
+				ref,
 			)
 		}
 		if knownRefs[ref] {
 			return fmt.Errorf(
-				"extraNodes[%d]: duplicate ref %q -- collides with a task or another extraNode. "+
+				"node duplicate ref %q -- collides with another node's 'ref'. "+
 					"Give each node a unique 'ref'.",
-				i, ref,
+				ref,
 			)
 		}
 		knownRefs[ref] = true
-		// extraNodes is for trivial type-only graph nodes (start/end). Other
-		// types belong in 'tasks' where they get full validation; putting
-		// them in extraNodes 400s at the backing-task POST with an opaque
-		// "field required" because compose synthesizes a minimal body.
+		// ExtraNodes only ever contains start-typed nodes (the parse-time
+		// split puts type=="start" -> ExtraNodes, everything else -> Tasks).
+		// Just count starts; no other case can fire by construction.
 		nodeType, _ := node["type"].(string)
-		switch nodeType {
-		case "start":
+		if nodeType == "start" {
 			startCount++
-		case "end":
-			endCount++
-		default:
-			return fmt.Errorf(
-				"extraNodes[%d] (ref=%q): type=%q is not allowed in extraNodes. "+
-					"Only 'start' and 'end' belong here -- those are trivial type-only nodes that compose "+
-					"synthesizes a backing task for. Move %q to 'tasks' instead so its required config "+
-					"fields can be supplied (compose will reject the task body if anything's missing).",
-				i, ref, nodeType, nodeType,
-			)
 		}
 	}
 	if startCount == 0 {
 		return fmt.Errorf(
-			"compose spec has no 'start' node in extraNodes. Every workflow needs exactly one " +
-				"start node; the engine doesn't know where to begin without it. Add: " +
-				`{"ref": "start", "type": "start", "label": "Start"} to extraNodes.`,
+			"spec has no 'start' node. Every workflow needs exactly one start node; " +
+				"the engine doesn't know where to begin without it. Add " +
+				`{"ref": "start", "type": "start", "label": "Start"} to nodes[].`,
 		)
 	}
 	if startCount > 1 {
 		return fmt.Errorf(
-			"compose spec has %d 'start' nodes in extraNodes. Every workflow needs exactly ONE "+
-				"start; multiple starts make the engine's traversal non-deterministic. Drop the extras.",
+			"spec has %d 'start' nodes. Every workflow needs exactly ONE start; "+
+				"multiple starts make the engine's traversal non-deterministic. Drop the extras.",
 			startCount,
 		)
 	}
-	// End nodes can live in either ExtraNodes (trivial type-only) or Tasks
-	// (the common pattern -- end nodes need an endConfig to emit output, so
-	// they go through the full task creation path). Count both.
+	// End nodes always come through the Tasks bucket post-split (end nodes
+	// need an endConfig to emit output, so they go through the full task
+	// creation path). Count end nodes there.
 	endInTasks := 0
 	for _, t := range spec.Tasks {
 		if tt, _ := t["type"].(string); tt == "end" {
 			endInTasks++
 		}
 	}
-	if endCount+endInTasks == 0 {
+	if endInTasks == 0 {
 		// 'end' is conventional but not strictly required; warn-only via
 		// stderr, never block. Keep this open for niche use cases (e.g.
 		// workflows that terminate via 'exception' branches).
@@ -2803,7 +2868,7 @@ func preflightTasks(spec *composeSpec) error {
 		label, _ := task["label"].(string)
 		taskType, _ := task["type"].(string)
 		if label == "" || taskType == "" {
-			return fmt.Errorf("tasks[%d] (ref=%q): label and type are required (validated before any POST)", i, ref)
+			return fmt.Errorf("node ref=%q: label and type are required (validated before any POST)", ref)
 		}
 		if !validTaskTypes[taskType] {
 			suggestion := closestTaskType(taskType)
@@ -2812,14 +2877,14 @@ func preflightTasks(spec *composeSpec) error {
 				suggestionLine = fmt.Sprintf("Did you mean %q? ", suggestion)
 			}
 			return fmt.Errorf(
-				"tasks[%d] (ref=%q): unknown task type %q. %s"+
+				"node ref=%q: unknown task type %q. %s"+
 					"The backend TaskType enum accepts %d values (active + deprecated combined). "+
 					"For new workflows use the active palette (20 types) -- run "+
 					"'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' to list them, "+
 					"and '.tasks.deprecatedTypes | keys' for the legacy ones. "+
 					"Common deprecations: 'data-store' is split into 'data-store-write'/'data-store-query'; "+
 					"'pdf-report' is now part of the 'end' task's endConfig.",
-				i, ref, taskType, suggestionLine, len(validTaskTypes),
+				ref, taskType, suggestionLine, len(validTaskTypes),
 			)
 		}
 
@@ -2830,40 +2895,40 @@ func preflightTasks(spec *composeSpec) error {
 			if h, present := task["headers"]; present {
 				if _, ok := h.(string); !ok {
 					return fmt.Errorf(
-						"tasks[%d] (ref=%q): http task 'headers' must be a JSON-encoded string, "+
+						"node ref=%q: http task 'headers' must be a JSON-encoded string, "+
 							"not an inline object. Wrap it: \"headers\": \"{\\\"Content-Type\\\":\\\"application/json\\\"}\". "+
 							"The runtime fails with an opaque 'str type expected' error otherwise.",
-						i, ref,
+						ref,
 					)
 				}
 			}
 			if u, _ := task["url"].(string); u == "" {
-				return fmt.Errorf("tasks[%d] (ref=%q): http task requires 'url'", i, ref)
+				return fmt.Errorf("node ref=%q: http task requires 'url'", ref)
 			}
 		case "webhook":
 			if u, _ := task["url"].(string); u == "" {
-				return fmt.Errorf("tasks[%d] (ref=%q): webhook task requires 'url'", i, ref)
+				return fmt.Errorf("node ref=%q: webhook task requires 'url'", ref)
 			}
 			if s, _ := task["secret"].(string); s == "" {
-				return fmt.Errorf("tasks[%d] (ref=%q): webhook task requires 'secret'", i, ref)
+				return fmt.Errorf("node ref=%q: webhook task requires 'secret'", ref)
 			}
 		case "comment":
 			if c, _ := task["comment"].(string); c == "" {
 				return fmt.Errorf(
-					"tasks[%d] (ref=%q): comment task requires a non-empty 'comment' field "+
+					"node ref=%q: comment task requires a non-empty 'comment' field "+
 						"(the canvas annotation body, distinct from 'label' which is the node header).",
-					i, ref,
+					ref,
 				)
 			}
 		case "data-store-write":
 			cfg := asMap(task["dataStoreWriteConfig"])
 			if t, _ := cfg["tableName"].(string); t == "" {
-				return fmt.Errorf("tasks[%d] (ref=%q): data-store-write task requires dataStoreWriteConfig.tableName", i, ref)
+				return fmt.Errorf("node ref=%q: data-store-write task requires dataStoreWriteConfig.tableName", ref)
 			}
 		case "data-store-query":
 			cfg := asMap(task["dataStoreQueryConfig"])
 			if t, _ := cfg["tableName"].(string); t == "" {
-				return fmt.Errorf("tasks[%d] (ref=%q): data-store-query task requires dataStoreQueryConfig.tableName", i, ref)
+				return fmt.Errorf("node ref=%q: data-store-query task requires dataStoreQueryConfig.tableName", ref)
 			}
 		case "exception":
 			// Canonical wire name is 'errorMessage'. Both the BC API
@@ -2877,7 +2942,7 @@ func preflightTasks(spec *composeSpec) error {
 			em, _ := task["errorMessage"].(string)
 			m, _ := task["message"].(string)
 			if em == "" && m == "" {
-				return fmt.Errorf("tasks[%d] (ref=%q): exception task requires 'errorMessage' -- the failure message surfaced when this branch fires", i, ref)
+				return fmt.Errorf("node ref=%q: exception task requires 'errorMessage' -- the failure message surfaced when this branch fires", ref)
 			}
 			if em == "" {
 				task["errorMessage"] = m
@@ -2887,7 +2952,7 @@ func preflightTasks(spec *composeSpec) error {
 			eid, _ := task["executorId"].(string)
 			eal, _ := task["executorAlias"].(string)
 			if eid == "" && eal == "" {
-				return fmt.Errorf("tasks[%d] (ref=%q): child-workflow task requires 'executorId' or 'executorAlias'", i, ref)
+				return fmt.Errorf("node ref=%q: child-workflow task requires 'executorId' or 'executorAlias'", ref)
 			}
 			// Server's CreateTaskV2 only declares `executorId`. The runtime
 			// resolves it via find_latest_active_by_alias, so passing a
@@ -2918,8 +2983,8 @@ func preflightTasks(spec *composeSpec) error {
 			}
 			if fp, _ := task["failurePolicy"].(string); fp != "" && fp != "fail-fast" && fp != "best-effort" {
 				return fmt.Errorf(
-					"tasks[%d] (ref=%q): child-workflow failurePolicy=%q is invalid. Must be \"fail-fast\" or \"best-effort\" (default: \"best-effort\")",
-					i, ref, fp)
+					"node ref=%q: child-workflow failurePolicy=%q is invalid. Must be \"fail-fast\" or \"best-effort\" (default: \"best-effort\")",
+					ref, fp)
 			}
 		case "compute-variables":
 			// compute-variables expressions live in the customVariables DSL
@@ -2945,18 +3010,18 @@ func preflightTasks(spec *composeSpec) error {
 			for sci, sc := range sources {
 				sm, ok := sc.(map[string]any)
 				if !ok {
-					return fmt.Errorf("tasks[%d] (ref=%q): %s sourcesConfig[%d] must be an object", i, ref, taskType, sci)
+					return fmt.Errorf("node ref=%q: %s sourcesConfig[%d] must be an object", ref, taskType, sci)
 				}
 				if k, _ := sm["key"].(string); k == "" {
-					return fmt.Errorf("tasks[%d] (ref=%q): %s sourcesConfig[%d] missing 'key'", i, ref, taskType, sci)
+					return fmt.Errorf("node ref=%q: %s sourcesConfig[%d] missing 'key'", ref, taskType, sci)
 				}
 				if t, _ := sm["type"].(string); t == "" {
 					return fmt.Errorf(
-						"tasks[%d] (ref=%q): %s sourcesConfig[%d] missing 'type'. "+
+						"node ref=%q: %s sourcesConfig[%d] missing 'type'. "+
 							"The runtime activity needs the data-model type per entry "+
 							"(e.g. 'identity_key', 'borrower_field') -- a missing 'type' "+
 							"surfaces at runtime as an opaque KeyError.",
-						i, ref, taskType, sci,
+						ref, taskType, sci,
 					)
 				}
 			}
@@ -2973,19 +3038,19 @@ func preflightTasks(spec *composeSpec) error {
 			_, hasBorrowerMapping := mappings["borrower_id"]
 			if _, hasInlineBorrower := cfg["borrower_id"].(string); !hasInlineBorrower && !hasBorrowerMapping {
 				return fmt.Errorf(
-					"tasks[%d] (ref=%q): relationships task requires borrower_id "+
+					"node ref=%q: relationships task requires borrower_id "+
 						"via relationshipsConfig.borrower_id (inline) or inputMappings.borrower_id (variable)",
-					i, ref,
+					ref,
 				)
 			}
 			inlineItems := asSlice(cfg["items"])
 			_, hasItemsMapping := mappings["items"]
 			if len(inlineItems) == 0 && !hasItemsMapping {
 				return fmt.Errorf(
-					"tasks[%d] (ref=%q): relationships task requires either "+
+					"node ref=%q: relationships task requires either "+
 						"relationshipsConfig.items (inline list) or inputMappings.items "+
 						"(variable). Both empty would silently create zero relationships.",
-					i, ref,
+					ref,
 				)
 			}
 			// upsertContacts lets items omit contact_id and resolve via identity
@@ -3002,15 +3067,15 @@ func preflightTasks(spec *composeSpec) error {
 			for ii, item := range inlineItems {
 				im, ok := item.(map[string]any)
 				if !ok {
-					return fmt.Errorf("tasks[%d] (ref=%q): relationshipsConfig.items[%d] must be an object", i, ref, ii)
+					return fmt.Errorf("node ref=%q: relationshipsConfig.items[%d] must be an object", ref, ii)
 				}
 				contactID, _ := im["contact_id"].(string)
 				if contactID == "" {
 					if !upsertContacts {
 						return fmt.Errorf(
-							"tasks[%d] (ref=%q): relationshipsConfig.items[%d] missing contact_id "+
+							"node ref=%q: relationshipsConfig.items[%d] missing contact_id "+
 								"(set relationshipsConfig.upsertContacts=true to allow identity-based upsert)",
-							i, ref, ii,
+							ref, ii,
 						)
 					}
 					// upsert path: item must carry an identity to resolve.
@@ -3028,10 +3093,10 @@ func preflightTasks(spec *composeSpec) error {
 					}
 					if identityValue == "" {
 						return fmt.Errorf(
-							"tasks[%d] (ref=%q): relationshipsConfig.items[%d] missing contact_id AND missing "+
+							"node ref=%q: relationshipsConfig.items[%d] missing contact_id AND missing "+
 								"identity_value (or %q shorthand). Provide one so the activity can resolve "+
 								"or create the contact.",
-							i, ref, ii, identityField,
+							ref, ii, identityField,
 						)
 					}
 					// persona presence is checked at runtime (only required if
@@ -3039,9 +3104,9 @@ func preflightTasks(spec *composeSpec) error {
 				}
 				if kind, ok := im["relationship"].(string); ok && kind != "" && !validRelKinds[kind] {
 					return fmt.Errorf(
-						"tasks[%d] (ref=%q): relationshipsConfig.items[%d].relationship=%q not in "+
+						"node ref=%q: relationshipsConfig.items[%d].relationship=%q not in "+
 							"shareholder/employee/family/other/unspecified",
-						i, ref, ii, kind,
+						ref, ii, kind,
 					)
 				}
 				if lr, _ := im["is_legal_representative"].(bool); lr {
@@ -3050,11 +3115,11 @@ func preflightTasks(spec *composeSpec) error {
 			}
 			if legalRepCount > 1 {
 				return fmt.Errorf(
-					"tasks[%d] (ref=%q): relationshipsConfig.items has %d entries with "+
+					"node ref=%q: relationshipsConfig.items has %d entries with "+
 						"is_legal_representative=true. The runtime saves them sequentially and each "+
 						"True flag flips all others on the same borrower to false -- only one item "+
 						"may be the legal representative per batch.",
-					i, ref, legalRepCount,
+					ref, legalRepCount,
 				)
 			}
 		}
@@ -3064,7 +3129,7 @@ func preflightTasks(spec *composeSpec) error {
 		// rule-tree enums).
 		body, err := json.Marshal(task)
 		if err != nil {
-			return fmt.Errorf("tasks[%d] (ref=%q): cannot encode for preflight: %w", i, ref, err)
+			return fmt.Errorf("node ref=%q: cannot encode for preflight: %w", ref, err)
 		}
 		// Structural-only: the altdata-enrichment empty-inputKeys check
 		// belongs in validateTaskV2Body (used by manual tasks-v2 create),
@@ -3072,7 +3137,7 @@ func preflightTasks(spec *composeSpec) error {
 		// source's inputFields automatically; rejecting the spec at preflight
 		// would block work that compose can fix on its own.
 		if err := validateTaskV2BodyStructural(json.RawMessage(body)); err != nil {
-			return fmt.Errorf("tasks[%d] (ref=%q): %w", i, ref, err)
+			return fmt.Errorf("node ref=%q: %w", ref, err)
 		}
 
 		// inputSchema.<field>.type must be in the JSON-Schema-style enum
@@ -3091,9 +3156,9 @@ func preflightTasks(spec *composeSpec) error {
 				}
 				if !validInputSchemaTypes[t] {
 					return fmt.Errorf(
-						"tasks[%d] (ref=%q): inputSchema.%s.type=%q is not a valid type. "+
+						"node ref=%q: inputSchema.%s.type=%q is not a valid type. "+
 							"Valid: string, integer, number, boolean, object, array.",
-						i, ref, fname, t,
+						ref, fname, t,
 					)
 				}
 			}
@@ -3120,10 +3185,10 @@ func preflightTasks(spec *composeSpec) error {
 				if len(strays) > 0 {
 					sort.Strings(strays)
 					return fmt.Errorf(
-						"tasks[%d] (ref=%q): conditional inputMappings has key(s) not in inputSchema: %s. "+
+						"node ref=%q: conditional inputMappings has key(s) not in inputSchema: %s. "+
 							"Every inputMappings key must match an inputSchema key (the schema declares the type, the mapping wires the value). "+
 							"Add to inputSchema or remove from inputMappings.",
-						i, ref, strings.Join(strays, ", "),
+						ref, strings.Join(strays, ", "),
 					)
 				}
 			}
@@ -3135,9 +3200,9 @@ func preflightTasks(spec *composeSpec) error {
 				}
 				if missing := unknownConditionFields(asMap(bm["conditions"]), schemaFields); len(missing) > 0 {
 					return fmt.Errorf(
-						"tasks[%d] (ref=%q): conditional branch[%d] references field(s) not declared in inputSchema: %s. "+
+						"node ref=%q: conditional branch[%d] references field(s) not declared in inputSchema: %s. "+
 							"Add them to inputSchema (with type + inputMappings) or fix the typo -- otherwise the branch silently never matches at runtime.",
-						i, ref, bi, strings.Join(missing, ", "),
+						ref, bi, strings.Join(missing, ", "),
 					)
 				}
 			}
@@ -3165,11 +3230,11 @@ func preflightTasks(spec *composeSpec) error {
 				head := s[:dot]
 				if !reservedMappingScopes[head] && !knownRefs[head] {
 					return fmt.Errorf(
-						"tasks[%d] (ref=%q): inputMappings[%q]=%q has unknown leading segment %q. "+
+						"node ref=%q: inputMappings[%q]=%q has unknown leading segment %q. "+
 							"Valid namespaces: inputs, custom, system, task_outputs, task_outputs_by_type. "+
 							"Or use a spec-local ref (one of: %s) which compose rewrites to task_outputs.<alias>. "+
 							"Without one of these the runtime resolver fails with 'Unknown variable namespace' at execution.",
-						i, ref, k, s, head, strings.Join(sortedKeys(knownRefs), ", "),
+						ref, k, s, head, strings.Join(sortedKeys(knownRefs), ", "),
 					)
 				}
 				if head == "task_outputs" {
@@ -3183,10 +3248,10 @@ func preflightTasks(spec *composeSpec) error {
 						continue
 					}
 					return fmt.Errorf(
-						"tasks[%d] (ref=%q): inputMappings[%q]=%q references task_outputs.%s.* but %q "+
+						"node ref=%q: inputMappings[%q]=%q references task_outputs.%s.* but %q "+
 							"is not a known spec-local ref and doesn't look like a server-assigned alias "+
 							"(slug-NNNNNN). Known refs: %s. Likely a typo of one of those.",
-						i, ref, k, s, middle, middle,
+						ref, k, s, middle, middle,
 						strings.Join(sortedKeys(knownRefs), ", "),
 					)
 				}
@@ -3256,17 +3321,17 @@ func preflightTasks(spec *composeSpec) error {
 			}
 			if middle == ref {
 				return fmt.Errorf(
-					"tasks[%d] (ref=%q): inputMappings[%q]=%q references its own output -- "+
+					"node ref=%q: inputMappings[%q]=%q references its own output -- "+
 						"a task cannot consume its own task_outputs.<self>. Did you mean a different ref?",
-					i, ref, k, s,
+					ref, k, s,
 				)
 			}
 			if !ancestors[ref][middle] {
 				return fmt.Errorf(
-					"tasks[%d] (ref=%q): inputMappings[%q]=%q references task_outputs.%s.* but "+
+					"node ref=%q: inputMappings[%q]=%q references task_outputs.%s.* but "+
 						"%q is not an ancestor of %q in the edge graph (it doesn't run before this task). "+
 						"At runtime task_outputs.%s won't exist yet -- add an edge from %q to %q (directly or transitively) or remove the mapping.",
-					i, ref, k, s, middle, middle, ref, middle, middle, ref,
+					ref, k, s, middle, middle, ref, middle, middle, ref,
 				)
 			}
 		}
@@ -3707,7 +3772,7 @@ func validateEntityTypeVsTaskTypes(spec *composeSpec) error {
 		t, _ := task["type"].(string)
 		if hidden[t] {
 			ref := localRef(task, fmt.Sprintf("t%d", i))
-			violations = append(violations, fmt.Sprintf("tasks[%d] (ref=%q) type=%q", i, ref, t))
+			violations = append(violations, fmt.Sprintf("node ref=%q type=%q", ref, t))
 		}
 	}
 	if len(violations) == 0 {
