@@ -186,3 +186,147 @@ func TestPreflightTasks_RelationshipsInvalidKind(t *testing.T) {
 		t.Errorf("error should list valid kinds, got: %v", err)
 	}
 }
+
+// TestPreflightTasks_RelationshipsUpsertHappyPath: upsertContacts=true allows
+// items without contact_id as long as they carry tax_id (or identity_value).
+// The KYC husband+wife shape.
+func TestPreflightTasks_RelationshipsUpsertHappyPath(t *testing.T) {
+	spec := &composeSpec{
+		Label:      "Rel upsert",
+		Category:   "ACTION",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			relTask("rel", map[string]any{
+				"borrower_id":    "b-husband",
+				"upsertContacts": true,
+				"items": []any{
+					map[string]any{
+						"tax_id":       "27-32456789-4",
+						"persona":      "individual",
+						"label":        "Jane Doe",
+						"relationship": "family",
+					},
+				},
+			}, nil),
+		},
+		Edges: []map[string]any{{"from": "start", "to": "rel"}},
+	}
+	if err := preflightTasks(spec); err != nil {
+		t.Fatalf("preflight should accept upsert path with tax_id, got: %v", err)
+	}
+}
+
+// TestPreflightTasks_RelationshipsUpsertCustomIdentityKey: defaultIdentityKey
+// lets the item carry the value under a non-tax_id field name.
+func TestPreflightTasks_RelationshipsUpsertCustomIdentityKey(t *testing.T) {
+	spec := &composeSpec{
+		Label:      "Rel upsert email",
+		Category:   "ACTION",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			relTask("rel", map[string]any{
+				"borrower_id":        "b-husband",
+				"upsertContacts":     true,
+				"defaultIdentityKey": "email",
+				"items": []any{
+					map[string]any{
+						"email":        "wife@example.com",
+						"persona":      "individual",
+						"relationship": "family",
+					},
+				},
+			}, nil),
+		},
+		Edges: []map[string]any{{"from": "start", "to": "rel"}},
+	}
+	if err := preflightTasks(spec); err != nil {
+		t.Fatalf("preflight should accept defaultIdentityKey shorthand, got: %v", err)
+	}
+}
+
+// TestPreflightTasks_RelationshipsUpsertExplicitIdentityKey: per-item
+// identity_key + identity_value overrides defaultIdentityKey.
+func TestPreflightTasks_RelationshipsUpsertExplicitIdentityKey(t *testing.T) {
+	spec := &composeSpec{
+		Label:      "Rel upsert explicit",
+		Category:   "ACTION",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			relTask("rel", map[string]any{
+				"borrower_id":    "b-husband",
+				"upsertContacts": true,
+				"items": []any{
+					map[string]any{
+						"identity_key":   "phone",
+						"identity_value": "+5491100000000",
+						"persona":        "individual",
+						"relationship":   "family",
+					},
+				},
+			}, nil),
+		},
+		Edges: []map[string]any{{"from": "start", "to": "rel"}},
+	}
+	if err := preflightTasks(spec); err != nil {
+		t.Fatalf("preflight should accept explicit identity_key+identity_value, got: %v", err)
+	}
+}
+
+// TestPreflightTasks_RelationshipsUpsertMissingIdentity: upsertContacts=true
+// but item has neither contact_id nor any identity -- reject.
+func TestPreflightTasks_RelationshipsUpsertMissingIdentity(t *testing.T) {
+	spec := &composeSpec{
+		Label:      "Rel upsert no identity",
+		Category:   "ACTION",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			relTask("rel", map[string]any{
+				"borrower_id":    "b-husband",
+				"upsertContacts": true,
+				"items": []any{
+					map[string]any{
+						"persona":      "individual",
+						"relationship": "family",
+					},
+				},
+			}, nil),
+		},
+		Edges: []map[string]any{{"from": "start", "to": "rel"}},
+	}
+	err := preflightTasks(spec)
+	if err == nil {
+		t.Fatalf("preflight should reject item with no identity under upsert, got nil")
+	}
+	if !strings.Contains(err.Error(), "identity_value") {
+		t.Errorf("error should mention identity_value, got: %v", err)
+	}
+}
+
+// TestPreflightTasks_RelationshipsUpsertOffHintsAtFlag: missing contact_id
+// without upsertContacts should mention the flag so the user can opt in.
+func TestPreflightTasks_RelationshipsUpsertOffHintsAtFlag(t *testing.T) {
+	spec := &composeSpec{
+		Label:      "Rel no contact no upsert",
+		Category:   "ACTION",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			relTask("rel", map[string]any{
+				"borrower_id": "b-husband",
+				"items": []any{
+					map[string]any{
+						"tax_id":       "27-32456789-4",
+						"relationship": "family",
+					},
+				},
+			}, nil),
+		},
+		Edges: []map[string]any{{"from": "start", "to": "rel"}},
+	}
+	err := preflightTasks(spec)
+	if err == nil {
+		t.Fatalf("preflight should reject missing contact_id when upsert is off, got nil")
+	}
+	if !strings.Contains(err.Error(), "upsertContacts") {
+		t.Errorf("error should hint at upsertContacts flag, got: %v", err)
+	}
+}
