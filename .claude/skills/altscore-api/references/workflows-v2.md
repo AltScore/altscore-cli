@@ -493,7 +493,13 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 - **`schedule preview/validate`** don't take a workflow ID. Standalone cron checkers.
 - **`execute --execution-mode async`** returns only `executionId`. Poll `executions <id>` for status.
 - **`ai suggest-mappings`** returns 503 when the tenant has no LLM configured. Treat as a soft failure.
-- **No tasks LIST endpoint.** Discover task aliases via the workflows that use them, or via the Hub UI.
+- **No tasks LIST endpoint.** Discover task aliases via the workflows that use them, or via the Hub UI (the `tasks-v2 list --workflow-alias <alias>` filter does work).
+- **`failurePolicy` enum is `best-effort` | `fail-fast`.** `"continue"` (the v1 word) → 400.
+- **altdata output lives under `sources_output_packages`.** Read fields at `task_outputs.<altdataNode>.sources_output_packages.<sourceId>.data.<field>` — not `task_outputs.<node>.<sourceId>`. Each per-source package carries `isSuccess`; gate "source failed vs genuine null" on `isSuccess is True`, never on data-presence.
+- **compute-variables can't reference a sibling var in the SAME task.** `task_outputs.<thisTask>.<otherVar>` resolves to `null` mid-execution. Re-derive inline, or split into an earlier compute-variables task.
+- **End node runs no logic.** `endConfig.outputJson` is pure `{{path}}` substitution (a whole dict/list substitutes in as a JSON literal, but no conditionals/iteration/key-spread). Anything that needs logic (alert summaries, "all keys except N", reshaping) must come from an upstream `compute-variables` task; the end node just emits its output. Declare every referenced path in that task's `dependencies` (incl. plain `inputs.<var>`).
+- **htmlSections shorthand auto-wires to `custom.*`** (init-default scope only) — wrong for compute-variables outputs (which live at `task_outputs.*`). Put explicit end-node `inputMappings` → `task_outputs.<ref>.<var>` so `{placeholders}` resolve.
+- **`execute --test`** marks the whole run non-billable + hidden from metrics (injects the `test` tag). Use it for verification/dry-runs. NOT a dry run — side effects (borrower/deal/package writes, alerts) still happen.
 
 
 
