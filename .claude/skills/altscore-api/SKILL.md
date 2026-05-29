@@ -88,7 +88,7 @@ Full test mode (`set-test` + filters + `--is-test`): borrowers, identities, docu
 These are silent-failure modes — the API accepts the request and fails later, or "succeeds" while doing nothing. Each is detailed in the linked reference.
 
 1. **v2 workflows: use `apply`, not `create`.** `workflows-v2 apply --body @spec.json` is the one declarative verb for create-or-update. Hand-built `create` bodies produce orphan nodes that save but break the Hub. See [workflows-v2](references/workflows-v2.md).
-2. **DRAFT workflows run as no-ops.** A DRAFT v2 workflow executes with `status: complete, isSuccess: true` but skips every node and emits `null` output. Always `--publish`. See [workflows-v2](references/workflows-v2.md).
+2. **DRAFT executes faithfully — publish only sets the alias default.** A DRAFT v2 workflow runs its full graph (node execution is never gated by status), so executing a DRAFT *by id* is a real pre-publish test. Publishing only changes which version the *alias* serves. Test first, `--publish` when you want it live. See [workflows-v2](references/workflows-v2.md).
 3. **Execution outputs live on two surfaces.** Per-task outputs come from `/state` (alias-keyed) or `/output` (type-keyed) depending on the engine. Use `altscore executions state <id>` (it auto-falls-back and stamps `._source`). See [resources](references/resources.md).
 4. **`decisionKey` is case-sensitive** and must match a tenant-registered decision (`altscore decisions list`). A mismatch passes lint and fails at runtime. See [credit-decisioning](references/credit-decisioning.md).
 5. **Conditional branches use structured `conditions`, not `expression` strings** — the API stores `expression` as a no-op. See [workflows-v2](references/workflows-v2.md).

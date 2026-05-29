@@ -1442,11 +1442,16 @@ func makeWfv2ExecuteCmd() *cobra.Command {
 		Short: "Execute a v2 workflow by ID",
 		Long: `Execute a v2 workflow by ID. Pass workflow input as --body.
 
-By default, fetches the workflow first and warns to stderr if it isn't ACTIVE
-(DRAFT workflows execute successfully but the engine skips every node, so the
-output is empty and the run looks successful while doing nothing useful).
-Pass --skip-status-check to opt out of the warning if you're intentionally
-exercising a draft.
+The version you target by ID runs its full graph faithfully regardless of
+status -- a DRAFT executes every node exactly like an ACTIVE one. Status only
+governs which version the ALIAS serves (the alias resolves to the latest ACTIVE
+version), so executing a DRAFT by ID is the supported way to TEST a version
+before publishing it as the alias default -- you never have to publish untested
+work to run it.
+
+By default an informational note still prints to stderr when the targeted
+version isn't ACTIVE, so you know you're exercising a non-default version.
+Pass --skip-status-check to silence it.
 
 Use --execution-mode sync (default) or async.
 
@@ -1486,17 +1491,18 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 	}
 
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON body (or pipe via stdin)")
-	cmd.Flags().BoolVar(&skipStatusCheck, "skip-status-check", false, "skip the pre-flight ACTIVE-status check")
+	cmd.Flags().BoolVar(&skipStatusCheck, "skip-status-check", false, "silence the informational note printed when the targeted version isn't ACTIVE")
 	bindExecHeaderFlags(cmd, &headers)
 	bindWaitFlags(cmd, &wait)
 	return cmd
 }
 
-// warnIfNotActive does a best-effort GET /v2/workflows/{id}; if the workflow's
-// status is not ACTIVE, prints a clear warning to stderr explaining what will
-// happen at runtime (DRAFT workflows skip every node) and how to fix it. The
-// check is best-effort -- if the GET fails for any reason, we silently skip
-// the warning rather than block the execute.
+// warnIfNotActive does a best-effort GET /v2/workflows/{id}; if the targeted
+// version isn't ACTIVE, it prints an INFORMATIONAL note to stderr. The version
+// still executes its full graph faithfully -- node execution is never gated by
+// status -- so the note just flags that this isn't the version the alias
+// serves. Best-effort: if the GET fails for any reason we skip the note rather
+// than block the execute.
 func warnIfNotActive(stderr io.Writer, c *client.Client, idOrAlias string) {
 	data, _, err := c.Do("GET", "borrower_central", "/v2/workflows/"+idOrAlias, nil)
 	if err != nil {
@@ -1512,11 +1518,11 @@ func warnIfNotActive(stderr io.Writer, c *client.Client, idOrAlias string) {
 	}
 	switch status {
 	case "DRAFT":
-		fmt.Fprintf(stderr, "# warning: workflow %s is in DRAFT status -- the engine will skip every node and return an empty output. Run 'altscore workflows-v2 publish %s' (or re-apply with --publish) to make it executable.\n", idOrAlias, idOrAlias)
+		fmt.Fprintf(stderr, "# note: workflow %s is in DRAFT status -- it executes the full graph faithfully (a real pre-publish test run); it just isn't the version the alias serves until you publish it.\n", idOrAlias)
 	case "ARCHIVED":
-		fmt.Fprintf(stderr, "# warning: workflow %s is ARCHIVED -- restore it via 'altscore workflows-v2 restore %s' before expecting useful output.\n", idOrAlias, idOrAlias)
+		fmt.Fprintf(stderr, "# note: workflow %s is ARCHIVED -- it still executes faithfully, but it's a retired version; the alias serves the current ACTIVE one.\n", idOrAlias)
 	default:
-		fmt.Fprintf(stderr, "# warning: workflow %s status is %q (not ACTIVE) -- execution may behave unexpectedly.\n", idOrAlias, status)
+		fmt.Fprintf(stderr, "# note: workflow %s status is %q (not ACTIVE) -- it executes faithfully; it just isn't the version the alias serves.\n", idOrAlias, status)
 	}
 }
 
