@@ -210,12 +210,13 @@ old owner). Pass --skip-rescope to disable the entire rescope step (then
 a stale scope shows as a hard error in normalize and the agent has to fix
 it manually).
 
-DRAFT trap: the create path saves the workflow in DRAFT by default, mirror
-of the Hub editor's save-then-publish flow. DRAFT workflows execute but the
-engine skips every node. Pass --publish to publish immediately; that's the
-common case when applying from the CLI. The update path always publishes
-(autosave -> publish), because the underlying assumption of "apply" is the
-spec is the desired state.
+DRAFT vs publish: the create path saves the workflow in DRAFT by default,
+mirror of the Hub editor's save-then-publish flow. A DRAFT executes its full
+graph faithfully (so you can test it by id before publishing) -- it simply
+isn't the version the alias serves until published. Pass --publish to publish
+immediately; that's the common case when applying from the CLI. The update path
+always publishes (autosave -> publish), because the underlying assumption of
+"apply" is the spec is the desired state.
 
 Use --dry-run to print what would be sent without making any API calls.
 Use --diff to preview structural changes against the current tenant state:
