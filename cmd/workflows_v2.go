@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/AltScore/altscore-cli/internal/client"
@@ -1071,6 +1072,7 @@ func makeWfv2ValidateRulesCmd() *cobra.Command {
 
 type wfv2ExecHeaders struct {
 	tags               string
+	test               bool
 	testTaskID         string
 	testTimeoutSeconds int
 	storeLogs          string
@@ -1079,8 +1081,17 @@ type wfv2ExecHeaders struct {
 
 func (h wfv2ExecHeaders) asMap() map[string]string {
 	out := map[string]string{}
-	if h.tags != "" {
-		out["X-Tags"] = h.tags
+	// --test marks the whole execution as test: borrower-central sets
+	// is_test=true when the "test" tag is present, which forces
+	// is_billable=false and hides the run from metrics/default lists.
+	// (Side effects -- borrower/deal/package writes -- still run; test mode
+	// is about billing/metrics/visibility, not a dry run.)
+	tags := h.tags
+	if h.test {
+		tags = ensureTestTag(tags)
+	}
+	if tags != "" {
+		out["X-Tags"] = tags
 	}
 	if h.testTaskID != "" {
 		out["X-Test-Task-Id"] = h.testTaskID
@@ -1099,10 +1110,28 @@ func (h wfv2ExecHeaders) asMap() map[string]string {
 
 func bindExecHeaderFlags(cmd *cobra.Command, h *wfv2ExecHeaders) {
 	cmd.Flags().StringVar(&h.tags, "tags", "", "comma-separated tags (X-Tags)")
-	cmd.Flags().StringVar(&h.testTaskID, "test-task-id", "", "X-Test-Task-Id (required for test mode)")
-	cmd.Flags().IntVar(&h.testTimeoutSeconds, "test-timeout-seconds", 0, "X-Test-Timeout-Seconds")
+	cmd.Flags().BoolVar(&h.test, "test", false, "mark the execution as test: non-billable and hidden from metrics/default lists (injects the 'test' tag). Side effects still run -- not a dry run.")
+	cmd.Flags().StringVar(&h.testTaskID, "test-task-id", "", "X-Test-Task-Id -- test a SINGLE task/node in isolation (distinct from --test, which marks the whole run)")
+	cmd.Flags().IntVar(&h.testTimeoutSeconds, "test-timeout-seconds", 0, "X-Test-Timeout-Seconds (single-task test harness)")
 	cmd.Flags().StringVar(&h.storeLogs, "store-logs", "", `X-Store-Logs ("true"/"false")`)
 	cmd.Flags().StringVar(&h.executionMode, "execution-mode", "", `X-Execution-Mode ("sync"/"async")`)
+}
+
+// ensureTestTag returns a comma-separated tag string guaranteed to contain the
+// literal "test" tag. borrower-central auto-marks an execution is_test=true
+// (and therefore is_billable=false, hidden from metrics) when the "test" tag is
+// present on the run. Matching is on the exact "test" element, so "parity-test"
+// or "testing" do NOT trigger it -- only a standalone "test" tag does.
+func ensureTestTag(csv string) string {
+	if csv == "" {
+		return "test"
+	}
+	for _, t := range strings.Split(csv, ",") {
+		if strings.TrimSpace(t) == "test" {
+			return csv
+		}
+	}
+	return csv + ",test"
 }
 
 // wfv2WaitFlags holds the polling configuration shared by execute and
@@ -1558,6 +1587,7 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 
 func makeWfv2ExecuteBatchCmd() *cobra.Command {
 	var bodyFlag string
+	var test bool
 	cmd := &cobra.Command{
 		Use:   "execute-batch <id>",
 		Short: "Batch-execute a v2 workflow",
@@ -1568,9 +1598,13 @@ businessPriority (0-10), parallelExecutions (default 50), maxRetryAttempts
 Body shape note: 'inputs' is an array of objects, one per execution. A flat
 sync-shape body like '{"borrower_id":"abc"}' (no top-level 'inputs') is
 auto-wrapped as '{"inputs":[{"borrower_id":"abc"}]}' so it runs as a
-single-element batch. Use 'workflows-v2 execute' for true single sync runs.`,
-		Args:    cobra.ExactArgs(1),
-		Example: `  altscore workflows-v2 execute-batch <id> --body '{"inputs":[{"borrower_id":"a"},{"borrower_id":"b"}],"label":"smoke"}'`,
+single-element batch. Use 'workflows-v2 execute' for true single sync runs.
+
+--test sets the body's testMode=true so the batch (and its child executions)
+are non-billable and hidden from metrics; side effects still run.`,
+		Args: cobra.ExactArgs(1),
+		Example: `  altscore workflows-v2 execute-batch <id> --body '{"inputs":[{"borrower_id":"a"},{"borrower_id":"b"}],"label":"smoke"}'
+  altscore workflows-v2 execute-batch <id> --body '{"inputs":[{"borrower_id":"a"}]}' --test`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
 			if err != nil {
@@ -1593,6 +1627,12 @@ single-element batch. Use 'workflows-v2 execute' for true single sync runs.`,
 				fmt.Fprintf(cmd.OutOrStderr(),
 					"# wrapped flat body as {\"inputs\":[<body>]} -- execute-batch needs an inputs[] array, one object per execution.\n")
 			}
+			if test {
+				body, err = setBodyTestMode(body)
+				if err != nil {
+					return err
+				}
+			}
 			path := fmt.Sprintf("/v2/workflows/%s/execute-batch", args[0])
 			data, _, err := c.Do("POST", "borrower_central", path, body)
 			if err != nil {
@@ -1602,7 +1642,24 @@ single-element batch. Use 'workflows-v2 execute' for true single sync runs.`,
 		},
 	}
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON body (or pipe via stdin)")
+	cmd.Flags().BoolVar(&test, "test", false, "set testMode=true on the batch: non-billable and hidden from metrics. Side effects still run -- not a dry run.")
 	return cmd
+}
+
+// setBodyTestMode sets testMode=true on an execute-batch JSON body. The batch
+// endpoint's first-class test signal is the body field testMode (vs the X-Tags
+// header used by single execute), so --test injects it here.
+func setBodyTestMode(body json.RawMessage) (json.RawMessage, error) {
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return body, fmt.Errorf("set testMode on execute-batch body: %w", err)
+	}
+	parsed["testMode"] = true
+	out, err := json.Marshal(parsed)
+	if err != nil {
+		return body, fmt.Errorf("marshal execute-batch body with testMode: %w", err)
+	}
+	return json.RawMessage(out), nil
 }
 
 // normalizeBatchBody prepares an execute-batch body. When the body is a flat

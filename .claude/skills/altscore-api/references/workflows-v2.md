@@ -385,7 +385,13 @@ altscore workflows-v2 execute <id> --body '{"borrower_id":"abc"}'               
 altscore workflows-v2 execute <id> --body '{...}' --execution-mode async --tags smoke      # async returns executionId
 altscore workflows-v2 execute-by-alias my-wf latest --body '{...}'
 
-# Test mode
+# Test mode -- mark the WHOLE run non-billable + hidden from metrics/default lists.
+# --test injects the "test" tag (BC sets is_test=true -> is_billable=false).
+# NOTE: side effects (borrower/deal/package writes) STILL run -- it is not a dry run.
+altscore workflows-v2 execute <id> --body '{...}' --test
+altscore workflows-v2 execute-batch <id> --body '{"inputs":[...]}' --test   # sets testMode=true
+
+# Single-task test harness (test ONE node in isolation) -- distinct from --test:
 altscore workflows-v2 execute <id> --body '{...}' \
   --test-task-id <task-id> --test-timeout-seconds 60 --store-logs true
 
