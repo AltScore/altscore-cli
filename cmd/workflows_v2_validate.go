@@ -45,6 +45,9 @@ func validateWorkflowV2Body(body *json.RawMessage) error {
 	var problems []string
 	mutated := false
 
+	endCount := 0
+	hasConditional := false
+
 	if rawNodes, ok := wf["nodes"]; ok && rawNodes != nil {
 		nodes, _ := rawNodes.([]any)
 		for i, n := range nodes {
@@ -73,6 +76,12 @@ func validateWorkflowV2Body(body *json.RawMessage) error {
 				problems = append(problems, fmt.Sprintf("nodes[%d] (%q): missing 'type'", i, label))
 				continue
 			}
+			switch strings.ToLower(nodeType) {
+			case "end":
+				endCount++
+			case "conditional":
+				hasConditional = true
+			}
 
 			taskAlias, _ := nm["taskAlias"].(string)
 			taskID, _ := nm["taskId"].(string)
@@ -83,6 +92,15 @@ func validateWorkflowV2Body(body *json.RawMessage) error {
 					i, label, nodeType))
 			}
 		}
+	}
+
+	// A workflow must converge to a single end node unless it branches on a
+	// conditional (whose branches may terminate separately). Parallel fan-out
+	// such as relationships per-item handles must converge to one end node.
+	if endCount > 1 && !hasConditional {
+		problems = append(problems, fmt.Sprintf(
+			"%d 'end' nodes but no 'conditional' node -- a workflow must have a single end node unless it branches on a conditional; converge parallel paths (e.g. relationship handles) to one end",
+			endCount))
 	}
 
 	if rawEdges, ok := wf["edges"]; ok && rawEdges != nil {
@@ -233,6 +251,8 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 
 	seenIDs := map[string]int{}
 	hasStart, hasEnd := false, false
+	endCount := 0
+	hasConditional := false
 
 	for i, n := range nodes {
 		nm, _ := n.(map[string]any)
@@ -251,6 +271,10 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 		}
 		if nodeType == "end" {
 			hasEnd = true
+			endCount++
+		}
+		if nodeType == "conditional" {
+			hasConditional = true
 		}
 		ta, _ := nm["taskAlias"].(string)
 		tid, _ := nm["taskId"].(string)
@@ -278,6 +302,16 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 	}
 	if !hasEnd {
 		report.Issues = append(report.Issues, lintIssue{Severity: "warning", Message: "no node of type 'end'"})
+	}
+	// A workflow should converge to a single end node. Multiple end nodes are
+	// only legitimate when the graph branches on a conditional (each branch may
+	// terminate separately). Parallel fan-out (e.g. relationships per-item
+	// handles) must converge to one end.
+	if endCount > 1 && !hasConditional {
+		report.Issues = append(report.Issues, lintIssue{
+			Severity: "error",
+			Message:  fmt.Sprintf("%d 'end' nodes but no 'conditional' node -- a workflow must have a single end node unless it branches on a conditional; converge parallel paths to one end", endCount),
+		})
 	}
 
 	// Track edge endpoints so we can detect truly disconnected nodes (orphans).

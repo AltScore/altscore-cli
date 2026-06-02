@@ -257,3 +257,44 @@ func TestDeriveAltdataInputKeysForCreate_FallbackError(t *testing.T) {
 		t.Errorf("expected derive-failure guidance, got: %v", err)
 	}
 }
+
+// TestValidateWorkflowV2Body_MultipleEndNodes covers the rule: a workflow must
+// converge to a single end node unless it branches on a conditional.
+func TestValidateWorkflowV2Body_MultipleEndNodes(t *testing.T) {
+	// Two end nodes, no conditional -> error.
+	body := json.RawMessage(`{
+		"nodes": [
+			{"nodeId": "s", "type": "start", "taskAlias": "s"},
+			{"nodeId": "e1", "type": "end", "taskAlias": "e1"},
+			{"nodeId": "e2", "type": "end", "taskAlias": "e2"}
+		]
+	}`)
+	err := validateWorkflowV2Body(&body)
+	if err == nil || !strings.Contains(err.Error(), "single end node") {
+		t.Fatalf("expected single-end-node error, got: %v", err)
+	}
+
+	// Two end nodes WITH a conditional -> allowed.
+	body = json.RawMessage(`{
+		"nodes": [
+			{"nodeId": "s", "type": "start", "taskAlias": "s"},
+			{"nodeId": "c", "type": "conditional", "taskAlias": "c"},
+			{"nodeId": "e1", "type": "end", "taskAlias": "e1"},
+			{"nodeId": "e2", "type": "end", "taskAlias": "e2"}
+		]
+	}`)
+	if err := validateWorkflowV2Body(&body); err != nil {
+		t.Fatalf("conditional should permit multiple end nodes, got: %v", err)
+	}
+
+	// Single end node -> fine.
+	body = json.RawMessage(`{
+		"nodes": [
+			{"nodeId": "s", "type": "start", "taskAlias": "s"},
+			{"nodeId": "e1", "type": "end", "taskAlias": "e1"}
+		]
+	}`)
+	if err := validateWorkflowV2Body(&body); err != nil {
+		t.Fatalf("single end node should not error, got: %v", err)
+	}
+}
