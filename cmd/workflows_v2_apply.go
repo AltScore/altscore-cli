@@ -1931,6 +1931,19 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 	// recording), so this lint is advisory only.
 	lintCanonicalEndNode(spec)
 
+	// Advisory: flag customVariables that are pure pass-through extraction
+	// probes (a compute-variables node + a custom var whose expression merely
+	// extracts a scoped scalar). The cleaner design wires the scoped value
+	// directly into the consuming node's inputMappings. Advisory only --
+	// emitted to stderr, never blocks apply (see adviseExtractionProbes).
+	if len(spec.CustomVariables) > 0 {
+		specNodes := make([]any, len(spec.Nodes))
+		for i, n := range spec.Nodes {
+			specNodes[i] = n
+		}
+		adviseExtractionProbes(spec.CustomVariables, specNodes)
+	}
+
 	// Auto-add `persona` to the workflow's inputVariables when any
 	// customer/deal/asset task uses operation=write but the spec didn't
 	// declare it. CreateBorrower's strict Literal["individual","business"]
