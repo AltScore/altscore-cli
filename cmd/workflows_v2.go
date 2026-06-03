@@ -941,16 +941,49 @@ func makeWfv2ScheduleValidateCmd() *cobra.Command {
 // ===================== Import / export =====================
 
 func makeWfv2ExportCmd() *cobra.Command {
-	return &cobra.Command{
+	var format string
+	cmd := &cobra.Command{
 		Use:   "export <id>",
-		Short: "Export a v2 workflow as a JSON bundle",
+		Short: "Export a v2 workflow as a JSON bundle, or as an apply-ready flat spec",
 		Long: `Returns a bundle including the workflow plus its tasks, evaluation rules,
 scorecards, rule trees, and mapping tables. Suitable for piping to a file:
 
-  altscore workflows-v2 export <id> > workflow.json`,
+  altscore workflows-v2 export <id> > workflow.json
+
+--format controls the output shape:
+
+  bundle (default)   The raw export bundle: separate .workflow, .tasks[],
+                     .evaluationRules[], .scorecards[], .ruleTrees[],
+                     .mappingTables[]. Consumed by 'workflows-v2 import'.
+
+  apply-spec         A FLAT spec that 'workflows-v2 apply' accepts directly.
+                     Each graph node is emitted with its backing task body
+                     inlined (sourcesConfig, scorecardConfig, endConfig, etc.),
+                     plus type + label + a stable spec-local 'ref'. Top-level
+                     alias / label / description / category / customVariables /
+                     inputVariables / edges are carried over. Edges preserve
+                     sourceHandle. Pipe it straight back into apply:
+
+                       altscore workflows-v2 export <id> --format apply-spec \
+                         | altscore workflows-v2 apply
+
+REF LIMITATION (apply-spec): the export bundle does not retain the spec-local
+refs the workflow was originally applied with -- it only has server-assigned
+task aliases (slug-NNNNNN). apply-spec therefore emits each node's real server
+alias as its 'ref'. 'apply' tolerates this (a ref that is already a server
+alias is left as-is and resolved against task_outputs at runtime), so the spec
+round-trips. The only visible difference from a hand-authored spec is that
+refs read like 'fetch-ecu-a1b2c3' instead of 'fetch'.`,
 		Args:    cobra.ExactArgs(1),
-		Example: `  altscore workflows-v2 export <id> > my-wf.json`,
+		Example: `  altscore workflows-v2 export <id> > my-wf.json
+  altscore workflows-v2 export <id> --format apply-spec > spec.json
+  altscore workflows-v2 export <id> --format apply-spec | altscore workflows-v2 apply`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			switch format {
+			case "bundle", "apply-spec":
+			default:
+				return fmt.Errorf("--format must be \"bundle\" or \"apply-spec\", got %q", format)
+			}
 			c, err := loadClient()
 			if err != nil {
 				return err
@@ -960,9 +993,22 @@ scorecards, rule trees, and mapping tables. Suitable for piping to a file:
 			if err != nil {
 				return err
 			}
-			return output.RawJSON(data)
+			if format == "bundle" {
+				return output.RawJSON(data)
+			}
+			spec, err := bundleToApplySpec(data)
+			if err != nil {
+				return err
+			}
+			out, err := json.Marshal(spec)
+			if err != nil {
+				return fmt.Errorf("encode apply-spec: %w", err)
+			}
+			return output.RawJSON(json.RawMessage(out))
 		},
 	}
+	cmd.Flags().StringVar(&format, "format", "bundle", `output shape: "bundle" (raw export) or "apply-spec" (flat spec for 'apply')`)
+	return cmd
 }
 
 func makeWfv2ImportCmd() *cobra.Command {
