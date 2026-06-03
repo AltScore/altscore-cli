@@ -677,3 +677,14 @@ This is DISTINCT from the `sourcesConfig` `deal_contacts` entry (documented unde
 
 For a `relationships` source the only changes are: use `sourceHandle: "rel-0"`, and read the relationships scoped keys (`contact_id`, `relationship_id`, `relationship`, `ownership_pct`) instead of the deal ones.
 
+> **Anti-pattern: extraction probes.** The worked example above shows the *mechanics* of scoping, but the cleaner design is that scoped values flow **directly via `inputMappings`** into the nodes that consume them. Do NOT create a `compute-variables` node plus a custom variable whose expression merely extracts a scoped scalar (a pure pass-through like `result = inputs.get("task_outputs.<alias>.<field>")`). A node reachable only through a `rel-<id>`/`deal-<id>` handle already runs scoped, so the consuming node can reference `task_outputs.<alias>.<field>` in its own `inputMappings` and get THAT item's value — the probe node and the custom variable add nothing but indirection. Reserve custom variables for values a **rule or scorecard actually evaluates** (derived/computed figures), not for plain extraction. The cleaner shape for the example above drops the `probe` compute-variables node and its `scoped_deal_contact_id` custom variable, and wires the downstream node directly:
+>
+> ```jsonc
+> // edge: {"from": "attach-deal", "to": "score-contact", "sourceHandle": "deal-0"}
+> {"ref": "score-contact", "type": "evaluate-rules", "evaluatorTask": "contact-scoring",
+>  "inputSchema": {"deal_contact_id": {"type": "string"}},
+>  "inputMappings": {"deal_contact_id": "task_outputs.attach-deal.deal_contact_id"}}
+> ```
+>
+> The CLI flags extraction-probe custom variables with a **non-blocking advisory** (`# advisory: customVariable "<name>" looks like an extraction probe ...`) in both `altscore workflows-v2 lint` and the `apply` preflight. It is advisory only — it never fails `lint` or blocks `apply` — but it points you at the direct-wire fix above.
+
