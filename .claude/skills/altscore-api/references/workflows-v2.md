@@ -289,6 +289,8 @@ For `customer` / `deal` / `asset` write tasks the `sourcesConfig` entries map ea
 - `{type: "deal_contacts", key: "<context_key>", label: "...", upsertBorrowers: true}` — **plural-with-upsert** form. Each item without `borrower_id` is resolved by looking up `(identity_key, identity_value, tenant)`; if no identity exists, a new borrower is created (`persona` REQUIRED on the item — `"individual"` or `"business"`) and the identity row is written. Accepted item shapes: `{borrower_id, role_key?, is_primary?}` (existing-borrower path), `{tax_id, persona, label?, role_key?, is_primary?}` (shorthand: `tax_id` field doubles as identity_key+identity_value), or `{identity_key, identity_value, persona, label?, role_key?, is_primary?}` (explicit identity). Items with `borrower_id` short-circuit and bypass the upsert. Items with neither `borrower_id` nor a resolvable identity are silently skipped. Use when the deal task should own borrower creation (lets a single deal write upsert the customer + N guarantors atomically — eliminates the per-party customer-write child workflow before the deal).
 - `{type: "identity", key: "<identity_key>"}` / `{type: "borrower_field", key: "..."}` for customer/asset writes.
 
+> **`sourcesConfig deal_contacts` vs the inline `contacts` field.** These are two DIFFERENT ways to attach contacts and they behave differently for per-item scoping. The `sourcesConfig` `deal_contacts` entry (above) reads contacts from a context key and persists them — but it does NOT, on its own, expose per-contact output handles. To get per-contact output scoping (a downstream node running scoped to ONE contact), the deal task must declare its contacts in the **inline `contacts` field** on the node, which emits `deal-<id>` handles. See [Per-item output scoping](#per-item-output-scoping). (A parallel backend change is making the `sourcesConfig` path emit handles too, but author the inline `contacts` field as the primary scoping path.)
+
 #### Workflow CRUD
 
 ```bash
@@ -576,4 +578,102 @@ When the deal task should own borrower creation, set `upsertBorrowers: true` on 
   // ... end node ...
 ]
 ```
+
+#### Per-item output scoping
+
+A `deal` or `relationships` node that carries **inline items** exposes one output handle per item. A downstream node whose ONLY inbound path is a single item handle runs **scoped** to that one item: inside that node (and anything reached only through it) `task_outputs.<sourceRef>` resolves to that single item's dict instead of the source's parallel arrays. This is how you fan a downstream data-source / rules / scorecard subgraph out across N contacts and have each branch read THAT contact's values.
+
+**Handle naming** (used in the edge's `sourceHandle`):
+
+| Source node | Inline item field | Handle per item |
+|---|---|---|
+| `relationships` | (relationship items) | `rel-<id>` |
+| `deal` | `contacts` | `deal-<id>` |
+
+The `<id>` is the item's `id` within the inline array (e.g. the first item → `deal-0` / `rel-0`).
+
+**Scoped output keys differ per node type** — a common trap. When `task_outputs.<sourceRef>` is scoped to one item, the keys you can read are:
+
+| Scoped source | Keys available on the scoped item dict |
+|---|---|
+| `relationships` item | `contact_id`, `relationship_id`, `relationship`, `ownership_pct` |
+| `deal` contact item | `borrower_id`, `deal_contact_id`, `role_key`, `is_primary` |
+
+> **No `contact_id` on a scoped deal item.** A deal contact item exposes `borrower_id` (the party being attached) and `deal_contact_id` (the DealContact join-row id) — NOT `contact_id`. Reading `task_outputs.<dealRef>.contact_id` off a scoped deal item returns None. Use `borrower_id` for the party and `deal_contact_id` for the join row. (Relationships items are the inverse: they DO carry `contact_id`, plus `relationship_id`.)
+
+**Inline `contacts` field on a deal task** — the field that drives `deal-<id>` handles. Shape:
+
+```jsonc
+"contacts": [
+  {"id": "0", "borrower_id": "brw_abc", "role_key": "customer",  "is_primary": true},
+  {"id": "1", "borrower_id": "brw_def", "role_key": "guarantor", "is_primary": false}
+]
+```
+
+This is DISTINCT from the `sourcesConfig` `deal_contacts` entry (documented under the Tasks section's per-type `sourcesConfig` list): `deal_contacts` persists contacts read from a context key but does not emit per-contact handles. The **inline `contacts` field is what enables `deal-<id>` per-contact scoping.** A deal node can carry both — `contacts` for scoping/handles and a `deal_contacts` `sourcesConfig` entry for the persisted-attribute mapping.
+
+**The scoped compute-variables pattern.** Reading a scoped scalar into the rest of the graph takes four pieces:
+
+1. A **source node** (`deal` or `relationships`) with inline items.
+2. An **edge** carrying `sourceHandle: "deal-<id>"` (or `"rel-<id>"`) from the source node to a `compute-variables` "probe" node — that single inbound handle is what scopes the probe.
+3. A **workflow-level custom variable** whose expression reads a scoped scalar, and a `compute-variables` node that lists it in `selectedVariables`. The expression uses BC's Python DSL (see the customVariables normalization in `apply`): `result = inputs.get("task_outputs.<sourceRef>.deal_contact_id")`. The dependency string and the `inputs.get(...)` key must agree on the alias (`apply` rewrites the spec `ref` to the server alias).
+4. **Downstream nodes** (data source, rules, scorecard) read the scoped scalar via `custom.<name>` — each branch gets THAT item's value.
+
+**Worked example** — a deal node with inline `contacts`, a `deal-0` edge to a compute-variables probe, a custom var reading the scoped `deal_contact_id`, and a downstream node consuming the scoped scalar:
+
+```jsonc
+{
+  "label": "Per-contact scoping demo",
+  "alias": "per-contact-scoping-demo",
+  "category": "EVALUATION",
+  "inputVariables": {"external_id": {"type": "string", "required": true}},
+  "customVariables": {
+    // Scoped scalar: when "probe" is reached ONLY through the deal-0 handle,
+    // task_outputs.<dealRef> is the single contact dict, so this resolves to
+    // that contact's join-row id (NOT the parallel array).
+    "scoped_deal_contact_id": {
+      "type": "string",
+      "expression": "result = inputs.get(\"task_outputs.attach-deal.deal_contact_id\")",
+      "returnValue": "result",
+      "dependencies": ["task_outputs.attach-deal.deal_contact_id"]
+    }
+  },
+  "nodes": [
+    {"ref": "start", "type": "start", "label": "Start"},
+
+    {"ref": "attach-deal", "type": "deal", "operation": "write",
+     "lookupBy": "external_id", "key": "external_id",
+     "inputSchema": {"external_id": {"type": "string", "required": true}},
+     "inputMappings": {"external_id": "inputs.external_id"},
+     // Inline contacts -> emits deal-0 / deal-1 handles. (Pair with a
+     // deal_contacts sourcesConfig entry if you also need to persist them.)
+     "contacts": [
+       {"id": "0", "borrower_id": "brw_customer",  "role_key": "customer",  "is_primary": true},
+       {"id": "1", "borrower_id": "brw_guarantor", "role_key": "guarantor", "is_primary": false}
+     ]},
+
+    // Probe node: its ONLY inbound edge is the deal-0 handle, so it (and the
+    // custom var it computes) runs scoped to the first contact.
+    {"ref": "probe", "type": "compute-variables",
+     "selectedVariables": ["scoped_deal_contact_id"]},
+
+    // Downstream consumer reads the scoped scalar via custom.<name> -- it sees
+    // the FIRST contact's deal_contact_id, not the whole array.
+    {"ref": "score-contact", "type": "evaluate-rules", "evaluatorTask": "contact-scoring",
+     "inputSchema": {"deal_contact_id": {"type": "string"}},
+     "inputMappings": {"deal_contact_id": "custom.scoped_deal_contact_id"}},
+
+    {"ref": "end", "type": "end", "label": "End"}
+  ],
+  "edges": [
+    {"from": "start", "to": "attach-deal"},
+    // sourceHandle scopes the probe to the first inline contact (id "0").
+    {"from": "attach-deal", "to": "probe", "sourceHandle": "deal-0"},
+    {"from": "probe", "to": "score-contact"},
+    {"from": "score-contact", "to": "end"}
+  ]
+}
+```
+
+For a `relationships` source the only changes are: use `sourceHandle: "rel-0"`, and read the relationships scoped keys (`contact_id`, `relationship_id`, `relationship`, `ownership_pct`) instead of the deal ones.
 
