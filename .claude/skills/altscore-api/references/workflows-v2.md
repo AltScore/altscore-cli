@@ -612,6 +612,27 @@ The `<id>` is the item's `id` within the inline array (e.g. the first item → `
 
 This is DISTINCT from the `sourcesConfig` `deal_contacts` entry (documented under the Tasks section's per-type `sourcesConfig` list): `deal_contacts` persists contacts read from a context key but does not emit per-contact handles. The **inline `contacts` field is what enables `deal-<id>` per-contact scoping.** A deal node can carry both — `contacts` for scoping/handles and a `deal_contacts` `sourcesConfig` entry for the persisted-attribute mapping.
 
+**Inline `contacts` upsert — `upsertContacts` on the deal node.** By default each inline `contacts` row must reference an existing borrower via `borrower_id`. Set `upsertContacts: true` as a **top-level field on the deal task** (sibling to `contacts`) to let a row instead identify the borrower by identity — the deal write resolves `(identity_key, identity_value, tenant)` and **creates the borrower first if no identity matches**, then attaches it. This mirrors `relationshipsConfig.upsertContacts` on a `relationships` node and lets a single deal write own borrower creation for an inline-scoped row, the same way the plural `sourcesConfig deal_contacts` + `upsertBorrowers` path does for context-fed lists — but keeping the per-contact `deal-<id>` handles. Accepted item shapes:
+
+- `{borrower_id, role_key?, is_primary?}` — existing-borrower path; short-circuits the upsert (no identity/persona needed).
+- `{tax_id, persona, role_key?, is_primary?}` — shorthand: `tax_id` doubles as identity_key+identity_value. `persona` REQUIRED (`"individual"` or `"business"`).
+- `{identity_key, identity_value, persona, role_key?, is_primary?}` — explicit identity. `persona` REQUIRED.
+
+`apply` preflights this like relationships: when `upsertContacts` is off, a row missing `borrower_id` is rejected (with a hint to flip the flag); when on, a row without `borrower_id` must carry an identity (`identity_value`, or `tax_id` / `identity_key` shorthand) AND `persona`. Rows with `borrower_id` are accepted in either mode. Contrast with the `sourcesConfig deal_contacts` + `upsertBorrowers` plural path (above): that fans a context-key list into DealContact rows without per-item handles, whereas inline `contacts` + `upsertContacts` upserts the borrowers behind the **handle-emitting** inline rows.
+
+```jsonc
+{"ref": "attach-deal", "type": "deal", "operation": "write",
+ "lookupBy": "external_id", "key": "external_id",
+ "inputSchema": {"external_id": {"type": "string", "required": true}},
+ "inputMappings": {"external_id": "inputs.external_id"},
+ "upsertContacts": true,
+ "contacts": [
+   {"borrower_id": "brw_customer", "role_key": "customer",  "is_primary": true},
+   {"tax_id": "20-12345678-9", "persona": "business", "role_key": "guarantor"},
+   {"identity_key": "email", "identity_value": "co@example.com", "persona": "business", "role_key": "guarantor"}
+ ]}
+```
+
 **The scoped compute-variables pattern.** Reading a scoped scalar into the rest of the graph takes four pieces:
 
 1. A **source node** (`deal` or `relationships`) with inline items.
