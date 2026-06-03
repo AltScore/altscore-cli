@@ -3051,6 +3051,62 @@ func preflightTasks(spec *composeSpec) error {
 					)
 				}
 			}
+			// Deal nodes can carry an inline `contacts` list (the field that
+			// drives deal-<id> handles). Like relationshipsConfig.upsertContacts,
+			// a sibling `upsertContacts` bool lets each row omit borrower_id and
+			// resolve/create the borrower by identity instead. When OFF every
+			// row needs borrower_id; when ON a row needs borrower_id OR an
+			// identity (identity_value, or tax_id / identity_key shorthand) AND
+			// persona. Mirrors the relationships preflight below.
+			if taskType == "deal" {
+				inlineContacts := asSlice(task["contacts"])
+				upsertContacts, _ := task["upsertContacts"].(bool)
+				for ci, contact := range inlineContacts {
+					cm, ok := contact.(map[string]any)
+					if !ok {
+						return fmt.Errorf("node ref=%q: contacts[%d] must be an object", ref, ci)
+					}
+					borrowerID, _ := cm["borrower_id"].(string)
+					if borrowerID != "" {
+						// Existing-borrower path short-circuits; no identity needed.
+						continue
+					}
+					if !upsertContacts {
+						return fmt.Errorf(
+							"node ref=%q: contacts[%d] missing borrower_id "+
+								"(set upsertContacts=true to allow identity-based upsert)",
+							ref, ci,
+						)
+					}
+					// upsert path: row must carry an identity to resolve/create.
+					identityField := "tax_id"
+					if k, _ := cm["identity_key"].(string); k != "" {
+						identityField = k
+					}
+					identityValue, _ := cm["identity_value"].(string)
+					if identityValue == "" {
+						if v, ok := cm[identityField].(string); ok {
+							identityValue = v
+						}
+					}
+					if identityValue == "" {
+						return fmt.Errorf(
+							"node ref=%q: contacts[%d] missing borrower_id AND missing "+
+								"identity_value (or %q shorthand). Provide one so the activity "+
+								"can resolve or create the borrower.",
+							ref, ci, identityField,
+						)
+					}
+					if persona, _ := cm["persona"].(string); persona == "" {
+						return fmt.Errorf(
+							"node ref=%q: contacts[%d] resolves by identity but is missing "+
+								"persona (\"individual\" or \"business\") -- required to create "+
+								"the borrower when the identity doesn't already exist.",
+							ref, ci,
+						)
+					}
+				}
+			}
 		case "relationships":
 			// Bulk-create N borrower<->contact links in one activity.
 			// borrower_id and items must each come from either inline
