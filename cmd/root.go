@@ -51,6 +51,7 @@ func init() {
 
 	rootCmd.AddCommand(makeSchemaCmd())
 	rootCmd.AddCommand(makeToolsCmd())
+	rootCmd.AddCommand(makeVersionCmd())
 	registerResources()
 }
 
