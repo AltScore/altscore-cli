@@ -173,6 +173,7 @@ func makeWfv2ApplyCmd() *cobra.Command {
 	var skipLintOnPublish bool
 	var skipRescope bool
 	var allowStealOwnership bool
+	var verify bool
 
 	cmd := &cobra.Command{
 		Use:     "apply",
@@ -506,6 +507,16 @@ Spec format (see file header for full reference):
 				}
 			}
 
+			// Read-back verification: confirm the backend actually persisted
+			// every field the spec set on each task. Catches silent
+			// server-side field drops (e.g. a `contacts` array the task schema
+			// doesn't model). Best-effort and non-fatal -- the workflow is
+			// already applied; this only warns. Skipped on dry-run/diff (both
+			// returned above). Disable with --verify=false.
+			if verify {
+				verifyAppliedTasks(c, &spec, workflow, cmd.ErrOrStderr())
+			}
+
 			if wfID != "" && publish {
 				fmt.Fprintf(cmd.OutOrStderr(), "# applied workflow %s (alias=%s)\n", wfID, targetAlias)
 			}
@@ -519,6 +530,7 @@ Spec format (see file header for full reference):
 	cmd.Flags().BoolVar(&skipLintOnPublish, "skip-lint-on-publish", false, "skip the pre-publish topology lint that refuses to publish on errors")
 	cmd.Flags().BoolVar(&skipRescope, "skip-rescope", false, "do not stamp referenced credit-decisioning entities (scorecards, rule-trees, etc.) to the workflow's alias after apply")
 	cmd.Flags().BoolVar(&allowStealOwnership, "allow-steal-ownership", false, "permit apply to transfer a credit-decisioning entity's workflowAlias when it is currently owned by ANOTHER workflow. Default: refuse and instruct the spec author to clone the entity with a new code. Use only for rare workflow rename / identity migration / decommissioning scenarios")
+	cmd.Flags().BoolVar(&verify, "verify", true, "after writing, read back the persisted tasks and warn (stderr, non-fatal) about any spec-set field the backend dropped or nulled. Pass --verify=false to skip the extra GETs")
 	return cmd
 }
 
