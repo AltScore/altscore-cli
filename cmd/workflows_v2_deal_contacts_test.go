@@ -141,3 +141,26 @@ func TestPreflightTasks_DealNoContactsPasses(t *testing.T) {
 		t.Fatalf("preflight should accept a deal task with no inline contacts, got: %v", err)
 	}
 }
+
+// TestPreflightTasks_DealContactsSourcesConfigRejected: the legacy
+// deal_contacts (plural) / deal_contact (singular) sourcesConfig contact-
+// attachment paths are no longer supported. A deal node carrying such a
+// sourcesConfig entry must be rejected with a migration message pointing at
+// the inline `contacts` field.
+func TestPreflightTasks_DealContactsSourcesConfigRejected(t *testing.T) {
+	for _, srcType := range []string{"deal_contacts", "deal_contact"} {
+		deal := dealTask("attach-deal", false, nil)
+		deal["sourcesConfig"] = []any{
+			map[string]any{"type": srcType, "key": "contacts", "label": "Contacts"},
+		}
+		spec := dealSpec("Deal sources "+srcType, deal)
+		err := preflightTasks(spec)
+		if err == nil {
+			t.Fatalf("preflight should reject %s sourcesConfig, got nil", srcType)
+		}
+		if !strings.Contains(err.Error(), "no longer supported") ||
+			!strings.Contains(err.Error(), "inline 'contacts' field") {
+			t.Errorf("error for %s should explain migration to inline contacts, got: %v", srcType, err)
+		}
+	}
+}

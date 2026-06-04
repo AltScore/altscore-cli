@@ -3049,6 +3049,12 @@ func preflightTasks(spec *composeSpec) error {
 							"surfaces at runtime as an opaque KeyError.",
 						ref, taskType, sci,
 					)
+				} else if t == "deal_contact" || t == "deal_contacts" {
+					return fmt.Errorf(
+						"node ref=%q: deal_contact/deal_contacts sourcesConfig is no longer supported; "+
+							"attach contacts via the inline 'contacts' field (set upsertContacts:true for identity-based upsert)",
+						ref,
+					)
 				}
 			}
 			// Deal nodes can carry an inline `contacts` list (the field that
@@ -3135,8 +3141,8 @@ func preflightTasks(spec *composeSpec) error {
 					ref,
 				)
 			}
-			// upsertContacts lets items omit contact_id and resolve via identity
-			// (mirrors deal_contacts upsertBorrowers). When on, every item still
+			// upsertContacts lets items omit contact_id and resolve via identity.
+			// When on, every item still
 			// needs SOMETHING to identify the contact -- either contact_id or
 			// an identity_value (or tax_id / <defaultIdentityKey> as shorthand).
 			upsertContacts, _ := cfg["upsertContacts"].(bool)
