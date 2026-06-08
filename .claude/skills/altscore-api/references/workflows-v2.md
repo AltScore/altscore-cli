@@ -289,12 +289,9 @@ Per-type config (full reference: `schema-guide tasks`):
 For `customer` / `deal` / `asset` write tasks the `sourcesConfig` entries map each persisted attribute to a context key. Common entry shapes:
 
 - `{type: "deal_field", key: "<context_key>", label: "..."}` — write one deal_field record per entry.
-- `{type: "deal_contact", key: "<context_key>", label: "..."}` — write a single DealContact row from `context[<key>]` (one contact dict).
-- `{type: "deal_contacts", key: "<context_key>", label: "..."}` — **plural** form: `context[<key>]` is a list of contact dicts and one DealContact row is created per item. Same idempotency rules apply (see Gotchas).
-- `{type: "deal_contacts", key: "<context_key>", label: "...", upsertBorrowers: true}` — **plural-with-upsert** form. Each item without `borrower_id` is resolved by looking up `(identity_key, identity_value, tenant)`; if no identity exists, a new borrower is created (`persona` REQUIRED on the item — `"individual"` or `"business"`) and the identity row is written. Accepted item shapes: `{borrower_id, role_key?, is_primary?}` (existing-borrower path), `{tax_id, persona, label?, role_key?, is_primary?}` (shorthand: `tax_id` field doubles as identity_key+identity_value), or `{identity_key, identity_value, persona, label?, role_key?, is_primary?}` (explicit identity). Items with `borrower_id` short-circuit and bypass the upsert. Items with neither `borrower_id` nor a resolvable identity are silently skipped. Use when the deal task should own borrower creation (lets a single deal write upsert the customer + N guarantors atomically — eliminates the per-party customer-write child workflow before the deal).
 - `{type: "identity", key: "<identity_key>"}` / `{type: "borrower_field", key: "..."}` for customer/asset writes.
 
-> **`sourcesConfig deal_contacts` vs the inline `contacts` field.** These are two DIFFERENT ways to attach contacts and they behave differently for per-item scoping. The `sourcesConfig` `deal_contacts` entry (above) reads contacts from a context key and persists them — but it does NOT, on its own, expose per-contact output handles. To get per-contact output scoping (a downstream node running scoped to ONE contact), the deal task must declare its contacts in the **inline `contacts` field** on the node, which emits `deal-<id>` handles. See [Per-item output scoping](#per-item-output-scoping). (A parallel backend change is making the `sourcesConfig` path emit handles too, but author the inline `contacts` field as the primary scoping path.)
+> **Attaching contacts to a deal: inline `contacts` ONLY.** The `deal_contact` (singular) and `deal_contacts` (plural) `sourcesConfig` types are **no longer supported**. Attaching deal contacts via `sourcesConfig` is rejected by `apply`. Declare contacts in the **inline `contacts` field** on the deal node instead — it both persists the DealContact rows and emits the per-contact `deal-<id>` output handles needed for scoping. Set `upsertContacts: true` (top-level on the deal task) to let rows resolve/create borrowers by identity. See [Inline `contacts` field](#per-item-output-scoping) below.
 
 #### Workflow CRUD
 
@@ -506,7 +503,7 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 
 #### Atomic deal write with customer + N guarantors
 
-A single `deal` task can attach the customer plus an arbitrary number of guarantors atomically. Pattern: a single-mode child-workflow KYCs the customer, a batch child-workflow KYCs the guarantors, a `compute-variables` task assembles the full contacts list, and one `deal` task with a `deal_contacts` (plural) source entry writes them all in one shot.
+A single `deal` task can attach the customer plus an arbitrary number of guarantors atomically. Pattern: a single-mode child-workflow KYCs the customer, a batch child-workflow KYCs the guarantors, a `compute-variables` task assembles the full contacts list, and one `deal` task with an inline `contacts` field writes them all in one shot. (Contacts are attached ONLY via the inline `contacts` field — the legacy `deal_contacts` `sourcesConfig` type is no longer supported and is rejected by `apply`.)
 
 ```jsonc
 "nodes": [
@@ -524,17 +521,20 @@ A single `deal` task can attach the customer plus an arbitrary number of guarant
    "lookupBy": "external_id", "key": "external_id",
    "inputSchema": {
      "external_id": {"type": "string", "required": true},
-     "label":       {"type": "string"},
-     "contacts":    {"type": "object"}
+     "label":       {"type": "string"}
    },
    "inputMappings": {
      "external_id": "task_outputs.verify-customer.borrower_id",
-     "label":       "inputs.customer_legal_name",
-     "contacts":    "task_outputs.build-contacts.all_contacts"
+     "label":       "inputs.customer_legal_name"
    },
    "sourcesConfig": [
-     {"type": "deal_field",    "key": "label",    "label": "Label"},
-     {"type": "deal_contacts", "key": "contacts", "label": "Contacts"}
+     {"type": "deal_field", "key": "label", "label": "Label"}
+   ],
+   // Inline contacts: each row references an existing borrower by borrower_id.
+   "contacts": [
+     {"borrower_id": "{{task_outputs.verify-customer.borrower_id}}",
+      "role_key": "customer", "is_primary": true}
+     // ... plus one row per guarantor from the batch KYC ...
    ]
   }
   // ... end node ...
@@ -545,32 +545,25 @@ Re-running the deal task with the same `(deal_id, borrower_id, role_key)` triple
 
 #### Atomic deal write with borrower upsert (no per-party child needed)
 
-When the deal task should own borrower creation, set `upsertBorrowers: true` on the `deal_contacts` entry. The deal write becomes the single source of truth for the deal record, its contacts, AND the borrowers being attached. KYC/KYB can run AFTER the deal exists as pure scoring (no longer a hard dependency for contact attachment — a failed KYC no longer drops a contact).
+When the deal task should own borrower creation, set `upsertContacts: true` as a top-level field on the deal task (sibling to `contacts`). The deal write becomes the single source of truth for the deal record, its contacts, AND the borrowers being attached: each inline `contacts` row without `borrower_id` is resolved by looking up `(identity_key, identity_value, tenant)`, and a new borrower is created (`persona` REQUIRED — `"individual"` or `"business"`) when no identity matches. KYC/KYB can run AFTER the deal exists as pure scoring (no longer a hard dependency for contact attachment — a failed KYC no longer drops a contact).
 
 ```jsonc
 "nodes": [
   // ... start node ...
-  {"ref": "build-contacts", "type": "compute-variables",
-   "selectedVariables": ["contacts"]},
-  // customVariables.contacts emits a list like:
-  //   [{tax_id: "30-71234567-1", persona: "business", label: "Acme SRL",
-  //     role_key: "customer", is_primary: true},
-  //    {tax_id: "20-25678901-3", persona: "individual",
-  //     role_key: "guarantor", is_primary: false}]
-
   {"ref": "create-deal", "type": "deal", "operation": "write",
    "lookupBy": "external_id", "key": "external_id",
    "inputSchema": {
-     "external_id": {"type": "string", "required": true},
-     "contacts":    {"type": "array"}
+     "external_id": {"type": "string", "required": true}
    },
    "inputMappings": {
-     "external_id": "inputs.deal.dealId",
-     "contacts":    "task_outputs.build-contacts.contacts"
+     "external_id": "inputs.deal.dealId"
    },
-   "sourcesConfig": [
-     {"type": "deal_contacts", "key": "contacts", "label": "Contacts",
-      "upsertBorrowers": true}
+   "upsertContacts": true,
+   "contacts": [
+     {"tax_id": "30-71234567-1", "persona": "business", "label": "Acme SRL",
+      "role_key": "customer", "is_primary": true},
+     {"tax_id": "20-25678901-3", "persona": "individual",
+      "role_key": "guarantor", "is_primary": false}
    ]
   },
 
@@ -615,7 +608,28 @@ The `<id>` is the item's `id` within the inline array (e.g. the first item → `
 ]
 ```
 
-This is DISTINCT from the `sourcesConfig` `deal_contacts` entry (documented under the Tasks section's per-type `sourcesConfig` list): `deal_contacts` persists contacts read from a context key but does not emit per-contact handles. The **inline `contacts` field is what enables `deal-<id>` per-contact scoping.** A deal node can carry both — `contacts` for scoping/handles and a `deal_contacts` `sourcesConfig` entry for the persisted-attribute mapping.
+The **inline `contacts` field is the ONLY supported way to attach deal contacts** — it both persists the DealContact rows and enables `deal-<id>` per-contact scoping. (The legacy `deal_contact` / `deal_contacts` `sourcesConfig` types are no longer supported and are rejected by `apply`.)
+
+**Inline `contacts` upsert — `upsertContacts` on the deal node.** By default each inline `contacts` row must reference an existing borrower via `borrower_id`. Set `upsertContacts: true` as a **top-level field on the deal task** (sibling to `contacts`) to let a row instead identify the borrower by identity — the deal write resolves `(identity_key, identity_value, tenant)` and **creates the borrower first if no identity matches**, then attaches it. This mirrors `relationshipsConfig.upsertContacts` on a `relationships` node and lets a single deal write own borrower creation. Accepted item shapes:
+
+- `{borrower_id, role_key?, is_primary?}` — existing-borrower path; short-circuits the upsert (no identity/persona needed).
+- `{tax_id, persona, role_key?, is_primary?}` — shorthand: `tax_id` doubles as identity_key+identity_value. `persona` REQUIRED (`"individual"` or `"business"`).
+- `{identity_key, identity_value, persona, role_key?, is_primary?}` — explicit identity. `persona` REQUIRED.
+
+`apply` preflights this like relationships: when `upsertContacts` is off, a row missing `borrower_id` is rejected (with a hint to flip the flag); when on, a row without `borrower_id` must carry an identity (`identity_value`, or `tax_id` / `identity_key` shorthand) AND `persona`. Rows with `borrower_id` are accepted in either mode.
+
+```jsonc
+{"ref": "attach-deal", "type": "deal", "operation": "write",
+ "lookupBy": "external_id", "key": "external_id",
+ "inputSchema": {"external_id": {"type": "string", "required": true}},
+ "inputMappings": {"external_id": "inputs.external_id"},
+ "upsertContacts": true,
+ "contacts": [
+   {"borrower_id": "brw_customer", "role_key": "customer",  "is_primary": true},
+   {"tax_id": "20-12345678-9", "persona": "business", "role_key": "guarantor"},
+   {"identity_key": "email", "identity_value": "co@example.com", "persona": "business", "role_key": "guarantor"}
+ ]}
+```
 
 **The scoped compute-variables pattern.** Reading a scoped scalar into the rest of the graph takes four pieces:
 
@@ -650,8 +664,7 @@ This is DISTINCT from the `sourcesConfig` `deal_contacts` entry (documented unde
      "lookupBy": "external_id", "key": "external_id",
      "inputSchema": {"external_id": {"type": "string", "required": true}},
      "inputMappings": {"external_id": "inputs.external_id"},
-     // Inline contacts -> emits deal-0 / deal-1 handles. (Pair with a
-     // deal_contacts sourcesConfig entry if you also need to persist them.)
+     // Inline contacts -> persists DealContact rows AND emits deal-0 / deal-1 handles.
      "contacts": [
        {"id": "0", "borrower_id": "brw_customer",  "role_key": "customer",  "is_primary": true},
        {"id": "1", "borrower_id": "brw_guarantor", "role_key": "guarantor", "is_primary": false}
@@ -681,4 +694,15 @@ This is DISTINCT from the `sourcesConfig` `deal_contacts` entry (documented unde
 ```
 
 For a `relationships` source the only changes are: use `sourceHandle: "rel-0"`, and read the relationships scoped keys (`contact_id`, `relationship_id`, `relationship`, `ownership_pct`) instead of the deal ones.
+
+> **Anti-pattern: extraction probes.** The worked example above shows the *mechanics* of scoping, but the cleaner design is that scoped values flow **directly via `inputMappings`** into the nodes that consume them. Do NOT create a `compute-variables` node plus a custom variable whose expression merely extracts a scoped scalar (a pure pass-through like `result = inputs.get("task_outputs.<alias>.<field>")`). A node reachable only through a `rel-<id>`/`deal-<id>` handle already runs scoped, so the consuming node can reference `task_outputs.<alias>.<field>` in its own `inputMappings` and get THAT item's value — the probe node and the custom variable add nothing but indirection. Reserve custom variables for values a **rule or scorecard actually evaluates** (derived/computed figures), not for plain extraction. The cleaner shape for the example above drops the `probe` compute-variables node and its `scoped_deal_contact_id` custom variable, and wires the downstream node directly:
+>
+> ```jsonc
+> // edge: {"from": "attach-deal", "to": "score-contact", "sourceHandle": "deal-0"}
+> {"ref": "score-contact", "type": "evaluate-rules", "evaluatorTask": "contact-scoring",
+>  "inputSchema": {"deal_contact_id": {"type": "string"}},
+>  "inputMappings": {"deal_contact_id": "task_outputs.attach-deal.deal_contact_id"}}
+> ```
+>
+> The CLI flags extraction-probe custom variables with a **non-blocking advisory** (`# advisory: customVariable "<name>" looks like an extraction probe ...`) in both `altscore workflows-v2 lint` and the `apply` preflight. It is advisory only — it never fails `lint` or blocks `apply` — but it points you at the direct-wire fix above.
 

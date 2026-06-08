@@ -1600,13 +1600,6 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 		}
 	}
 
-	// Track deal_contact (singular) and deal_contacts (plural) keys so we
-	// can warn when both forms are present pointing at different context
-	// keys -- the singular accumulates one contact per task run while the
-	// plural fans out over a list, and mixing them on the same deal task
-	// usually means the agent meant to use only the plural form.
-	var dealContactKey, dealContactsKey string
-
 	for i, s := range asSlice(task["sourcesConfig"]) {
 		sm, ok := s.(map[string]any)
 		if !ok {
@@ -1623,33 +1616,6 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 			delete(sm, "value")
 			task["sourcesConfig"].([]any)[i] = sm
 		}
-		if taskType == "deal" {
-			srcType, _ := sm["type"].(string)
-			switch srcType {
-			case "deal_contacts":
-				// Plural form: runtime reads context[<key>] as a list of
-				// contact dicts and creates one DealContact per item.
-				// `key` is required -- without it the activity has no
-				// context entry to iterate.
-				key, _ := sm["key"].(string)
-				if strings.TrimSpace(key) == "" {
-					return fmt.Errorf("sourcesConfig[%d]: deal task with type=\"deal_contacts\" requires a non-empty \"key\" "+
-						"(the context entry holding the list of contact dicts to fan out into DealContact rows)", i)
-				}
-				dealContactsKey = key
-			case "deal_contact":
-				if key, _ := sm["key"].(string); key != "" {
-					dealContactKey = key
-				}
-			}
-		}
-	}
-
-	if dealContactKey != "" && dealContactsKey != "" && dealContactKey != dealContactsKey {
-		fmt.Fprintf(os.Stderr,
-			"# warning: deal task has both deal_contact (key=%q) and deal_contacts (key=%q) entries; "+
-				"the singular accumulation may overlap with the bulk items -- usually you want only the plural form\n",
-			dealContactKey, dealContactsKey)
 	}
 
 	operation, _ := task["operation"].(string)

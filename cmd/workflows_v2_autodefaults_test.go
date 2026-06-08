@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
@@ -134,21 +133,4 @@ func TestNormalizeEntityWriteTask_DealContactsSkippedWhenOptOut(t *testing.T) {
 	if _, has := c0["identity_value"]; has {
 		t.Errorf("identity_value should not be filled when AutoDefaults is off: %v", c0)
 	}
-}
-
-// captureStderr redirects os.Stderr for the duration of fn and returns what was written.
-func captureStderr(t *testing.T, fn func()) string {
-	t.Helper()
-	orig := os.Stderr
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stderr = w
-	fn()
-	w.Close()
-	os.Stderr = orig
-	buf := make([]byte, 4096)
-	n, _ := r.Read(buf)
-	return string(buf[:n])
 }
