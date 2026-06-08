@@ -71,14 +71,14 @@ import (
 // placeholder for future API support).
 
 type composeSpec struct {
-	Label           string                 `json:"label"`
-	Alias           string                 `json:"alias,omitempty"`
-	Category        string                 `json:"category"`
-	Description     string                 `json:"description,omitempty"`
-	Status          string                 `json:"status,omitempty"`
-	InputVariables  map[string]any         `json:"inputVariables,omitempty"`
-	CustomVariables map[string]any         `json:"customVariables,omitempty"`
-	Config          map[string]any         `json:"config,omitempty"`
+	Label           string         `json:"label"`
+	Alias           string         `json:"alias,omitempty"`
+	Category        string         `json:"category"`
+	Description     string         `json:"description,omitempty"`
+	Status          string         `json:"status,omitempty"`
+	InputVariables  map[string]any `json:"inputVariables,omitempty"`
+	CustomVariables map[string]any `json:"customVariables,omitempty"`
+	Config          map[string]any `json:"config,omitempty"`
 	// Nodes is the workflow's graph -- one flat list, one entry per node
 	// (start, end, every task type). Apply dispatches each entry by `type`
 	// at parse time. This is the only accepted input shape.
@@ -174,6 +174,7 @@ func makeWfv2ApplyCmd() *cobra.Command {
 	var skipRescope bool
 	var allowStealOwnership bool
 	var verify bool
+	var noAutoDefaults bool
 
 	cmd := &cobra.Command{
 		Use:     "apply",
@@ -335,7 +336,7 @@ Spec format (see file header for full reference):
 			if diffFlag {
 				composeAllowSteal = true
 			}
-			workflow, err := composeWorkflowBody(c, &spec, dryRun || diffFlag, publish, !skipRescope, composeAllowSteal)
+			workflow, err := composeWorkflowBody(c, &spec, dryRun || diffFlag, publish, !skipRescope, composeAllowSteal, !noAutoDefaults)
 			if err != nil {
 				return err
 			}
@@ -531,6 +532,7 @@ Spec format (see file header for full reference):
 	cmd.Flags().BoolVar(&skipRescope, "skip-rescope", false, "do not stamp referenced credit-decisioning entities (scorecards, rule-trees, etc.) to the workflow's alias after apply")
 	cmd.Flags().BoolVar(&allowStealOwnership, "allow-steal-ownership", false, "permit apply to transfer a credit-decisioning entity's workflowAlias when it is currently owned by ANOTHER workflow. Default: refuse and instruct the spec author to clone the entity with a new code. Use only for rare workflow rename / identity migration / decommissioning scenarios")
 	cmd.Flags().BoolVar(&verify, "verify", true, "after writing, read back the persisted tasks and warn (stderr, non-fatal) about any spec-set field the backend dropped or nulled. Pass --verify=false to skip the extra GETs")
+	cmd.Flags().BoolVar(&noAutoDefaults, "no-auto-defaults", false, "disable apply's opinionated convenience defaults: (1) end-node borrower_id/billable_id wired to the single customer node's borrower_id, (2) forced end-node PDF generation (pdfConfig.enabled+pdfGenerationRequired=true), (3) deal-contact identity_value back-filled from each contact's identity_key field (default tax_id). Each only fills an absent field; caller-supplied values always win")
 	return cmd
 }
 
@@ -817,7 +819,6 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 	walkTasks(spec.ExtraNodes)
 	return nil
 }
-
 
 // localRef returns the spec-local reference for a task or extraNode entry,
 // in priority order: explicit `ref`, then `alias` (for tasks) or `nodeId`
@@ -1542,25 +1543,25 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 // excluding too much defeats that. New entries here should be cross-checked
 // against whether the field is also walked by rewriteRefsInTaskTemplates.
 var residualSpecRefExcludedFields = map[string]bool{
-	"label":         true,
-	"description":   true,
-	"title":         true,
-	"subtitle":      true,
-	"name":          true,
-	"code":          true,
-	"comment":       true,
-	"errorMessage":  true, // template, rewritten elsewhere; value may match a ref legitimately
-	"outputJson":    true, // template, rewritten elsewhere
-	"filePrefix":    true, // PDF metadata
-	"brandLogo":     true, // PDF metadata
-	"value":         true, // condition literals, mapping entry literals
-	"outputValue":   true, // mapping table literals
-	"defaultValue":  true, // mapping table fallback literals
-	"default":       true, // input-variable defaults
-	"placeholder":   true,
-	"helpText":      true,
-	"hint":          true,
-	"tooltip":       true,
+	"label":        true,
+	"description":  true,
+	"title":        true,
+	"subtitle":     true,
+	"name":         true,
+	"code":         true,
+	"comment":      true,
+	"errorMessage": true, // template, rewritten elsewhere; value may match a ref legitimately
+	"outputJson":   true, // template, rewritten elsewhere
+	"filePrefix":   true, // PDF metadata
+	"brandLogo":    true, // PDF metadata
+	"value":        true, // condition literals, mapping entry literals
+	"outputValue":  true, // mapping table literals
+	"defaultValue": true, // mapping table fallback literals
+	"default":      true, // input-variable defaults
+	"placeholder":  true,
+	"helpText":     true,
+	"hint":         true,
+	"tooltip":      true,
 }
 
 // validateNoResidualSpecRefs walks a composed task body and returns an error
@@ -1877,7 +1878,70 @@ func humanizeKey(key string) string {
 // nodeId + taskAlias and is used to rewrite all references downstream. If the
 // caller provided `alias` in a task body, that alias is sent to the API; if
 // absent, the server picks one and we use whatever it returns.
-func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool, allowStealOwnership bool) (map[string]any, error) {
+// applyAutoEndDefaults injects apply's opinionated end-node defaults into the
+// spec in place (gated by --no-auto-defaults). For every end node it:
+//   - forces endConfig.pdfConfig.enabled=true and pdfGenerationRequired=true so
+//     the runtime always renders a report (other pdfConfig fields are preserved);
+//   - wires inputMappings.borrower_id and inputMappings.billable_id to the single
+//     customer node's borrower_id output, so the run is attributed to and billed
+//     for the deal owner. end_activity defaults billable_id->borrower_id, but we
+//     set both explicitly for clarity. Caller-supplied mappings always win.
+//
+// The borrower_id source uses the customer node's SPEC-LOCAL ref; the task-build
+// loop's rewriteRefsInMappings rewrites it to the server alias. When the spec has
+// zero or more than one customer node the source is ambiguous, so we skip the
+// borrower/billable wiring and warn (PDF forcing still applies).
+func applyAutoEndDefaults(spec *composeSpec) {
+	var customerRefs []string
+	for i, t := range spec.Tasks {
+		if tt, _ := t["type"].(string); tt == "customer" {
+			customerRefs = append(customerRefs, localRef(t, fmt.Sprintf("n%d", i)))
+		}
+	}
+
+	for _, t := range spec.Tasks {
+		if tt, _ := t["type"].(string); tt != "end" {
+			continue
+		}
+
+		// Force PDF generation on.
+		endCfg, _ := t["endConfig"].(map[string]any)
+		if endCfg == nil {
+			endCfg = map[string]any{}
+		}
+		pdf, _ := endCfg["pdfConfig"].(map[string]any)
+		if pdf == nil {
+			pdf = map[string]any{}
+		}
+		pdf["enabled"] = true
+		pdf["pdfGenerationRequired"] = true
+		endCfg["pdfConfig"] = pdf
+		t["endConfig"] = endCfg
+
+		// Wire borrower_id / billable_id from the single customer node.
+		if len(customerRefs) != 1 {
+			fmt.Fprintf(os.Stderr,
+				"# warning: skipped auto-wiring end-node borrower_id/billable_id -- found %d customer nodes (need exactly 1). "+
+					"Map them explicitly in the end node's inputMappings, or pass --no-auto-defaults.\n",
+				len(customerRefs))
+			continue
+		}
+		im, _ := t["inputMappings"].(map[string]any)
+		if im == nil {
+			im = map[string]any{}
+		}
+		src := fmt.Sprintf("task_outputs.%s.borrower_id", customerRefs[0])
+		if _, has := im["borrower_id"]; !has {
+			im["borrower_id"] = src
+		}
+		if _, has := im["billable_id"]; !has {
+			im["billable_id"] = src
+		}
+		t["inputMappings"] = im
+	}
+}
+
+func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool, allowStealOwnership bool, autoDefaults bool) (map[string]any, error) {
 	if err := validateEntityTypeVsTaskTypes(spec); err != nil {
 		return nil, err
 	}
@@ -1974,6 +2038,15 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			}
 		}
 		break // one auto-add covers all entity-write tasks in the spec
+	}
+
+	// Opinionated end-node defaults (gated by --no-auto-defaults): force PDF
+	// generation on and wire borrower_id/billable_id to the single customer
+	// node. Runs before the task-build loop so the borrower_id mapping uses a
+	// spec-local ref that the loop's rewriteRefsInMappings turns into the
+	// server alias.
+	if autoDefaults {
+		applyAutoEndDefaults(spec)
 	}
 
 	createdAliases := []string{}
@@ -2118,6 +2191,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			Publish:             publish,
 			AutoRescopeEntities: autoRescopeEntities,
 			AllowStealOwnership: allowStealOwnership,
+			AutoDefaults:        autoDefaults,
 		}, dryRun); err != nil {
 			return nil, fmt.Errorf("node ref=%q: %w", ref, err)
 		}
@@ -2600,20 +2674,20 @@ var validTaskTypes = map[string]bool{
 // catch locally we MUST.
 //
 // Checks (in order, fail-fast):
-//   1. duplicate spec-local refs / explicit aliases
-//   2. label + type present
-//   3. type is in the backend TaskType enum (with closest-match suggestion)
-//   4. http: headers must be a JSON-encoded string
-//   5. data-store-write / data-store-query / webhook / comment / exception /
-//      child-workflow: per-type required fields
-//   6. validateTaskV2Body: type-specific structural checks (conditional
-//      branches, scorecard reference, mapping-table entries, rule-tree
-//      enums)
-//   7. inputMappings values: leading segment must be a runtime namespace OR
-//      a known spec-local ref; task_outputs.<X>.<rest> validates <X> too.
-//      {{...}} template syntax is skipped (handled by template engine).
-//   8. edge endpoints (from/to) must reference a known ref.
-//   9. duplicate edges and self-loops are rejected.
+//  1. duplicate spec-local refs / explicit aliases
+//  2. label + type present
+//  3. type is in the backend TaskType enum (with closest-match suggestion)
+//  4. http: headers must be a JSON-encoded string
+//  5. data-store-write / data-store-query / webhook / comment / exception /
+//     child-workflow: per-type required fields
+//  6. validateTaskV2Body: type-specific structural checks (conditional
+//     branches, scorecard reference, mapping-table entries, rule-tree
+//     enums)
+//  7. inputMappings values: leading segment must be a runtime namespace OR
+//     a known spec-local ref; task_outputs.<X>.<rest> validates <X> too.
+//     {{...}} template syntax is skipped (handled by template engine).
+//  8. edge endpoints (from/to) must reference a known ref.
+//  9. duplicate edges and self-loops are rejected.
 func preflightTasks(spec *composeSpec) error {
 	// Spec-level checks: workflow category + inputVariables shape. These
 	// fail with opaque backend errors otherwise; surface here.
@@ -3532,10 +3606,10 @@ var validAliasPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 // Surveyed from the v2 task type Pydantic models + activity output shapes.
 // Conservative -- list only fields confirmed to produce object/array values.
 var objectTypedOutputsByTaskType = map[string]map[string]bool{
-	"scorecard":           {"score_breakdown": true},
-	"evaluate-rules":      {"alerts": true},
-	"altdata-enrichment":  {},
-	"mapping-table":       {},
+	"scorecard":          {"score_breakdown": true},
+	"evaluate-rules":     {"alerts": true},
+	"altdata-enrichment": {},
+	"mapping-table":      {},
 }
 
 // outputJsonTemplateRefRegex extracts {{task_outputs.<alias>.<field>}} refs

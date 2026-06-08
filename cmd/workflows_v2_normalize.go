@@ -273,6 +273,13 @@ type composeNormalizeOpts struct {
 	// behavior is restored. Only apply's --allow-steal-ownership flag
 	// sets this; non-apply callers leave it false.
 	AllowStealOwnership bool
+	// AutoDefaults -- when true (the default; disabled by --no-auto-defaults),
+	// apply injects opinionated convenience defaults: end-node borrower_id /
+	// billable_id wiring + forced PDF generation (see applyAutoEndDefaults),
+	// and deal-contact identity_value back-fill (see normalizeEntityWriteTask).
+	// Each is only applied when the field is absent -- caller-supplied values
+	// always win.
+	AutoDefaults bool
 }
 
 // missingEntityHandler returns an error when --publish is set, otherwise
@@ -403,7 +410,7 @@ func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNorma
 	case "conditional":
 		return normalizeConditionalTask(task)
 	case "customer", "deal", "asset":
-		return normalizeEntityWriteTask(task)
+		return normalizeEntityWriteTask(task, opts)
 	case "evaluate-rules":
 		return normalizeEvaluateRulesTask(c, task, opts, dryRun)
 	case "mapping-table":
@@ -456,8 +463,8 @@ func lookupChildInputVariables(c *client.Client, alias string, dryRun bool) (map
 // required inputs aren't covered by the parent's inputMappings. The
 // inputSchema / outputSchema fill that this normalizer used to perform now
 // lives in BC's DerivedSchemaService and surfaces at GET /v2/tasks time as
-// ``derivedSchema``. preflightTasks already renamed executorAlias ->
-// executorId; by the time this runs the alias lives on ``executorId``.
+// “derivedSchema“. preflightTasks already renamed executorAlias ->
+// executorId; by the time this runs the alias lives on “executorId“.
 func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bool) error {
 	executor, _ := task["executorId"].(string)
 	if executor == "" {
@@ -1206,7 +1213,7 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *com
 // MappingTableEntry pydantic model requires it). The per-entry outputSchema
 // fill (3 canonical outputs per entry) has moved to BC's
 // DerivedSchemaService and is exposed at GET /v2/tasks time via the
-// ``derivedSchema`` field. Top-level inputMappings mirroring is preserved
+// “derivedSchema“ field. Top-level inputMappings mirroring is preserved
 // because it controls runtime wiring, not schema display.
 func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
@@ -1358,7 +1365,7 @@ func mirrorEntryInputsToTopLevel(task map[string]any, entries []any) {
 // the nested scorecardConfig.inputMappings (the runtime activity reads its
 // per-rule inputs from the nested map specifically). outputSchema fill has
 // moved to BC's DerivedSchemaService and is exposed at GET /v2/tasks time
-// via the ``derivedSchema`` field.
+// via the “derivedSchema“ field.
 func normalizeScorecardTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
 	if opts != nil {
@@ -1412,7 +1419,7 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, opts *compose
 // inputMappings into the nested ruleTreeConfig.inputMappings. The
 // outputSchema fill (outputVariable + 4 canonical companions) has moved to
 // BC's DerivedSchemaService and is exposed at GET /v2/tasks time via the
-// ``derivedSchema`` field.
+// “derivedSchema“ field.
 func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
 	if opts != nil {
@@ -1554,8 +1561,44 @@ func mirrorNestedInputMappings(task map[string]any, cfg map[string]any, cfgKey s
 // Symmetric for customer/deal/asset because all three share CustomerTaskData /
 // DealTaskData / AssetTaskData schemas and the same operation/lookupBy/key
 // shape.
-func normalizeEntityWriteTask(task map[string]any) error {
+func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) error {
+	if opts == nil {
+		opts = &composeNormalizeOpts{}
+	}
 	taskType, _ := task["type"].(string)
+
+	// Auto-fill each inline deal contact's identity_value so the contact's
+	// borrower upsert keys on a real value. The deal-contact upsert resolves
+	// (or creates) the borrower by identity_key (default "tax_id") + identity_value;
+	// a contact that carries only e.g. `tax_id` but no identity_value resolves to a
+	// null identity. We copy the value from the field named by identity_key (so the
+	// source may itself be an `{{inputs.*}}` or `{{task_outputs.*}}` template),
+	// defaulting identity_key to "tax_id". Caller-supplied identity_value always
+	// wins. Gated by --no-auto-defaults.
+	if taskType == "deal" && opts.AutoDefaults {
+		for _, ci := range asSlice(task["contacts"]) {
+			contact, ok := ci.(map[string]any)
+			if !ok {
+				continue
+			}
+			identityKey, _ := contact["identity_key"].(string)
+			if strings.TrimSpace(identityKey) == "" {
+				identityKey = "tax_id"
+				contact["identity_key"] = identityKey
+			}
+			if iv, _ := contact["identity_value"].(string); strings.TrimSpace(iv) != "" {
+				continue // caller already mapped it
+			}
+			if src, _ := contact[identityKey].(string); strings.TrimSpace(src) != "" {
+				contact["identity_value"] = src
+			} else {
+				fmt.Fprintf(os.Stderr,
+					"# warning: deal contact id=%v has no identity_value and no %q field to source it from; "+
+						"the contact's borrower will resolve to a null identity\n",
+					contact["id"], identityKey)
+			}
+		}
+	}
 
 	for i, s := range asSlice(task["sourcesConfig"]) {
 		sm, ok := s.(map[string]any)

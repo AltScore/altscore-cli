@@ -173,6 +173,11 @@ When a spec contains a `rule-tree` task, the recommended end-node shape is **one
 
 Wired this way, the rule-tree's per-run decision string flows through to BC's decision recorder, the PDF generates once, and there's no per-branch hand-maintained `outputJson` to drift. Apply ships a non-blocking lint (`lintCanonicalEndNode`) that warns when a spec has both a rule-tree and an end node but the end node is missing any of: `inputMappings.decision_key`, `endConfig.decisionConfig.enabled=true`, `endConfig.pdfConfig.enabled=true`.
 
+> **Auto-defaults (on by default; `--no-auto-defaults` to skip).** apply injects three convenience defaults so common specs don't have to hand-wire them — each only fills an **absent** field, so caller-supplied values always win:
+> 1. **End-node `borrower_id` + `billable_id`** — wired to the single `customer` node's `borrower_id` output (`task_outputs.<customer-ref>.borrower_id`). Skipped with a stderr warning when the spec has 0 or >1 customer nodes (ambiguous — wire them yourself). `billable_id` defaults to `borrower_id` in `end_activity` anyway; both are set for clarity.
+> 2. **End-node PDF generation** — `endConfig.pdfConfig.enabled` and `pdfGenerationRequired` are **forced** to `true` (other pdfConfig fields like `title`/`subtitle` are preserved). This is a force, not a fill: a spec setting `enabled:false` is overridden — use `--no-auto-defaults` if you genuinely want no PDF.
+> 3. **Deal-contact `identity_value`** — for each inline deal `contact`, if `identity_value` is absent it's copied from the field named by the contact's `identity_key` (default `tax_id`, which is also set when absent). The source value may itself be an `{{inputs.*}}` or `{{task_outputs.*}}` template. Without this, a contact carrying only `tax_id` resolves its borrower upsert to a null identity.
+
 Canonical shape:
 
 ```json
