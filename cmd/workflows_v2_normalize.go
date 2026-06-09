@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -715,23 +714,6 @@ func normalizeComputeVariablesTask(task map[string]any, customVariables map[stri
 		if name == "" {
 			continue
 		}
-		if cv, _ := customVariables[name].(map[string]any); cv != nil {
-			// Anti-pattern: a compute-variable whose expression does nothing
-			// but re-expose a single reference (e.g. `result = inputs.is_active`).
-			// The value should be wired straight into the consuming node's
-			// inputMappings -- a passthrough compute-variables node is an extra
-			// node, an extra task_outputs hop, and an extra place to drift.
-			// Warn (non-fatal); the author may have a reason.
-			if expr, _ := cv["expression"].(string); expr != "" {
-				if ref, ok := passthroughComputeExpr(expr); ok {
-					fmt.Fprintf(os.Stderr,
-						"# warning: compute-variable %q only extracts %s -- prefer assigning that source "+
-							"directly to the consuming node's inputMappings instead of routing it through a "+
-							"passthrough compute-variables node.\n",
-						name, ref)
-				}
-			}
-		}
 		if _, has := out[name]; has {
 			continue
 		}
@@ -755,45 +737,6 @@ func normalizeComputeVariablesTask(task map[string]any, customVariables map[stri
 	}
 	task["outputSchema"] = out
 	return nil
-}
-
-// passthroughExtractionRe matches a single-line compute expression that is just
-// a bare reference extraction: an optional `name =` assignment followed by
-// either `inputs.get("literal")` / `context.get("literal")` (single string-
-// literal arg, no fallback) or a bare dotted/indexed scope access
-// (inputs.x.y, task_outputs.a.b, custom.z, ...). The full-line anchors ($)
-// guarantee there is NO trailing computation (`+ 1`, `or 0`, `if ... else`,
-// comparisons, a second reference) -- any of those make it a real computation
-// we must NOT flag.
-var passthroughExtractionRe = regexp.MustCompile(
-	`^(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?(` +
-		`(?:inputs|context)\.get\(\s*["'][^"']*["']\s*\)` +
-		`|(?:inputs|custom|system|task_outputs|task_outputs_by_type)\.[A-Za-z0-9_.\[\]*-]+` +
-		`)$`)
-
-// passthroughComputeExpr reports whether a compute-variable expression only
-// extracts a single reference (the anti-pattern the user should avoid), and
-// returns that reference for the warning message. Conservative: it requires a
-// single meaningful line (comments/blank lines ignored) that is exactly one
-// bare extraction, so legitimate multi-statement or transforming expressions
-// are never flagged.
-func passthroughComputeExpr(expr string) (string, bool) {
-	var meaningful []string
-	for _, ln := range strings.Split(expr, "\n") {
-		t := strings.TrimSpace(ln)
-		if t == "" || strings.HasPrefix(t, "#") {
-			continue
-		}
-		meaningful = append(meaningful, t)
-	}
-	if len(meaningful) != 1 {
-		return "", false
-	}
-	m := passthroughExtractionRe.FindStringSubmatch(meaningful[0])
-	if m == nil {
-		return "", false
-	}
-	return m[1], true
 }
 
 // errSourceNotFound is the sentinel returned when a source-version is absent
