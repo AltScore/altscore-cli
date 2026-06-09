@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -132,5 +133,101 @@ func TestNormalizeEntityWriteTask_DealContactsSkippedWhenOptOut(t *testing.T) {
 	c0 := task["contacts"].([]any)[0].(map[string]any)
 	if _, has := c0["identity_value"]; has {
 		t.Errorf("identity_value should not be filled when AutoDefaults is off: %v", c0)
+	}
+}
+
+// --- persona-as-task-property (vs forced workflow input) -----------------
+
+// Default: no persona input declared and no persona mapping -> persona is set
+// as a task literal ("individual"), and NOT wired as an input or inputSchema
+// field. The runtime reads CustomerTaskData.persona.
+func TestNormalizeEntityWriteTask_PersonaDefaultsToTaskLiteral(t *testing.T) {
+	task := map[string]any{"type": "customer", "operation": "write", "key": "person_id"}
+	if err := normalizeEntityWriteTask(task, &composeNormalizeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if task["persona"] != "individual" {
+		t.Errorf("persona literal = %v, want individual", task["persona"])
+	}
+	if m, _ := task["inputMappings"].(map[string]any); m != nil {
+		if _, has := m["persona"]; has {
+			t.Errorf("persona must not be wired to an input by default: %v", m)
+		}
+	}
+	if s, _ := task["inputSchema"].(map[string]any); s != nil {
+		if _, has := s["persona"]; has {
+			t.Errorf("persona must not be added to inputSchema by default: %v", s)
+		}
+	}
+}
+
+// Agent-set task literal persona is preserved (e.g. "business" for a RUC flow).
+func TestNormalizeEntityWriteTask_PersonaLiteralPreserved(t *testing.T) {
+	task := map[string]any{"type": "customer", "operation": "write", "persona": "business"}
+	if err := normalizeEntityWriteTask(task, &composeNormalizeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if task["persona"] != "business" {
+		t.Errorf("persona literal overwritten: %v", task["persona"])
+	}
+}
+
+// Opt-in via a declared workflow input: persona keeps the input path -- the
+// task gets the inputSchema shape + an inputs.persona mapping, and no literal.
+func TestNormalizeEntityWriteTask_PersonaInputPath(t *testing.T) {
+	task := map[string]any{"type": "customer", "operation": "write"}
+	opts := &composeNormalizeOpts{InputVariables: map[string]any{"persona": map[string]any{"type": "string"}}}
+	if err := normalizeEntityWriteTask(task, opts); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := task["persona"]; has {
+		t.Errorf("no task literal expected on the input path: %v", task["persona"])
+	}
+	m := task["inputMappings"].(map[string]any)
+	if m["persona"] != "inputs.persona" {
+		t.Errorf("persona mapping = %v, want inputs.persona", m["persona"])
+	}
+	s := task["inputSchema"].(map[string]any)
+	if _, has := s["persona"]; !has {
+		t.Errorf("inputSchema.persona expected on the input path: %v", s)
+	}
+}
+
+// A persona mapping to a non-input source (custom.*) is left untouched and no
+// task literal is injected -- the mapping supplies persona at runtime.
+func TestNormalizeEntityWriteTask_PersonaCustomMappingLeftAlone(t *testing.T) {
+	task := map[string]any{
+		"type":          "customer",
+		"operation":     "write",
+		"inputMappings": map[string]any{"persona": "custom.persona"},
+	}
+	if err := normalizeEntityWriteTask(task, &composeNormalizeOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := task["persona"]; has {
+		t.Errorf("no task literal expected when persona is mapped: %v", task["persona"])
+	}
+	m := task["inputMappings"].(map[string]any)
+	if m["persona"] != "custom.persona" {
+		t.Errorf("persona mapping overwritten: %v", m["persona"])
+	}
+}
+
+// composeSpec.Description is a pointer so an explicit "" (blank it) is
+// distinguishable from an omitted field (leave untouched).
+func TestComposeSpec_DescriptionPointerSemantics(t *testing.T) {
+	var withEmpty composeSpec
+	if err := json.Unmarshal([]byte(`{"label":"x","description":""}`), &withEmpty); err != nil {
+		t.Fatal(err)
+	}
+	if withEmpty.Description == nil || *withEmpty.Description != "" {
+		t.Errorf("explicit empty description should be non-nil empty string, got %v", withEmpty.Description)
+	}
+	var omitted composeSpec
+	if err := json.Unmarshal([]byte(`{"label":"x"}`), &omitted); err != nil {
+		t.Fatal(err)
+	}
+	if omitted.Description != nil {
+		t.Errorf("omitted description should be nil, got %v", *omitted.Description)
 	}
 }

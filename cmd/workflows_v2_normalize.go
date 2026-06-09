@@ -1639,38 +1639,53 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 
 	operation, _ := task["operation"].(string)
 	if operation == "write" {
-		inSchema := asMap(task["inputSchema"])
-		persona := asMap(inSchema["persona"])
-		if _, has := persona["type"]; !has {
-			persona["type"] = "string"
-		}
-		if _, has := persona["default"]; !has {
-			persona["default"] = "individual"
-		}
-		if _, has := persona["title"]; !has {
-			persona["title"] = "Type of customer"
-		}
-		if _, has := persona["required"]; !has {
-			persona["required"] = true
-		}
-		inSchema["persona"] = persona
-		task["inputSchema"] = inSchema
-
-		// Wire persona from the workflow's inputs scope. compose's
-		// preflight auto-adds `inputVariables.persona` (default
-		// "individual") to the workflow when an entity write is present,
-		// so this resolves at runtime without the agent having to thread
-		// persona through the spec. Without this wiring, the runtime
-		// entity_activity reads context.get("persona") -> None and the
-		// new-borrower path crashes with a Pydantic Literal validator
-		// error -- the inputSchema above describes the *shape* of the
-		// resolved context, not the wiring that populates it. Caller-
-		// supplied inputMappings.persona always wins.
+		// persona is required by CreateBorrower's Literal validator. It is a
+		// property of the workflow's DESIGN (a cedula flow is always
+		// "individual", a RUC flow always "business"), not a per-execution
+		// choice -- so by default it lives on the task as a literal
+		// (CustomerTaskData.persona) and never surfaces as a user-facing
+		// input. The runtime resolves persona as `context.get("persona") or
+		// task.persona`, so a resolved context value still wins.
+		//
+		// Two opt-ins keep persona as a real workflow input: the agent
+		// declares inputVariables.persona, or wires an entity-write task's
+		// inputMappings.persona to inputs.*. In those cases we describe the
+		// input shape + ensure the wiring; otherwise we set the task literal.
 		mappings := asMap(task["inputMappings"])
-		if _, has := mappings["persona"]; !has {
-			mappings["persona"] = "inputs.persona"
+		personaSrc, hasPersonaMapping := mappings["persona"].(string)
+		personaFromInput := hasPersonaMapping && strings.HasPrefix(strings.TrimSpace(personaSrc), "inputs.")
+		_, personaDeclaredInput := asMap(opts.InputVariables)["persona"]
+
+		if personaFromInput || personaDeclaredInput {
+			inSchema := asMap(task["inputSchema"])
+			persona := asMap(inSchema["persona"])
+			if _, has := persona["type"]; !has {
+				persona["type"] = "string"
+			}
+			if _, has := persona["default"]; !has {
+				persona["default"] = "individual"
+			}
+			if _, has := persona["title"]; !has {
+				persona["title"] = "Type of customer"
+			}
+			if _, has := persona["required"]; !has {
+				persona["required"] = true
+			}
+			inSchema["persona"] = persona
+			task["inputSchema"] = inSchema
+
+			if !hasPersonaMapping {
+				mappings["persona"] = "inputs.persona"
+				task["inputMappings"] = mappings
+			}
+		} else if !hasPersonaMapping {
+			// No input opt-in and no explicit mapping: default the task
+			// literal so the runtime resolves persona without an input.
+			if v, ok := task["persona"].(string); !ok || strings.TrimSpace(v) == "" {
+				task["persona"] = "individual"
+			}
 		}
-		task["inputMappings"] = mappings
+		// (persona wired to a non-input source, e.g. custom.* -> leave as-is)
 
 		out := asMap(task["outputSchema"])
 		if _, has := out["borrower_id"]; !has {
