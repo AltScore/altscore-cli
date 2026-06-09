@@ -1270,6 +1270,12 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *comp
 		}
 	}
 
+	// Caller-supplied top-level inputMappings (already ref-rewritten upstream).
+	// A bare entry inputVariable is only acceptable when one of these provides
+	// the real scoped value: the runtime falls back to context[<last-segment>],
+	// which top-level inputMappings populate via resolvedInputs.
+	callerMappings := asMap(task["inputMappings"])
+
 	for i, e := range entries {
 		em, ok := e.(map[string]any)
 		if !ok {
@@ -1288,16 +1294,26 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *comp
 		if inVar == "" || outVar == "" {
 			return fmt.Errorf("mappingTableConfig.entries[%d]: missing inputVariable or outputVariable", i)
 		}
-		// Wrap bare inputVariable names into the Hub-canonical scope form
-		// when we can recognize them. Currently we only know about workflow
-		// inputs (via spec.inputVariables); a bare name matching an input
-		// gets `inputs.<name>`. Bare names not matching anything are left
-		// alone -- they may legitimately reference a runtime-context key
-		// (e.g. an upstream task output already promoted to root) that
-		// compose can't see from this side.
+		// Wrap a bare inputVariable as inputs.<name> when it's a recognized
+		// workflow input. Otherwise it must already be scoped: task outputs are
+		// never promoted to the context root, so a bare name only resolves via
+		// the context[<last-segment>] fallback, populated solely by a matching
+		// top-level inputMappings entry. Without one it silently hits the default
+		// bucket and mirrors into a path-less mapping /v2/tasks rejects -- fail loud.
 		if !strings.Contains(inVar, ".") {
 			if _, isInput := inputVars[inVar]; isInput {
 				em["inputVariable"] = "inputs." + inVar
+				inVar = "inputs." + inVar
+			}
+		}
+		if !isScopedRef(inVar) {
+			field := lastDotSegment(inVar)
+			if _, has := callerMappings[field]; !has {
+				return fmt.Errorf(
+					"mappingTableConfig.entries[%d].inputVariable %q is an unscoped bare name. "+
+						"Scope it (e.g. task_outputs.<producingTask>.%s, inputs.%s, custom.%s, system.%s) "+
+						"or add an explicit inputMappings.%s on this node.",
+					i, inVar, field, field, field, field, field)
 			}
 		}
 		ref := code
@@ -1348,10 +1364,13 @@ func mirrorEntryInputsToTopLevel(task map[string]any, entries []any) {
 		if inVar == "" {
 			continue
 		}
-		field := inVar
-		if idx := strings.LastIndex(inVar, "."); idx >= 0 {
-			field = inVar[idx+1:]
+		// Only mirror scoped refs; a bare name yields a self-referential mapping
+		// /v2/tasks rejects. normalizeMappingTableTask already guarantees any bare
+		// name here has a backing top-level mapping, which we must not clobber.
+		if !isScopedRef(inVar) {
+			continue
 		}
+		field := lastDotSegment(inVar)
 		if _, has := mappings[field]; !has {
 			mappings[field] = inVar
 		}
