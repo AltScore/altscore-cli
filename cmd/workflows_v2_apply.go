@@ -451,14 +451,10 @@ Spec format (see file header for full reference):
 					fmt.Fprintf(cmd.ErrOrStderr(), "# created draft %s (version %d)\n", draftID, draftVersion)
 				}
 
-				// 2) lock acquire (alias-keyed endpoint)
+				// 2) lock acquire (alias-keyed endpoint). acquireWfv2Lock wraps
+				// the POST + parse + token extraction.
 				clientID := fmt.Sprintf("apply-%d", time.Now().UnixNano())
-				acquireLock := func() (json.RawMessage, error) {
-					lockBody, _ := json.Marshal(map[string]string{"clientId": clientID})
-					resp, _, e := c.Do("POST", "borrower_central", "/v2/workflows/"+targetAlias+"/lock", json.RawMessage(lockBody))
-					return resp, e
-				}
-				lockResp, err := acquireLock()
+				lockToken, err := acquireWfv2Lock(c, targetAlias, clientID)
 				if err != nil && strings.Contains(err.Error(), "SELF_LOCK_CONFLICT") {
 					// A stale lock left by THIS principal -- e.g. a prior apply
 					// that died before releasing. Each apply uses a fresh
@@ -468,18 +464,10 @@ Spec format (see file header for full reference):
 					// left untouched so apply never stomps a live Hub editor.
 					fmt.Fprintf(cmd.ErrOrStderr(), "# stale self-lock on %s; force-releasing and retrying\n", targetAlias)
 					_, _, _ = c.Do("DELETE", "borrower_central", "/v2/workflows/"+targetAlias+"/lock/force", nil)
-					lockResp, err = acquireLock()
+					lockToken, err = acquireWfv2Lock(c, targetAlias, clientID)
 				}
 				if err != nil {
 					return fmt.Errorf("acquire lock on %s: %w", targetAlias, err)
-				}
-				var lock map[string]any
-				if err := json.Unmarshal(lockResp, &lock); err != nil {
-					return fmt.Errorf("parse lock acquire response: %w", err)
-				}
-				lockToken, _ := lock["lockToken"].(string)
-				if lockToken == "" {
-					return fmt.Errorf("lock acquire for %s returned no lockToken", targetAlias)
 				}
 				fmt.Fprintf(cmd.ErrOrStderr(), "# acquired lock client-id=%s\n", clientID)
 				// Release the lock when apply returns (after autosave + any
