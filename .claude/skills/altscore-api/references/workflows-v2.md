@@ -485,6 +485,8 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 
 **Deep paths into altdata output**: an `altdata-enrichment` task outputs the entire package object on `sources_output_packages`. To map a single field into a downstream conditional/compute-variables task, use the deep form: `task_outputs.<altdataAlias>.<sourceId>.data.<fieldName>`. No intermediate compute-variables required.
 
+**Prefer direct assignment over passthrough compute-variables.** Do NOT add a `compute-variables` custom variable whose expression only re-exposes a single reference (e.g. `result = inputs.is_active` or `result = inputs.get("task_outputs.fetch.X.data.is_active")`). Wire that source straight into the consuming node's `inputMappings` instead — a passthrough variable is an extra node, an extra `task_outputs` hop, and an extra place to drift. Reserve `compute-variables` for real transformation (arithmetic, conditionals, coercion, aggregation). `apply` warns when it detects a passthrough.
+
 **Bare `<alias>.<field>` resolves fine** at runtime — the backend resolver accepts the bare-alias form (WITH a dot), and `apply` deliberately emits it for cross-task references. Both `task_outputs.<server-alias>.<rest>` and the bare `<alias>.<rest>` form are valid.
 
 **Multi-dot inputMappings are accepted on create**: a single POST lands the task at version 1, and the workflow node references version 1.
