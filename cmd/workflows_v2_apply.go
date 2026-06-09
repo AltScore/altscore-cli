@@ -1925,16 +1925,6 @@ func humanizeKey(key string) string {
 	return strings.Join(words, " ")
 }
 
-// composeWorkflowBody resolves task creates and assembles the final workflow body.
-// In dryRun mode, prints what would be POSTed to /v2/tasks but does not call.
-//
-// Reference resolution: each task/extraNode has a spec-local "ref" (taken from
-// the explicit `ref` field, falling back to `alias`/`nodeId`, falling back to a
-// generated `t<idx>`). Edges and inputMappings reference tasks by ref. After
-// creating a task, the server returns an alias which becomes the canonical
-// nodeId + taskAlias and is used to rewrite all references downstream. If the
-// caller provided `alias` in a task body, that alias is sent to the API; if
-// absent, the server picks one and we use whatever it returns.
 // applyAutoEndDefaults injects apply's opinionated end-node defaults into the
 // spec in place (gated by --no-auto-defaults). For every end node it:
 //   - forces endConfig.pdfConfig.enabled=true and pdfGenerationRequired=true so
@@ -1998,6 +1988,16 @@ func applyAutoEndDefaults(spec *composeSpec) {
 	}
 }
 
+// composeWorkflowBody resolves task creates and assembles the final workflow body.
+// In dryRun mode, prints what would be POSTed to /v2/tasks but does not call.
+//
+// Reference resolution: each task/extraNode has a spec-local "ref" (taken from
+// the explicit `ref` field, falling back to `alias`/`nodeId`, falling back to a
+// generated `t<idx>`). Edges and inputMappings reference tasks by ref. After
+// creating a task, the server returns an alias which becomes the canonical
+// nodeId + taskAlias and is used to rewrite all references downstream. If the
+// caller provided `alias` in a task body, that alias is sent to the API; if
+// absent, the server picks one and we use whatever it returns.
 func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool, allowStealOwnership bool, autoDefaults bool) (map[string]any, error) {
 	if err := validateEntityTypeVsTaskTypes(spec); err != nil {
 		return nil, err
