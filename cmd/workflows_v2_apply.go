@@ -314,10 +314,12 @@ Spec format (see file header for full reference):
 				targetAlias = slugifyWorkflowLabel(spec.Label)
 			}
 
-			// Lookup: is there an ACTIVE workflow with this alias on the tenant?
+			// Lookup: is there an existing workflow with this alias on the
+			// tenant? Prefer ACTIVE, else fall back to the latest DRAFT so a
+			// prior un-published apply is updated in place rather than forked.
 			// dry-run still does the lookup so the agent sees which branch will
 			// fire when they un-dry the run.
-			existing, lookupErr := findActiveWorkflowByAlias(c, targetAlias)
+			existing, existingStatus, lookupErr := findWorkflowByAlias(c, targetAlias)
 			if lookupErr != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "# warning: alias lookup for %q failed (%v); falling back to create path\n", targetAlias, lookupErr)
 			}
@@ -353,7 +355,11 @@ Spec format (see file header for full reference):
 			if dryRun {
 				if existing != nil {
 					existingID, _ := existing["id"].(string)
-					fmt.Fprintf(cmd.OutOrStderr(), "# DRY RUN -- apply UPDATE path: would draft + autosave + publish workflow id=%s alias=%s\n", existingID, targetAlias)
+					if existingStatus == "DRAFT" {
+						fmt.Fprintf(cmd.OutOrStderr(), "# DRY RUN -- apply UPDATE path: would adopt existing DRAFT id=%s alias=%s (lock + autosave%s)\n", existingID, targetAlias, publishSuffix(publish))
+					} else {
+						fmt.Fprintf(cmd.OutOrStderr(), "# DRY RUN -- apply UPDATE path: would draft + autosave + publish ACTIVE workflow id=%s alias=%s\n", existingID, targetAlias)
+					}
 				} else {
 					fmt.Fprintln(cmd.OutOrStderr(), "# DRY RUN -- apply CREATE path: would POST /v2/workflows with the body below")
 				}
@@ -402,40 +408,68 @@ Spec format (see file header for full reference):
 					lastKnownVersion = int(v)
 				}
 
-				fmt.Fprintf(cmd.ErrOrStderr(), "# apply UPDATE path: workflow id=%s alias=%s lastKnownVersion=%d\n", wfID, targetAlias, lastKnownVersion)
+				adoptDraft := existingStatus == "DRAFT"
+				fmt.Fprintf(cmd.ErrOrStderr(), "# apply UPDATE path: workflow id=%s alias=%s status=%s lastKnownVersion=%d\n", wfID, targetAlias, existingStatus, lastKnownVersion)
 				printComposeSummary(cmd.ErrOrStderr(), workflow)
 
-				// 1) create-draft --force-recreate (clean draft regardless
-				//    of whether one already exists). The response is wrapped:
-				//    {created, message, workflow: {id, ...}}.
-				draftBody, _ := json.Marshal(map[string]any{"forceRecreate": true})
-				draftResp, _, err := c.Do("POST", "borrower_central", "/v2/workflows/"+wfID+"/create-draft", json.RawMessage(draftBody))
-				if err != nil {
-					return fmt.Errorf("create draft for %s: %w", wfID, err)
-				}
-				var draftWrap map[string]any
-				if err := json.Unmarshal(draftResp, &draftWrap); err != nil {
-					return fmt.Errorf("parse create-draft response: %w", err)
-				}
-				draft, _ := draftWrap["workflow"].(map[string]any)
-				if draft == nil {
-					// Fallback for an unwrapped shape.
-					draft = draftWrap
-				}
-				draftID, _ := draft["id"].(string)
-				if draftID == "" {
-					return fmt.Errorf("create-draft for %s returned no workflow.id", wfID)
-				}
+				// 1) Obtain the draft to autosave onto.
+				//    - ACTIVE base: create-draft --force-recreate (clean draft
+				//      regardless of whether one already exists). Response is
+				//      wrapped: {created, message, workflow: {id, ...}}.
+				//    - DRAFT base: the workflow IS already a draft (a prior
+				//      un-published apply). Adopt it directly -- create-draft
+				//      requires an ACTIVE base and would fail here -- so we lock
+				//      and autosave onto this id, exactly as the Hub editor does
+				//      when you re-open an unpublished draft.
+				var draftID string
 				draftVersion := lastKnownVersion
-				if v, ok := draft["version"].(float64); ok {
-					draftVersion = int(v)
+				if adoptDraft {
+					draftID = wfID
+					fmt.Fprintf(cmd.ErrOrStderr(), "# adopting existing draft %s (version %d)\n", draftID, draftVersion)
+				} else {
+					draftBody, _ := json.Marshal(map[string]any{"forceRecreate": true})
+					draftResp, _, err := c.Do("POST", "borrower_central", "/v2/workflows/"+wfID+"/create-draft", json.RawMessage(draftBody))
+					if err != nil {
+						return fmt.Errorf("create draft for %s: %w", wfID, err)
+					}
+					var draftWrap map[string]any
+					if err := json.Unmarshal(draftResp, &draftWrap); err != nil {
+						return fmt.Errorf("parse create-draft response: %w", err)
+					}
+					draft, _ := draftWrap["workflow"].(map[string]any)
+					if draft == nil {
+						// Fallback for an unwrapped shape.
+						draft = draftWrap
+					}
+					draftID, _ = draft["id"].(string)
+					if draftID == "" {
+						return fmt.Errorf("create-draft for %s returned no workflow.id", wfID)
+					}
+					if v, ok := draft["version"].(float64); ok {
+						draftVersion = int(v)
+					}
+					fmt.Fprintf(cmd.ErrOrStderr(), "# created draft %s (version %d)\n", draftID, draftVersion)
 				}
-				fmt.Fprintf(cmd.ErrOrStderr(), "# created draft %s (version %d)\n", draftID, draftVersion)
 
 				// 2) lock acquire (alias-keyed endpoint)
 				clientID := fmt.Sprintf("apply-%d", time.Now().UnixNano())
-				lockBody, _ := json.Marshal(map[string]string{"clientId": clientID})
-				lockResp, _, err := c.Do("POST", "borrower_central", "/v2/workflows/"+targetAlias+"/lock", json.RawMessage(lockBody))
+				acquireLock := func() (json.RawMessage, error) {
+					lockBody, _ := json.Marshal(map[string]string{"clientId": clientID})
+					resp, _, e := c.Do("POST", "borrower_central", "/v2/workflows/"+targetAlias+"/lock", json.RawMessage(lockBody))
+					return resp, e
+				}
+				lockResp, err := acquireLock()
+				if err != nil && strings.Contains(err.Error(), "SELF_LOCK_CONFLICT") {
+					// A stale lock left by THIS principal -- e.g. a prior apply
+					// that died before releasing. Each apply uses a fresh
+					// clientId, so it can't reuse its own lock; force-release and
+					// retry once. We only do this for a self-conflict: a lock held
+					// by a different user surfaces as a non-self conflict and is
+					// left untouched so apply never stomps a live Hub editor.
+					fmt.Fprintf(cmd.ErrOrStderr(), "# stale self-lock on %s; force-releasing and retrying\n", targetAlias)
+					_, _, _ = c.Do("DELETE", "borrower_central", "/v2/workflows/"+targetAlias+"/lock/force", nil)
+					lockResp, err = acquireLock()
+				}
 				if err != nil {
 					return fmt.Errorf("acquire lock on %s: %w", targetAlias, err)
 				}
@@ -448,6 +482,14 @@ Spec format (see file header for full reference):
 					return fmt.Errorf("lock acquire for %s returned no lockToken", targetAlias)
 				}
 				fmt.Fprintf(cmd.ErrOrStderr(), "# acquired lock client-id=%s\n", clientID)
+				// Release the lock when apply returns (after autosave + any
+				// publish). Each apply uses a fresh clientId, so a lock left
+				// dangling from a prior apply makes the NEXT apply fail with a
+				// SELF_LOCK_CONFLICT until the 300s TTL expires -- especially on
+				// the DRAFT-adopt-without-publish path, which otherwise never
+				// clears it. Best-effort: publish may already release it
+				// server-side, in which case this DELETE is a harmless no-op.
+				defer releaseWfv2Lock(c, targetAlias, lockToken)
 
 				// 3) autosave the assembled body onto the draft
 				autosavePayload := map[string]any{
@@ -487,12 +529,22 @@ Spec format (see file header for full reference):
 				resultJSON = autoResp
 				fmt.Fprintf(cmd.ErrOrStderr(), "# autosaved draft %s\n", draftID)
 
-				// 4) publish the draft (apply's contract is the spec is
-				//    desired state -- so we always publish on the update
-				//    path, regardless of --publish). The pre-publish lint
-				//    still runs, same gating as the create path.
-				if err := lintAndPublish(c, cmd, draftID, skipLintOnPublish); err != nil {
-					return err
+				// 4) publish decision.
+				//    - ACTIVE base: always publish. The workflow is already live,
+				//      so the spec-as-desired-state contract means republish the
+				//      updated graph (unchanged behavior). Pre-publish lint gates.
+				//    - DRAFT base (adopt): publish only when --publish is set,
+				//      otherwise leave it a draft. The workflow was never live; a
+				//      prior apply deliberately (or incidentally) left it in
+				//      DRAFT, so re-applying without --publish keeps it editable
+				//      rather than surprising the author by going live. This
+				//      mirrors the CREATE path (DRAFT unless --publish).
+				if !adoptDraft || publish {
+					if err := lintAndPublish(c, cmd, draftID, skipLintOnPublish); err != nil {
+						return err
+					}
+				} else {
+					fmt.Fprintf(cmd.OutOrStderr(), "# updated DRAFT workflow %s (alias=%s); not published (pass --publish to go live)\n", draftID, targetAlias)
 				}
 			}
 
@@ -574,22 +626,40 @@ func lintAndPublish(c *client.Client, cmd *cobra.Command, wfID string, skipLintO
 	return nil
 }
 
-// findActiveWorkflowByAlias returns the (single) ACTIVE workflow with the
-// given alias on the tenant, or nil when nothing matches. Used by apply to
-// decide between CREATE and UPDATE paths.
-//
-// Calls /v2/workflows?alias=<x>&status=ACTIVE&is-latest=true. The generic
-// filter has historically been ignored silently by some BC handlers, so we
-// also filter client-side after parsing. If the API returns multiple ACTIVE
-// versions sharing the alias (shouldn't happen post-publish, but possible
-// during a half-broken state), we return the highest-version one and warn.
-func findActiveWorkflowByAlias(c *client.Client, alias string) (map[string]any, error) {
+// findWorkflowByAlias resolves the workflow apply should reconcile against:
+// the ACTIVE version, else the latest DRAFT. Returns the workflow, its status
+// ("ACTIVE"|"DRAFT"), or (nil, "", nil) when nothing matches. The DRAFT
+// fallback keeps apply an idempotent upsert: a prior apply WITHOUT --publish
+// leaves a DRAFT that an ACTIVE-only lookup can't see, so the next apply would
+// otherwise fork a duplicate instead of adopting it.
+func findWorkflowByAlias(c *client.Client, alias string) (map[string]any, string, error) {
+	active, err := queryLatestWorkflowByAliasStatus(c, alias, "ACTIVE")
+	if err != nil {
+		return nil, "", err
+	}
+	if active != nil {
+		return active, "ACTIVE", nil
+	}
+	draft, err := queryLatestWorkflowByAliasStatus(c, alias, "DRAFT")
+	if err != nil {
+		return nil, "", err
+	}
+	if draft != nil {
+		return draft, "DRAFT", nil
+	}
+	return nil, "", nil
+}
+
+// queryLatestWorkflowByAliasStatus returns the highest-version workflow matching
+// alias+status, or nil when none match. BC handlers have historically ignored
+// the query filters, so we also filter client-side after parsing.
+func queryLatestWorkflowByAliasStatus(c *client.Client, alias, status string) (map[string]any, error) {
 	if alias == "" {
 		return nil, nil
 	}
 	q := url.Values{}
 	q.Set("alias", alias)
-	q.Set("status", "ACTIVE")
+	q.Set("status", status)
 	q.Set("is-latest", "true")
 	q.Set("per-page", "10")
 	path := "/v2/workflows?" + q.Encode()
@@ -615,8 +685,8 @@ func findActiveWorkflowByAlias(c *client.Client, alias string) (map[string]any, 
 		if wa == "" {
 			wa, _ = w["workflowAlias"].(string)
 		}
-		status, _ := w["status"].(string)
-		if wa == alias && status == "ACTIVE" {
+		st, _ := w["status"].(string)
+		if wa == alias && st == status {
 			matches = append(matches, w)
 		}
 	}
@@ -624,8 +694,7 @@ func findActiveWorkflowByAlias(c *client.Client, alias string) (map[string]any, 
 		return nil, nil
 	}
 	if len(matches) > 1 {
-		// Pick the highest version, warn so the caller knows the tenant is
-		// in a weird state.
+		// Pick the highest version.
 		best := matches[0]
 		bestV := 0
 		if v, ok := best["version"].(float64); ok {

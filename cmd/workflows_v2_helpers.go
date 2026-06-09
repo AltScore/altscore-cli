@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/client"
 	"github.com/AltScore/altscore-cli/internal/output"
@@ -121,6 +122,30 @@ func asSlice(v any) []any {
 	return []any{}
 }
 
+// publishSuffix renders the publish-or-not tail used in apply's DRAFT-adoption
+// dry-run message.
+func publishSuffix(publish bool) string {
+	if publish {
+		return " + publish"
+	}
+	return " (stays DRAFT; pass --publish to go live)"
+}
+
+// isScopedRef reports whether s is a scoped reference (a dotted path like
+// inputs.x / task_outputs.a.b, or the __static__:: literal escape). Bare names
+// like "total_score" are unscoped and won't resolve at runtime.
+func isScopedRef(s string) bool {
+	return strings.Contains(s, ".") || strings.HasPrefix(s, "__static__::")
+}
+
+// lastDotSegment returns the substring after the final "." (or all of s if none).
+func lastDotSegment(s string) string {
+	if i := strings.LastIndex(s, "."); i >= 0 {
+		return s[i+1:]
+	}
+	return s
+}
+
 // asMap coerces any (possibly nil) value into map[string]any.
 func asMap(v any) map[string]any {
 	if v == nil {
@@ -185,9 +210,9 @@ custom UI hints, etc.). Do not put task config in --data.`,
 			}
 			if taskAlias == "" && taskID == "" {
 				return fmt.Errorf(
-					"every node needs --task-alias (or --task-id) -- including start/end/conditional. "+
-						"The Hub creates a backing task for every node, including trivial ones. "+
-						"Create the task first with 'altscore tasks-v2 create' OR scaffold the whole workflow with "+
+					"every node needs --task-alias (or --task-id) -- including start/end/conditional. " +
+						"The Hub creates a backing task for every node, including trivial ones. " +
+						"Create the task first with 'altscore tasks-v2 create' OR scaffold the whole workflow with " +
 						"'altscore workflows-v2 apply --body @spec.json'.")
 			}
 			c, err := loadClient()
