@@ -1,5 +1,7 @@
 ### Workflows V2 (Visual Builder)
 
+> Building a KYC, KYB, or onboarding flow? Read [kyc-kyb-habits](kyc-kyb-habits.md) first — tenant/country-agnostic structure (orchestrator vs per-party child, identity & idempotency, two-layer decisioning) that complements the build mechanics below.
+
 > **⚠️ STOP — read this before doing anything.**
 >
 > If the user asks "create a v2 workflow that does X" — or "update workflow Y to do Z" — run **`altscore workflows-v2 apply`** with a single spec file. `apply` is declarative: it reconciles the spec against the tenant. If no workflow shares the spec's alias, it creates one (POST tasks + POST workflow); if one already exists, it updates in place (fresh tasks + create-draft + lock + autosave + publish, same workflow id and alias retained). One verb, one validation pipeline, no fork-vs-update branch for the agent.

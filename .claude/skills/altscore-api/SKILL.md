@@ -105,6 +105,7 @@ Load the file that matches the task:
 | Workflows v1 | [references/workflows-v1.md](references/workflows-v1.md) | workflow-tasks, task-tests, v1 workflows, input-schema reference, DAG data-flow rules |
 | Workflows v2 | [references/workflows-v2.md](references/workflows-v2.md) | `apply`, tasks-v2, CRUD, lock dance, lifecycle, schedules, import/export, execute, helpers, variable resolution, atomic deal patterns |
 | Credit decisioning | [references/credit-decisioning.md](references/credit-decisioning.md) | mapping-tables, scorecards, evaluation-rules, decisions, rule-trees, pitfalls |
+| KYC/KYB good habits | [references/kyc-kyb-habits.md](references/kyc-kyb-habits.md) | tenant/country-agnostic structural habits for onboarding & screening flows — read before authoring a KYC/KYB/onboarding workflow |
 | AltData | [references/altdata.md](references/altdata.md) | source discovery (`describe` pre-flight), data requests |
 | Python SDK | [references/sdk.md](references/sdk.md) | in-task SDK, modules, borrower methods, macros, evaluators, reading enrichment packages |
 | Report generation | [references/reports.md](references/reports.md) | PDF report components and task patterns |
