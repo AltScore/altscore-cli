@@ -74,7 +74,9 @@ type composeSpec struct {
 	Label           string         `json:"label"`
 	Alias           string         `json:"alias,omitempty"`
 	Category        string         `json:"category"`
-	Description     string         `json:"description,omitempty"`
+	// Pointer so an explicit "" (blank the description) is distinguishable from
+	// an omitted field (leave the existing description untouched on update).
+	Description     *string        `json:"description,omitempty"`
 	Status          string         `json:"status,omitempty"`
 	InputVariables  map[string]any `json:"inputVariables,omitempty"`
 	CustomVariables map[string]any `json:"customVariables,omitempty"`
@@ -2065,23 +2067,38 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		adviseExtractionProbes(spec.CustomVariables, specNodes)
 	}
 
-	// Auto-add `persona` to the workflow's inputVariables when any
-	// customer/deal/asset task uses operation=write but the spec didn't
-	// declare it. CreateBorrower's strict Literal["individual","business"]
-	// validator fires at runtime on the new-borrower path; without this
-	// auto-add, a workflow first-time-running for a not-yet-existing
-	// borrower crashes with a Pydantic ValidationError that surfaces as
-	// statusCode=500 and an opaque error message. The default value is
-	// "individual" -- conservative, matches what the Hub UI fills in.
-	// Caller-supplied inputVariables.persona always wins (we never override).
-	for _, t := range spec.Tasks {
-		tt, _ := t["type"].(string)
-		if tt != "customer" && tt != "deal" && tt != "asset" {
-			continue
+	// persona is required by CreateBorrower's Literal["individual","business"]
+	// validator on the new-borrower path. It is a property of the workflow's
+	// DESIGN (a cedula flow is always "individual", a RUC flow always
+	// "business"), not a per-execution choice -- so by default it lives on the
+	// entity-write task as a literal (set by normalizeEntityWriteTask) and does
+	// NOT surface as a user-facing input. The runtime resolves persona as
+	// `context.get("persona") or task.persona`, so a mapped context value wins.
+	//
+	// Only add inputVariables.persona when the agent opted into a per-execution
+	// persona: by declaring it, or by wiring an entity-write task's
+	// inputMappings.persona to inputs.*. Caller-supplied inputVariables.persona
+	// always wins (we never override).
+	personaAsInput := false
+	if _, has := spec.InputVariables["persona"]; has {
+		personaAsInput = true
+	}
+	if !personaAsInput {
+		for _, t := range spec.Tasks {
+			tt, _ := t["type"].(string)
+			if tt != "customer" && tt != "deal" && tt != "asset" {
+				continue
+			}
+			if op, _ := t["operation"].(string); op != "write" {
+				continue
+			}
+			if src, _ := asMap(t["inputMappings"])["persona"].(string); strings.HasPrefix(strings.TrimSpace(src), "inputs.") {
+				personaAsInput = true
+				break
+			}
 		}
-		if op, _ := t["operation"].(string); op != "write" {
-			continue
-		}
+	}
+	if personaAsInput {
 		if spec.InputVariables == nil {
 			spec.InputVariables = map[string]any{}
 		}
@@ -2094,7 +2111,6 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				"description": "Borrower persona at create time. Defaults to 'individual'; pass 'business' when triggering the workflow for a corporate borrower.",
 			}
 		}
-		break // one auto-add covers all entity-write tasks in the spec
 	}
 
 	// Opinionated end-node defaults (gated by --no-auto-defaults): force PDF
@@ -2678,8 +2694,11 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 	if spec.Alias != "" {
 		wf["alias"] = spec.Alias
 	}
-	if spec.Description != "" {
-		wf["description"] = spec.Description
+	// Send description whenever the spec set the field -- including an explicit
+	// "" -- so a workflow's description can be blanked on update. Omitting the
+	// field (nil) leaves the existing description untouched.
+	if spec.Description != nil {
+		wf["description"] = *spec.Description
 	}
 	if spec.Config != nil {
 		wf["config"] = spec.Config
