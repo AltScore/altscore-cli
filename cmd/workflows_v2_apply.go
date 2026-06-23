@@ -2904,6 +2904,17 @@ func preflightTasks(spec *composeSpec) error {
 		fmt.Fprintln(os.Stderr,
 			"# warning: compose spec has no 'end' node. Most workflows need one for the engine to know where to terminate cleanly.")
 	}
+	if endInTasks > 1 {
+		// A workflow must converge to exactly one end node. Surfaced here in
+		// preflight so the apply CREATE path catches it before POSTing (the
+		// CREATE path doesn't run validateWorkflowV2Body). Mirror the start-node
+		// uniqueness check above.
+		return fmt.Errorf(
+			"spec has %d 'end' nodes. A workflow must have exactly ONE end node; "+
+				"converge all paths (conditional branches, relationship handles) to a single end.",
+			endInTasks,
+		)
+	}
 
 	// Soft advisory: routing tasks (conditional) with branch
 	// edges targeting exception tasks usually indicate the agent is treating

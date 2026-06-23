@@ -259,7 +259,7 @@ func TestDeriveAltdataInputKeysForCreate_FallbackError(t *testing.T) {
 }
 
 // TestValidateWorkflowV2Body_MultipleEndNodes covers the rule: a workflow must
-// converge to a single end node unless it branches on a conditional.
+// have exactly one end node -- no exception, not even behind a conditional.
 func TestValidateWorkflowV2Body_MultipleEndNodes(t *testing.T) {
 	// Two end nodes, no conditional -> error.
 	body := json.RawMessage(`{
@@ -270,11 +270,11 @@ func TestValidateWorkflowV2Body_MultipleEndNodes(t *testing.T) {
 		]
 	}`)
 	err := validateWorkflowV2Body(&body)
-	if err == nil || !strings.Contains(err.Error(), "single end node") {
+	if err == nil || !strings.Contains(err.Error(), "exactly one end node") {
 		t.Fatalf("expected single-end-node error, got: %v", err)
 	}
 
-	// Two end nodes WITH a conditional -> allowed.
+	// Two end nodes WITH a conditional -> still rejected (hard limit, no carve-out).
 	body = json.RawMessage(`{
 		"nodes": [
 			{"nodeId": "s", "type": "start", "taskAlias": "s"},
@@ -283,8 +283,8 @@ func TestValidateWorkflowV2Body_MultipleEndNodes(t *testing.T) {
 			{"nodeId": "e2", "type": "end", "taskAlias": "e2"}
 		]
 	}`)
-	if err := validateWorkflowV2Body(&body); err != nil {
-		t.Fatalf("conditional should permit multiple end nodes, got: %v", err)
+	if err := validateWorkflowV2Body(&body); err == nil || !strings.Contains(err.Error(), "exactly one end node") {
+		t.Fatalf("a conditional must NOT permit multiple end nodes, got: %v", err)
 	}
 
 	// Single end node -> fine.
@@ -296,5 +296,36 @@ func TestValidateWorkflowV2Body_MultipleEndNodes(t *testing.T) {
 	}`)
 	if err := validateWorkflowV2Body(&body); err != nil {
 		t.Fatalf("single end node should not error, got: %v", err)
+	}
+}
+
+// TestPreflightTasks_MultipleEndNodes pins the apply CREATE-path guard: the
+// preflight rejects >1 end node before any /v2 POST (the CREATE path never runs
+// validateWorkflowV2Body).
+func TestPreflightTasks_MultipleEndNodes(t *testing.T) {
+	twoEnds := &composeSpec{
+		Label:      "Two ends",
+		Category:   "EVALUATION",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			{"ref": "e1", "type": "end", "label": "End A"},
+			{"ref": "e2", "type": "end", "label": "End B"},
+		},
+		Edges: []map[string]any{{"from": "start", "to": "e1"}, {"from": "start", "to": "e2"}},
+	}
+	err := preflightTasks(twoEnds)
+	if err == nil || !strings.Contains(err.Error(), "exactly ONE end node") {
+		t.Fatalf("preflight should reject two end nodes, got: %v", err)
+	}
+
+	oneEnd := &composeSpec{
+		Label:      "One end",
+		Category:   "EVALUATION",
+		ExtraNodes: startNode,
+		Tasks:      []map[string]any{{"ref": "e1", "type": "end", "label": "End"}},
+		Edges:      []map[string]any{{"from": "start", "to": "e1"}},
+	}
+	if err := preflightTasks(oneEnd); err != nil {
+		t.Fatalf("preflight should accept a single end node, got: %v", err)
 	}
 }
