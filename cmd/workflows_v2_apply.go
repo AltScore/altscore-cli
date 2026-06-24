@@ -2741,6 +2741,7 @@ var validTaskTypes = map[string]bool{
 	"compute-variables": true, "data-store-write": true, "data-store-query": true,
 	"customer": true, "deal": true, "credit-line": true,
 	"list-of-similars": true, "asset": true, "relationships": true,
+	"package-io": true, "sftp": true, "notices": true,
 }
 
 // preflightTasks runs cheap, local-only validation across every task in the
@@ -3284,14 +3285,12 @@ func preflightTasks(spec *composeSpec) error {
 			if mappings == nil {
 				mappings = map[string]any{}
 			}
-			_, hasBorrowerMapping := mappings["borrower_id"]
-			if _, hasInlineBorrower := cfg["borrower_id"].(string); !hasInlineBorrower && !hasBorrowerMapping {
-				return fmt.Errorf(
-					"node ref=%q: relationships task requires borrower_id "+
-						"via relationshipsConfig.borrower_id (inline) or inputMappings.borrower_id (variable)",
-					ref,
-				)
-			}
+			// borrower_id (the anchor borrower) is no longer required here: the
+			// backend resolves it from the workflow primary borrower
+			// (_primary_borrower_id, set by an upstream customer/create-borrower
+			// node or a borrower_id workflow input). An inline/mapped borrower_id
+			// still wins. The "needs a borrower" case is surfaced as a workflow-level
+			// warning in the Hub, not a hard compose-time error.
 			inlineItems := asSlice(cfg["items"])
 			_, hasItemsMapping := mappings["items"]
 			if len(inlineItems) == 0 && !hasItemsMapping {

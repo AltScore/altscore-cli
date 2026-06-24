@@ -68,12 +68,14 @@ func TestPreflightTasks_RelationshipsVariableBound(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsMissingBorrower: no borrower_id source on
-// either side -- reject. This is exactly the silent-zero-write bug the
-// preflight is supposed to catch.
-func TestPreflightTasks_RelationshipsMissingBorrower(t *testing.T) {
+// TestPreflightTasks_RelationshipsNoBorrowerOK: borrower_id is now OPTIONAL.
+// The backend resolves the anchor borrower from the workflow primary borrower
+// (_primary_borrower_id, set by an upstream customer/create-borrower node or a
+// borrower_id workflow input), so a relationships task with items but no
+// borrower_id must PASS preflight.
+func TestPreflightTasks_RelationshipsNoBorrowerOK(t *testing.T) {
 	spec := &composeSpec{
-		Label:    "Rel no borrower",
+		Label:      "Rel no borrower",
 		Category:   "ACTION",
 		ExtraNodes: startNode,
 		Tasks: []map[string]any{
@@ -81,13 +83,33 @@ func TestPreflightTasks_RelationshipsMissingBorrower(t *testing.T) {
 				"items": []any{map[string]any{"contact_id": "c-1"}},
 			}, nil),
 		},
+		Edges: []map[string]any{{"from": "start", "to": "rel"}},
 	}
-	err := preflightTasks(spec)
-	if err == nil {
-		t.Fatalf("preflight should reject missing borrower_id, got nil")
+	if err := preflightTasks(spec); err != nil {
+		t.Fatalf("preflight should accept relationships without borrower_id (backend-resolved), got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "borrower_id") {
-		t.Errorf("error should mention borrower_id, got: %v", err)
+}
+
+// TestPreflightTasks_PackageIO: package-io is a valid backend task type and must
+// pass preflight (regression for the missing-from-validTaskTypes bug that made
+// the CLI reject it as an "unknown task type").
+func TestPreflightTasks_PackageIO(t *testing.T) {
+	spec := &composeSpec{
+		Label:      "Package IO",
+		Category:   "OTHER",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			{
+				"ref":           "pkg",
+				"type":          "package-io",
+				"label":         "Package IO",
+				"packageConfig": map[string]any{"mode": "read", "alias": "x"},
+			},
+		},
+		Edges: []map[string]any{{"from": "start", "to": "pkg"}},
+	}
+	if err := preflightTasks(spec); err != nil {
+		t.Fatalf("preflight should accept package-io, got: %v", err)
 	}
 }
 
