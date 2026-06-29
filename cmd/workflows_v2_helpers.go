@@ -635,12 +635,13 @@ func makeWfv2SetMappingCmd() *cobra.Command {
 		Short: "Set or clear an input mapping on a node",
 		Long: `Set node.data.input_mappings[--input-name] = --expression on a node.
 
-Expression syntax (5-scope variable system):
+Expression syntax (variable system scopes):
   inputs.<name>
   task_outputs.<taskAlias>.<field>
   custom.<name>
   system.<key>
   task_outputs_by_type.<taskType>[<idx>].<field>
+  entity.<root>.<group>.<key>[.<subkey>]
 
 Use --clear to remove the mapping instead.`,
 		Example: `  altscore workflows-v2 set-mapping <id> --client-id cli-1 \
