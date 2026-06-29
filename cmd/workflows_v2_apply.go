@@ -1182,6 +1182,12 @@ var reservedMappingScopes = map[string]bool{
 	"system":               true,
 	"task_outputs":         true,
 	"task_outputs_by_type": true,
+	// entity.<root>.<group>.<key>[.<subkey>] is a backend pass-through scope
+	// (e.g. entity.borrower.identities.tax_id, entity.deal.deal_fields.x.amount,
+	// entity.<alias>:<handle>.identities.cedula for rel/deal-contact branch
+	// roots). The CLI has no data-model catalog, so like the other reserved
+	// scopes it only recognises the leading segment and never validates deeper.
+	"entity": true,
 }
 
 // mappingDependencyRef returns the spec-local task ref that an inputMappings
@@ -1277,8 +1283,8 @@ func templateDependencyRefs(task map[string]any) []string {
 // branch feat/workflows-v2-resolver-bare-alias-refs). We no longer rewrite
 // bare form to the long form; the server-side resolver expands it.
 //
-// Reserved scopes (inputs, custom, system, task_outputs, task_outputs_by_type)
-// are never treated as refs.
+// Reserved scopes (inputs, custom, system, task_outputs, task_outputs_by_type,
+// entity) are never treated as refs.
 //
 // Errors when a mapping value has a path-like shape whose head is neither a
 // reserved scope nor a known ref. composeWorkflowBody sorts tasks
@@ -1305,7 +1311,7 @@ func rewriteRefsInMappings(mappings map[string]any, refMap map[string]string) (m
 				} else if !isServerAlias(ref) {
 					return nil, fmt.Errorf(
 						"inputMappings[%q]=%q references task_outputs.%s.* but %q is not a known spec ref. "+
-							"Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type.)",
+							"Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type, entity.)",
 						k, v, ref, ref, sortedRefMapKeys(refMap))
 				}
 			}
@@ -1324,7 +1330,7 @@ func rewriteRefsInMappings(mappings map[string]any, refMap map[string]string) (m
 					return nil, fmt.Errorf(
 						"inputMappings[%q]=%q has head %q which is neither a reserved namespace "+
 							"nor a known spec ref nor a server alias (slug-NNNNNN). "+
-							"Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type.)",
+							"Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type, entity.)",
 						k, v, head, sortedRefMapKeys(refMap))
 				}
 			}
@@ -1429,7 +1435,7 @@ func rewriteRefsInTemplate(s string, refMap map[string]string, localMappings map
 			}
 			if !isServerAlias(ref) {
 				firstErr = fmt.Errorf(
-					"template references task_outputs.%s.* but %q is not a known spec ref. Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type.)",
+					"template references task_outputs.%s.* but %q is not a known spec ref. Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type, entity.)",
 					ref, ref, sortedRefMapKeys(refMap))
 				return match
 			}
@@ -1453,7 +1459,7 @@ func rewriteRefsInTemplate(s string, refMap map[string]string, localMappings map
 		// Unknown head -- error so the user sees the typo before runtime
 		// silently substitutes nothing.
 		firstErr = fmt.Errorf(
-			"template uses {{%s.<...>}} but %q is neither a reserved namespace nor a known spec ref nor a server alias. Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type.)",
+			"template uses {{%s.<...>}} but %q is neither a reserved namespace nor a known spec ref nor a server alias. Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type, entity.)",
 			inner, head, sortedRefMapKeys(refMap))
 		return match
 	})
@@ -3479,7 +3485,7 @@ func preflightTasks(spec *composeSpec) error {
 				if !reservedMappingScopes[head] && !knownRefs[head] {
 					return fmt.Errorf(
 						"node ref=%q: inputMappings[%q]=%q has unknown leading segment %q. "+
-							"Valid namespaces: inputs, custom, system, task_outputs, task_outputs_by_type. "+
+							"Valid namespaces: inputs, custom, system, task_outputs, task_outputs_by_type, entity. "+
 							"Or use a spec-local ref (one of: %s) which compose rewrites to task_outputs.<alias>. "+
 							"Without one of these the runtime resolver fails with 'Unknown variable namespace' at execution.",
 						ref, k, s, head, strings.Join(sortedKeys(knownRefs), ", "),
