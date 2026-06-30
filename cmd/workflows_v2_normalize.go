@@ -626,6 +626,57 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 		task["inputKeys"] = inputKeys
 	}
 
+	// Warn when a REQUIRED source field has no value wired through inputMappings.
+	// inputKeys only NAMES the task variable feeding each source field; the VALUE
+	// comes from inputMappings, the only field the runtime resolves. A required
+	// field with no mapping resolves to empty at runtime and the source returns
+	// 404 (the backend now blocks publish on this) -- surface it at compose time
+	// with the exact fix. Batch mode is exempt: row inputs come from
+	// inputRowsExpression, not inputMappings.
+	if mode, _ := task["mode"].(string); mode != "batch" {
+		inputMappings := asMap(task["inputMappings"])
+		seenReq := map[string]bool{}
+		var unmapped []string
+		for _, s := range sources {
+			sm, ok := s.(map[string]any)
+			if !ok {
+				continue
+			}
+			sid, _ := sm["sourceId"].(string)
+			ver, _ := sm["version"].(string)
+			if sid == "" {
+				continue
+			}
+			reqFields, err := lookupAltdataSourceRequiredFields(c, sid, ver, dryRun)
+			if err != nil {
+				continue // lookup failure already warned above; don't double-report
+			}
+			for _, f := range reqFields {
+				if seenReq[f] {
+					continue
+				}
+				if !altdataRequiredFieldSatisfied(f, inputKeys, inputMappings) {
+					seenReq[f] = true
+					unmapped = append(unmapped, f)
+				}
+			}
+		}
+		if len(unmapped) > 0 {
+			name, _ := task["alias"].(string)
+			if name == "" {
+				name, _ = task["label"].(string)
+			}
+			if name == "" {
+				name = "altdata-enrichment"
+			}
+			fmt.Fprintf(os.Stderr,
+				"# warning: altdata task %q: required source input(s) %v have no inputMappings entry; "+
+					"they resolve to empty at runtime and the source returns 404 (the backend blocks publish on this). "+
+					"Add an inputMappings entry, e.g. {%q: \"inputs.%s\"}.\n",
+				name, unmapped, unmapped[0], unmapped[0])
+		}
+	}
+
 	// Populate outputSchema from each source's declared output metadata.
 	// BC's DerivedSchemaService computes a parallel derivedSchema.output at
 	// GET time, but the Hub UI's variable-mapping pickers only read the
@@ -867,6 +918,75 @@ func lookupAltdataSourceInputFields(c *client.Client, sourceID, version string, 
 		}
 	}
 	return fieldNames, nil
+}
+
+// lookupAltdataSourceRequiredFields returns the names of a source's REQUIRED
+// input fields (a subset of inputFields). Reuses the per-run source-status
+// cache populated by lookupAltdataSourceInputFields, so it adds no extra fetch.
+func lookupAltdataSourceRequiredFields(c *client.Client, sourceID, version string, dryRun bool) ([]string, error) {
+	s, err := lookupAltdataSourceStatus(c, sourceID, version, dryRun)
+	if err != nil {
+		return nil, err
+	}
+	var required []string
+	for _, f := range asSlice(s["inputFields"]) {
+		fm, ok := f.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, _ := fm["field"].(string); name != "" && altdataFieldRequired(fm) {
+			required = append(required, name)
+		}
+	}
+	return required, nil
+}
+
+// altdataFieldRequired reads a source inputField's `required` flag. The source
+// catalogs emit it as the string "REQUIRED"/"OPTIONAL" (some as a bool); an
+// absent flag defaults to required, matching the backend source-status model.
+func altdataFieldRequired(fm map[string]any) bool {
+	switch v := fm["required"].(type) {
+	case bool:
+		return v
+	case string:
+		return !strings.EqualFold(v, "OPTIONAL") && !strings.EqualFold(v, "false")
+	default:
+		return true
+	}
+}
+
+// altdataRequiredFieldSatisfied reports whether a required source field will
+// receive a value at runtime: mapped directly by name, or its inputKeys entry
+// is a literal/constant, or every {{var}} that entry references is itself in
+// inputMappings (or a runtime builtin). Mirrors the backend publish gate
+// (ValidateSourceInputsUC) so CLI compose-time warnings match what publish
+// enforces.
+func altdataRequiredFieldSatisfied(field string, inputKeys, inputMappings map[string]any) bool {
+	if _, ok := inputMappings[field]; ok {
+		return true
+	}
+	entry, ok := inputKeys[field]
+	if !ok {
+		return false
+	}
+	tmpl, ok := entry.(string)
+	if !ok {
+		return true // a non-template literal value -> supplied
+	}
+	matches := templatePlaceholderRegex.FindAllStringSubmatch(tmpl, -1)
+	if len(matches) == 0 {
+		return true // constant literal -> supplied
+	}
+	for _, m := range matches {
+		v := strings.TrimSpace(m[1])
+		if strings.HasPrefix(v, "secret:") || v == "source_id" || v == "version" {
+			continue
+		}
+		if _, ok := inputMappings[v]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // lookupAltdataSourceOutputSchema returns the per-source JSON-Schema-shaped
