@@ -17,6 +17,26 @@ Or build from source (requires Go 1.25+):
 go build -buildvcs=false -o altscore .
 ```
 
+## Updating
+
+```bash
+altscore update
+```
+
+Downloads the latest release, verifies its SHA-256 checksum, and replaces the
+binary in place.
+
+The CLI also checks for newer releases on its own. At most once every 24 hours it
+refreshes a cached version number in a detached background process (it never adds
+latency to your command), and prints a one-line "update available" notice on an
+interactive terminal when you are behind. To upgrade silently instead of being
+notified, set `auto_update = true` under `[defaults]` in `~/.config/altscore/config.toml`
+or export `ALTSCORE_AUTO_UPDATE=1`. Silent auto-update is skipped in CI and
+non-interactive shells.
+
+Disable the check entirely with `ALTSCORE_NO_UPDATE_CHECK=1`. Dev builds never
+check or notify.
+
 ## Login
 
 ```bash
