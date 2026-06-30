@@ -20,6 +20,9 @@ type Profile struct {
 // Defaults holds global default settings.
 type Defaults struct {
 	PerPage int `toml:"per_page,omitempty"`
+	// AutoUpdate, when true, lets the background update check replace the
+	// binary in place instead of only printing an "update available" notice.
+	AutoUpdate bool `toml:"auto_update,omitempty"`
 }
 
 // Config is the top-level TOML config file structure.
@@ -49,6 +52,17 @@ func Path() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "config.toml"), nil
+}
+
+// StateFilePath returns the path to a non-credential state file inside the
+// config directory (e.g. the update-check cache). Kept separate from the
+// config file so transient state never rewrites stored credentials.
+func StateFilePath(name string) (string, error) {
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, name), nil
 }
 
 // Load reads the config file. Returns an empty config if the file does not exist.

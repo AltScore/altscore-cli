@@ -68,6 +68,23 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr, "Warning: running a dev build. Updating to the latest release.")
 	}
 
+	if err := performUpdate(rel, os.Stderr); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "Updated to %s\n", rel.TagName)
+	return nil
+}
+
+// performUpdate downloads the platform binary for rel, verifies its SHA-256
+// against the release checksums, and atomically replaces the running
+// executable. Progress lines are written to status; pass nil (or io.Discard)
+// to run silently, as the background updater does.
+func performUpdate(rel *ghRelease, status io.Writer) error {
+	if status == nil {
+		status = io.Discard
+	}
+
 	// Determine the asset name for this platform.
 	assetName := fmt.Sprintf("altscore-%s-%s", runtime.GOOS, runtime.GOARCH)
 
@@ -105,7 +122,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Download the binary to a temp file.
-	fmt.Fprintf(os.Stderr, "Downloading %s...\n", assetName)
+	fmt.Fprintf(status, "Downloading %s...\n", assetName)
 	tmpFile, actualHash, err := downloadToTemp(binaryURL)
 	if err != nil {
 		return err
@@ -116,7 +133,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	if actualHash != expectedHash {
 		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedHash, actualHash)
 	}
-	fmt.Fprintln(os.Stderr, "Checksum verified.")
+	fmt.Fprintln(status, "Checksum verified.")
 
 	// Replace the running binary.
 	execPath, err := os.Executable()
@@ -128,7 +145,6 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Updated to %s\n", rel.TagName)
 	return nil
 }
 
