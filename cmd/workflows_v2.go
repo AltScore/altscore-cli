@@ -1963,6 +1963,7 @@ Available sections (run with no arg to see the full structure):
   variables                             input/custom/system/task_outputs scopes
   mappings                              inputMappings rules + multi-dot syntax
   tasks                                 per-type config (perType + deprecatedTypes)
+  taskTypes                             lean machine-readable type list (live, enum-derived)
   composeSpec                           the spec format used by 'workflows-v2 apply'
   conditions                            ConditionGroup operator vocabulary
   creditDecisioningEntities             /v1/{evaluation-rules,mapping-tables,scorecards,rule-trees}
