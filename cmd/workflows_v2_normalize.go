@@ -394,9 +394,9 @@ func validateEntityWorkflowAliasMatch(opts *composeNormalizeOpts, entity map[str
 // broken (missing isElse branch, expression instead of conditions, etc.).
 //
 // opts threads the compose-time context (workflow's predicted alias for
-// cross-checking entity scopes, customVariables for compute-variables
-// outputSchema derivation). Pass nil when running outside compose -- the
-// normalizers degrade gracefully (e.g. mismatch warnings are skipped).
+// cross-checking entity scopes, declared inputVariables for the persona
+// input opt-in). Pass nil when running outside compose -- the normalizers
+// degrade gracefully (e.g. mismatch warnings are skipped).
 func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	if opts == nil {
 		opts = &composeNormalizeOpts{}
@@ -405,8 +405,9 @@ func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNorma
 	switch taskType {
 	case "altdata-enrichment":
 		return normalizeAltdataTask(c, task, dryRun)
-	case "compute-variables":
-		return normalizeComputeVariablesTask(task, opts.CustomVariables)
+	// compute-variables needs no normalization: its outputSchema is derived
+	// server-side by BC's DerivedSchemaService from selectedVariables plus
+	// the workflow's live customVariables.
 	case "conditional":
 		return normalizeConditionalTask(task)
 	case "customer", "deal", "asset":
@@ -677,67 +678,11 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 		}
 	}
 
-	// Populate outputSchema from each source's declared output metadata.
-	// BC's DerivedSchemaService computes a parallel derivedSchema.output at
-	// GET time, but the Hub UI's variable-mapping pickers only read the
-	// persisted outputSchema field -- CLI-created altdata tasks otherwise
-	// show "no outputs" in downstream task editors until the user re-saves
-	// in the Hub. Match the EXACT wrap the Hub itself applies when it falls
-	// back from outputSchema to derivedSchema (see
-	// altscore-ai-chat/lib/workflow-outputs/calculate-available-outputs.ts):
-	//
-	//   outputSchema[sourceId] = {
-	//     type: "object",
-	//     title: sourceId,
-	//     properties: <catalog[sourceId]>,   // the {data, sourceData} blob
-	//   }
-	//
-	// This shape satisfies BC's Task.outputSchema validator
-	// (Dict[str, SchemaTypes] -> ObjectSchema for each source entry) AND
-	// yields the same downstream variable paths the Hub generates from its
-	// derivedSchema fallback, so users who already mapped against derived
-	// paths don't see surprising differences once outputSchema is persisted.
-	// User-supplied entries on the task body win on collision.
-	outputSchema := asMap(task["outputSchema"])
-	for _, s := range sources {
-		sm, ok := s.(map[string]any)
-		if !ok {
-			continue
-		}
-		sid, _ := sm["sourceId"].(string)
-		ver, _ := sm["version"].(string)
-		if sid == "" {
-			continue
-		}
-		if _, has := outputSchema[sid]; has {
-			// User-supplied entry wins.
-			continue
-		}
-		catalogOutput, err := lookupAltdataSourceOutputSchema(c, sid, ver, dryRun)
-		if err != nil {
-			// Best-effort: warn and skip; don't block apply on a single
-			// failed source lookup (network blip, unknown source id).
-			fmt.Fprintf(os.Stderr,
-				"# warning: could not populate outputSchema for source %s %s (%v); the Hub will fall back to derivedSchema\n",
-				sid, ver, err)
-			continue
-		}
-		entry := asMap(catalogOutput[sid])
-		if len(entry) == 0 {
-			// Catalog didn't declare an outputSchema for this source --
-			// nothing useful to mirror. Skip; derivedSchema fallback will
-			// kick in at the Hub layer if BC computes anything later.
-			continue
-		}
-		outputSchema[sid] = map[string]any{
-			"type":       "object",
-			"title":      sid,
-			"properties": entry,
-		}
-	}
-	if len(outputSchema) > 0 {
-		task["outputSchema"] = outputSchema
-	}
+	// outputSchema is no longer filled here: BC stamps it at task-create time
+	// AND serves a reconciled outputSchema + derivedSchema on every GET
+	// (DerivedSchemaService covers altdata-enrichment), so the CLI-side
+	// catalog mirror became redundant duplication. User-authored entries on
+	// the task body still pass through untouched and win on reconcile.
 
 	if _, has := task["mode"]; !has {
 		task["mode"] = "single"
@@ -748,45 +693,6 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 	if _, has := task["timeout"]; !has {
 		task["timeout"] = 60
 	}
-	return nil
-}
-
-// normalizeComputeVariablesTask derives outputSchema from selectedVariables +
-// the workflow's customVariables, mirroring the Hub plugin's buildOutputSchema.
-// Without this, downstream tasks see no available outputs from this task.
-func normalizeComputeVariablesTask(task map[string]any, customVariables map[string]any) error {
-	rawSelected := asSlice(task["selectedVariables"])
-	if len(rawSelected) == 0 {
-		return nil
-	}
-	out := asMap(task["outputSchema"])
-	for _, raw := range rawSelected {
-		name, _ := raw.(string)
-		if name == "" {
-			continue
-		}
-		if _, has := out[name]; has {
-			continue
-		}
-		entry := map[string]any{
-			"type":        "string",
-			"title":       name,
-			"description": "",
-		}
-		if cv, _ := customVariables[name].(map[string]any); cv != nil {
-			if t, _ := cv["type"].(string); t != "" {
-				entry["type"] = t
-			}
-			if title, _ := cv["title"].(string); title != "" {
-				entry["title"] = title
-			}
-			if desc, _ := cv["description"].(string); desc != "" {
-				entry["description"] = desc
-			}
-		}
-		out[name] = entry
-	}
-	task["outputSchema"] = out
 	return nil
 }
 
@@ -987,21 +893,6 @@ func altdataRequiredFieldSatisfied(field string, inputKeys, inputMappings map[st
 		}
 	}
 	return true
-}
-
-// lookupAltdataSourceOutputSchema returns the per-source JSON-Schema-shaped
-// output map declared by the altdata catalog. The catalog already returns
-// outputSchema in the BC DerivedSchemaService-compatible shape, namely
-// {<sourceId>: {properties: {<key>: {type, title, ...}}, type: "object",
-// title: ...}}, so this passes it through verbatim and the caller merges
-// into task["outputSchema"]. Returns nil (not an error) if the catalog
-// entry has no outputSchema -- some sources just don't declare one.
-func lookupAltdataSourceOutputSchema(c *client.Client, sourceID, version string, dryRun bool) (map[string]any, error) {
-	s, err := lookupAltdataSourceStatus(c, sourceID, version, dryRun)
-	if err != nil {
-		return nil, err
-	}
-	return asMap(s["outputSchema"]), nil
 }
 
 func normalizeConditionalTask(task map[string]any) error {
