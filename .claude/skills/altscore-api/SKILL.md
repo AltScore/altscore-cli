@@ -112,3 +112,4 @@ Load the file that matches the task:
 | Data-models | [references/data-models.md](references/data-models.md) | schema definitions: identity keys, fields, steps, decisions |
 | Workflow output fields | [references/output-fields.md](references/output-fields.md) | the `w_` prefix envelope (`w_standard_exec_output`, `w_attachments`, ...) |
 | Alerts | [references/alerts.md](references/alerts.md) | policy alerts on borrowers |
+| Analytics | [references/analytics.md](references/analytics.md) | metrics, widgets, dashboards, filter helpers; provisioning + verify loop |

@@ -902,6 +902,9 @@ already have a hand-assembled body and know exactly what you are sending.`
 	rootCmd.AddCommand(makePaymentOrdersGroupCmd("payment-orders"))
 	rootCmd.AddCommand(makePaymentOrdersGroupCmd("disbursements"))
 	rootCmd.AddCommand(makeDpasGroupCmd())
+
+	// --- Analytics (metrics, widgets, dashboards) ---
+	rootCmd.AddCommand(makeAnalyticsGroupCmd())
 }
 
 // Execute runs the root command.
