@@ -2055,6 +2055,28 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 	liveConditionOperatorsFetched = false
 	defer func() { fetchLiveConditionOperators = nil }()
 
+	// Same live-fallback treatment for the three remaining compiled-in
+	// vocabularies preflight validates: workflow category, relationship kind,
+	// and inputSchema type. Each map is only a mirror of a backend enum
+	// (CategoryEnum / relationships kinds / SchemaTypes), so wiring these hooks
+	// lets validation accept values the backend gained after this binary was
+	// built instead of falsely rejecting a valid spec. Reset each memo so every
+	// compose re-fetches lazily on its first miss.
+	fetchLiveWorkflowCategories = func() map[string]bool { return fetchServerWorkflowCategories(c) }
+	liveWorkflowCategories = nil
+	liveWorkflowCategoriesFetched = false
+	defer func() { fetchLiveWorkflowCategories = nil }()
+
+	fetchLiveRelationshipKinds = func() map[string]bool { return fetchServerRelationshipKinds(c) }
+	liveRelationshipKinds = nil
+	liveRelationshipKindsFetched = false
+	defer func() { fetchLiveRelationshipKinds = nil }()
+
+	fetchLiveInputSchemaTypes = func() map[string]bool { return fetchServerInputSchemaTypes(c) }
+	liveInputSchemaTypes = nil
+	liveInputSchemaTypesFetched = false
+	defer func() { fetchLiveInputSchemaTypes = nil }()
+
 	if err := preflightTasks(spec); err != nil {
 		return nil, err
 	}
@@ -2823,12 +2845,8 @@ func fetchServerTaskTypes(c *client.Client) map[string]bool {
 func preflightTasks(spec *composeSpec) error {
 	// Spec-level checks: workflow category + inputVariables shape. These
 	// fail with opaque backend errors otherwise; surface here.
-	if spec.Category != "" && !validWorkflowCategories[strings.ToUpper(spec.Category)] {
-		return fmt.Errorf(
-			"workflow.category=%q is not a valid value. Valid: ACTION, EVALUATION, CONTACT, OTHER. "+
-				"Note: CUSTOMER and DEAL are workflow ENTITY TYPES (config.entityType), not categories.",
-			spec.Category,
-		)
+	if err := checkWorkflowCategory(spec.Category); err != nil {
+		return err
 	}
 	for name, def := range spec.InputVariables {
 		dm, _ := def.(map[string]any)
@@ -2839,12 +2857,8 @@ func preflightTasks(spec *composeSpec) error {
 		if t == "" {
 			continue
 		}
-		if !validInputSchemaTypes[t] {
-			return fmt.Errorf(
-				"workflow.inputVariables.%s.type=%q is not a valid type. "+
-					"Valid: string, integer, number, boolean, object, array.",
-				name, t,
-			)
+		if err := checkInputSchemaType(t, fmt.Sprintf("workflow.inputVariables.%s.type", name)); err != nil {
+			return err
 		}
 	}
 
@@ -3383,10 +3397,6 @@ func preflightTasks(spec *composeSpec) error {
 			// an identity_value (or tax_id / <defaultIdentityKey> as shorthand).
 			upsertContacts, _ := cfg["upsertContacts"].(bool)
 			defaultIdentityKey, _ := cfg["defaultIdentityKey"].(string)
-			validRelKinds := map[string]bool{
-				"shareholder": true, "employee": true, "family": true,
-				"other": true, "unspecified": true,
-			}
 			legalRepCount := 0
 			for ii, item := range inlineItems {
 				im, ok := item.(map[string]any)
@@ -3426,12 +3436,10 @@ func preflightTasks(spec *composeSpec) error {
 					// persona presence is checked at runtime (only required if
 					// identity doesn't resolve to an existing borrower).
 				}
-				if kind, ok := im["relationship"].(string); ok && kind != "" && !validRelKinds[kind] {
-					return fmt.Errorf(
-						"node ref=%q: relationshipsConfig.items[%d].relationship=%q not in "+
-							"shareholder/employee/family/other/unspecified",
-						ref, ii, kind,
-					)
+				if kind, ok := im["relationship"].(string); ok && kind != "" {
+					if err := checkRelationshipKind(kind, fmt.Sprintf("node ref=%q: relationshipsConfig.items[%d]", ref, ii)); err != nil {
+						return err
+					}
 				}
 				if lr, _ := im["is_legal_representative"].(bool); lr {
 					legalRepCount++
@@ -3478,12 +3486,8 @@ func preflightTasks(spec *composeSpec) error {
 				if t == "" {
 					continue
 				}
-				if !validInputSchemaTypes[t] {
-					return fmt.Errorf(
-						"node ref=%q: inputSchema.%s.type=%q is not a valid type. "+
-							"Valid: string, integer, number, boolean, object, array.",
-						ref, fname, t,
-					)
+				if err := checkInputSchemaType(t, fmt.Sprintf("node ref=%q: inputSchema.%s.type", ref, fname)); err != nil {
+					return err
 				}
 			}
 		}
@@ -3753,6 +3757,181 @@ var validWorkflowCategories = map[string]bool{
 	"OTHER":      true,
 }
 
+// fetchLiveWorkflowCategories, when set, lazily returns the LIVE backend's
+// workflow-category vocabulary so validation can accept categories the backend
+// gained after this binary was built (validWorkflowCategories above is only a
+// mirror of the CategoryEnum). composeWorkflowBody wires it to
+// fetchServerWorkflowCategories before preflight; unit tests leave it nil,
+// keeping validation fully offline. Mirrors the fetchLiveTaskTypes hook.
+var fetchLiveWorkflowCategories func() map[string]bool
+
+// Live-category list, fetched at most once per compose and only when a category
+// is missing from the compiled-in mirror. liveWorkflowCategoriesFetched guards
+// the at-most-once semantics even when the fetch returns nil (offline or an
+// older backend without the section). Reset when the hook is wired.
+var (
+	liveWorkflowCategories        map[string]bool
+	liveWorkflowCategoriesFetched bool
+)
+
+// fetchServerWorkflowCategories queries
+// GET /v1/meta/workflows-v2-schema?section=workflowCategories, the sorted string
+// list BC derives from its CategoryEnum at request time. Returns nil on any
+// transport/shape error (incl. a 404 from an older backend that lacks the
+// section) so callers fall back to the compiled-in mirror -- exactly the
+// pre-existing behavior. Mirrors fetchServerTaskTypes.
+func fetchServerWorkflowCategories(c *client.Client) map[string]bool {
+	data, _, err := c.Do("GET", "borrower_central", "/v1/meta/workflows-v2-schema?section=workflowCategories", nil)
+	if err != nil {
+		return nil
+	}
+	var payload struct {
+		WorkflowCategories struct {
+			Values []string `json:"values"`
+		} `json:"workflowCategories"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil || len(payload.WorkflowCategories.Values) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(payload.WorkflowCategories.Values))
+	for _, v := range payload.WorkflowCategories.Values {
+		out[strings.ToUpper(v)] = true
+	}
+	return out
+}
+
+// checkWorkflowCategory validates a workflow's category, consulting the live
+// backend at most once when the (upper-cased) category is absent from the
+// compiled-in mirror. Empty category is always fine (the field is optional).
+// Mirrors checkConditionOperator's live-fallback semantics:
+//   - compiled-in-known           -> accept (fast path, no fetch)
+//   - live-known (newer backend)  -> warn + accept
+//   - unknown to a reachable backend -> reject, listing the live vocabulary
+//   - backend unreachable (offline / older backend / no hook wired)
+//     -> reject against the compiled-in list, exactly as before
+func checkWorkflowCategory(category string) error {
+	if category == "" {
+		return nil
+	}
+	up := strings.ToUpper(category)
+	if validWorkflowCategories[up] {
+		return nil
+	}
+	if !liveWorkflowCategoriesFetched && fetchLiveWorkflowCategories != nil {
+		liveWorkflowCategories = fetchLiveWorkflowCategories()
+		liveWorkflowCategoriesFetched = true
+	}
+	if liveWorkflowCategories[up] {
+		fmt.Fprintf(os.Stderr,
+			"# WARNING: workflow.category=%q is newer than this CLI build "+
+				"(absent from its compiled-in list) but IS accepted by the live backend -- proceeding. "+
+				"Update altscore-cli to refresh its offline category list.\n",
+			category,
+		)
+		return nil
+	}
+	if len(liveWorkflowCategories) > 0 {
+		return fmt.Errorf(
+			"workflow.category=%q is not a valid value. "+
+				"The live backend was consulted and does not list it either (%d categories): %v. "+
+				"Note: CUSTOMER and DEAL are workflow ENTITY TYPES (config.entityType), not categories.",
+			category, len(liveWorkflowCategories), sortedBoolMapKeys(liveWorkflowCategories),
+		)
+	}
+	return fmt.Errorf(
+		"workflow.category=%q is not a valid value "+
+			"(the live backend could not be checked -- offline or an older backend; "+
+			"validated against this build's compiled-in list only). Valid: ACTION, EVALUATION, CONTACT, OTHER. "+
+			"Note: CUSTOMER and DEAL are workflow ENTITY TYPES (config.entityType), not categories.",
+		category,
+	)
+}
+
+// validRelKinds mirrors the backend relationships-kind Literal
+// (app/model/core/relationships.py). Only a mirror -- checkRelationshipKind
+// consults the live backend once before rejecting, so a stale mirror can no
+// longer cause a FALSE REJECTION of a valid relationship kind.
+var validRelKinds = map[string]bool{
+	"shareholder": true, "employee": true, "family": true,
+	"other": true, "unspecified": true,
+}
+
+// fetchLiveRelationshipKinds, when set, lazily returns the LIVE backend's
+// relationship-kind vocabulary. composeWorkflowBody wires it to
+// fetchServerRelationshipKinds before preflight; unit tests leave it nil.
+var fetchLiveRelationshipKinds func() map[string]bool
+
+// Live relationship-kind list, fetched at most once per compose and only on the
+// first miss. liveRelationshipKindsFetched guards at-most-once even when the
+// fetch returns nil. Reset when the hook is wired.
+var (
+	liveRelationshipKinds        map[string]bool
+	liveRelationshipKindsFetched bool
+)
+
+// fetchServerRelationshipKinds queries
+// GET /v1/meta/workflows-v2-schema?section=relationshipKinds, the sorted string
+// list BC derives from the relationships-kind Literal at request time. Returns
+// nil on any transport/shape error so callers fall back to the compiled-in
+// mirror. Mirrors fetchServerTaskTypes.
+func fetchServerRelationshipKinds(c *client.Client) map[string]bool {
+	data, _, err := c.Do("GET", "borrower_central", "/v1/meta/workflows-v2-schema?section=relationshipKinds", nil)
+	if err != nil {
+		return nil
+	}
+	var payload struct {
+		RelationshipKinds struct {
+			Values []string `json:"values"`
+		} `json:"relationshipKinds"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil || len(payload.RelationshipKinds.Values) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(payload.RelationshipKinds.Values))
+	for _, v := range payload.RelationshipKinds.Values {
+		out[v] = true
+	}
+	return out
+}
+
+// checkRelationshipKind validates a relationships item's kind, consulting the
+// live backend at most once when the kind is absent from the compiled-in
+// mirror. `path` is the caller-formatted field prefix (e.g.
+// `node ref="x": relationshipsConfig.items[0]`). Mirrors
+// checkConditionOperator's live-fallback semantics.
+func checkRelationshipKind(kind, path string) error {
+	if validRelKinds[kind] {
+		return nil
+	}
+	if !liveRelationshipKindsFetched && fetchLiveRelationshipKinds != nil {
+		liveRelationshipKinds = fetchLiveRelationshipKinds()
+		liveRelationshipKindsFetched = true
+	}
+	if liveRelationshipKinds[kind] {
+		fmt.Fprintf(os.Stderr,
+			"# WARNING: %s.relationship=%q is newer than this CLI build "+
+				"(absent from its compiled-in list) but IS accepted by the live backend -- proceeding. "+
+				"Update altscore-cli to refresh its offline relationship-kind list.\n",
+			path, kind,
+		)
+		return nil
+	}
+	if len(liveRelationshipKinds) > 0 {
+		return fmt.Errorf(
+			"%s.relationship=%q is not a known relationship kind. "+
+				"The live backend was consulted and does not list it either (%d kinds): %v",
+			path, kind, len(liveRelationshipKinds), sortedBoolMapKeys(liveRelationshipKinds),
+		)
+	}
+	return fmt.Errorf(
+		"%s.relationship=%q not in "+
+			"shareholder/employee/family/other/unspecified "+
+			"(the live backend could not be checked -- offline or an older backend; "+
+			"validated against this build's compiled-in list only)",
+		path, kind,
+	)
+}
+
 // validAliasPattern matches the alias regex the backend treats as URL-safe.
 // Lowercase alphanumeric with internal dashes; backend does additional
 // length/uniqueness checks but at minimum aliases must match this shape so
@@ -3942,7 +4121,8 @@ func lintCanonicalEndNode(spec *composeSpec) {
 // validInputSchemaTypes mirrors the SchemaTypes Pydantic discriminated union
 // in borrower-central. The backend's error message lies ("permitted:
 // 'array'"); the real enum is below. Used by preflight to reject typos in
-// inputSchema.<field>.type before the API round-trip.
+// inputSchema.<field>.type before the API round-trip. Only a mirror --
+// checkInputSchemaType consults the live backend once before rejecting.
 var validInputSchemaTypes = map[string]bool{
 	"string":  true,
 	"integer": true,
@@ -3950,6 +4130,82 @@ var validInputSchemaTypes = map[string]bool{
 	"boolean": true,
 	"object":  true,
 	"array":   true,
+}
+
+// fetchLiveInputSchemaTypes, when set, lazily returns the LIVE backend's
+// inputSchema-type vocabulary. composeWorkflowBody wires it to
+// fetchServerInputSchemaTypes before preflight; unit tests leave it nil.
+var fetchLiveInputSchemaTypes func() map[string]bool
+
+// Live inputSchema-type list, fetched at most once per compose and only on the
+// first miss. liveInputSchemaTypesFetched guards at-most-once even when the
+// fetch returns nil. Reset when the hook is wired.
+var (
+	liveInputSchemaTypes        map[string]bool
+	liveInputSchemaTypesFetched bool
+)
+
+// fetchServerInputSchemaTypes queries
+// GET /v1/meta/workflows-v2-schema?section=inputSchemaTypes, the sorted string
+// list BC derives from the SchemaTypes discriminated union at request time.
+// Returns nil on any transport/shape error so callers fall back to the
+// compiled-in mirror. Mirrors fetchServerTaskTypes.
+func fetchServerInputSchemaTypes(c *client.Client) map[string]bool {
+	data, _, err := c.Do("GET", "borrower_central", "/v1/meta/workflows-v2-schema?section=inputSchemaTypes", nil)
+	if err != nil {
+		return nil
+	}
+	var payload struct {
+		InputSchemaTypes struct {
+			Values []string `json:"values"`
+		} `json:"inputSchemaTypes"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil || len(payload.InputSchemaTypes.Values) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(payload.InputSchemaTypes.Values))
+	for _, v := range payload.InputSchemaTypes.Values {
+		out[v] = true
+	}
+	return out
+}
+
+// checkInputSchemaType validates a schema field's type, consulting the live
+// backend at most once when the type is absent from the compiled-in mirror.
+// `path` is the caller-formatted field path (e.g. `workflow.inputVariables.x.type`
+// or `node ref="y": inputSchema.z.type`), so the `=%q` in the message reads as
+// `path=type`. Mirrors checkConditionOperator's live-fallback semantics.
+func checkInputSchemaType(t, path string) error {
+	if validInputSchemaTypes[t] {
+		return nil
+	}
+	if !liveInputSchemaTypesFetched && fetchLiveInputSchemaTypes != nil {
+		liveInputSchemaTypes = fetchLiveInputSchemaTypes()
+		liveInputSchemaTypesFetched = true
+	}
+	if liveInputSchemaTypes[t] {
+		fmt.Fprintf(os.Stderr,
+			"# WARNING: %s=%q is newer than this CLI build "+
+				"(absent from its compiled-in list) but IS accepted by the live backend -- proceeding. "+
+				"Update altscore-cli to refresh its offline type list.\n",
+			path, t,
+		)
+		return nil
+	}
+	if len(liveInputSchemaTypes) > 0 {
+		return fmt.Errorf(
+			"%s=%q is not a valid type. "+
+				"The live backend was consulted and does not list it either (%d types): %v.",
+			path, t, len(liveInputSchemaTypes), sortedBoolMapKeys(liveInputSchemaTypes),
+		)
+	}
+	return fmt.Errorf(
+		"%s=%q is not a valid type "+
+			"(the live backend could not be checked -- offline or an older backend; "+
+			"validated against this build's compiled-in list only). "+
+			"Valid: string, integer, number, boolean, object, array.",
+		path, t,
+	)
 }
 
 // unknownConditionFields walks a ConditionGroup tree and returns every leaf
