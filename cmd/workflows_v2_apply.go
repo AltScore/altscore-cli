@@ -2041,6 +2041,20 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 	// the cheap-and-obvious mistakes are now blocked client-side.
 	fetchLiveTaskTypes = func() map[string]bool { return fetchServerTaskTypes(c) }
 	defer func() { fetchLiveTaskTypes = nil }()
+
+	// Same live-fallback for conditional-node operator validation. The
+	// compiled-in conditionOperators map is only a mirror of the backend's
+	// WORKFLOW_CONDITION_OPERATORS table; wiring this hook lets validation accept
+	// operators the backend gained after this binary was built instead of
+	// falsely rejecting a valid workflow. Must be wired BEFORE preflightTasks:
+	// preflight's structural pass (validateTaskV2Body) already validates
+	// conditional-branch operators, so the hook has to be live by then. Reset the
+	// memo so each compose re-fetches lazily on the first miss.
+	fetchLiveConditionOperators = func() map[string]bool { return fetchServerConditionOperators(c) }
+	liveConditionOperators = nil
+	liveConditionOperatorsFetched = false
+	defer func() { fetchLiveConditionOperators = nil }()
+
 	if err := preflightTasks(spec); err != nil {
 		return nil, err
 	}
