@@ -2039,6 +2039,8 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 	// surface those errors before the first HTTP call. Server-side errors
 	// (e.g. "headers must be JSON-encoded string") still happen mid-loop, but
 	// the cheap-and-obvious mistakes are now blocked client-side.
+	fetchLiveTaskTypes = func() map[string]bool { return fetchServerTaskTypes(c) }
+	defer func() { fetchLiveTaskTypes = nil }()
 	if err := preflightTasks(spec); err != nil {
 		return nil, err
 	}
@@ -2750,6 +2752,37 @@ var validTaskTypes = map[string]bool{
 	"package-io": true, "sftp": true, "notices": true,
 }
 
+// fetchLiveTaskTypes, when set, lazily returns the LIVE backend's task-type
+// list so preflight can accept types added to the backend after this binary
+// was built (the compiled-in validTaskTypes map above is only a mirror).
+// composeWorkflowBody wires it to fetchServerTaskTypes before preflight;
+// unit tests leave it nil, keeping preflight fully offline.
+var fetchLiveTaskTypes func() map[string]bool
+
+// fetchServerTaskTypes queries GET /v1/meta/workflows-v2-schema?section=taskTypes,
+// the machine-readable type list BC derives from its TaskType enum at request
+// time. Returns nil on any transport/shape error -- callers fall back to the
+// compiled-in mirror, which is exactly the pre-existing behavior.
+func fetchServerTaskTypes(c *client.Client) map[string]bool {
+	data, _, err := c.Do("GET", "borrower_central", "/v1/meta/workflows-v2-schema?section=taskTypes", nil)
+	if err != nil {
+		return nil
+	}
+	var payload struct {
+		TaskTypes struct {
+			Values []string `json:"values"`
+		} `json:"taskTypes"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil || len(payload.TaskTypes.Values) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(payload.TaskTypes.Values))
+	for _, v := range payload.TaskTypes.Values {
+		out[v] = true
+	}
+	return out
+}
+
 // preflightTasks runs cheap, local-only validation across every task in the
 // spec before composeWorkflowBody starts POSTing. Catches the mistakes that
 // would otherwise create orphan /v2/tasks rows mid-loop. Without a tasks-v2
@@ -3057,6 +3090,12 @@ func preflightTasks(spec *composeSpec) error {
 		seenEdges[key] = true
 	}
 
+	// Live-backend type list, fetched at most once and only when a type is
+	// missing from the compiled-in mirror. Lets an older CLI accept types the
+	// backend gained after this binary was built instead of hard-rejecting.
+	var liveTaskTypes map[string]bool
+	liveTypesFetched := false
+
 	for i, task := range spec.Tasks {
 		ref := localRef(task, fmt.Sprintf("t%d", i))
 		label, _ := task["label"].(string)
@@ -3065,21 +3104,34 @@ func preflightTasks(spec *composeSpec) error {
 			return fmt.Errorf("node ref=%q: label and type are required (validated before any POST)", ref)
 		}
 		if !validTaskTypes[taskType] {
-			suggestion := closestTaskType(taskType)
-			suggestionLine := ""
-			if suggestion != "" {
-				suggestionLine = fmt.Sprintf("Did you mean %q? ", suggestion)
+			if !liveTypesFetched && fetchLiveTaskTypes != nil {
+				liveTaskTypes = fetchLiveTaskTypes()
+				liveTypesFetched = true
 			}
-			return fmt.Errorf(
-				"node ref=%q: unknown task type %q. %s"+
-					"The backend TaskType enum accepts %d values (active + deprecated combined). "+
-					"For new workflows use the active palette (20 types) -- run "+
-					"'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' to list them, "+
-					"and '.tasks.deprecatedTypes | keys' for the legacy ones. "+
-					"Common deprecations: 'data-store' is split into 'data-store-write'/'data-store-query'; "+
-					"'pdf-report' is now part of the 'end' task's endConfig.",
-				ref, taskType, suggestionLine, len(validTaskTypes),
-			)
+			if liveTaskTypes[taskType] {
+				fmt.Fprintf(os.Stderr,
+					"# WARNING: node ref=%q: task type %q is newer than this CLI build "+
+						"(absent from its compiled-in list) but IS accepted by the live backend -- proceeding. "+
+						"Per-type local validation is skipped for it; update altscore-cli to get it.\n",
+					ref, taskType,
+				)
+			} else {
+				suggestion := closestTaskType(taskType)
+				suggestionLine := ""
+				if suggestion != "" {
+					suggestionLine = fmt.Sprintf("Did you mean %q? ", suggestion)
+				}
+				return fmt.Errorf(
+					"node ref=%q: unknown task type %q. %s"+
+						"The backend TaskType enum accepts %d values (active + deprecated combined). "+
+						"For new workflows use the active palette (20 types) -- run "+
+						"'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' to list them, "+
+						"and '.tasks.deprecatedTypes | keys' for the legacy ones. "+
+						"Common deprecations: 'data-store' is split into 'data-store-write'/'data-store-query'; "+
+						"'pdf-report' is now part of the 'end' task's endConfig.",
+					ref, taskType, suggestionLine, len(validTaskTypes),
+				)
+			}
 		}
 
 		// Per-type required-field checks. These cover the orphan-task class
