@@ -24,10 +24,16 @@ func newUUIDv4() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// conditionOperators is the canonical operator vocabulary used by conditional
-// task branches and evaluation rules. Mirrors CONDITION_OPERATORS in
-// altscore-ai-chat/lib/types/borrower_central/evaluation-rules.ts -- keep
-// in sync.
+// conditionOperators is the compiled-in operator vocabulary used by conditional
+// task branches and evaluation rules -- the fast path and the offline fallback.
+// It is only a mirror of borrower-central's WORKFLOW_CONDITION_OPERATORS table
+// (app/service/condition_evaluator.py), served at
+// GET /v1/meta/workflows-v2-schema?section=conditionOperators. The server table
+// is a superset (canonical long forms like "equals"/"greater_than", plus
+// "is_true"/"is_false"/"is_empty"/"not_contains") whose aliases this mirror only
+// partially carries, so an operator absent here may still be perfectly valid.
+// checkConditionOperator consults the live backend once before rejecting, so a
+// stale mirror can no longer cause a FALSE REJECTION of a valid workflow.
 var conditionOperators = map[string]bool{
 	"eq": true, "neq": true,
 	"gt": true, "gte": true, "lt": true, "lte": true,
@@ -37,6 +43,107 @@ var conditionOperators = map[string]bool{
 	"isAltdataEmpty": true, "isAltdataNotCalculated": true,
 	"isAltdataError": true, "isAltdataNull": true, "isNotAltdataNull": true,
 	"arrayContainsAny": true, "arrayContainsAll": true,
+}
+
+// fetchLiveConditionOperators, when set, lazily returns the LIVE backend's
+// workflows-v2 conditional-operator vocabulary (canonical names AND their
+// aliases, flattened into one set -- they're interchangeable on the wire) so
+// validation can accept operators the backend gained after this binary was
+// built. composeWorkflowBody wires it to fetchServerConditionOperators before
+// normalize runs; unit tests leave it nil, keeping validation fully offline.
+// Mirrors the fetchLiveTaskTypes hook in workflows_v2_apply.go.
+var fetchLiveConditionOperators func() map[string]bool
+
+// Live-operator list, fetched at most once per compose and only when an
+// operator is missing from the compiled-in mirror. liveConditionOperatorsFetched
+// guards the at-most-once semantics even when the fetch returns nil (offline or
+// an older backend without the endpoint). Reset when the hook is wired.
+var (
+	liveConditionOperators        map[string]bool
+	liveConditionOperatorsFetched bool
+)
+
+// fetchServerConditionOperators queries
+// GET /v1/meta/workflows-v2-schema?section=conditionOperators and flattens the
+// `workflow` subsection (the superset a v2 conditional node accepts) into a set
+// of every accepted string -- canonical operator names plus each one's aliases.
+// Returns nil on any transport/shape error so callers fall back to the
+// compiled-in mirror, which is exactly the pre-existing behavior. Mirrors
+// fetchServerTaskTypes.
+func fetchServerConditionOperators(c *client.Client) map[string]bool {
+	data, _, err := c.Do("GET", "borrower_central", "/v1/meta/workflows-v2-schema?section=conditionOperators", nil)
+	if err != nil {
+		return nil
+	}
+	var payload struct {
+		ConditionOperators struct {
+			Workflow map[string]struct {
+				Aliases []string `json:"aliases"`
+			} `json:"workflow"`
+		} `json:"conditionOperators"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil || len(payload.ConditionOperators.Workflow) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(payload.ConditionOperators.Workflow))
+	for name, spec := range payload.ConditionOperators.Workflow {
+		out[name] = true
+		for _, alias := range spec.Aliases {
+			out[alias] = true
+		}
+	}
+	return out
+}
+
+// checkConditionOperator validates a single condition operator, consulting the
+// live backend at most once when the operator is absent from the compiled-in
+// mirror. Mirrors preflightTasks' live-type fallback semantics:
+//   - compiled-in-known           -> accept (fast path, no fetch)
+//   - live-known (newer backend)  -> warn + accept
+//   - unknown to a reachable backend -> reject, listing the live vocabulary
+//   - backend unreachable (offline / older backend / no hook wired)
+//     -> reject against the compiled-in list, exactly as before
+func checkConditionOperator(op, path string) error {
+	if conditionOperators[op] {
+		return nil
+	}
+	if !liveConditionOperatorsFetched && fetchLiveConditionOperators != nil {
+		liveConditionOperators = fetchLiveConditionOperators()
+		liveConditionOperatorsFetched = true
+	}
+	if liveConditionOperators[op] {
+		fmt.Fprintf(os.Stderr,
+			"# WARNING: %s.operator %q is newer than this CLI build "+
+				"(absent from its compiled-in list) but IS accepted by the live backend -- proceeding. "+
+				"Update altscore-cli to refresh its offline operator list.\n",
+			path, op,
+		)
+		return nil
+	}
+	if len(liveConditionOperators) > 0 {
+		return fmt.Errorf(
+			"%s.operator %q is not a known condition operator. "+
+				"The live backend was consulted and does not list it either (%d operators). valid: %v",
+			path, op, len(liveConditionOperators), sortedBoolMapKeys(liveConditionOperators),
+		)
+	}
+	return fmt.Errorf(
+		"%s.operator %q is not a known condition operator "+
+			"(the live backend could not be checked -- offline or an older backend; "+
+			"validated against this build's compiled-in list only). valid: %v",
+		path, op, sortedBoolMapKeys(conditionOperators),
+	)
+}
+
+// sortedBoolMapKeys returns the keys of a set map in deterministic order, so
+// error messages listing the valid operators are stable across runs.
+func sortedBoolMapKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // validateTaskV2Body is a non-mutating, network-free check used by the
@@ -1009,12 +1116,8 @@ func validateConditionGroup(v any, path string) error {
 	if op == "" {
 		return fmt.Errorf("%s.operator is required", path)
 	}
-	if !conditionOperators[op] {
-		known := []string{}
-		for k := range conditionOperators {
-			known = append(known, k)
-		}
-		return fmt.Errorf("%s.operator %q is not a known condition operator. valid: %v", path, op, known)
+	if err := checkConditionOperator(op, path); err != nil {
+		return err
 	}
 	if _, has := m["valueType"]; !has {
 		m["valueType"] = "value"
