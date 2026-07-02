@@ -173,7 +173,11 @@ func TestNormalizeEntityWriteTask_PersonaLiteralPreserved(t *testing.T) {
 }
 
 // Opt-in via a declared workflow input: persona keeps the input path -- the
-// task gets the inputSchema shape + an inputs.persona mapping, and no literal.
+// task gets an inputs.persona mapping and no literal. The inputSchema.persona
+// display entry is NO LONGER authored here: BC's DerivedSchemaService derives
+// it into derivedSchema server-side (#1526), and BC's create validator keeps a
+// persona mapping even when inputSchema doesn't declare it (shape-check only,
+// never prune). Only the load-bearing inputMappings wiring stays.
 func TestNormalizeEntityWriteTask_PersonaInputPath(t *testing.T) {
 	task := map[string]any{"type": "customer", "operation": "write"}
 	opts := &composeNormalizeOpts{InputVariables: map[string]any{"persona": map[string]any{"type": "string"}}}
@@ -187,9 +191,10 @@ func TestNormalizeEntityWriteTask_PersonaInputPath(t *testing.T) {
 	if m["persona"] != "inputs.persona" {
 		t.Errorf("persona mapping = %v, want inputs.persona", m["persona"])
 	}
-	s := task["inputSchema"].(map[string]any)
-	if _, has := s["persona"]; !has {
-		t.Errorf("inputSchema.persona expected on the input path: %v", s)
+	if s, _ := task["inputSchema"].(map[string]any); s != nil {
+		if _, has := s["persona"]; has {
+			t.Errorf("inputSchema.persona must no longer be authored (server-derived): %v", s)
+		}
 	}
 }
 

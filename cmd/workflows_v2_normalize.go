@@ -1677,19 +1677,24 @@ func mirrorNestedInputMappings(task map[string]any, cfg map[string]any, cfgKey s
 }
 
 // normalizeEntityWriteTask covers customer / deal / asset task types. Fills
-// gaps between what the canonical Hub-shaped body looks like and what an
-// agent typically writes from the schema-guide:
+// the RUNTIME gaps between the canonical Hub-shaped body and what an agent
+// typically writes from the schema-guide:
 //   - sourcesConfig[].type = "identity_key" -> "identity" (runtime checks
 //     `source["type"] == "identity"` literally; "identity_key" is silently
 //     dropped at runtime because the canonical entity_activity branch
 //     filter doesn't match it, so the borrower never gets the identity
 //     stamped on it)
-//   - For operation=write, pre-fill inputSchema.persona with the default
-//     ("individual") + required=true so CreateBorrower's strict Literal
-//     validator passes without the agent having to thread persona through
-//     every spec
-//   - Pre-fill outputSchema with the lookup key + borrower_id so downstream
-//     tasks see them in mapping pickers
+//   - For operation=write, resolve the borrower persona: either wire it from a
+//     declared workflow input (inputMappings.persona -> inputs.persona) or set
+//     the task literal ("individual") so CreateBorrower's strict Literal
+//     validator has a value at runtime.
+//
+// The persona INPUT-display entry and the outputSchema (borrower_id + lookup
+// key) that this normalizer used to mirror onto the task body are now derived
+// server-side by BC's DerivedSchemaService (_derive_customer_write /
+// _derive_deal / _derive_asset, deployed in #1526) and served as derivedSchema
+// on every GET, so the CLI no longer authors them. The runtime wiring above
+// has no server replacement (derivation is display-only) and stays.
 //
 // Symmetric for customer/deal/asset because all three share CustomerTaskData /
 // DealTaskData / AssetTaskData schemas and the same operation/lookupBy/key
@@ -1761,33 +1766,23 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 		// input. The runtime resolves persona as `context.get("persona") or
 		// task.persona`, so a resolved context value still wins.
 		//
+		// This is RUNTIME wiring, NOT a display fill. BC's DerivedSchemaService
+		// (schema_derivation.py, deployed in #1526) now derives the persona
+		// INPUT entry into derivedSchema for customer / create-borrower, so the
+		// CLI no longer authors inputSchema.persona -- but the display
+		// derivation never sets task.persona nor wires inputMappings.persona,
+		// so those two runtime steps stay here.
+		//
 		// Two opt-ins keep persona as a real workflow input: the agent
 		// declares inputVariables.persona, or wires an entity-write task's
-		// inputMappings.persona to inputs.*. In those cases we describe the
-		// input shape + ensure the wiring; otherwise we set the task literal.
+		// inputMappings.persona to inputs.*. In those cases we ensure the
+		// wiring; otherwise we set the task literal.
 		mappings := asMap(task["inputMappings"])
 		personaSrc, hasPersonaMapping := mappings["persona"].(string)
 		personaFromInput := hasPersonaMapping && strings.HasPrefix(strings.TrimSpace(personaSrc), "inputs.")
 		_, personaDeclaredInput := asMap(opts.InputVariables)["persona"]
 
 		if personaFromInput || personaDeclaredInput {
-			inSchema := asMap(task["inputSchema"])
-			persona := asMap(inSchema["persona"])
-			if _, has := persona["type"]; !has {
-				persona["type"] = "string"
-			}
-			if _, has := persona["default"]; !has {
-				persona["default"] = "individual"
-			}
-			if _, has := persona["title"]; !has {
-				persona["title"] = "Type of customer"
-			}
-			if _, has := persona["required"]; !has {
-				persona["required"] = true
-			}
-			inSchema["persona"] = persona
-			task["inputSchema"] = inSchema
-
 			if !hasPersonaMapping {
 				mappings["persona"] = "inputs.persona"
 				task["inputMappings"] = mappings
@@ -1801,30 +1796,15 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 		}
 		// (persona wired to a non-input source, e.g. custom.* -> leave as-is)
 
-		out := asMap(task["outputSchema"])
-		if _, has := out["borrower_id"]; !has {
-			out["borrower_id"] = map[string]any{
-				"type":        "string",
-				"description": "ID of the " + taskType,
-			}
-		}
-		// BC coalesces identityKey -> key on ingest (CreateTaskV2 pre-validator),
-		// but compose runs before ingest, so we have to honor both spellings
-		// here -- otherwise a spec using the agent-friendly `identityKey` loses
-		// the outputSchema entry for the lookup field.
-		key, _ := task["key"].(string)
-		if key == "" {
-			key, _ = task["identityKey"].(string)
-		}
-		if key != "" {
-			if _, has := out[key]; !has {
-				out[key] = map[string]any{
-					"type":        "string",
-					"description": humanizeKey(key),
-				}
-			}
-		}
-		task["outputSchema"] = out
+		// outputSchema fill removed: BC's DerivedSchemaService now derives
+		// customer/deal/asset outputSchema server-side (_derive_customer_write /
+		// _derive_deal / _derive_asset) and serves it as derivedSchema on every
+		// GET. The derived shape matches the runtime output exactly -- the
+		// per-source-row keys plus the entity id (borrower_id for customer,
+		// asset_id for asset, deal_id for deal) -- and is strictly more accurate
+		// than the CLI's one-size fill, which stamped borrower_id even on
+		// asset/deal (whose activities return asset_id/deal_id) and a lookup key
+		// that the write activities never emit as an output.
 	}
 	return nil
 }
