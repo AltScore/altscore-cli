@@ -2783,11 +2783,13 @@ func fetchServerTaskTypes(c *client.Client) map[string]bool {
 	return out
 }
 
-// preflightTasks runs cheap, local-only validation across every task in the
-// spec before composeWorkflowBody starts POSTing. Catches the mistakes that
-// would otherwise create orphan /v2/tasks rows mid-loop. Without a tasks-v2
-// DELETE endpoint, partial-failure cleanup is impossible; everything we can
-// catch locally we MUST.
+// preflightTasks runs cheap validation across every task in the spec before
+// composeWorkflowBody starts POSTing -- fully local, except at most one
+// read-only backend lookup when a task type is unknown to this build (see
+// fetchLiveTaskTypes). Catches the mistakes that would otherwise create
+// orphan /v2/tasks rows mid-loop. Without a tasks-v2 DELETE endpoint,
+// partial-failure cleanup is impossible; everything we can catch here we
+// MUST.
 //
 // Checks (in order, fail-fast):
 //  1. duplicate spec-local refs / explicit aliases
@@ -3121,15 +3123,17 @@ func preflightTasks(spec *composeSpec) error {
 				if suggestion != "" {
 					suggestionLine = fmt.Sprintf("Did you mean %q? ", suggestion)
 				}
+				liveNote := "The live backend type list could not be checked (offline or older backend); validated against this build's compiled-in list only. "
+				if len(liveTaskTypes) > 0 {
+					liveNote = fmt.Sprintf("The live backend was also consulted and does not list this type either (%d types). ", len(liveTaskTypes))
+				}
 				return fmt.Errorf(
-					"node ref=%q: unknown task type %q. %s"+
-						"The backend TaskType enum accepts %d values (active + deprecated combined). "+
-						"For new workflows use the active palette (20 types) -- run "+
-						"'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' to list them, "+
-						"and '.tasks.deprecatedTypes | keys' for the legacy ones. "+
+					"node ref=%q: unknown task type %q. %s%s"+
+						"Run 'altscore workflows-v2 schema-guide taskTypes' for the live list, or "+
+						"'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' for the active palette. "+
 						"Common deprecations: 'data-store' is split into 'data-store-write'/'data-store-query'; "+
 						"'pdf-report' is now part of the 'end' task's endConfig.",
-					ref, taskType, suggestionLine, len(validTaskTypes),
+					ref, taskType, suggestionLine, liveNote,
 				)
 			}
 		}
