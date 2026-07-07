@@ -154,9 +154,6 @@ workflow.`,
 		Example: `  altscore evaluation-rules copy <id> --workflow-alias scoring-pn-nuevo-cliente`,
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if workflowAlias == "" {
-				return fmt.Errorf("--workflow-alias is required (the target workflow to copy the rule into)")
-			}
 			c, err := loadClient()
 			if err != nil {
 				return err
@@ -174,6 +171,7 @@ workflow.`,
 		},
 	}
 	cmd.Flags().StringVar(&workflowAlias, "workflow-alias", "", "target workflow to copy the rule into (required)")
+	_ = cmd.MarkFlagRequired("workflow-alias")
 	return cmd
 }
 
