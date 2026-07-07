@@ -683,6 +683,7 @@ tasks via scorecardConfig (inline rules + totalScoreVariable).`,
 	// Credit-decisioning extras (declared in cmd/credit_decisioning.go).
 	erGroup.AddCommand(makeErImportCmd())
 	erGroup.AddCommand(makeErHistoryCmd())
+	erGroup.AddCommand(makeErCopyCmd())
 	rtGroup.AddCommand(makeRtImportCmd())
 	mtGroup.AddCommand(makeMtImportCmd())
 	scGroup.AddCommand(makeScImportCmd())

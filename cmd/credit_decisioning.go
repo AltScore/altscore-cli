@@ -136,6 +136,47 @@ func makeErHistoryCmd() *cobra.Command {
 	}
 }
 
+func makeErCopyCmd() *cobra.Command {
+	var workflowAlias string
+	cmd := &cobra.Command{
+		Use:   "copy <id>",
+		Short: "Duplicate an evaluation rule into another workflow",
+		Long: `POST /v1/evaluation-rules/{id}/copy. Creates an INDEPENDENT copy of the
+rule (new id, same code and conditions) scoped to --workflow-alias, leaving
+the source rule untouched.
+
+This is the correct way to reuse a rule in another flow. Do NOT use
+'update --workflow-alias' for that: update RE-SCOPES (moves) the rule and
+makes it disappear from its previous workflow's evaluate-rules picker.
+
+Fails with 409 if a rule with the same code already exists in the target
+workflow.`,
+		Example: `  altscore evaluation-rules copy <id> --workflow-alias scoring-pn-nuevo-cliente`,
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if workflowAlias == "" {
+				return fmt.Errorf("--workflow-alias is required (the target workflow to copy the rule into)")
+			}
+			c, err := loadClient()
+			if err != nil {
+				return err
+			}
+			body, err := json.Marshal(map[string]string{"workflowAlias": workflowAlias})
+			if err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/v1/evaluation-rules/%s/copy", args[0])
+			data, _, err := c.Do("POST", "borrower_central", path, json.RawMessage(body))
+			if err != nil {
+				return err
+			}
+			return output.RawJSON(data)
+		},
+	}
+	cmd.Flags().StringVar(&workflowAlias, "workflow-alias", "", "target workflow to copy the rule into (required)")
+	return cmd
+}
+
 // ----- rule-trees -----
 
 func makeRtImportCmd() *cobra.Command {
