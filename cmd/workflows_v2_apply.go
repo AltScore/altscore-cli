@@ -326,39 +326,36 @@ Spec format (see file header for full reference):
 				fmt.Fprintf(cmd.ErrOrStderr(), "# warning: alias lookup for %q failed (%v); falling back to create path\n", targetAlias, lookupErr)
 			}
 
-			// Build the workflow body. composeWorkflowBody POSTs new tasks
-			// for every node (create AND update paths use fresh tasks; the
-			// old tasks orphan on the update path, that's accepted -- no
-			// /v2/tasks DELETE exists today). In diff mode, we run compose
-			// in dryRun=true so no /v2/tasks POSTs happen; the assembled body
-			// is purely for shape-comparison against the current tenant.
-			// We also force allowStealOwnership=true in diff mode so cross-
-			// owned entities don't abort compose -- they're surfaced in the
-			// diff output as "would RE-STAMP" instead, which is the whole
-			// point of a preview tool.
+			// Assemble the workflow body. composeWorkflowBody POSTs nothing: it
+			// builds the graph with spec-local refs standing in for the not-yet-
+			// minted server aliases, and (via capture) records the task bodies to
+			// post later. The create AND update paths both mint fresh tasks; old
+			// tasks orphan on update (no /v2/tasks DELETE exists). In diff mode we
+			// force allowStealOwnership=true so cross-owned entities don't abort
+			// assembly -- they surface in the diff output as "would RE-STAMP"
+			// instead, which is the whole point of a preview tool.
 			composeAllowSteal := allowStealOwnership
 			if diffFlag {
 				composeAllowSteal = true
 			}
 
-			// Assemble the workflow body. compose in dryRun mode assembles the
-			// full graph with spec-local refs standing in for the not-yet-minted
-			// server aliases and POSTs nothing. The real (posting) path validates
-			// the assembled graph against BC's server-side pre-flight BEFORE it
-			// POSTs any /v2/tasks -- a graph BC would reject at create/publish
-			// otherwise leaks task versions with no rollback.
+			// dryRun=true selects PREVIEW assembly (tolerant normalization + a
+			// "Would POST" echo of each body); the real apply path assembles
+			// strictly, validates the assembled graph against BC's server-side
+			// pre-flight, and only then POSTs -- a graph BC would reject at
+			// create/publish otherwise leaks task versions with no rollback.
 			var workflow map[string]any
 			switch {
 			case diffFlag:
-				// Read-only preview: assemble dry, skip the server pre-flight.
+				// Read-only preview: assemble (no POSTs), skip the server pre-flight.
 				workflow, err = composeWorkflowBody(c, &spec, true, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, nil)
 				if err != nil {
 					return err
 				}
 			case dryRun:
-				// Dry-run: assemble dry, then run the server pre-flight and print
-				// its findings. Advisory here -- dry-run mutates nothing and still
-				// prints the assembled body below regardless of findings.
+				// Dry-run: assemble (no POSTs), then run the server pre-flight and
+				// print its findings. Advisory here -- dry-run mutates nothing and
+				// still prints the assembled body below regardless of findings.
 				capture := newComposeCapture()
 				workflow, err = composeWorkflowBody(c, &spec, true, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, capture)
 				if err != nil {
@@ -1156,30 +1153,17 @@ func printComposeSummary(w io.Writer, workflow map[string]any) {
 }
 
 // postTask creates a task via POST /v2/tasks and returns the server-assigned
-// alias and version. Used by the tasks loop and the extraNodes loop. The
-// previous two-phase create (postTaskWithMultiDotFallback) is gone:
-// CreateTaskV2's strict-vs-lenient distinction was relaxed in the backend --
-// the input_mappings validator now just returns its argument unchanged
-// (see borrower-central/app/model/workflows_v2/task_schemas.py). Multi-dot
+// alias and version. Called by the task post phase (postCapturedTasks) once the
+// assembled graph has cleared the server pre-flight -- assembly itself POSTs
+// nothing. The previous two-phase create (postTaskWithMultiDotFallback) is
+// gone: CreateTaskV2's strict-vs-lenient distinction was relaxed in the backend
+// -- the input_mappings validator now just returns its argument unchanged (see
+// borrower-central/app/model/workflows_v2/task_schemas.py). Multi-dot
 // inputMappings now land at version 1 in a single POST.
-//
-// In dryRun mode the caller-supplied `ref` is used as the alias placeholder
-// (so downstream extraNode positioning matches what real-run produces) and
-// the version is always 1.
-func postTask(c *client.Client, body map[string]any, ref string, dryRun bool, label string) (alias string, version int, err error) {
+func postTask(c *client.Client, body map[string]any, label string) (alias string, version int, err error) {
 	bytes, err := json.Marshal(body)
 	if err != nil {
 		return "", 0, fmt.Errorf("encode %s: %w", label, err)
-	}
-
-	if dryRun {
-		fmt.Fprintf(os.Stderr, "# Would POST /v2/tasks (%s): %s\n", label, string(bytes))
-		if a, _ := body["alias"].(string); a != "" {
-			alias = a
-		} else {
-			alias = ref
-		}
-		return alias, 1, nil
 	}
 
 	data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(bytes))
@@ -1731,6 +1715,84 @@ func validateNoResidualSpecRefs(body map[string]any, refMap map[string]string, c
 	return walk(body, "")
 }
 
+// rewriteTaskRefs applies every ref->alias rewrite a task-node body needs, in
+// the order the runtime resolver expects: top-level inputMappings, the nested
+// scorecardConfig/ruleTreeConfig inputMappings (resolved from their own map),
+// mappingTableConfig entry inputVariables, then {{...}} templates + conditional
+// condition values, and finally the residual-ref safety net.
+//
+// It is run TWICE across the assemble/post split, and is designed to be a no-op
+// on the second run for the identifiers it already resolved: once during
+// assembly with an identity ref->placeholder map (validates the graph and pins
+// placeholders in place) and once during the post phase with the real
+// placeholder->server-alias map (the actual substitution). Because both the
+// assembly loop and postCapturedTasks call this single function, the validated
+// task body and the posted task body can only differ by that substitution.
+func rewriteTaskRefs(task map[string]any, refMap map[string]string, ctx string) error {
+	if mappings, ok := task["inputMappings"].(map[string]any); ok {
+		rewritten, rerr := rewriteRefsInMappings(mappings, refMap)
+		if rerr != nil {
+			return fmt.Errorf("%s: %w", ctx, rerr)
+		}
+		task["inputMappings"] = rewritten
+	}
+	// scorecard and rule-tree activities resolve their per-rule field
+	// references from a NESTED inputMappings map (scorecardConfig /
+	// ruleTreeConfig) -- see graph_workflow's per-task-type branches in
+	// _resolve_task_variables. Rewrite those too, or every rule field resolves
+	// to None at runtime (scorecard total=0, rule-tree falls to default).
+	for _, nested := range []string{"scorecardConfig", "ruleTreeConfig"} {
+		cfg, _ := task[nested].(map[string]any)
+		if cfg == nil {
+			continue
+		}
+		nestedMappings, ok := cfg["inputMappings"].(map[string]any)
+		if !ok || len(nestedMappings) == 0 {
+			continue
+		}
+		rewritten, rerr := rewriteRefsInMappings(nestedMappings, refMap)
+		if rerr != nil {
+			return fmt.Errorf("%s %s.inputMappings: %w", ctx, nested, rerr)
+		}
+		cfg["inputMappings"] = rewritten
+		task[nested] = cfg
+	}
+	// Mapping-table tasks store their per-entry input wiring as
+	// mappingTableConfig.entries[].inputVariable (NOT inputMappings). The
+	// runtime resolves that string verbatim against _task_outputs (keyed by
+	// server alias), so a spec-local ref left here doesn't resolve.
+	if cfg, _ := task["mappingTableConfig"].(map[string]any); cfg != nil {
+		if entries, ok := cfg["entries"].([]any); ok {
+			for idx, e := range entries {
+				em, ok := e.(map[string]any)
+				if !ok {
+					continue
+				}
+				if s, ok := em["inputVariable"].(string); ok && s != "" {
+					em["inputVariable"] = rewriteTaskOutputsRefsInString(s, refMap)
+				}
+				entries[idx] = em
+			}
+			cfg["entries"] = entries
+			task["mappingTableConfig"] = cfg
+		}
+	}
+	// {{...}} template placeholders (http url/body/headers, end outputJson) and
+	// conditional condition values.
+	if err := rewriteRefsInTaskTemplates(task, refMap); err != nil {
+		return fmt.Errorf("%s: %w", ctx, err)
+	}
+	// Safety net: after all known rewriters run, fail loud on any string that
+	// still exactly equals a ref/placeholder the map would rename -- a field a
+	// rewriter doesn't yet walk. Run with the map that excludes THIS task's own
+	// identifier (the caller has not added it yet), so a task type/ref collision
+	// (e.g. an "end" node) is never mistaken for a residue.
+	if err := validateNoResidualSpecRefs(task, refMap, ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
 // rewriteRefsInConditionGroup walks a ConditionGroup tree (operator + items
 // where each item is either a leaf {field, operator, value, valueType} or
 // another nested group) and rewrites the `value` of every variable-typed
@@ -2025,20 +2087,28 @@ func applyAutoEndDefaults(spec *composeSpec) {
 	}
 }
 
-// composeWorkflowBody resolves task creates and assembles the final workflow body.
-// In dryRun mode, prints what would be POSTed to /v2/tasks but does not call.
+// composeWorkflowBody assembles the workflow body. It POSTs NOTHING: every task
+// node is recorded on `capture`'s ordered post-plan (with a substitution
+// closure) and the graph is built with PLACEHOLDER identifiers -- the spec-local
+// ref (or an explicit `alias` on the body). postCapturedTasks POSTs the bodies
+// afterward and substituteWorkflowAliases swaps placeholders for the
+// server-minted aliases. Splitting assembly from posting lets the caller
+// validate the exact artifacts it will post BEFORE the first /v2/tasks POST.
+//
+// dryRun selects PREVIEW behavior, not posting behavior (there is no posting
+// here): tolerant normalization (offline-friendly source/entity lookups) plus a
+// "# Would POST /v2/tasks ..." echo of each assembled body. --dry-run / --diff
+// pass true; the real apply assembly passes false for strict normalization.
 //
 // Reference resolution: each task/extraNode has a spec-local "ref" (taken from
 // the explicit `ref` field, falling back to `alias`/`nodeId`, falling back to a
-// generated `t<idx>`). Edges and inputMappings reference tasks by ref. After
-// creating a task, the server returns an alias which becomes the canonical
-// nodeId + taskAlias and is used to rewrite all references downstream. If the
-// caller provided `alias` in a task body, that alias is sent to the API; if
-// absent, the server picks one and we use whatever it returns.
-// capture, when non-nil, collects the per-node task bodies (keyed by node id)
-// and a node-id->ref reverse map as the graph is assembled. It is populated
-// only in the dry assembly pass that feeds the server pre-flight validator
-// (see applyAssembleValidateAndPost); the real posting pass passes nil.
+// generated `t<idx>`). Edges and inputMappings reference tasks by ref; assembly
+// rewrites them to the placeholder identifier, and the post phase then rewrites
+// the placeholder to the server alias.
+//
+// capture, when non-nil, collects the per-node task bodies (keyed by placeholder)
+// + a placeholder->ref reverse map for readable findings, AND the ordered
+// post-plan the post phase consumes. --diff passes nil (it only needs the body).
 func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool, allowStealOwnership bool, autoDefaults bool, capture *composeCapture) (map[string]any, error) {
 	if err := validateEntityTypeVsTaskTypes(spec); err != nil {
 		return nil, err
@@ -2199,11 +2269,44 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		applyAutoEndDefaults(spec)
 	}
 
-	createdAliases := []string{}
 	taskNodes := []map[string]any{}
 
-	// refMap: spec-local reference -> server-assigned alias.
+	// refMap: spec-local reference -> placeholder identifier used in the
+	// assembled graph. Assembly POSTs nothing, so the placeholder is the ref
+	// (or an explicit `alias` on the body), not a server-minted alias;
+	// postCapturedTasks maps each placeholder to its real alias afterward.
 	refMap := map[string]string{}
+
+	// registerTask records a fully-assembled task body for the post phase and
+	// returns the placeholder identifier the graph should use for it. Assembly
+	// never POSTs: it captures the body (for the pre-flight payload) and appends
+	// to the ordered post-plan -- each entry re-runs `substitute` with the real
+	// alias map, then POSTs. In preview mode (--dry-run / --diff) it also echoes
+	// the body that WOULD be posted. `substitute` is nil for trivial bodies.
+	registerTask := func(body map[string]any, ref, label string, substitute func(map[string]string) error) string {
+		placeholder := ref
+		if a, _ := body["alias"].(string); a != "" {
+			placeholder = a
+		}
+		if dryRun {
+			if snap, err := json.Marshal(body); err == nil {
+				fmt.Fprintf(os.Stderr, "# Would POST /v2/tasks (%s): %s\n", label, string(snap))
+			}
+		}
+		if capture != nil {
+			if snap, merr := json.Marshal(body); merr == nil {
+				capture.tasks[placeholder] = snap
+				capture.refByNodeID[placeholder] = ref
+			}
+			capture.postPlan = append(capture.postPlan, &capturedTask{
+				placeholder: placeholder,
+				body:        body,
+				label:       label,
+				substitute:  substitute,
+			})
+		}
+		return placeholder
+	}
 
 	// Topologically sort task creation order so cross-task inputMappings
 	// always resolve at the time we POST each task. Without this, a task
@@ -2244,91 +2347,16 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		// Strip the spec-only `ref` field before posting; it's not part of the API.
 		delete(task, "ref")
 
-		// Rewrite inputMappings using refs resolved so far. Topological
-		// ordering above guarantees every dependency is in refMap by the
-		// time we get here, so an "unknown ref" error here always means a
+		// Rewrite every ref-bearing field (inputMappings, nested scorecard/
+		// rule-tree maps, mapping-table entries, {{...}} templates, conditional
+		// conditions) and run the residual-ref safety net. During assembly refMap
+		// is identity (ref->placeholder), so this validates the graph and leaves
+		// refs in place; postCapturedTasks re-runs the SAME function with the real
+		// alias map to substitute. Topological ordering above guarantees every
+		// dependency is already in refMap, so an "unknown ref" here always means a
 		// typo or a reference to a task that simply isn't in spec.tasks.
-		if mappings, ok := task["inputMappings"].(map[string]any); ok {
-			rewritten, rerr := rewriteRefsInMappings(mappings, refMap)
-			if rerr != nil {
-				return nil, fmt.Errorf("node ref=%q: %w", ref, rerr)
-			}
-			task["inputMappings"] = rewritten
-		}
-		// scorecard and rule-tree activities resolve their per-rule field
-		// references from a NESTED inputMappings map (scorecardConfig and
-		// ruleTreeConfig respectively -- see graph_workflow's dedicated
-		// per-task-type branches in _resolve_task_variables). Compose's
-		// rewrite was only walking the top-level map, leaving nested refs
-		// like "task_outputs.<spec-ref>.field" untouched at the server
-		// after spec-ref-to-alias translation -- so the runtime resolver
-		// looked up the spec ref (which doesn't exist in task_outputs)
-		// and every rule field came back None. Symptom: scorecard total=0
-		// for every input, rule-tree falls through to its default branch
-		// regardless of upstream values. Rewrite the nested maps too.
-		for _, nested := range []string{"scorecardConfig", "ruleTreeConfig"} {
-			cfg, _ := task[nested].(map[string]any)
-			if cfg == nil {
-				continue
-			}
-			nestedMappings, ok := cfg["inputMappings"].(map[string]any)
-			if !ok || len(nestedMappings) == 0 {
-				continue
-			}
-			rewritten, rerr := rewriteRefsInMappings(nestedMappings, refMap)
-			if rerr != nil {
-				return nil, fmt.Errorf("node ref=%q %s.inputMappings: %w", ref, nested, rerr)
-			}
-			cfg["inputMappings"] = rewritten
-			task[nested] = cfg
-		}
-		// Mapping-table tasks store their per-entry input wiring as
-		// mappingTableConfig.entries[].inputVariable -- NOT in inputMappings.
-		// The runtime mapping_table_activity resolves each entry's input
-		// against the workflow context using whatever string is in
-		// inputVariable verbatim, so a spec-local ref left as
-		// `task_outputs.compute.X` after compose doesn't resolve (the
-		// _task_outputs key is the server alias, not the spec ref). The same
-		// is true for the top-level inputMappings that
-		// normalizeMappingTableTask later mirrors from the entries -- if we
-		// rewrite the entries here, the mirror will pick up canonical
-		// (server-aliased) values too.
-		if cfg, _ := task["mappingTableConfig"].(map[string]any); cfg != nil {
-			if entries, ok := cfg["entries"].([]any); ok {
-				for idx, e := range entries {
-					em, ok := e.(map[string]any)
-					if !ok {
-						continue
-					}
-					if s, ok := em["inputVariable"].(string); ok && s != "" {
-						em["inputVariable"] = rewriteTaskOutputsRefsInString(s, refMap)
-					}
-					entries[idx] = em
-				}
-				cfg["entries"] = entries
-				task["mappingTableConfig"] = cfg
-			}
-		}
-
-		// Rewrite {{...}} template placeholders in known per-type fields
-		// (http url/body/headers, end outputJson). Same rules as
-		// inputMappings rewrite, just operating on substrings inside
-		// template strings. Without this, a `{{<other-task>.field}}` on
-		// an http body silently survives compose and fails at execute
-		// time -- the runtime template engine substitutes nothing because
-		// the bare ref isn't a valid runtime namespace.
-		if err := rewriteRefsInTaskTemplates(task, refMap); err != nil {
-			return nil, fmt.Errorf("node ref=%q: %w", ref, err)
-		}
-
-		// Safety net: after all known rewriters have run, scan the task body
-		// for any string value that still exactly equals a spec-local ref.
-		// Such a residue means a ref-bearing field exists somewhere in the
-		// task schema that no rewriter knows about -- the same class of bug
-		// as endConfig.pdfConfig.sourcesConfig[].taskAlias before it was
-		// added to the per-type switch above. Failing here surfaces the path
-		// before postTask ships a broken body.
-		if err := validateNoResidualSpecRefs(task, refMap, fmt.Sprintf("node ref=%q", ref)); err != nil {
+		ctx := fmt.Sprintf("node ref=%q", ref)
+		if err := rewriteTaskRefs(task, refMap, ctx); err != nil {
 			return nil, err
 		}
 
@@ -2346,37 +2374,22 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			return nil, fmt.Errorf("node ref=%q: %w", ref, err)
 		}
 
-		serverAlias, version, err := postTask(
-			c, task, ref, dryRun,
-			fmt.Sprintf("node ref=%q", ref),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("%w (created so far: %v)", err, createdAliases)
-		}
-		if !dryRun {
-			createdAliases = append(createdAliases, serverAlias)
-		}
+		// Assemble (do NOT post): record the body + its substitution closure for
+		// the post phase and take a placeholder identifier for the graph. The
+		// closure re-runs the exact same rewriters with the real alias map once
+		// prior tasks have been posted; substituteWorkflowAliases then stamps the
+		// server alias + version onto the node.
+		placeholder := registerTask(task, ref, ctx, func(rm map[string]string) error {
+			return rewriteTaskRefs(task, rm, ctx)
+		})
+		refMap[ref] = placeholder
 
-		refMap[ref] = serverAlias
-
-		// Snapshot the task body apply would POST for this node (keyed by the
-		// node id it backs) so the server pre-flight validator sees the exact
-		// bodies. Only the dry assembly pass sets capture; the real pass leaves
-		// it nil.
-		if capture != nil {
-			if snap, merr := json.Marshal(task); merr == nil {
-				capture.tasks[serverAlias] = snap
-				capture.refByNodeID[serverAlias] = ref
-			}
-		}
-
-		// Build the corresponding graph node using the server-assigned alias.
 		node := map[string]any{
-			"nodeId":      serverAlias,
+			"nodeId":      placeholder,
 			"type":        taskType,
 			"label":       label,
-			"taskAlias":   serverAlias,
-			"taskVersion": version,
+			"taskAlias":   placeholder,
+			"taskVersion": 1,
 			"position":    map[string]float64{"x": float64(200 * (i + 1)), "y": 0},
 			"data":        map[string]any{},
 		}
@@ -2567,27 +2580,22 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				}
 			}
 
-			alias, version, err := postTask(
-				c, taskBody, ref, dryRun,
-				fmt.Sprintf("node ref=%q (extra-node backing)", ref),
-			)
-			if err != nil {
-				return nil, err
-			}
-			taskAlias = alias
-			n["taskAlias"] = alias
-			n["taskVersion"] = version
-			if !dryRun {
-				createdAliases = append(createdAliases, alias)
-			}
-			// Snapshot the auto-created backing task body for the server
-			// pre-flight validator (dry assembly pass only; see the task loop).
-			if capture != nil {
-				if snap, merr := json.Marshal(taskBody); merr == nil {
-					capture.tasks[alias] = snap
-					capture.refByNodeID[alias] = ref
+			// Assemble (do NOT post): record the backing task body for the post
+			// phase and take a placeholder identifier. Only `end` bodies carry
+			// ref-bearing templates (endConfig.outputJson), so only they need a
+			// substitution closure; start / other trivial bodies need none.
+			var substitute func(map[string]string) error
+			if strings.ToLower(nodeType) == "end" {
+				substitute = func(rm map[string]string) error {
+					if err := rewriteRefsInTaskTemplates(taskBody, rm); err != nil {
+						return fmt.Errorf("node ref=%q: %w", ref, err)
+					}
+					return validateNoResidualSpecRefs(taskBody, rm, fmt.Sprintf("node ref=%q", ref))
 				}
 			}
+			taskAlias = registerTask(taskBody, ref, fmt.Sprintf("node ref=%q (extra-node backing)", ref), substitute)
+			n["taskAlias"] = taskAlias
+			n["taskVersion"] = 1
 		}
 
 		// nodeId follows the server-assigned task alias (1:1) so edges and
@@ -2871,8 +2879,8 @@ func fetchServerTaskTypes(c *client.Client) map[string]bool {
 	return out
 }
 
-// preflightTasks runs cheap validation across every task in the spec before
-// composeWorkflowBody starts POSTing -- fully local, except at most one
+// preflightTasks runs cheap validation across every task in the spec during
+// assembly, before apply POSTs any /v2/tasks -- fully local, except at most one
 // read-only backend lookup when a task type is unknown to this build (see
 // fetchLiveTaskTypes). Catches the mistakes that would otherwise create
 // orphan /v2/tasks rows mid-loop. Without a tasks-v2 DELETE endpoint,

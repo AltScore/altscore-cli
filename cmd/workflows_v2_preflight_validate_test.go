@@ -392,51 +392,6 @@ func TestDryAssemblyValidation_PostsNoTasks(t *testing.T) {
 	}
 }
 
-// --- deep copy independence -------------------------------------------------
-
-// deepCopyComposeSpec must produce a spec whose mutation cannot leak back into
-// the original -- the whole point of validating against a throwaway copy.
-func TestDeepCopyComposeSpec_Independence(t *testing.T) {
-	desc := "original"
-	orig := &composeSpec{
-		Label:       "L",
-		Description: &desc,
-		Tasks:       []map[string]any{{"ref": "a", "type": "http", "inputMappings": map[string]any{"x": "inputs.x"}}},
-		ExtraNodes:  []map[string]any{{"ref": "start", "type": "start"}},
-		Edges:       []map[string]any{{"from": "start", "to": "a"}},
-		InputVariables: map[string]any{
-			"x": map[string]any{"type": "string"},
-		},
-	}
-	cp, err := deepCopyComposeSpec(orig)
-	if err != nil {
-		t.Fatalf("deep copy failed: %v", err)
-	}
-
-	// Mutate the copy the way compose would.
-	delete(cp.Tasks[0], "ref")
-	cp.Tasks[0]["specRef"] = "a"
-	cp.Tasks[0]["inputMappings"].(map[string]any)["x"] = "MUTATED"
-	*cp.Description = "changed"
-	cp.InputVariables["x"].(map[string]any)["type"] = "integer"
-
-	if _, ok := orig.Tasks[0]["ref"]; !ok {
-		t.Error("original lost its ref -- copy shared the backing map")
-	}
-	if _, ok := orig.Tasks[0]["specRef"]; ok {
-		t.Error("original gained specRef -- copy shared the backing map")
-	}
-	if got := orig.Tasks[0]["inputMappings"].(map[string]any)["x"]; got != "inputs.x" {
-		t.Errorf("original nested inputMappings mutated; got %v", got)
-	}
-	if *orig.Description != "original" {
-		t.Errorf("original description mutated; got %q", *orig.Description)
-	}
-	if got := orig.InputVariables["x"].(map[string]any)["type"]; got != "string" {
-		t.Errorf("original inputVariables mutated; got %v", got)
-	}
-}
-
 // --- honoring the server verdict (finding 1) --------------------------------
 
 // A `valid:false` verdict with NO error-severity finding must still abort -- the
@@ -581,35 +536,5 @@ func TestApplyAssembleValidateAndPost_422LoudNoteProceedsAndPosts(t *testing.T) 
 	}
 	if strings.Contains(out, "older backend") {
 		t.Errorf("a 422 must NOT be misattributed to an older backend; got:\n%s", out)
-	}
-}
-
-// --- deep-copy failure propagation (finding 3) ------------------------------
-//
-// A copy failure that reaches applyAssembleValidateAndPost cannot be exercised
-// end-to-end -- any value that breaks the deep copy (json.Marshal) also breaks
-// the real posting pass's marshal, so there is no spec that fails the copy yet
-// posts cleanly. Instead these assert the copy helpers now PROPAGATE the error
-// (previously they silently returned the shared original), which is what lets
-// the caller skip the dry pass rather than run it against shared state.
-
-func TestDeepCopyMap_PropagatesMarshalError(t *testing.T) {
-	// A channel is not JSON-encodable, so json.Marshal fails.
-	if _, err := deepCopyMap(map[string]any{"bad": make(chan int)}); err == nil {
-		t.Fatal("expected a marshal error for a non-JSON-encodable value, got nil (silently returned shared state?)")
-	}
-}
-
-func TestDeepCopyComposeSpec_PropagatesCopyError(t *testing.T) {
-	spec := &composeSpec{
-		Label: "x",
-		Tasks: []map[string]any{{"ref": "a", "bad": make(chan int)}},
-	}
-	cp, err := deepCopyComposeSpec(spec)
-	if err == nil {
-		t.Fatal("expected deepCopyComposeSpec to propagate the copy error")
-	}
-	if cp != nil {
-		t.Errorf("expected nil spec on copy error, got: %#v", cp)
 	}
 }

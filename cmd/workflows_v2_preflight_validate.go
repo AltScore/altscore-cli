@@ -31,17 +31,33 @@ import (
 // yet deployed), so a 404 / connection error / non-JSON response FAILS OPEN --
 // apply proceeds exactly as it did before this check existed.
 
-// composeCapture collects what the server-side validator needs from a dry
-// assembly pass: the exact per-node task bodies apply would POST, keyed by the
-// node id that backs them (the server-assigned alias -- which, in a dry
-// assembly where nothing is posted, is the spec-local ref or an explicit
-// alias), and a reverse map from that node id back to the spec-local ref so
-// findings can be reported using the name from the author's spec.
+// composeCapture is what the single assembly pass hands to the two phases that
+// follow it: the server pre-flight validator and the task-posting phase.
+// Assembly POSTs nothing, so a task's node id is a PLACEHOLDER -- the spec-local
+// ref or an explicit alias -- not a server-minted alias.
+//
+//   - tasks: the exact per-node task bodies apply will POST, keyed by placeholder
+//     -- the validator's `tasks` payload.
+//   - refByNodeID: placeholder -> spec-local ref, so findings read with the
+//     author's own names.
+//   - postPlan: the task bodies in POST order (topologically-ordered task nodes,
+//     then extra nodes), each with a substitution closure that re-applies the
+//     assembly rewriters with the real alias map. postCapturedTasks consumes it.
 type composeCapture struct {
-	// tasks maps node id -> the marshaled task body apply would POST for it.
-	tasks map[string]json.RawMessage
-	// refByNodeID maps node id -> spec-local ref, for human-readable findings.
+	tasks       map[string]json.RawMessage
 	refByNodeID map[string]string
+	postPlan    []*capturedTask
+}
+
+// capturedTask is one entry of the ordered post-plan: an assembled task body,
+// its placeholder identifier in the graph, and the closure that rewrites its
+// ref placeholders to the server aliases minted by earlier POSTs. substitute is
+// nil for trivial bodies (e.g. a start node's backing task) with no refs.
+type capturedTask struct {
+	placeholder string
+	body        map[string]any
+	label       string
+	substitute  func(refMap map[string]string) error
 }
 
 func newComposeCapture() *composeCapture {
@@ -275,150 +291,176 @@ func dimNote(w io.Writer, msg string) {
 	fmt.Fprintf(w, "# %s\n", msg)
 }
 
-// applyAssembleValidateAndPost runs the real (non-dry, non-diff) apply
-// assembly. It validates a throwaway dry assembly against the server pre-flight
-// BEFORE the real posting pass, so a graph BC would reject at create/publish is
-// caught before the first POST /v2/tasks -- no task versions leak (there is no
-// rollback). On any error-severity finding it returns an error and posts
-// nothing. Otherwise it runs the real posting pass and returns its assembled
-// workflow body.
+// applyAssembleValidateAndPost runs the real (non-dry, non-diff) apply path in
+// four phases so nothing is persisted until the graph has cleared the server
+// pre-flight:
 //
-// compose mutates the spec in place (it deletes each node's `ref`, stamps
-// specRef/workflowAlias, applies auto-defaults), so the validation pass runs
-// against a deep copy; its stderr is suppressed so its guidance output doesn't
-// duplicate the real pass's. If the spec can't be deep-copied, the pre-flight is
-// skipped entirely (fail-open) rather than run against shared state.
+//  1. ASSEMBLE once (strict normalization, no POSTs): composeWorkflowBody builds
+//     the workflow body with ref placeholders and records the ordered task
+//     post-plan on `capture`. Because it posts nothing, mutating the spec in
+//     place is harmless -- no deep copy, no stderr suppression, and the meta
+//     lookups (task types, operators, ...) run once, not twice.
+//  2. VALIDATE those exact artifacts against POST /v2/workflows/validate. On any
+//     error-severity finding (or valid=false) it returns an error and posts
+//     nothing -- no /v2/tasks rows leak (there is no rollback). Fail-open on
+//     oracle trouble (see serverPreflightValidate).
+//  3. POST the task bodies in order, collecting placeholder -> (alias, version).
+//  4. SUBSTITUTE those aliases + versions into the assembled workflow body.
+//
+// The posted workflow body is the validated body mutated in place by phase 4
+// alone, so it differs from what the validator saw ONLY by the ref -> server
+// alias identifier substitution.
 func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *composeSpec, publish, skipRescope, allowStealOwnership, noAutoDefaults bool) (map[string]any, error) {
-	// Single definition of the compose call so the dry (validation) pass and the
-	// real (posting) pass can never diverge in their shared arguments -- a future
-	// arg change lands in one place, not two positional call sites. `dry` also
-	// selects the spec: the validation pass runs against a throwaway deep copy
-	// (compose mutates in place), the posting pass against the live spec.
-	var specCopy *composeSpec
-	compose := func(dry bool, capture *composeCapture) (map[string]any, error) {
-		s := spec
-		if dry {
-			s = specCopy
-		}
-		return composeWorkflowBody(c, s, dry, publish, !skipRescope, allowStealOwnership, !noAutoDefaults, capture)
-	}
-
-	dup, copyErr := deepCopyComposeSpec(spec)
-	if copyErr != nil {
-		// The dry validation pass depends on an isolated copy; without one we must
-		// not run it against shared state (a mutating dry pass would corrupt the
-		// spec the real pass posts). Skip pre-flight and post directly -- same
-		// fail-open contract as an unavailable oracle.
-		dimNote(cmd.ErrOrStderr(), fmt.Sprintf("server pre-flight skipped: spec not copyable (%v); proceeding without it", copyErr))
-		return compose(false, nil)
-	}
-	specCopy = dup
-
+	// Phase 1: assemble once. dryRun=false selects strict normalization -- the
+	// real apply must hard-fail on a bad source/entity, not stub it as a preview
+	// would. An assembly-level error surfaces here, before any /v2/tasks POST.
 	capture := newComposeCapture()
-	var dryWf map[string]any
-	var dryErr error
-	withSuppressedStderr(func() {
-		dryWf, dryErr = compose(true, capture)
-	})
-	if dryErr != nil {
-		// An assembly-level error (not a server finding): it would fail the real
-		// pass too, so surface it now -- before any /v2/tasks POST.
-		return nil, dryErr
+	wf, err := composeWorkflowBody(c, spec, false, publish, !skipRescope, allowStealOwnership, !noAutoDefaults, capture)
+	if err != nil {
+		return nil, err
 	}
-	if abortErr := serverPreflightValidate(c, cmd, dryWf, capture, true); abortErr != nil {
+
+	// Phase 2: validate the exact artifacts we are about to post.
+	if abortErr := serverPreflightValidate(c, cmd, wf, capture, true); abortErr != nil {
 		return nil, abortErr
 	}
-	// Real posting pass -- unchanged behavior.
-	return compose(false, nil)
-}
 
-// withSuppressedStderr runs fn with os.Stderr redirected to the null device,
-// restoring it afterward. Used to silence the throwaway dry-assembly pass that
-// feeds the server pre-flight validator on the real apply path -- that pass's
-// guidance output (alias notes, "Would POST /v2/tasks ...", advisories) would
-// otherwise duplicate the real posting pass's. The CLI is single-threaded per
-// command, so the global swap is safe here. If the null device can't be opened,
-// fn still runs (unsuppressed) rather than being skipped.
-func withSuppressedStderr(fn func()) {
-	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	// Phase 3: post the task bodies, minting the real aliases + versions.
+	refMap, versionMap, err := postCapturedTasks(c, capture)
 	if err != nil {
-		fn()
-		return
+		return nil, err
 	}
-	saved := os.Stderr
-	os.Stderr = devnull
-	defer func() {
-		os.Stderr = saved
-		_ = devnull.Close()
-	}()
-	fn()
+
+	// Phase 4: the only change between the validated body and the posted body.
+	if err := substituteWorkflowAliases(wf, refMap, versionMap); err != nil {
+		return nil, err
+	}
+	return wf, nil
 }
 
-// deepCopyComposeSpec returns an independent copy of the spec so the throwaway
-// dry assembly (used to feed the server pre-flight validator) can't disturb the
-// spec the real posting pass consumes. A copy error is propagated -- NOT
-// swallowed by returning shared state -- so the caller can skip the dry pass
-// rather than silently run it against the original.
-func deepCopyComposeSpec(s *composeSpec) (*composeSpec, error) {
-	cp := *s
-	if s.Description != nil {
-		d := *s.Description
-		cp.Description = &d
-	}
-	var err error
-	if cp.Nodes, err = deepCopyMapSlice(s.Nodes); err != nil {
-		return nil, err
-	}
-	if cp.Tasks, err = deepCopyMapSlice(s.Tasks); err != nil {
-		return nil, err
-	}
-	if cp.ExtraNodes, err = deepCopyMapSlice(s.ExtraNodes); err != nil {
-		return nil, err
-	}
-	if cp.Edges, err = deepCopyMapSlice(s.Edges); err != nil {
-		return nil, err
-	}
-	if cp.Notes, err = deepCopyMapSlice(s.Notes); err != nil {
-		return nil, err
-	}
-	if cp.InputVariables, err = deepCopyMap(s.InputVariables); err != nil {
-		return nil, err
-	}
-	if cp.CustomVariables, err = deepCopyMap(s.CustomVariables); err != nil {
-		return nil, err
-	}
-	if cp.Config, err = deepCopyMap(s.Config); err != nil {
-		return nil, err
-	}
-	return &cp, nil
-}
-
-func deepCopyMapSlice(in []map[string]any) ([]map[string]any, error) {
-	if in == nil {
-		return nil, nil
-	}
-	out := make([]map[string]any, len(in))
-	for i, m := range in {
-		cp, err := deepCopyMap(m)
-		if err != nil {
-			return nil, err
+// postCapturedTasks POSTs every task body the assembly pass recorded, in the
+// order they were assembled (topologically-ordered task nodes, then extra
+// nodes). Before each POST it re-runs that body's substitution closure with the
+// aliases minted by earlier POSTs -- the same rewriters assembly ran with
+// identity placeholders, now resolving cross-task references to the stored
+// server alias. It returns placeholder -> alias and placeholder -> version for
+// substituting the workflow body. A mid-loop failure leaves earlier tasks
+// created (there is no tasks-v2 DELETE); the phase-2 pre-flight makes that rare.
+func postCapturedTasks(c *client.Client, capture *composeCapture) (map[string]string, map[string]int, error) {
+	refMap := map[string]string{}
+	versionMap := map[string]int{}
+	posted := []string{}
+	for _, ct := range capture.postPlan {
+		// Resolve this body's cross-task references to the aliases minted so far.
+		// The closure runs with refMap BEFORE this task's own placeholder is
+		// added, so a task type/ref collision can't be mistaken for a residue.
+		if ct.substitute != nil {
+			if err := ct.substitute(refMap); err != nil {
+				return nil, nil, fmt.Errorf("%w (created so far: %v)", err, posted)
+			}
 		}
-		out[i] = cp
+		alias, version, err := postTask(c, ct.body, ct.label)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w (created so far: %v)", err, posted)
+		}
+		refMap[ct.placeholder] = alias
+		versionMap[ct.placeholder] = version
+		posted = append(posted, alias)
 	}
-	return out, nil
+	return refMap, versionMap, nil
 }
 
-func deepCopyMap(in map[string]any) (map[string]any, error) {
-	if in == nil {
-		return nil, nil
+// substituteWorkflowAliases rewrites the assembled workflow body in place,
+// replacing the ref placeholders used during assembly with the server aliases +
+// task versions from postCapturedTasks. It touches only identifier-bearing
+// fields -- node id / taskAlias / taskVersion + node.data.inputMappings, edge
+// endpoints + auto-generated ids, and customVariable expressions / returnValues
+// / dependencies -- reusing the same rewriters assembly used. refMap is keyed by
+// placeholder (the identifier the graph carries).
+//
+// This is the sole transformation between validation and the workflow POST, so
+// the posted body differs from the validated one only by this substitution.
+func substituteWorkflowAliases(wf map[string]any, refMap map[string]string, versionMap map[string]int) error {
+	for _, n := range asMapSlice(wf["nodes"]) {
+		id, _ := n["nodeId"].(string)
+		if alias, ok := refMap[id]; ok {
+			n["nodeId"] = alias
+			if ta, _ := n["taskAlias"].(string); ta == id {
+				n["taskAlias"] = alias
+			}
+			if v, ok := versionMap[id]; ok {
+				n["taskVersion"] = v
+			}
+		}
+		if data, _ := n["data"].(map[string]any); data != nil {
+			if im, _ := data["inputMappings"].(map[string]any); len(im) > 0 {
+				rewritten, err := rewriteRefsInMappings(im, refMap)
+				if err != nil {
+					return fmt.Errorf("node %q data.inputMappings: %w", id, err)
+				}
+				data["inputMappings"] = rewritten
+			}
+		}
 	}
-	raw, err := json.Marshal(in)
-	if err != nil {
-		return nil, err
+	for _, e := range asMapSlice(wf["edges"]) {
+		oldSrc, _ := e["sourceNodeId"].(string)
+		oldTgt, _ := e["targetNodeId"].(string)
+		newSrc, newTgt := oldSrc, oldTgt
+		if a, ok := refMap[oldSrc]; ok {
+			newSrc = a
+		}
+		if a, ok := refMap[oldTgt]; ok {
+			newTgt = a
+		}
+		// An auto-generated edge id tracks its endpoints (src->tgt); an explicit
+		// id is left alone.
+		if id, _ := e["id"].(string); id == oldSrc+"->"+oldTgt {
+			e["id"] = newSrc + "->" + newTgt
+		}
+		e["sourceNodeId"] = newSrc
+		e["targetNodeId"] = newTgt
 	}
-	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, err
+	if cvs, _ := wf["customVariables"].(map[string]any); cvs != nil {
+		for name, raw := range cvs {
+			v, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if s, _ := v["expression"].(string); s != "" {
+				v["expression"] = rewriteTaskOutputsRefsInString(s, refMap)
+			}
+			if s, _ := v["returnValue"].(string); s != "" {
+				v["returnValue"] = rewriteTaskOutputsRefsInString(s, refMap)
+			}
+			if deps, ok := v["dependencies"].([]any); ok {
+				for i, d := range deps {
+					if ds, ok := d.(string); ok {
+						deps[i] = rewriteTaskOutputsRefsInString(ds, refMap)
+					}
+				}
+				v["dependencies"] = deps
+			}
+			cvs[name] = v
+		}
 	}
-	return out, nil
+	return nil
+}
+
+// asMapSlice coerces an assembled node/edge list to []map[string]any. compose
+// builds them as []map[string]any; the []any branch guards a marshaled
+// round-trip.
+func asMapSlice(v any) []map[string]any {
+	switch s := v.(type) {
+	case []map[string]any:
+		return s
+	case []any:
+		out := make([]map[string]any, 0, len(s))
+		for _, e := range s {
+			if m, ok := e.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	return nil
 }
