@@ -364,7 +364,7 @@ Spec format (see file header for full reference):
 				if err != nil {
 					return err
 				}
-				serverPreflightValidate(c, cmd, workflow, capture, false)
+				_ = serverPreflightValidate(c, cmd, workflow, capture, false)
 			default:
 				// Real apply (create OR update): validate before posting anything,
 				// abort on server errors.

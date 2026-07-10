@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/client"
 	"github.com/spf13/cobra"
@@ -71,16 +73,19 @@ type validationResponse struct {
 // serverPreflightValidate POSTs the assembled workflow body plus the per-node
 // task bodies to BC's /v2/workflows/validate and reports the findings.
 //
-// Fail-open: a 404 / connection error / non-2xx / non-JSON response means an
-// older backend without the endpoint -- it prints a dim one-line note and
-// returns nil so apply proceeds unchanged.
+// Fail-open, split by outcome so a contract breakage is never misattributed to
+// an old backend: a 404 / 5xx / transport error / empty or non-JSON body prints
+// a dim "unavailable (older backend)" note; a non-404 4xx (the endpoint IS there
+// and rejected the request -- a likely contract mismatch) prints a LOUD warning
+// with the status and a trimmed body. Either way it returns nil so apply
+// proceeds unchanged -- oracle trouble never blocks apply.
 //
-// When abortOnError is true (the real apply path) and the server reports any
-// error-severity finding, it returns a non-nil error so the caller aborts
-// before the first POST. Warnings never abort: they print prominently (they
-// include "branch has no edge", which now fails at runtime when the branch is
-// matched) and apply continues. When abortOnError is false (--dry-run) it never
-// returns an error -- it only prints results.
+// When abortOnError is true (the real apply path) it returns a non-nil error --
+// so the caller aborts before the first POST -- when the server reports any
+// error-severity finding OR judges the graph invalid (valid=false), even with no
+// error-severity finding to pin it to. Warnings never abort: they print
+// prominently and apply continues. When abortOnError is false (--dry-run) it
+// never returns an error -- it only prints results.
 func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[string]any, capture *composeCapture, abortOnError bool) error {
 	if c == nil || workflow == nil || capture == nil {
 		return nil
@@ -103,35 +108,65 @@ func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[
 	}
 
 	data, status, derr := c.Do("POST", "borrower_central", "/v2/workflows/validate", json.RawMessage(body))
-	if derr != nil || status < 200 || status >= 300 || len(data) == 0 {
-		// 404 / connection error / non-2xx / empty body -> older backend that
-		// doesn't have the endpoint yet. Fail open.
-		dimNote(errOut, "server pre-flight skipped: POST /v2/workflows/validate unavailable (older backend); proceeding without it")
+	switch {
+	case status == http.StatusNotFound:
+		// Endpoint absent -> older backend that doesn't have it yet. Fail open.
+		dimNote(errOut, preflightUnavailableNote)
+		return nil
+	case status >= 500:
+		// Server-side trouble -- never block apply on the oracle's health.
+		dimNote(errOut, preflightUnavailableNote)
+		return nil
+	case status >= 400:
+		// A non-404 4xx (400 / 401 / 403 / 422 / ...): the endpoint IS there and
+		// rejected the request -- a likely request/response contract mismatch.
+		// Flag it LOUDLY (not the dim "older backend" note) but never block apply
+		// on it. The client folds a >=400 body into derr (data is nil).
+		fmt.Fprintf(errOut, "# warning: server rejected the validation request (HTTP %d) -- possible contract mismatch; proceeding without pre-flight.\n", status)
+		if detail := preflightResponseDetail(data, derr, status); detail != "" {
+			fmt.Fprintf(errOut, "#   response: %s\n", detail)
+		}
+		return nil
+	case derr != nil, status < 200 || status >= 300, len(data) == 0:
+		// Transport error (no HTTP status), an unexpected non-2xx (e.g. a
+		// surfaced 3xx), or an empty body -> nothing usable. Fail open.
+		dimNote(errOut, preflightUnavailableNote)
 		return nil
 	}
 
 	var resp validationResponse
 	if jerr := json.Unmarshal(data, &resp); jerr != nil {
-		// Non-JSON / unexpected shape -> treat as an older backend, fail open.
+		// Non-JSON / unexpected shape -> treat as an older/foreign backend, fail open.
 		dimNote(errOut, "server pre-flight skipped: unrecognized /v2/workflows/validate response; proceeding without it")
 		return nil
 	}
 
 	var errs, warns []validationFinding
 	for _, f := range resp.Findings {
-		if f.Severity == "error" {
+		// Severity is lowercase "error"/"warning" today; match robustly in case
+		// that ever shifts case.
+		if strings.EqualFold(f.Severity, "error") {
 			errs = append(errs, f)
 		} else {
 			warns = append(warns, f)
 		}
 	}
 
+	// The server's `valid` verdict is authoritative: honor it even when no
+	// error-severity finding is attached. A false verdict with only warnings (or
+	// none) still means "do not apply this graph".
+	invalid := !resp.Valid || len(errs) > 0
+
 	if len(warns) > 0 {
 		fmt.Fprintf(errOut, "# server validation: %d warning(s):\n", len(warns))
 		for _, f := range warns {
 			fmt.Fprintf(errOut, "#   [WARN] %s\n", formatValidationFinding(f, capture))
 		}
-		fmt.Fprintln(errOut, "# warnings do not block apply -- but a branch with no edge WILL fail at runtime when matched.")
+		// The branch-specific claim only holds when that specific finding is
+		// present -- other warnings get no branch claim.
+		if hasFindingCode(warns, "CONDITIONAL_BRANCH_WITHOUT_EDGE") {
+			fmt.Fprintln(errOut, "# warnings do not block apply -- but a branch with no edge WILL fail at runtime when matched.")
+		}
 	}
 
 	if len(errs) > 0 {
@@ -139,9 +174,20 @@ func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[
 		for _, f := range errs {
 			fmt.Fprintf(errOut, "#   [ERROR] %s\n", formatValidationFinding(f, capture))
 		}
+	}
+
+	if invalid {
+		if len(errs) == 0 {
+			// valid=false with no error-severity finding to point at: state the
+			// server's verdict plainly so it is never silent.
+			fmt.Fprintln(errOut, "# server validation FAILED: the server judged the graph invalid (valid=false) with no error-severity finding.")
+		}
 		if abortOnError {
 			fmt.Fprintln(errOut, "# aborting before any task was created -- no /v2/tasks rows were leaked. Fix the spec and re-apply.")
-			return fmt.Errorf("server validation failed with %d error(s); no tasks were created", len(errs))
+			if len(errs) > 0 {
+				return fmt.Errorf("server validation failed with %d error(s); no tasks were created", len(errs))
+			}
+			return fmt.Errorf("server validation failed (valid=false); no tasks were created")
 		}
 		return nil
 	}
@@ -151,6 +197,40 @@ func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[
 		fmt.Fprintln(errOut, "# server validation: no issues found.")
 	}
 	return nil
+}
+
+// preflightUnavailableNote is the dim fail-open note shared by every "the oracle
+// isn't usable" branch (404 / 5xx / transport error / non-2xx / empty body).
+const preflightUnavailableNote = "server pre-flight skipped: POST /v2/workflows/validate unavailable (older backend); proceeding without it"
+
+// hasFindingCode reports whether any finding carries the given code.
+func hasFindingCode(findings []validationFinding, code string) bool {
+	for _, f := range findings {
+		if f.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+// preflightResponseDetail returns a short, trimmed description of a rejected
+// validation response for the loud contract-mismatch note. The client folds a
+// >=400 response body into derr (data is nil), so it falls back to derr; a bare
+// "HTTP <status>" (empty body) is dropped since the caller already prints the
+// status.
+func preflightResponseDetail(data json.RawMessage, derr error, status int) string {
+	detail := strings.TrimSpace(string(data))
+	if detail == "" && derr != nil {
+		detail = strings.TrimSpace(derr.Error())
+	}
+	if detail == fmt.Sprintf("HTTP %d", status) {
+		return ""
+	}
+	const maxLen = 400
+	if len(detail) > maxLen {
+		detail = detail[:maxLen] + "..."
+	}
+	return detail
 }
 
 // formatValidationFinding renders one finding for stderr. The caller supplies
@@ -206,14 +286,39 @@ func dimNote(w io.Writer, msg string) {
 // compose mutates the spec in place (it deletes each node's `ref`, stamps
 // specRef/workflowAlias, applies auto-defaults), so the validation pass runs
 // against a deep copy; its stderr is suppressed so its guidance output doesn't
-// duplicate the real pass's.
+// duplicate the real pass's. If the spec can't be deep-copied, the pre-flight is
+// skipped entirely (fail-open) rather than run against shared state.
 func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *composeSpec, publish, skipRescope, allowStealOwnership, noAutoDefaults bool) (map[string]any, error) {
-	specCopy := deepCopyComposeSpec(spec)
+	// Single definition of the compose call so the dry (validation) pass and the
+	// real (posting) pass can never diverge in their shared arguments -- a future
+	// arg change lands in one place, not two positional call sites. `dry` also
+	// selects the spec: the validation pass runs against a throwaway deep copy
+	// (compose mutates in place), the posting pass against the live spec.
+	var specCopy *composeSpec
+	compose := func(dry bool, capture *composeCapture) (map[string]any, error) {
+		s := spec
+		if dry {
+			s = specCopy
+		}
+		return composeWorkflowBody(c, s, dry, publish, !skipRescope, allowStealOwnership, !noAutoDefaults, capture)
+	}
+
+	dup, copyErr := deepCopyComposeSpec(spec)
+	if copyErr != nil {
+		// The dry validation pass depends on an isolated copy; without one we must
+		// not run it against shared state (a mutating dry pass would corrupt the
+		// spec the real pass posts). Skip pre-flight and post directly -- same
+		// fail-open contract as an unavailable oracle.
+		dimNote(cmd.ErrOrStderr(), fmt.Sprintf("server pre-flight skipped: spec not copyable (%v); proceeding without it", copyErr))
+		return compose(false, nil)
+	}
+	specCopy = dup
+
 	capture := newComposeCapture()
 	var dryWf map[string]any
 	var dryErr error
 	withSuppressedStderr(func() {
-		dryWf, dryErr = composeWorkflowBody(c, specCopy, true, publish, !skipRescope, allowStealOwnership, !noAutoDefaults, capture)
+		dryWf, dryErr = compose(true, capture)
 	})
 	if dryErr != nil {
 		// An assembly-level error (not a server finding): it would fail the real
@@ -224,7 +329,7 @@ func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *co
 		return nil, abortErr
 	}
 	// Real posting pass -- unchanged behavior.
-	return composeWorkflowBody(c, spec, false, publish, !skipRescope, allowStealOwnership, !noAutoDefaults, nil)
+	return compose(false, nil)
 }
 
 // withSuppressedStderr runs fn with os.Stderr redirected to the null device,
@@ -251,46 +356,69 @@ func withSuppressedStderr(fn func()) {
 
 // deepCopyComposeSpec returns an independent copy of the spec so the throwaway
 // dry assembly (used to feed the server pre-flight validator) can't disturb the
-// spec the real posting pass consumes.
-func deepCopyComposeSpec(s *composeSpec) *composeSpec {
+// spec the real posting pass consumes. A copy error is propagated -- NOT
+// swallowed by returning shared state -- so the caller can skip the dry pass
+// rather than silently run it against the original.
+func deepCopyComposeSpec(s *composeSpec) (*composeSpec, error) {
 	cp := *s
 	if s.Description != nil {
 		d := *s.Description
 		cp.Description = &d
 	}
-	cp.Nodes = deepCopyMapSlice(s.Nodes)
-	cp.Tasks = deepCopyMapSlice(s.Tasks)
-	cp.ExtraNodes = deepCopyMapSlice(s.ExtraNodes)
-	cp.Edges = deepCopyMapSlice(s.Edges)
-	cp.Notes = deepCopyMapSlice(s.Notes)
-	cp.InputVariables = deepCopyMap(s.InputVariables)
-	cp.CustomVariables = deepCopyMap(s.CustomVariables)
-	cp.Config = deepCopyMap(s.Config)
-	return &cp
+	var err error
+	if cp.Nodes, err = deepCopyMapSlice(s.Nodes); err != nil {
+		return nil, err
+	}
+	if cp.Tasks, err = deepCopyMapSlice(s.Tasks); err != nil {
+		return nil, err
+	}
+	if cp.ExtraNodes, err = deepCopyMapSlice(s.ExtraNodes); err != nil {
+		return nil, err
+	}
+	if cp.Edges, err = deepCopyMapSlice(s.Edges); err != nil {
+		return nil, err
+	}
+	if cp.Notes, err = deepCopyMapSlice(s.Notes); err != nil {
+		return nil, err
+	}
+	if cp.InputVariables, err = deepCopyMap(s.InputVariables); err != nil {
+		return nil, err
+	}
+	if cp.CustomVariables, err = deepCopyMap(s.CustomVariables); err != nil {
+		return nil, err
+	}
+	if cp.Config, err = deepCopyMap(s.Config); err != nil {
+		return nil, err
+	}
+	return &cp, nil
 }
 
-func deepCopyMapSlice(in []map[string]any) []map[string]any {
+func deepCopyMapSlice(in []map[string]any) ([]map[string]any, error) {
 	if in == nil {
-		return nil
+		return nil, nil
 	}
 	out := make([]map[string]any, len(in))
 	for i, m := range in {
-		out[i] = deepCopyMap(m)
+		cp, err := deepCopyMap(m)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = cp
 	}
-	return out
+	return out, nil
 }
 
-func deepCopyMap(in map[string]any) map[string]any {
+func deepCopyMap(in map[string]any) (map[string]any, error) {
 	if in == nil {
-		return nil
+		return nil, nil
 	}
 	raw, err := json.Marshal(in)
 	if err != nil {
-		return in // best-effort; spec maps are always JSON-round-trippable
+		return nil, err
 	}
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return in
+		return nil, err
 	}
-	return out
+	return out, nil
 }

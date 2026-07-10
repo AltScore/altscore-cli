@@ -408,7 +408,10 @@ func TestDeepCopyComposeSpec_Independence(t *testing.T) {
 			"x": map[string]any{"type": "string"},
 		},
 	}
-	cp := deepCopyComposeSpec(orig)
+	cp, err := deepCopyComposeSpec(orig)
+	if err != nil {
+		t.Fatalf("deep copy failed: %v", err)
+	}
 
 	// Mutate the copy the way compose would.
 	delete(cp.Tasks[0], "ref")
@@ -431,5 +434,182 @@ func TestDeepCopyComposeSpec_Independence(t *testing.T) {
 	}
 	if got := orig.InputVariables["x"].(map[string]any)["type"]; got != "string" {
 		t.Errorf("original inputVariables mutated; got %v", got)
+	}
+}
+
+// --- honoring the server verdict (finding 1) --------------------------------
+
+// A `valid:false` verdict with NO error-severity finding must still abort -- the
+// verdict is authoritative, not just the error-severity findings.
+func TestServerPreflightValidate_ValidFalseWithoutErrorAborts(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"no findings", `{"valid":false,"findings":[]}`},
+		{"warning only", `{"valid":false,"findings":[
+			{"code":"SOME_ADVISORY","severity":"warning","nodeId":null,"edgeId":null,"params":{},"message":"heads up"}
+		]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			c := newTestClient(t, srv.URL)
+			cmd, errb := preflightTestCmd()
+
+			err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
+			if err == nil {
+				t.Fatal("valid:false must abort even with no error-severity finding")
+			}
+			out := errb.String()
+			for _, want := range []string{"FAILED", "valid=false", "aborting"} {
+				if !strings.Contains(out, want) {
+					t.Errorf("stderr missing %q; got:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
+
+// A warning-only `valid:false` still prints the warning it was given before the
+// verdict line, so the operator sees what the server flagged.
+func TestServerPreflightValidate_ValidFalseStillPrintsWarnings(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"valid":false,"findings":[
+			{"code":"SOME_ADVISORY","severity":"warning","nodeId":null,"edgeId":null,"params":{},"message":"heads up"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	cmd, errb := preflightTestCmd()
+	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true); err == nil {
+		t.Fatal("expected abort")
+	}
+	if out := errb.String(); !strings.Contains(out, "[WARN]") || !strings.Contains(out, "SOME_ADVISORY") {
+		t.Errorf("expected the warning to be printed alongside the verdict; got:\n%s", out)
+	}
+}
+
+// Severity matching is case-insensitive: an uppercase "ERROR" still aborts.
+func TestServerPreflightValidate_UppercaseSeverityAborts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"valid":false,"findings":[
+			{"code":"MULTIPLE_END_NODES","severity":"ERROR","nodeId":null,"edgeId":null,"params":{},"message":"two end nodes"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	cmd, errb := preflightTestCmd()
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
+	if err == nil {
+		t.Fatal("uppercase ERROR severity must be treated as an error and abort")
+	}
+	out := errb.String()
+	for _, want := range []string{"[ERROR]", "MULTIPLE_END_NODES", "1 error(s)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stderr missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// --- banner accuracy (finding 4) --------------------------------------------
+
+// The "branch with no edge WILL fail at runtime" banner prints ONLY when a
+// CONDITIONAL_BRANCH_WITHOUT_EDGE finding is present; a different warning gets
+// the generic warning block but no branch-specific claim.
+func TestServerPreflightValidate_BranchBannerOnlyForBranchCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"valid":true,"findings":[
+			{"code":"SOME_OTHER_WARNING","severity":"warning","nodeId":null,"edgeId":null,"params":{},"message":"an unrelated advisory"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	cmd, errb := preflightTestCmd()
+	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true); err != nil {
+		t.Fatalf("warning must not abort; got: %v", err)
+	}
+	out := errb.String()
+	if !strings.Contains(out, "[WARN]") || !strings.Contains(out, "SOME_OTHER_WARNING") {
+		t.Errorf("expected the warning to be printed; got:\n%s", out)
+	}
+	if strings.Contains(out, "WILL fail at runtime") {
+		t.Errorf("branch-specific banner must NOT print without CONDITIONAL_BRANCH_WITHOUT_EDGE; got:\n%s", out)
+	}
+}
+
+// --- fail-open split: non-404 4xx is loud (finding 2) -----------------------
+
+// A 422 means the endpoint IS there and rejected the request -- it must produce
+// a LOUD "contract mismatch" note (not the dim "older backend" one), then let
+// apply proceed and POST every node's task.
+func TestApplyAssembleValidateAndPost_422LoudNoteProceedsAndPosts(t *testing.T) {
+	var validateCalls, taskCalls int32
+	srv := applyServerHandler(t, http.StatusUnprocessableEntity, "", &validateCalls, &taskCalls)
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	cmd, errb := preflightTestCmd()
+
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false)
+	if err != nil {
+		t.Fatalf("a 4xx from the oracle must not block apply; got: %v", err)
+	}
+	if wf == nil {
+		t.Fatal("expected an assembled workflow body after a loud fail-open")
+	}
+	if got := atomic.LoadInt32(&taskCalls); got != 3 {
+		t.Errorf("expected 3 /v2/tasks POSTs after fail-open; got %d", got)
+	}
+	if got := atomic.LoadInt32(&validateCalls); got != 1 {
+		t.Errorf("expected 1 validate attempt, got %d", got)
+	}
+	out := errb.String()
+	if !strings.Contains(out, "contract mismatch") || !strings.Contains(out, "422") {
+		t.Errorf("expected a loud contract-mismatch note mentioning HTTP 422; got:\n%s", out)
+	}
+	if strings.Contains(out, "older backend") {
+		t.Errorf("a 422 must NOT be misattributed to an older backend; got:\n%s", out)
+	}
+}
+
+// --- deep-copy failure propagation (finding 3) ------------------------------
+//
+// A copy failure that reaches applyAssembleValidateAndPost cannot be exercised
+// end-to-end -- any value that breaks the deep copy (json.Marshal) also breaks
+// the real posting pass's marshal, so there is no spec that fails the copy yet
+// posts cleanly. Instead these assert the copy helpers now PROPAGATE the error
+// (previously they silently returned the shared original), which is what lets
+// the caller skip the dry pass rather than run it against shared state.
+
+func TestDeepCopyMap_PropagatesMarshalError(t *testing.T) {
+	// A channel is not JSON-encodable, so json.Marshal fails.
+	if _, err := deepCopyMap(map[string]any{"bad": make(chan int)}); err == nil {
+		t.Fatal("expected a marshal error for a non-JSON-encodable value, got nil (silently returned shared state?)")
+	}
+}
+
+func TestDeepCopyComposeSpec_PropagatesCopyError(t *testing.T) {
+	spec := &composeSpec{
+		Label: "x",
+		Tasks: []map[string]any{{"ref": "a", "bad": make(chan int)}},
+	}
+	cp, err := deepCopyComposeSpec(spec)
+	if err == nil {
+		t.Fatal("expected deepCopyComposeSpec to propagate the copy error")
+	}
+	if cp != nil {
+		t.Errorf("expected nil spec on copy error, got: %#v", cp)
 	}
 }
