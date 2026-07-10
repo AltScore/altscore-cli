@@ -340,9 +340,38 @@ Spec format (see file header for full reference):
 			if diffFlag {
 				composeAllowSteal = true
 			}
-			workflow, err := composeWorkflowBody(c, &spec, dryRun || diffFlag, publish, !skipRescope, composeAllowSteal, !noAutoDefaults)
-			if err != nil {
-				return err
+
+			// Assemble the workflow body. compose in dryRun mode assembles the
+			// full graph with spec-local refs standing in for the not-yet-minted
+			// server aliases and POSTs nothing. The real (posting) path validates
+			// the assembled graph against BC's server-side pre-flight BEFORE it
+			// POSTs any /v2/tasks -- a graph BC would reject at create/publish
+			// otherwise leaks task versions with no rollback.
+			var workflow map[string]any
+			switch {
+			case diffFlag:
+				// Read-only preview: assemble dry, skip the server pre-flight.
+				workflow, err = composeWorkflowBody(c, &spec, true, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, nil)
+				if err != nil {
+					return err
+				}
+			case dryRun:
+				// Dry-run: assemble dry, then run the server pre-flight and print
+				// its findings. Advisory here -- dry-run mutates nothing and still
+				// prints the assembled body below regardless of findings.
+				capture := newComposeCapture()
+				workflow, err = composeWorkflowBody(c, &spec, true, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, capture)
+				if err != nil {
+					return err
+				}
+				serverPreflightValidate(c, cmd, workflow, capture, false)
+			default:
+				// Real apply (create OR update): validate before posting anything,
+				// abort on server errors.
+				workflow, err = applyAssembleValidateAndPost(c, cmd, &spec, publish, skipRescope, allowStealOwnership, noAutoDefaults)
+				if err != nil {
+					return err
+				}
 			}
 
 			wfBody, err := json.Marshal(workflow)
@@ -2006,7 +2035,11 @@ func applyAutoEndDefaults(spec *composeSpec) {
 // nodeId + taskAlias and is used to rewrite all references downstream. If the
 // caller provided `alias` in a task body, that alias is sent to the API; if
 // absent, the server picks one and we use whatever it returns.
-func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool, allowStealOwnership bool, autoDefaults bool) (map[string]any, error) {
+// capture, when non-nil, collects the per-node task bodies (keyed by node id)
+// and a node-id->ref reverse map as the graph is assembled. It is populated
+// only in the dry assembly pass that feeds the server pre-flight validator
+// (see applyAssembleValidateAndPost); the real posting pass passes nil.
+func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool, allowStealOwnership bool, autoDefaults bool, capture *composeCapture) (map[string]any, error) {
 	if err := validateEntityTypeVsTaskTypes(spec); err != nil {
 		return nil, err
 	}
@@ -2326,6 +2359,17 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 
 		refMap[ref] = serverAlias
 
+		// Snapshot the task body apply would POST for this node (keyed by the
+		// node id it backs) so the server pre-flight validator sees the exact
+		// bodies. Only the dry assembly pass sets capture; the real pass leaves
+		// it nil.
+		if capture != nil {
+			if snap, merr := json.Marshal(task); merr == nil {
+				capture.tasks[serverAlias] = snap
+				capture.refByNodeID[serverAlias] = ref
+			}
+		}
+
 		// Build the corresponding graph node using the server-assigned alias.
 		node := map[string]any{
 			"nodeId":      serverAlias,
@@ -2535,6 +2579,14 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			n["taskVersion"] = version
 			if !dryRun {
 				createdAliases = append(createdAliases, alias)
+			}
+			// Snapshot the auto-created backing task body for the server
+			// pre-flight validator (dry assembly pass only; see the task loop).
+			if capture != nil {
+				if snap, merr := json.Marshal(taskBody); merr == nil {
+					capture.tasks[alias] = snap
+					capture.refByNodeID[alias] = ref
+				}
 			}
 		}
 
