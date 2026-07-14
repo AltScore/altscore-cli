@@ -2846,6 +2846,7 @@ var validTaskTypes = map[string]bool{
 	"customer": true, "deal": true, "credit-line": true,
 	"list-of-similars": true, "asset": true, "relationships": true,
 	"package-io": true, "sftp": true, "notices": true,
+	"contact": true,
 }
 
 // fetchLiveTaskTypes, when set, lazily returns the LIVE backend's task-type
