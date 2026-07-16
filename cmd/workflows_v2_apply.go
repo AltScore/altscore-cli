@@ -71,9 +71,9 @@ import (
 // placeholder for future API support).
 
 type composeSpec struct {
-	Label           string         `json:"label"`
-	Alias           string         `json:"alias,omitempty"`
-	Category        string         `json:"category"`
+	Label    string `json:"label"`
+	Alias    string `json:"alias,omitempty"`
+	Category string `json:"category"`
 	// Pointer so an explicit "" (blank the description) is distinguishable from
 	// an omitted field (leave the existing description untouched on update).
 	Description     *string        `json:"description,omitempty"`
@@ -3427,6 +3427,40 @@ func preflightTasks(spec *composeSpec) error {
 				}
 			}
 		case "relationships":
+			// Dual-mode node. READ (operation:read) pinpoints EXISTING
+			// relationships via readRelationshipsConfig.picks (each pick resolves
+			// one relationship on a relpick-<id> handle); WRITE (default)
+			// bulk-creates N borrower<->contact links from relationshipsConfig.items.
+			if op, _ := task["operation"].(string); op == "read" {
+				readCfg := asMap(task["readRelationshipsConfig"])
+				readKinds := map[string]bool{
+					"shareholder": true, "employee": true, "family": true,
+					"other": true, "unspecified": true,
+				}
+				for pi, p := range asSlice(readCfg["picks"]) {
+					pm, ok := p.(map[string]any)
+					if !ok {
+						return fmt.Errorf("node ref=%q: readRelationshipsConfig.picks[%d] must be an object", ref, pi)
+					}
+					if kind, ok := pm["relationship"].(string); ok && kind != "" && !readKinds[kind] {
+						return fmt.Errorf(
+							"node ref=%q: readRelationshipsConfig.picks[%d].relationship=%q not in "+
+								"shareholder/employee/family/other/unspecified",
+							ref, pi, kind,
+						)
+					}
+					if take, ok := pm["take"].(string); ok && take != "" && take != "highest" && take != "lowest" {
+						return fmt.Errorf(
+							"node ref=%q: readRelationshipsConfig.picks[%d].take=%q must be \"highest\" or \"lowest\"",
+							ref, pi, take,
+						)
+					}
+				}
+				// Zero picks is warn-only in the Hub (node produces no output), not
+				// a hard compose error. No inline write items to validate in read
+				// mode. Fall through to the shared structural validator below.
+				break
+			}
 			// Bulk-create N borrower<->contact links in one activity.
 			// borrower_id and items must each come from either inline
 			// relationshipsConfig or inputMappings -- empty/missing on both

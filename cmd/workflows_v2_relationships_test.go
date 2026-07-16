@@ -117,7 +117,7 @@ func TestPreflightTasks_PackageIO(t *testing.T) {
 // inline and no items mapping -- reject.
 func TestPreflightTasks_RelationshipsEmptyItems(t *testing.T) {
 	spec := &composeSpec{
-		Label:    "Rel no items",
+		Label:      "Rel no items",
 		Category:   "ACTION",
 		ExtraNodes: startNode,
 		Tasks: []map[string]any{
@@ -137,7 +137,7 @@ func TestPreflightTasks_RelationshipsEmptyItems(t *testing.T) {
 // in the inline list is rejected.
 func TestPreflightTasks_RelationshipsMissingContactId(t *testing.T) {
 	spec := &composeSpec{
-		Label:    "Rel missing contact",
+		Label:      "Rel missing contact",
 		Category:   "ACTION",
 		ExtraNodes: startNode,
 		Tasks: []map[string]any{
@@ -162,7 +162,7 @@ func TestPreflightTasks_RelationshipsMissingContactId(t *testing.T) {
 // is_legal_representative=true would clobber each other -- reject upfront.
 func TestPreflightTasks_RelationshipsTwoLegalReps(t *testing.T) {
 	spec := &composeSpec{
-		Label:    "Rel two legal reps",
+		Label:      "Rel two legal reps",
 		Category:   "ACTION",
 		ExtraNodes: startNode,
 		Tasks: []map[string]any{
@@ -188,7 +188,7 @@ func TestPreflightTasks_RelationshipsTwoLegalReps(t *testing.T) {
 // allowed enum is rejected.
 func TestPreflightTasks_RelationshipsInvalidKind(t *testing.T) {
 	spec := &composeSpec{
-		Label:    "Rel invalid kind",
+		Label:      "Rel invalid kind",
 		Category:   "ACTION",
 		ExtraNodes: startNode,
 		Tasks: []map[string]any{
@@ -350,5 +350,105 @@ func TestPreflightTasks_RelationshipsUpsertOffHintsAtFlag(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "upsertContacts") {
 		t.Errorf("error should hint at upsertContacts flag, got: %v", err)
+	}
+}
+
+// relReadTask builds a relationships READ task (operation:read + picks). No
+// inline write items -- the read op resolves existing relationships.
+func relReadTask(ref string, picks []any, inputMappings map[string]any) map[string]any {
+	t := map[string]any{
+		"ref":       ref,
+		"type":      "relationships",
+		"label":     "Read relationships",
+		"operation": "read",
+		"readRelationshipsConfig": map[string]any{
+			"picks": picks,
+		},
+	}
+	if inputMappings != nil {
+		t["inputMappings"] = inputMappings
+	}
+	return t
+}
+
+// TestPreflightTasks_RelationshipsReadHappyPath: operation:read with valid picks
+// passes preflight WITHOUT any relationshipsConfig.items (the write-only items
+// requirement must not apply in read mode).
+func TestPreflightTasks_RelationshipsReadHappyPath(t *testing.T) {
+	spec := &composeSpec{
+		Label:      "Rel read",
+		Category:   "ACTION",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			relReadTask("read-rel", []any{
+				map[string]any{"id": "legalrep", "isLegalRepresentative": true, "take": "highest"},
+				map[string]any{"id": "sh", "relationship": "shareholder", "take": "lowest"},
+				map[string]any{"id": "any", "take": "highest"},
+			}, nil),
+		},
+		Edges: []map[string]any{{"from": "start", "to": "read-rel"}},
+	}
+	if err := preflightTasks(spec); err != nil {
+		t.Fatalf("preflight should accept a read relationships task with picks and no items, got: %v", err)
+	}
+}
+
+// TestPreflightTasks_RelationshipsReadNoPicksOK: read mode with zero picks is
+// warn-only (node produces no output), not a hard compose error.
+func TestPreflightTasks_RelationshipsReadNoPicksOK(t *testing.T) {
+	spec := &composeSpec{
+		Label:      "Rel read empty",
+		Category:   "ACTION",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			relReadTask("read-rel", []any{}, nil),
+		},
+		Edges: []map[string]any{{"from": "start", "to": "read-rel"}},
+	}
+	if err := preflightTasks(spec); err != nil {
+		t.Fatalf("preflight should accept a read relationships task with zero picks, got: %v", err)
+	}
+}
+
+// TestPreflightTasks_RelationshipsReadBadTake: an invalid tie-break is rejected.
+func TestPreflightTasks_RelationshipsReadBadTake(t *testing.T) {
+	spec := &composeSpec{
+		Label:      "Rel read bad take",
+		Category:   "ACTION",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			relReadTask("read-rel", []any{
+				map[string]any{"id": "p", "take": "middle"},
+			}, nil),
+		},
+	}
+	err := preflightTasks(spec)
+	if err == nil {
+		t.Fatalf("preflight should reject take=middle, got nil")
+	}
+	if !strings.Contains(err.Error(), "take") {
+		t.Errorf("error should mention take, got: %v", err)
+	}
+}
+
+// TestPreflightTasks_RelationshipsReadBadKind: an invalid pick relationship kind
+// is rejected (same enum as write items).
+func TestPreflightTasks_RelationshipsReadBadKind(t *testing.T) {
+	spec := &composeSpec{
+		Label:      "Rel read bad kind",
+		Category:   "ACTION",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			relReadTask("read-rel", []any{
+				map[string]any{"id": "p", "relationship": "cousin"},
+			}, nil),
+		},
+	}
+	err := preflightTasks(spec)
+	if err == nil {
+		t.Fatalf("preflight should reject relationship=cousin, got nil")
+	}
+	if !strings.Contains(err.Error(), "shareholder/employee/family/other/unspecified") {
+		t.Errorf("error should mention the kind enum, got: %v", err)
 	}
 }
