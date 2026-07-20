@@ -262,7 +262,7 @@ func TestCharacterization_RealApply_AliasSubstitution(t *testing.T) {
 	cmd, _ := preflightTestCmd()
 
 	// noAutoDefaults=true keeps the end node deterministic (no borrower_id wiring).
-	wf, err := applyAssembleValidateAndPost(c, cmd, richSplitSpec(), false, false, false, true, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, richSplitSpec(), false, false, false, true)
 	if err != nil {
 		t.Fatalf("real apply failed: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestCharacterization_ValidatedMatchesPostedModuloAlias(t *testing.T) {
 	defer srv.Close()
 	c := newTestClient(t, srv.URL)
 	cmd, _ := preflightTestCmd()
-	realWf, err := applyAssembleValidateAndPost(c, cmd, richSplitSpec(), false, false, false, true, false)
+	realWf, err := applyAssembleValidateAndPost(c, cmd, richSplitSpec(), false, false, false, true)
 	if err != nil {
 		t.Fatalf("real apply failed: %v", err)
 	}

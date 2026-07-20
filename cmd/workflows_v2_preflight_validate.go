@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/client"
@@ -103,15 +102,7 @@ type validationResponse struct {
 // error-severity finding to pin it to. Warnings never abort: they print
 // prominently and apply continues. When abortOnError is false (--dry-run) it
 // never returns an error -- it only prints results.
-//
-// When fixCustomVars is true, error findings that carry a machine-readable fix
-// (CUSTOM_VAR_UNDECLARED_REFERENCE's params.suggestedDependencies /
-// CUSTOM_VAR_MISSING_RETURN_VALUE's params.suggestedReturnValue -- the server
-// derives them from the expression) are applied to the workflow body's
-// customVariables in place and the body is validated once more. Fixes touch
-// only the posted body, never the author's spec file; the note tells them to
-// update the spec. One retry only -- the recursion disables the flag.
-func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[string]any, capture *composeCapture, abortOnError bool, fixCustomVars bool) error {
+func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[string]any, capture *composeCapture, abortOnError bool) error {
 	if c == nil || workflow == nil || capture == nil {
 		return nil
 	}
@@ -177,17 +168,6 @@ func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[
 		}
 	}
 
-	if fixCustomVars {
-		if fixedVars := applySuggestedCustomVariableFixes(workflow, errs); len(fixedVars) > 0 {
-			fmt.Fprintf(errOut, "# --fix-custom-variables: applied server-suggested fixes to %d variable(s): %s\n",
-				len(fixedVars), strings.Join(fixedVars, ", "))
-			fmt.Fprintln(errOut, "#   fixes touch the posted body only -- update your spec's customVariables to match, or keep the flag on.")
-			// Re-validate the fixed body once; the recursion disables the flag so
-			// a fix the server does not accept cannot loop.
-			return serverPreflightValidate(c, cmd, workflow, capture, abortOnError, false)
-		}
-	}
-
 	// The server's `valid` verdict is authoritative: honor it even when no
 	// error-severity finding is attached. A false verdict with only warnings (or
 	// none) still means "do not apply this graph".
@@ -238,68 +218,6 @@ func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[
 // preflightUnavailableNote is the dim fail-open note shared by every "the oracle
 // isn't usable" branch (404 / 5xx / transport error / non-2xx / empty body).
 const preflightUnavailableNote = "server pre-flight skipped: POST /v2/workflows/validate unavailable (older backend); proceeding without it"
-
-// applySuggestedCustomVariableFixes mutates workflow["customVariables"] with the
-// machine-readable fixes attached to error findings and returns the sorted
-// names of the variables it changed. The server derives the suggestions from
-// the variable's own expression (suggestedDependencies is the union of the
-// declared dependencies and the expression's static references), so applying
-// them never drops an author-declared dependency. No fix logic is
-// re-implemented in Go: the server is the single source of the derivation, and
-// findings without a suggestion are left for the author.
-func applySuggestedCustomVariableFixes(workflow map[string]any, errs []validationFinding) []string {
-	customs, _ := workflow["customVariables"].(map[string]any)
-	if len(customs) == 0 {
-		return nil
-	}
-	fixed := map[string]bool{}
-	for _, f := range errs {
-		name, _ := f.Params["variable"].(string)
-		if name == "" {
-			continue
-		}
-		varDef, _ := customs[name].(map[string]any)
-		if varDef == nil {
-			continue
-		}
-		switch f.Code {
-		case "CUSTOM_VAR_UNDECLARED_REFERENCE":
-			if deps := stringSlice(f.Params["suggestedDependencies"]); len(deps) > 0 {
-				varDef["dependencies"] = deps
-				fixed[name] = true
-			}
-		case "CUSTOM_VAR_MISSING_RETURN_VALUE":
-			if rv, _ := f.Params["suggestedReturnValue"].(string); rv != "" {
-				varDef["returnValue"] = rv
-				fixed[name] = true
-			}
-		}
-	}
-	names := make([]string, 0, len(fixed))
-	for name := range fixed {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-// stringSlice coerces a decoded-JSON []any into []string, returning nil if any
-// element is not a string (a partial fix is worse than no fix).
-func stringSlice(value any) []string {
-	items, ok := value.([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]string, 0, len(items))
-	for _, item := range items {
-		s, ok := item.(string)
-		if !ok {
-			return nil
-		}
-		out = append(out, s)
-	}
-	return out
-}
 
 // hasFindingCode reports whether any finding carries the given code.
 func hasFindingCode(findings []validationFinding, code string) bool {
@@ -392,7 +310,7 @@ func dimNote(w io.Writer, msg string) {
 // The posted workflow body is the validated body mutated in place by phase 4
 // alone, so it differs from what the validator saw ONLY by the ref -> server
 // alias identifier substitution.
-func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *composeSpec, publish, skipRescope, allowStealOwnership, noAutoDefaults, fixCustomVars bool) (map[string]any, error) {
+func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *composeSpec, publish, skipRescope, allowStealOwnership, noAutoDefaults bool) (map[string]any, error) {
 	// Phase 1: assemble once. dryRun=false selects strict normalization -- the
 	// real apply must hard-fail on a bad source/entity, not stub it as a preview
 	// would. An assembly-level error surfaces here, before any /v2/tasks POST.
@@ -403,7 +321,7 @@ func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *co
 	}
 
 	// Phase 2: validate the exact artifacts we are about to post.
-	if abortErr := serverPreflightValidate(c, cmd, wf, capture, true, fixCustomVars); abortErr != nil {
+	if abortErr := serverPreflightValidate(c, cmd, wf, capture, true); abortErr != nil {
 		return nil, abortErr
 	}
 
