@@ -177,6 +177,7 @@ func makeWfv2ApplyCmd() *cobra.Command {
 	var allowStealOwnership bool
 	var verify bool
 	var noAutoDefaults bool
+	var fixCustomVars bool
 
 	cmd := &cobra.Command{
 		Use:     "apply",
@@ -361,11 +362,11 @@ Spec format (see file header for full reference):
 				if err != nil {
 					return err
 				}
-				_ = serverPreflightValidate(c, cmd, workflow, capture, false)
+				_ = serverPreflightValidate(c, cmd, workflow, capture, false, fixCustomVars)
 			default:
 				// Real apply (create OR update): validate before posting anything,
 				// abort on server errors.
-				workflow, err = applyAssembleValidateAndPost(c, cmd, &spec, publish, skipRescope, allowStealOwnership, noAutoDefaults)
+				workflow, err = applyAssembleValidateAndPost(c, cmd, &spec, publish, skipRescope, allowStealOwnership, noAutoDefaults, fixCustomVars)
 				if err != nil {
 					return err
 				}
@@ -600,6 +601,7 @@ Spec format (see file header for full reference):
 	cmd.Flags().BoolVar(&skipRescope, "skip-rescope", false, "do not stamp referenced credit-decisioning entities (scorecards, rule-trees, etc.) to the workflow's alias after apply")
 	cmd.Flags().BoolVar(&allowStealOwnership, "allow-steal-ownership", false, "permit apply to transfer a credit-decisioning entity's workflowAlias when it is currently owned by ANOTHER workflow. Default: refuse and instruct the spec author to clone the entity with a new code. Use only for rare workflow rename / identity migration / decommissioning scenarios")
 	cmd.Flags().BoolVar(&verify, "verify", true, "after writing, read back the persisted tasks and warn (stderr, non-fatal) about any spec-set field the backend dropped or nulled. Pass --verify=false to skip the extra GETs")
+	cmd.Flags().BoolVar(&fixCustomVars, "fix-custom-variables", false, "apply the server pre-flight's machine-readable fixes to customVariables before posting: declare the dependencies the expression references (suggestedDependencies) and set a missing returnValue (suggestedReturnValue). Fixes only what the server suggests -- no derivation logic lives in the CLI -- and touches the posted body, not your spec file; update the spec to match. Without this flag those findings abort apply with the same suggestions printed")
 	cmd.Flags().BoolVar(&noAutoDefaults, "no-auto-defaults", false, "disable apply's opinionated convenience defaults: (1) end-node borrower_id/billable_id wired to the single customer node's borrower_id, (2) forced end-node PDF generation (pdfConfig.enabled+pdfGenerationRequired=true), (3) deal-contact identity_value back-filled from each contact's identity_key field (default tax_id). Each only fills an absent field; caller-supplied values always win")
 	return cmd
 }

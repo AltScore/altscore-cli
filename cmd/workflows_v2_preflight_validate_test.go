@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -65,7 +67,7 @@ func TestServerPreflightValidate_ErrorAborts(t *testing.T) {
 	cmd, errb := preflightTestCmd()
 	capture := newComposeCapture()
 
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true, false)
 	if err == nil {
 		t.Fatal("expected abort error on error-severity finding, got nil")
 	}
@@ -95,7 +97,7 @@ func TestServerPreflightValidate_WarningProceeds(t *testing.T) {
 	capture := newComposeCapture()
 	capture.refByNodeID["route"] = "route"
 
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true, false)
 	if err != nil {
 		t.Fatalf("warnings must not abort; got: %v", err)
 	}
@@ -120,7 +122,7 @@ func TestServerPreflightValidate_404FailsOpen(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false)
 	if err != nil {
 		t.Fatalf("404 must fail open (nil error); got: %v", err)
 	}
@@ -143,7 +145,7 @@ func TestServerPreflightValidate_NonJSONFailsOpen(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false)
 	if err != nil {
 		t.Fatalf("non-JSON must fail open (nil error); got: %v", err)
 	}
@@ -168,7 +170,7 @@ func TestServerPreflightValidate_NodeIDMappedToRef(t *testing.T) {
 	// Server assigned "conditional-1a2b3c"; the author's spec called it "route".
 	capture.refByNodeID["conditional-1a2b3c"] = "route"
 
-	_ = serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true)
+	_ = serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true, false)
 	out := errb.String()
 	if !strings.Contains(out, `node "route"`) {
 		t.Errorf("expected finding rendered with mapped ref 'route'; got:\n%s", out)
@@ -196,7 +198,7 @@ func TestServerPreflightValidate_UnknownCodeRenderedGenerically(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false)
 	if err == nil {
 		t.Fatal("unknown error-severity code must still abort")
 	}
@@ -221,7 +223,7 @@ func TestServerPreflightValidate_DryRunNeverAborts(t *testing.T) {
 	defer srvErr.Close()
 	c := newTestClient(t, srvErr.URL)
 	cmd, errb := preflightTestCmd()
-	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), false); err != nil {
+	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), false, false); err != nil {
 		t.Fatalf("dry-run must never abort; got: %v", err)
 	}
 	if !strings.Contains(errb.String(), "MULTIPLE_END_NODES") {
@@ -236,7 +238,7 @@ func TestServerPreflightValidate_DryRunNeverAborts(t *testing.T) {
 	defer srvOK.Close()
 	c2 := newTestClient(t, srvOK.URL)
 	cmd2, errb2 := preflightTestCmd()
-	if err := serverPreflightValidate(c2, cmd2, map[string]any{"label": "x"}, newComposeCapture(), false); err != nil {
+	if err := serverPreflightValidate(c2, cmd2, map[string]any{"label": "x"}, newComposeCapture(), false, false); err != nil {
 		t.Fatalf("clean pass must not error; got: %v", err)
 	}
 	if !strings.Contains(errb2.String(), "no issues found") {
@@ -284,7 +286,7 @@ func TestApplyAssembleValidateAndPost_ErrorAbortsBeforeTaskCreate(t *testing.T) 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
 	if err == nil {
 		t.Fatal("expected apply to abort on error finding")
 	}
@@ -314,7 +316,7 @@ func TestApplyAssembleValidateAndPost_WarningProceedsAndPosts(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
 	if err != nil {
 		t.Fatalf("warnings must not block apply; got: %v", err)
 	}
@@ -342,7 +344,7 @@ func TestApplyAssembleValidateAndPost_404FailsOpenAndPosts(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
 	if err != nil {
 		t.Fatalf("404 must fail open and let apply proceed; got: %v", err)
 	}
@@ -379,7 +381,7 @@ func TestDryAssemblyValidation_PostsNoTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dry compose failed: %v", err)
 	}
-	serverPreflightValidate(c, cmd, wf, capture, false)
+	serverPreflightValidate(c, cmd, wf, capture, false, false)
 
 	if got := atomic.LoadInt32(&taskCalls); got != 0 {
 		t.Errorf("dry-run must not POST any /v2/tasks; got %d", got)
@@ -417,7 +419,7 @@ func TestServerPreflightValidate_ValidFalseWithoutErrorAborts(t *testing.T) {
 			c := newTestClient(t, srv.URL)
 			cmd, errb := preflightTestCmd()
 
-			err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
+			err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false)
 			if err == nil {
 				t.Fatal("valid:false must abort even with no error-severity finding")
 			}
@@ -444,7 +446,7 @@ func TestServerPreflightValidate_ValidFalseStillPrintsWarnings(t *testing.T) {
 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
-	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true); err == nil {
+	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false); err == nil {
 		t.Fatal("expected abort")
 	}
 	if out := errb.String(); !strings.Contains(out, "[WARN]") || !strings.Contains(out, "SOME_ADVISORY") {
@@ -464,7 +466,7 @@ func TestServerPreflightValidate_UppercaseSeverityAborts(t *testing.T) {
 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false)
 	if err == nil {
 		t.Fatal("uppercase ERROR severity must be treated as an error and abort")
 	}
@@ -492,7 +494,7 @@ func TestServerPreflightValidate_BranchBannerOnlyForBranchCode(t *testing.T) {
 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
-	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true); err != nil {
+	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false); err != nil {
 		t.Fatalf("warning must not abort; got: %v", err)
 	}
 	out := errb.String()
@@ -517,7 +519,7 @@ func TestApplyAssembleValidateAndPost_422LoudNoteProceedsAndPosts(t *testing.T) 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
 	if err != nil {
 		t.Fatalf("a 4xx from the oracle must not block apply; got: %v", err)
 	}
@@ -536,5 +538,182 @@ func TestApplyAssembleValidateAndPost_422LoudNoteProceedsAndPosts(t *testing.T) 
 	}
 	if strings.Contains(out, "older backend") {
 		t.Errorf("a 422 must NOT be misattributed to an older backend; got:\n%s", out)
+	}
+}
+
+// --- --fix-custom-variables ---------------------------------------------------
+
+// With the flag on, error findings carrying machine-readable suggestions are
+// applied to the workflow body's customVariables and the body is validated a
+// second time; a clean second verdict lets apply proceed.
+func TestServerPreflightValidate_FixCustomVariablesAppliesAndRevalidates(t *testing.T) {
+	var validateCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || r.URL.Path != "/v2/workflows/validate" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			return
+		}
+		call := atomic.AddInt32(&validateCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			_, _ = w.Write([]byte(`{"valid":false,"findings":[
+				{"code":"CUSTOM_VAR_UNDECLARED_REFERENCE","severity":"error","nodeId":null,"edgeId":null,
+				 "params":{"variable":"raw_debt","missingDependencies":["task_outputs.enrich.x"],"suggestedDependencies":["task_outputs.enrich.x"]},
+				 "message":"expression references 'task_outputs.enrich.x' but dependencies does not declare them"},
+				{"code":"CUSTOM_VAR_MISSING_RETURN_VALUE","severity":"error","nodeId":null,"edgeId":null,
+				 "params":{"variable":"raw_debt","suggestedReturnValue":"result"},
+				 "message":"returnValue is empty"}
+			]}`))
+			return
+		}
+		// Second round: the fixed body must carry the applied suggestions.
+		var payload struct {
+			Workflow map[string]any `json:"workflow"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Errorf("second validate payload not JSON: %v", err)
+		}
+		customs, _ := payload.Workflow["customVariables"].(map[string]any)
+		varDef, _ := customs["raw_debt"].(map[string]any)
+		if varDef == nil {
+			t.Error("second validate payload missing customVariables.raw_debt")
+		} else {
+			if rv, _ := varDef["returnValue"].(string); rv != "result" {
+				t.Errorf("returnValue not applied; got %v", varDef["returnValue"])
+			}
+			deps, _ := varDef["dependencies"].([]any)
+			if len(deps) != 1 || deps[0] != "task_outputs.enrich.x" {
+				t.Errorf("dependencies not applied; got %v", varDef["dependencies"])
+			}
+		}
+		_, _ = w.Write([]byte(`{"valid":true,"findings":[]}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	cmd, errb := preflightTestCmd()
+	workflow := map[string]any{
+		"label": "x",
+		"customVariables": map[string]any{
+			"raw_debt": map[string]any{
+				"expression": "result = inputs.get('task_outputs.enrich.x')",
+			},
+		},
+	}
+
+	err := serverPreflightValidate(c, cmd, workflow, newComposeCapture(), true, true)
+	if err != nil {
+		t.Fatalf("fixed body must pass; got: %v", err)
+	}
+	if got := atomic.LoadInt32(&validateCalls); got != 2 {
+		t.Errorf("expected 2 validate calls (fix + revalidate), got %d", got)
+	}
+	out := errb.String()
+	for _, want := range []string{"--fix-custom-variables", "raw_debt", "update your spec"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stderr missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// Findings with no machine-readable suggestion (or unrelated codes) are not
+// fixable: the flag changes nothing and apply aborts exactly as without it.
+func TestServerPreflightValidate_FixCustomVariablesUnfixableAborts(t *testing.T) {
+	var validateCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&validateCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"valid":false,"findings":[
+			{"code":"CUSTOM_VAR_DEPENDENCY_UNRESOLVED","severity":"error","nodeId":null,"edgeId":null,
+			 "params":{"variable":"v","dependency":"inputs.ghost"},
+			 "message":"input variable 'ghost' does not exist"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	cmd, _ := preflightTestCmd()
+	workflow := map[string]any{
+		"label":           "x",
+		"customVariables": map[string]any{"v": map[string]any{"expression": "result = 1"}},
+	}
+
+	err := serverPreflightValidate(c, cmd, workflow, newComposeCapture(), true, true)
+	if err == nil {
+		t.Fatal("unfixable error finding must still abort")
+	}
+	if got := atomic.LoadInt32(&validateCalls); got != 1 {
+		t.Errorf("no fix applied -> no revalidation; expected 1 call, got %d", got)
+	}
+}
+
+// A fix the server does not accept cannot loop: the retry runs with the flag
+// off, so persistent errors abort after exactly two calls.
+func TestServerPreflightValidate_FixCustomVariablesRetriesOnce(t *testing.T) {
+	var validateCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&validateCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"valid":false,"findings":[
+			{"code":"CUSTOM_VAR_MISSING_RETURN_VALUE","severity":"error","nodeId":null,"edgeId":null,
+			 "params":{"variable":"v","suggestedReturnValue":"result"},
+			 "message":"returnValue is empty"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	cmd, _ := preflightTestCmd()
+	workflow := map[string]any{
+		"label":           "x",
+		"customVariables": map[string]any{"v": map[string]any{"expression": "result = 1"}},
+	}
+
+	err := serverPreflightValidate(c, cmd, workflow, newComposeCapture(), true, true)
+	if err == nil {
+		t.Fatal("persistent error must abort after the single retry")
+	}
+	if got := atomic.LoadInt32(&validateCalls); got != 2 {
+		t.Errorf("expected exactly 2 validate calls (fix round + retry), got %d", got)
+	}
+}
+
+// Pure unit: only suggestion-bearing custom-variable findings mutate the body,
+// and a malformed suggestion (non-string entries) is ignored whole.
+func TestApplySuggestedCustomVariableFixes(t *testing.T) {
+	workflow := map[string]any{
+		"customVariables": map[string]any{
+			"a": map[string]any{"expression": "result = inputs['x']"},
+			"b": map[string]any{"expression": "result = 1"},
+		},
+	}
+	fixed := applySuggestedCustomVariableFixes(workflow, []validationFinding{
+		{Code: "CUSTOM_VAR_UNDECLARED_REFERENCE", Params: map[string]any{
+			"variable": "a", "suggestedDependencies": []any{"x"}}},
+		{Code: "CUSTOM_VAR_MISSING_RETURN_VALUE", Params: map[string]any{
+			"variable": "b", "suggestedReturnValue": "result"}},
+		// no variable name -> ignored
+		{Code: "CUSTOM_VAR_MISSING_RETURN_VALUE", Params: map[string]any{
+			"suggestedReturnValue": "result"}},
+		// unknown variable -> ignored
+		{Code: "CUSTOM_VAR_UNDECLARED_REFERENCE", Params: map[string]any{
+			"variable": "ghost", "suggestedDependencies": []any{"x"}}},
+		// malformed suggestion (non-string entry) -> ignored whole
+		{Code: "CUSTOM_VAR_UNDECLARED_REFERENCE", Params: map[string]any{
+			"variable": "b", "suggestedDependencies": []any{"ok", 7}}},
+	})
+	if len(fixed) != 2 || fixed[0] != "a" || fixed[1] != "b" {
+		t.Fatalf("expected fixed [a b]; got %v", fixed)
+	}
+	customs := workflow["customVariables"].(map[string]any)
+	if deps := customs["a"].(map[string]any)["dependencies"].([]string); len(deps) != 1 || deps[0] != "x" {
+		t.Errorf("a.dependencies not applied: %v", deps)
+	}
+	if rv := customs["b"].(map[string]any)["returnValue"]; rv != "result" {
+		t.Errorf("b.returnValue not applied: %v", rv)
+	}
+	if _, has := customs["b"].(map[string]any)["dependencies"]; has {
+		t.Errorf("malformed suggestion must not be applied")
 	}
 }
