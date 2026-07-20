@@ -642,6 +642,8 @@ The **inline `contacts` field is the ONLY supported way to attach deal contacts*
 3. A **workflow-level custom variable** whose expression reads a scoped scalar, and a `compute-variables` node that lists it in `selectedVariables`. The expression uses BC's Python DSL (see the customVariables normalization in `apply`): `result = inputs.get("task_outputs.<sourceRef>.deal_contact_id")`. The dependency string and the `inputs.get(...)` key must agree on the alias (`apply` rewrites the spec `ref` to the server alias).
 4. **Downstream nodes** (data source, rules, scorecard) read the scoped scalar via `custom.<name>` — each branch gets THAT item's value.
 
+**Every custom variable needs `dependencies` and `returnValue`, not just `expression`.** The runtime injects ONLY the declared `dependencies` into the expression's `inputs` dict (it never parses the expression) and wraps the code with `return <returnValue or None>` — a variable stored with only an `expression` runs with `inputs = {}` and outputs null on every execution, silently. BC's pre-flight/publish validation rejects this shape (`CUSTOM_VAR_UNDECLARED_REFERENCE`, `CUSTOM_VAR_MISSING_RETURN_VALUE`) with the exact dependencies to add; pass `--fix-custom-variables` to `apply` to have the server-suggested fixes applied to the posted body automatically (then update the spec to match).
+
 **Worked example** — a deal node with inline `contacts`, a `deal-0` edge to a compute-variables probe, a custom var reading the scoped `deal_contact_id`, and a downstream node consuming the scoped scalar:
 
 ```jsonc
