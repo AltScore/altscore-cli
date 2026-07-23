@@ -237,7 +237,28 @@ Spec format (see file header for full reference):
     (including 'end') gets a backing task created. This is the only
     accepted shape; the legacy 'tasks[]' + 'extraNodes[]' two-bucket
     shape was removed -- apply rejects it with an inline rewrite.
-  - edges: list of {from, to, sourceHandle?, label?}`,
+  - edges: list of {from, to, sourceHandle?, label?}
+
+End-node output (endConfig on the 'end' node):
+  - outputJson: free-form JSON string -> the execution's customOutput.
+  - standardOutput: the structured v1 white-box decisioning result -> the
+    execution's standard 'output' field. Each section binds to ONE variable
+    (a {{task_outputs.<ref>.<field>}} template); spec refs are rewritten to
+    server aliases and validated on apply. Shape:
+      "standardOutput": {
+        "enabled": true,
+        "score":    {"key":"score","label":"Score",
+                     "value":"{{task_outputs.score.total}}","maxValue":1000},
+        "scorecard":"{{task_outputs.score.rows}}",
+        "metrics":  "{{task_outputs.score.metrics}}",
+        "rules":    "{{task_outputs.tree.rules}}",
+        "alerts":   "{{task_outputs.kyb.alerts}}",
+        "decision": "{{task_outputs.score.decision}}",
+        "data":     "{{task_outputs.score.data}}",
+        "fields":   {"tax_id":"{{inputs.tax_id}}","note":"approved"}
+      }
+    score.value/scorecard/metrics/rules/alerts/decision/data each take a single
+    variable; score.key/label/maxValue and fields values may be literals.`,
 		Example: `  altscore workflows-v2 apply --body @scoring-pipeline.json
   altscore workflows-v2 apply --body @spec.json --publish          # create+publish OR update+publish
   altscore workflows-v2 apply --body @spec.json --dry-run
@@ -1562,6 +1583,54 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 					pdfCfg["sourcesConfig"] = sources
 				}
 			}
+			// standardOutput carries {{task_outputs.<ref>...}} templates on each
+			// section (data/scorecard/metrics/rules/alerts/decision), the score
+			// sub-object's fields, and each author-added `fields` entry. Like
+			// outputJson these are runtime templates whose spec-local refs must be
+			// rewritten to server aliases -- and validated (unknown ref -> error).
+			// Without this walk a section ships with a stale spec ref and the
+			// runtime resolves it to an empty section (the safety net below only
+			// catches BARE refs, not {{...}}-wrapped ones).
+			if raw, present := endCfg["standardOutput"]; present {
+				stdOut, ok := raw.(map[string]any)
+				if !ok {
+					return fmt.Errorf("endConfig.standardOutput must be an object, got %T", raw)
+				}
+				if err := validateStandardOutputShape(stdOut); err != nil {
+					return err
+				}
+				for _, key := range []string{"data", "scorecard", "metrics", "rules", "alerts", "decision"} {
+					if s, ok := stdOut[key].(string); ok && s != "" {
+						out, err := rewriteField("endConfig.standardOutput."+key, s)
+						if err != nil {
+							return err
+						}
+						stdOut[key] = out
+					}
+				}
+				if score, _ := stdOut["score"].(map[string]any); score != nil {
+					for _, key := range []string{"value", "key", "label", "maxValue"} {
+						if s, ok := score[key].(string); ok && s != "" {
+							out, err := rewriteField("endConfig.standardOutput.score."+key, s)
+							if err != nil {
+								return err
+							}
+							score[key] = out
+						}
+					}
+				}
+				if fields, _ := stdOut["fields"].(map[string]any); fields != nil {
+					for k, v := range fields {
+						if s, ok := v.(string); ok && s != "" {
+							out, err := rewriteField("endConfig.standardOutput.fields."+k, s)
+							if err != nil {
+								return err
+							}
+							fields[k] = out
+						}
+					}
+				}
+			}
 		}
 	case "exception":
 		// errorMessage flows through graph_workflow's _resolve_dict_variables
@@ -1713,6 +1782,76 @@ func validateNoResidualSpecRefs(body map[string]any, refMap map[string]string, c
 		return nil
 	}
 	return walk(body, "")
+}
+
+// standardOutputSectionKeys are the whole-section bindings on
+// endConfig.standardOutput -- each holds a single {{task_outputs.<ref>.<field>}}
+// template string bound to a variable that produces that section's shape.
+var standardOutputSectionKeys = []string{"data", "scorecard", "metrics", "rules", "alerts", "decision"}
+
+// standardOutputAllowedKeys is the frozen v1 white-box shape. It is an allowlist
+// (not passthrough) on purpose: the schema is a stable legacy contract, so an
+// unknown top-level key is almost always a typo (scoreCard, metric, rule) worth
+// catching locally instead of shipping a silently-ignored field.
+var standardOutputAllowedKeys = map[string]bool{
+	"enabled": true, "fields": true, "score": true,
+	"data": true, "scorecard": true, "metrics": true,
+	"rules": true, "alerts": true, "decision": true,
+}
+
+var standardOutputScoreAllowedKeys = map[string]bool{
+	"key": true, "label": true, "value": true, "maxValue": true,
+}
+
+// validateStandardOutputShape checks the structural shape of
+// endConfig.standardOutput before it ships, surfacing a clear local error
+// instead of a backend 400. Variable refs are NOT checked here --
+// rewriteRefsInTaskTemplates rewrites and validates those.
+func validateStandardOutputShape(stdOut map[string]any) error {
+	for k := range stdOut {
+		if !standardOutputAllowedKeys[k] {
+			return fmt.Errorf(
+				"endConfig.standardOutput has unknown field %q (allowed: enabled, fields, score, "+
+					"data, scorecard, metrics, rules, alerts, decision)", k)
+		}
+	}
+	if v, ok := stdOut["enabled"]; ok {
+		if _, isBool := v.(bool); !isBool {
+			return fmt.Errorf("endConfig.standardOutput.enabled must be a boolean, got %T", v)
+		}
+	}
+	// Whole-section bindings must be a single template string (or absent). A list
+	// or object here is the classic "I pasted the data instead of a variable"
+	// mistake -- bind the section to ONE variable, e.g. "{{task_outputs.sc.rows}}".
+	for _, key := range standardOutputSectionKeys {
+		if v, ok := stdOut[key]; ok && v != nil {
+			if _, isStr := v.(string); !isStr {
+				return fmt.Errorf(
+					"endConfig.standardOutput.%s must be a variable template string like "+
+						"\"{{task_outputs.<ref>.<field>}}\", got %T", key, v)
+			}
+		}
+	}
+	if v, ok := stdOut["score"]; ok && v != nil {
+		score, isMap := v.(map[string]any)
+		if !isMap {
+			return fmt.Errorf(
+				"endConfig.standardOutput.score must be an object {key,label,value,maxValue}, got %T", v)
+		}
+		for sk := range score {
+			if !standardOutputScoreAllowedKeys[sk] {
+				return fmt.Errorf(
+					"endConfig.standardOutput.score has unknown field %q (allowed: key, label, value, maxValue)", sk)
+			}
+		}
+	}
+	if v, ok := stdOut["fields"]; ok && v != nil {
+		if _, isMap := v.(map[string]any); !isMap {
+			return fmt.Errorf(
+				"endConfig.standardOutput.fields must be an object of key -> value, got %T", v)
+		}
+	}
+	return nil
 }
 
 // rewriteTaskRefs applies every ref->alias rewrite a task-node body needs, in
