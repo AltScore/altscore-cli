@@ -233,3 +233,117 @@ func TestDetectLegacySpecShape_IgnoresMalformedJSON(t *testing.T) {
 		t.Errorf("malformed JSON should defer to caller's unmarshal; got: %v", err)
 	}
 }
+
+// TestRewriteRefsInTaskTemplates_EndStandardOutput covers the rewrite of
+// endConfig.standardOutput template refs (sections, score sub-fields, and
+// author-added fields) from spec-local refs to server aliases -- the same
+// treatment outputJson gets. Without it an authored standardOutput ships with
+// stale spec refs and the runtime resolves each section to empty.
+func TestRewriteRefsInTaskTemplates_EndStandardOutput(t *testing.T) {
+	refMap := map[string]string{
+		"score": "scorecard-059a48",
+		"tree":  "rbol-de-decisi-n-55e977",
+	}
+	task := map[string]any{
+		"type": "end",
+		"endConfig": map[string]any{
+			"standardOutput": map[string]any{
+				"enabled":   true,
+				"scorecard": "{{task_outputs.score.rows}}",
+				"rules":     "{{task_outputs.tree.rules}}",
+				"decision":  "{{task_outputs.score.decision}}",
+				"score": map[string]any{
+					"key":      "score",
+					"label":    "Score",
+					"value":    "{{task_outputs.score.total}}",
+					"maxValue": float64(1000),
+				},
+				"fields": map[string]any{
+					"tax_id": "{{inputs.tax_id}}",
+					"note":   "approved",
+				},
+			},
+		},
+	}
+	if err := rewriteRefsInTaskTemplates(task, refMap); err != nil {
+		t.Fatalf("rewriteRefsInTaskTemplates: %v", err)
+	}
+	std := task["endConfig"].(map[string]any)["standardOutput"].(map[string]any)
+	if got := std["scorecard"]; got != "{{task_outputs.scorecard-059a48.rows}}" {
+		t.Errorf("scorecard = %q, want rewritten server alias", got)
+	}
+	if got := std["rules"]; got != "{{task_outputs.rbol-de-decisi-n-55e977.rules}}" {
+		t.Errorf("rules = %q, want rewritten server alias", got)
+	}
+	if got := std["decision"]; got != "{{task_outputs.scorecard-059a48.decision}}" {
+		t.Errorf("decision = %q", got)
+	}
+	score := std["score"].(map[string]any)
+	if got := score["value"]; got != "{{task_outputs.scorecard-059a48.total}}" {
+		t.Errorf("score.value = %q, want rewritten", got)
+	}
+	// Literals survive untouched.
+	if got := score["key"]; got != "score" {
+		t.Errorf("score.key literal changed: %q", got)
+	}
+	fields := std["fields"].(map[string]any)
+	if got := fields["note"]; got != "approved" {
+		t.Errorf("fields.note literal changed: %q", got)
+	}
+	// inputs.* is a reserved scope, left as-is.
+	if got := fields["tax_id"]; got != "{{inputs.tax_id}}" {
+		t.Errorf("fields.tax_id = %q, want unchanged", got)
+	}
+}
+
+// TestRewriteRefsInTaskTemplates_EndStandardOutputUnknownRef ensures an unknown
+// task ref in a standardOutput template fails loudly, same as outputJson.
+func TestRewriteRefsInTaskTemplates_EndStandardOutputUnknownRef(t *testing.T) {
+	task := map[string]any{
+		"type": "end",
+		"endConfig": map[string]any{
+			"standardOutput": map[string]any{
+				"scorecard": "{{task_outputs.nonexistent.rows}}",
+			},
+		},
+	}
+	err := rewriteRefsInTaskTemplates(task, map[string]string{"score": "scorecard-1"})
+	if err == nil {
+		t.Fatal("expected error for unknown standardOutput ref, got nil")
+	}
+	if !strings.Contains(err.Error(), "standardOutput.scorecard") {
+		t.Errorf("error should name the offending field, got: %v", err)
+	}
+}
+
+// TestValidateStandardOutputShape covers the structural validation surfaced
+// before apply ships the body.
+func TestValidateStandardOutputShape(t *testing.T) {
+	cases := []struct {
+		name    string
+		std     map[string]any
+		wantErr string // substring; "" = no error
+	}{
+		{"valid", map[string]any{"enabled": true, "scorecard": "{{task_outputs.s.rows}}", "score": map[string]any{"value": "{{task_outputs.s.t}}"}, "fields": map[string]any{"a": "b"}}, ""},
+		{"enabled not bool", map[string]any{"enabled": "yes"}, "enabled must be a boolean"},
+		{"section is list", map[string]any{"scorecard": []any{1, 2}}, "scorecard must be a variable template string"},
+		{"unknown top key", map[string]any{"scoreCard": "x"}, `unknown field "scoreCard"`},
+		{"score not object", map[string]any{"score": "x"}, "score must be an object"},
+		{"score unknown key", map[string]any{"score": map[string]any{"maximum": 1}}, `score has unknown field "maximum"`},
+		{"fields not object", map[string]any{"fields": []any{}}, "fields must be an object"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateStandardOutputShape(c.std)
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("want error containing %q, got %v", c.wantErr, err)
+			}
+		})
+	}
+}
