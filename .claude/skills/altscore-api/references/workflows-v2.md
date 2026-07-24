@@ -205,7 +205,7 @@ Canonical shape:
 }
 ```
 
-> **outputJson template syntax.** Bare placeholders like `{{borrower_id}}` and `{{decision_key}}` do NOT resolve in BC's `VariableResolver` -- only `{{inputs.X}}`, `{{task_outputs.X.Y}}`, `{{custom.X}}`, `{{system.X}}`, and bare-alias `{{<alias>.<field>}}` (with a dot). A bare key stays literal, corrupts the rendered JSON, and the runtime silently falls back to the promoted-scope dump (your custom envelope vanishes with no error). The `inputMappings` short-name keys (`borrower_id`, `decision_key`) drive BC's per-context promotion (`result['decision_key']`, `result['borrower_id']` on the execution record) and PDF section enrichment -- but NOT outputJson substitution. Always use the long form (`{{task_outputs.<ref>.decision_key}}`) in outputJson, even when the same key is also in `inputMappings`.
+> **outputJson template syntax.** Bare placeholders like `{{borrower_id}}` and `{{decision_key}}` do NOT resolve in BC's `VariableResolver` -- only `{{inputs.X}}`, `{{task_outputs.X.Y}}`, `{{custom.X}}`, `{{system.X}}`, and bare-alias `{{<alias>.<field>}}` (with a dot). A bare key stays literal, corrupts the rendered JSON, and the runtime silently falls back to the promoted-scope dump (your custom envelope vanishes with no error). The `inputMappings` short-name keys (`borrower_id`, `decision_key`) drive BC's per-context promotion (`result['decision_key']`, `result['borrower_id']` on the execution record) and PDF section enrichment -- but NOT outputJson substitution. Always use the long form (`{{task_outputs.<ref>.decision_key}}`) in outputJson, even when the same key is also in `inputMappings`. To stamp the workflow's own execution id into the output, use `{{system.workflow_execution_id}}` -- the key is `workflow_execution_id`, NOT `execution_id` (see the System scope note under "Variable resolution syntax").
 
 **When multiple end nodes are correct.** Rare, but legal: post-decision tasks differ per branch (one branch hits an external webhook the other doesn't), or per-branch `htmlSections` that aren't expressible as `{decision_key}` substitutions. In those cases keep the conditional + N ends, but still wire `decision_key` on every end's `inputMappings`.
 
@@ -480,8 +480,12 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 | Task output (top-level) | `task_outputs.<taskAlias>.<field>` | `task_outputs.fetch.sources_output_packages` |
 | Task output (deep path) | `task_outputs.<taskAlias>.<deep>.<path>.<to>.<field>` | `task_outputs.fetch.ECU-PUB-0002.data.pdEc_sri_esActivo` |
 | Custom variable | `custom.<name>` | `custom.normalized_score` |
-| System | `system.<key>` | `system.execution_id` |
+| System | `system.<key>` | `system.workflow_execution_id` |
 | Indexed by type | `task_outputs_by_type.<taskType>[<idx>].<field>` | `task_outputs_by_type.altdata-enrichment[0].result` |
+
+**System scope keys — the execution id is `workflow_execution_id`, NOT `execution_id`.** There is no `system.execution_id` key; referencing it resolves to `None` and the `{{...}}` token is left in place literally (so `"{{system.execution_id}}"` survives verbatim into `custom_output`). The keys that exist include `workflow_execution_id`, `tenant`, `executed_by`, `execution_batch_id`, `primary_borrower_id`, `primary_deal_id`, and `workflow_start_time`.
+
+**This table resolves in TEMPLATE contexts only — outputJson `{{...}}` placeholders and node `inputMappings`. It does NOT reach `compute-variables` Python.** A `compute-variables` node's `inputs` dict is built solely from its declared `inputs.` / `task_outputs.` / `custom.` dependencies; the runtime has no `system` branch, so a `system.*` dependency passes publish validation but always resolves to `None` at runtime (this is why even a trivially-present key like `system.tenant` reads `None` from `inputs.get(...)`). To use the execution id inside `compute-variables`, wire `{{system.workflow_execution_id}}` into a normal node's `inputMappings` and read it back via `task_outputs.<alias>.<field>`.
 
 **Deep paths into altdata output**: an `altdata-enrichment` task outputs the entire package object on `sources_output_packages`. To map a single field into a downstream conditional/compute-variables task, use the deep form: `task_outputs.<altdataAlias>.<sourceId>.data.<fieldName>`. No intermediate compute-variables required.
 
