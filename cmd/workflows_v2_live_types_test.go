@@ -23,10 +23,19 @@ func TestPreflightTasks_LiveBackendTypeFallback(t *testing.T) {
 		}
 	}
 
-	// No hook (unit-test / offline mode): unknown type stays fatal.
+	// No hook (unit-test / offline mode): an unverifiable type warns and proceeds
+	// rather than hard-blocking. The backend enforces the TaskType enum on write,
+	// so a real typo is still rejected there -- and with no --no-preflight flag,
+	// rejecting here would leave a stale mirror as an unrecoverable block.
 	fetchLiveTaskTypes = nil
-	if err := preflightTasks(spec("brand-new-node")); err == nil || !strings.Contains(err.Error(), "unknown task type") {
-		t.Fatalf("without live hook, unknown type must be fatal, got: %v", err)
+	var offlineErr error
+	stderr := captureStderr(t, func() { offlineErr = preflightTasks(spec("brand-new-node")) })
+	if offlineErr != nil {
+		t.Fatalf("without live hook, unknown type must warn and proceed, got: %v", offlineErr)
+	}
+	if !strings.Contains(stderr, "brand-new-node") ||
+		!strings.Contains(stderr, "live backend could not be consulted") {
+		t.Fatalf("offline acceptance must warn on stderr, got: %q", stderr)
 	}
 
 	// Hook reports the type: preflight accepts (warn-only).
@@ -43,15 +52,25 @@ func TestPreflightTasks_LiveBackendTypeFallback(t *testing.T) {
 		t.Fatalf("live list must be fetched exactly once, got %d", calls)
 	}
 
-	// Hook does NOT report the type: fatal as before.
-	fetchLiveTaskTypes = func() map[string]bool { return map[string]bool{} }
+	// Hook returns a real vocabulary that does NOT list the type: the backend is
+	// reachable and disowns it, so preflight has authority and stays fatal. A
+	// populated map is what a reachable backend actually yields --
+	// fetchServerTaskTypes returns nil, not an empty map, when the list is empty.
+	fetchLiveTaskTypes = func() map[string]bool {
+		return map[string]bool{"http": true, "end": true, "start": true}
+	}
 	if err := preflightTasks(spec("still-bogus")); err == nil || !strings.Contains(err.Error(), "unknown task type") {
-		t.Fatalf("type unknown to both must stay fatal, got: %v", err)
+		t.Fatalf("type unknown to a reachable backend must stay fatal, got: %v", err)
 	}
 
-	// Hook errors out (returns nil): fatal as before, no crash.
+	// Hook errors out (returns nil): unverifiable, so warn + proceed, no crash.
 	fetchLiveTaskTypes = func() map[string]bool { return nil }
-	if err := preflightTasks(spec("also-bogus")); err == nil || !strings.Contains(err.Error(), "unknown task type") {
-		t.Fatalf("nil live list must fall back to fatal, got: %v", err)
+	var nilErr error
+	stderr = captureStderr(t, func() { nilErr = preflightTasks(spec("also-bogus")) })
+	if nilErr != nil {
+		t.Fatalf("nil live list must warn and proceed, got: %v", nilErr)
+	}
+	if !strings.Contains(stderr, "live backend could not be consulted") {
+		t.Fatalf("nil live list must warn on stderr, got: %q", stderr)
 	}
 }

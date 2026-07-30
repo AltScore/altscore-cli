@@ -495,6 +495,47 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 
 **Multi-dot inputMappings are accepted on create**: a single POST lands the task at version 1, and the workflow node references version 1.
 
+#### Secrets (API keys and stored credentials)
+
+**There is no `secrets.` namespace.** `secrets.MY_KEY` is not a scope — it parses as a bare reference whose first segment is `secrets`, resolves to `None`, and fails silently. Same for `inputs.MY_KEY` unless a workflow input variable of that name actually exists.
+
+Secrets live in a **tenant-wide** store (`/v1/stores/secrets`), not on the workflow. The Hub surfaces it as the "Secrets" card on the workflow *detail* page, which makes it look workflow-scoped — it is not; every workflow in the tenant sees the same entries. Each entry is one `secretId` holding `{"value": "<the secret>"}` (the Hub's dialog always writes the `value` key, and the runtime reads exactly that key).
+
+```bash
+altscore api GET  borrower_central /v1/stores/secrets
+altscore api POST borrower_central /v1/stores/secrets \
+  --body '{"id": "openai-api-key", "secret": {"value": "sk-..."}}'
+```
+
+`ALTSCORE_CLIENT_ID` and `ALTSCORE_CLIENT_SECRET` are reserved key names and rejected.
+
+**To read a secret in any node, declare it as a `secret`-typed inputSchema field whose `default` is the secretId:**
+
+```json
+"inputSchema": {
+  "OPENAI_API_KEY": { "type": "secret", "default": "openai-api-key" },
+  "prompt":         { "type": "string" }
+}
+```
+
+At runtime `resolved_secret_inputs()` looks the secretId up in the tenant store and merges the secret's **value** into the context the activity receives, before the node body runs. The field takes no `inputMapping` — its value comes from `default`.
+
+In a `compute-variables` expression, reference it as a **bare** dependency name — never `secrets.` or `inputs.`:
+
+```json
+"dependencies": ["OPENAI_API_KEY", "inputs.prompt"],
+"expression":   "key = inputs[\"OPENAI_API_KEY\"]\nresult = call(key, inputs[\"inputs.prompt\"])",
+"returnValue":  "result"
+```
+
+Caveats worth knowing before you reach for this:
+
+- **`http` / `soap` nodes should not use it.** They have first-class secret fields (`user`, `password`, `token`, `secret`) — set the field to the *secretId* and the runtime dereferences it. That path is the one the Hub UI supports (its editors have a secret picker).
+- **No Hub UI can author a `secret`-typed inputSchema field.** Every type dropdown in the builder offers `string|number|integer|boolean|object|array` only, so this shape is CLI/API-authored and the builder will not show a picker for it.
+- **The validation oracle flags the bare dependency.** `POST /v2/workflows/validate` reports `CUSTOM_VAR_DEPENDENCY_UNRESOLVED` because the name matches no workflow input, custom variable, or task alias. It still resolves correctly at runtime — treat that one finding as a known false positive.
+- **A workflow-level `inputVariables` entry with `type: "secret"` is a dead end.** The type is accepted, but nothing dereferences it against the secret store, so the run sees the literal secretId string. Only the task `inputSchema` path resolves.
+- **Secrets are not written to the task-execution record**, but a compute-variables failure logs a preview of each resolved input at error level — so a failing expression can put the first 32 characters of a key in the logs. Don't hold secrets in variables you also log.
+
 #### Gotchas (v2 specific)
 
 - **Tasks first — for every node.** Even `start`/`end` need a backing `/v2/tasks` record. Hub workflows use trivial type-only tasks for those (`{"type":"start","label":"Start"}`). The API saves orphan-node bodies, but the Hub then hits `GET /v2/tasks/null` 404 on render.
@@ -506,6 +547,8 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 - **`execute --execution-mode async`** returns only `executionId`. Poll `executions <id>` for status.
 - **`ai suggest-mappings`** returns 503 when the tenant has no LLM configured. Treat as a soft failure.
 - **No tasks LIST endpoint.** Discover task aliases via the workflows that use them, or via the Hub UI.
+- **`secrets.<name>` is not a scope.** To read a stored secret in a node, declare a `secret`-typed `inputSchema` field whose `default` is the secretId — see "Secrets" above.
+- **Preflight warns instead of blocking on an unverifiable enum value.** When a task type / workflow category / relationship kind / inputSchema type is absent from this build's compiled-in list *and* the backend's meta endpoint can't be reached, `apply` prints a warning and proceeds rather than rejecting: the CLI cannot tell "invalid" from "newer than me" without the backend, and the backend validates all four on write. A value a *reachable* backend disowns is still a hard error.
 
 
 
