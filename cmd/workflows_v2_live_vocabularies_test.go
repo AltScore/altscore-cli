@@ -36,20 +36,37 @@ func TestCheckWorkflowCategory_LiveBackendFallback(t *testing.T) {
 		t.Fatalf("empty category must be accepted, got: %v", err)
 	}
 
-	// Offline / no hook: an unknown category stays fatal and cites the offline
-	// fallback. Case-insensitive: the check upper-cases before comparing.
+	// Case-insensitive: the check upper-cases before comparing.
 	resetLiveWorkflowCategories()
 	err := checkWorkflowCategory("action")
 	if err != nil {
 		t.Fatalf("compiled-in category (any case) must be accepted, got: %v", err)
 	}
+
+	// Offline / no hook: an unverifiable category WARNS and proceeds rather than
+	// hard-blocking. The backend enforces CategoryEnum on write, so a real typo
+	// is still caught there; rejecting here would make a stale mirror an
+	// unrecoverable block on a valid spec (there is no --no-preflight flag).
 	resetLiveWorkflowCategories()
-	err = checkWorkflowCategory("MADE_UP")
-	if err == nil || !strings.Contains(err.Error(), "is not a valid value") {
-		t.Fatalf("without live hook, unknown category must be fatal, got: %v", err)
+	var offlineErr error
+	stderr := captureStderr(t, func() { offlineErr = checkWorkflowCategory("MADE_UP") })
+	if offlineErr != nil {
+		t.Fatalf("without live hook, unknown category must warn and proceed, got: %v", offlineErr)
 	}
-	if !strings.Contains(err.Error(), "offline or an older backend") {
-		t.Fatalf("offline rejection must cite the offline fallback, got: %v", err)
+	if !strings.Contains(stderr, "MADE_UP") ||
+		!strings.Contains(stderr, "live backend could not be consulted") {
+		t.Fatalf("offline acceptance must warn on stderr, got: %q", stderr)
+	}
+
+	// RECOMMENDATION is a real backend category and must be on the fast path
+	// (it was missing from the mirror, which is exactly the drift this guards).
+	resetLiveWorkflowCategories()
+	fetchLiveWorkflowCategories = func() map[string]bool {
+		t.Fatalf("RECOMMENDATION must be compiled-in, not fetched")
+		return nil
+	}
+	if err := checkWorkflowCategory("RECOMMENDATION"); err != nil {
+		t.Fatalf("RECOMMENDATION must be accepted offline, got: %v", err)
 	}
 
 	// Compiled-in category is accepted on the fast path -- never triggers a fetch.
@@ -92,12 +109,16 @@ func TestCheckWorkflowCategory_LiveBackendFallback(t *testing.T) {
 		t.Fatalf("reachable-backend rejection must say the backend was consulted, got: %v", err)
 	}
 
-	// Hook errors out (nil, e.g. 404 on an old backend): fatal, offline message.
+	// Hook errors out (nil, e.g. 404 on an old backend): warn + proceed, same as
+	// no hook at all -- an unreachable meta endpoint must never block a valid spec.
 	resetLiveWorkflowCategories()
 	fetchLiveWorkflowCategories = func() map[string]bool { return nil }
-	err = checkWorkflowCategory("still_bogus")
-	if err == nil || !strings.Contains(err.Error(), "offline or an older backend") {
-		t.Fatalf("nil live list must fall back to the offline message, got: %v", err)
+	stderr = captureStderr(t, func() { offlineErr = checkWorkflowCategory("still_bogus") })
+	if offlineErr != nil {
+		t.Fatalf("nil live list must warn and proceed, got: %v", offlineErr)
+	}
+	if !strings.Contains(stderr, "live backend could not be consulted") {
+		t.Fatalf("nil live list must warn on stderr, got: %q", stderr)
 	}
 }
 
@@ -113,15 +134,17 @@ func TestCheckRelationshipKind_LiveBackendFallback(t *testing.T) {
 	defer resetLiveRelationshipKinds()
 	const path = `node ref="rels": relationshipsConfig.items[0]`
 
-	// Offline / no hook: unknown kind stays fatal, preserves the original
-	// slash-list message plus the offline note.
+	// Offline / no hook: an unverifiable kind warns and proceeds. The backend
+	// enforces the relationship Literal on write, so a typo is still caught.
 	resetLiveRelationshipKinds()
-	err := checkRelationshipKind("guarantor", path)
-	if err == nil || !strings.Contains(err.Error(), "shareholder/employee/family/other/unspecified") {
-		t.Fatalf("without live hook, unknown kind must be fatal with the slash list, got: %v", err)
+	var offlineErr error
+	stderr := captureStderr(t, func() { offlineErr = checkRelationshipKind("guarantor", path) })
+	if offlineErr != nil {
+		t.Fatalf("without live hook, unknown kind must warn and proceed, got: %v", offlineErr)
 	}
-	if !strings.Contains(err.Error(), "offline or an older backend") {
-		t.Fatalf("offline rejection must cite the offline fallback, got: %v", err)
+	if !strings.Contains(stderr, "guarantor") ||
+		!strings.Contains(stderr, "live backend could not be consulted") {
+		t.Fatalf("offline acceptance must warn on stderr, got: %q", stderr)
 	}
 
 	// Compiled-in kind is accepted on the fast path -- never triggers a fetch.
@@ -156,7 +179,7 @@ func TestCheckRelationshipKind_LiveBackendFallback(t *testing.T) {
 	fetchLiveRelationshipKinds = func() map[string]bool {
 		return map[string]bool{"shareholder": true, "employee": true}
 	}
-	err = checkRelationshipKind("totally_bogus", path)
+	err := checkRelationshipKind("totally_bogus", path)
 	if err == nil || !strings.Contains(err.Error(), "not a known relationship kind") {
 		t.Fatalf("kind unknown to both must stay fatal, got: %v", err)
 	}
@@ -164,12 +187,15 @@ func TestCheckRelationshipKind_LiveBackendFallback(t *testing.T) {
 		t.Fatalf("reachable-backend rejection must say the backend was consulted, got: %v", err)
 	}
 
-	// Hook errors out (nil): fatal, offline message.
+	// Hook errors out (nil): warn + proceed, never a hard block.
 	resetLiveRelationshipKinds()
 	fetchLiveRelationshipKinds = func() map[string]bool { return nil }
-	err = checkRelationshipKind("still_bogus", path)
-	if err == nil || !strings.Contains(err.Error(), "offline or an older backend") {
-		t.Fatalf("nil live list must fall back to the offline message, got: %v", err)
+	stderr = captureStderr(t, func() { offlineErr = checkRelationshipKind("still_bogus", path) })
+	if offlineErr != nil {
+		t.Fatalf("nil live list must warn and proceed, got: %v", offlineErr)
+	}
+	if !strings.Contains(stderr, "live backend could not be consulted") {
+		t.Fatalf("nil live list must warn on stderr, got: %q", stderr)
 	}
 }
 
@@ -185,19 +211,35 @@ func TestCheckInputSchemaType_LiveBackendFallback(t *testing.T) {
 	defer resetLiveInputSchemaTypes()
 	const path = "workflow.inputVariables.foo.type"
 
-	// Offline / no hook: unknown type stays fatal. "secret" is a real backend
-	// SchemaTypes member the mirror happens to lack -- exactly the false
-	// rejection the live fetch is meant to cure when a backend IS present.
+	// "secret" is a real backend SchemaTypes member (a node reads a stored tenant
+	// secret via inputSchema.<f> = {type:"secret", default:"<secretId>"}). It was
+	// missing from the mirror, which hard-blocked valid specs offline. It must now
+	// be on the fast path -- accepted with NO fetch and NO warning.
 	resetLiveInputSchemaTypes()
-	err := checkInputSchemaType("secret", path)
-	if err == nil || !strings.Contains(err.Error(), "is not a valid type") {
-		t.Fatalf("without live hook, unknown type must be fatal, got: %v", err)
+	fetchLiveInputSchemaTypes = func() map[string]bool {
+		t.Fatalf(`"secret" must be compiled-in, not fetched`)
+		return nil
 	}
-	if !strings.Contains(err.Error(), "offline or an older backend") {
-		t.Fatalf("offline rejection must cite the offline fallback, got: %v", err)
+	secretStderr := captureStderr(t, func() {
+		if err := checkInputSchemaType("secret", path); err != nil {
+			t.Fatalf(`"secret" must be accepted offline, got: %v`, err)
+		}
+	})
+	if secretStderr != "" {
+		t.Fatalf(`"secret" must not warn, got: %q`, secretStderr)
 	}
-	if !strings.Contains(err.Error(), "Valid: string, integer, number, boolean, object, array") {
-		t.Fatalf("offline rejection must keep the hardcoded valid-type list, got: %v", err)
+
+	// Offline / no hook: a type this build cannot verify warns and proceeds. The
+	// backend's SchemaTypes union rejects a genuine typo on write.
+	resetLiveInputSchemaTypes()
+	var offlineErr error
+	stderr := captureStderr(t, func() { offlineErr = checkInputSchemaType("bogus_type", path) })
+	if offlineErr != nil {
+		t.Fatalf("without live hook, unknown type must warn and proceed, got: %v", offlineErr)
+	}
+	if !strings.Contains(stderr, "bogus_type") ||
+		!strings.Contains(stderr, "live backend could not be consulted") {
+		t.Fatalf("offline acceptance must warn on stderr, got: %q", stderr)
 	}
 
 	// Compiled-in type is accepted on the fast path -- never triggers a fetch.
@@ -210,17 +252,19 @@ func TestCheckInputSchemaType_LiveBackendFallback(t *testing.T) {
 		t.Fatalf("compiled-in type must be accepted, got: %v", err)
 	}
 
-	// Hook reports the type: accept (warn-only), fetched exactly once.
+	// Hook reports the type: accept (warn-only), fetched exactly once. Uses a type
+	// absent from the mirror on purpose -- a compiled-in one would short-circuit
+	// before any fetch.
 	resetLiveInputSchemaTypes()
 	calls := 0
 	fetchLiveInputSchemaTypes = func() map[string]bool {
 		calls++
-		return map[string]bool{"string": true, "secret": true}
+		return map[string]bool{"string": true, "decimal": true}
 	}
-	if err := checkInputSchemaType("secret", path); err != nil {
+	if err := checkInputSchemaType("decimal", path); err != nil {
 		t.Fatalf("live-known type must be accepted, got: %v", err)
 	}
-	if err := checkInputSchemaType("secret", "node ref=\"x\": inputSchema.bar.type"); err != nil {
+	if err := checkInputSchemaType("decimal", "node ref=\"x\": inputSchema.bar.type"); err != nil {
 		t.Fatalf("second live-known lookup must reuse the memo, got: %v", err)
 	}
 	if calls != 1 {
@@ -232,7 +276,7 @@ func TestCheckInputSchemaType_LiveBackendFallback(t *testing.T) {
 	fetchLiveInputSchemaTypes = func() map[string]bool {
 		return map[string]bool{"string": true, "integer": true}
 	}
-	err = checkInputSchemaType("totally_bogus", path)
+	err := checkInputSchemaType("totally_bogus", path)
 	if err == nil || !strings.Contains(err.Error(), "is not a valid type") {
 		t.Fatalf("type unknown to both must stay fatal, got: %v", err)
 	}
@@ -240,12 +284,15 @@ func TestCheckInputSchemaType_LiveBackendFallback(t *testing.T) {
 		t.Fatalf("reachable-backend rejection must say the backend was consulted, got: %v", err)
 	}
 
-	// Hook errors out (nil): fatal, offline message.
+	// Hook errors out (nil): warn + proceed, never a hard block.
 	resetLiveInputSchemaTypes()
 	fetchLiveInputSchemaTypes = func() map[string]bool { return nil }
-	err = checkInputSchemaType("still_bogus", path)
-	if err == nil || !strings.Contains(err.Error(), "offline or an older backend") {
-		t.Fatalf("nil live list must fall back to the offline message, got: %v", err)
+	stderr = captureStderr(t, func() { offlineErr = checkInputSchemaType("still_bogus", path) })
+	if offlineErr != nil {
+		t.Fatalf("nil live list must warn and proceed, got: %v", offlineErr)
+	}
+	if !strings.Contains(stderr, "live backend could not be consulted") {
+		t.Fatalf("nil live list must warn on stderr, got: %q", stderr)
 	}
 }
 

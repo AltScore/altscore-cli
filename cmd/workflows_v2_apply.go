@@ -3345,24 +3345,29 @@ func preflightTasks(spec *composeSpec) error {
 						"Per-type local validation is skipped for it; update altscore-cli to get it.\n",
 					ref, taskType,
 				)
-			} else {
+			} else if len(liveTaskTypes) > 0 {
 				suggestion := closestTaskType(taskType)
 				suggestionLine := ""
 				if suggestion != "" {
 					suggestionLine = fmt.Sprintf("Did you mean %q? ", suggestion)
 				}
-				liveNote := "The live backend type list could not be checked (offline or older backend); validated against this build's compiled-in list only. "
-				if len(liveTaskTypes) > 0 {
-					liveNote = fmt.Sprintf("The live backend was also consulted and does not list this type either (%d types). ", len(liveTaskTypes))
-				}
 				return fmt.Errorf(
-					"node ref=%q: unknown task type %q. %s%s"+
+					"node ref=%q: unknown task type %q. %s"+
+						"The live backend was also consulted and does not list this type either (%d types). "+
 						"Run 'altscore workflows-v2 schema-guide taskTypes' for the live list, or "+
 						"'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' for the active palette. "+
 						"Common deprecations: 'data-store' is split into 'data-store-write'/'data-store-query'; "+
 						"'pdf-report' is now part of the 'end' task's endConfig.",
-					ref, taskType, suggestionLine, liveNote,
+					ref, taskType, suggestionLine, len(liveTaskTypes),
 				)
+			} else {
+				// Backend unreachable: warn rather than hard-block, then skip
+				// this type's per-type field checks (we have no schema for it).
+				warnUnverifiedVocabularyValue(
+					fmt.Sprintf("node ref=%q: task type", ref), taskType, "task-type")
+				if s := closestTaskType(taskType); s != "" {
+					fmt.Fprintf(os.Stderr, "#   (did you mean %q?)\n", s)
+				}
 			}
 		}
 
@@ -3985,10 +3990,11 @@ var validEdgeKeys = map[string]bool{
 // Common confusion: CUSTOMER and DEAL are entity TYPES (config.entityType),
 // not categories. Keep these distinct in error messages.
 var validWorkflowCategories = map[string]bool{
-	"ACTION":     true,
-	"EVALUATION": true,
-	"CONTACT":    true,
-	"OTHER":      true,
+	"ACTION":         true,
+	"EVALUATION":     true,
+	"CONTACT":        true,
+	"RECOMMENDATION": true,
+	"OTHER":          true,
 }
 
 // fetchLiveWorkflowCategories, when set, lazily returns the LIVE backend's
@@ -4034,15 +4040,43 @@ func fetchServerWorkflowCategories(c *client.Client) map[string]bool {
 	return out
 }
 
+// warnUnverifiedVocabularyValue reports a value this build does not recognize
+// and could NOT confirm against the backend, then lets it through.
+//
+// Why fail open here. Every vocabulary that calls this (task type, workflow
+// category, relationship kind, inputSchema type) is enforced by a Pydantic enum
+// on the backend, so the API rejects a genuine typo on write regardless of what
+// preflight decides. Preflight is an error-message optimization, not a safety
+// boundary. Rejecting instead asserts knowledge this build does not have -- it
+// cannot tell "invalid" from "valid but newer than me" without the backend --
+// and because there is no --no-preflight escape hatch, a stale mirror plus an
+// unreachable meta endpoint becomes an unrecoverable hard block on a perfectly
+// valid spec. That is not hypothetical: `secret` (inputSchema type) and
+// `RECOMMENDATION` (workflow category) were both missing from their mirrors.
+//
+// Condition operators deliberately do NOT use this: borrower-central logs
+// "Unknown operator" and evaluates the item to False rather than failing
+// (standard_class_activity.py), so a typo there silently makes a branch never
+// match. Nothing downstream catches it, so preflight stays strict.
+func warnUnverifiedVocabularyValue(path, value, vocabulary string) {
+	fmt.Fprintf(os.Stderr,
+		"# WARNING: %s=%q is not in this CLI build's compiled-in %s list, and the "+
+			"live backend could not be consulted (offline, an older backend, or the "+
+			"meta endpoint is unavailable) -- proceeding, since the backend validates "+
+			"%s on write and will reject it if it is genuinely wrong. "+
+			"Update altscore-cli to refresh its offline list.\n",
+		path, value, vocabulary, vocabulary,
+	)
+}
+
 // checkWorkflowCategory validates a workflow's category, consulting the live
 // backend at most once when the (upper-cased) category is absent from the
 // compiled-in mirror. Empty category is always fine (the field is optional).
-// Mirrors checkConditionOperator's live-fallback semantics:
 //   - compiled-in-known           -> accept (fast path, no fetch)
 //   - live-known (newer backend)  -> warn + accept
 //   - unknown to a reachable backend -> reject, listing the live vocabulary
 //   - backend unreachable (offline / older backend / no hook wired)
-//     -> reject against the compiled-in list, exactly as before
+//     -> warn + accept (see warnUnverifiedVocabularyValue)
 func checkWorkflowCategory(category string) error {
 	if category == "" {
 		return nil
@@ -4072,13 +4106,8 @@ func checkWorkflowCategory(category string) error {
 			category, len(liveWorkflowCategories), sortedBoolMapKeys(liveWorkflowCategories),
 		)
 	}
-	return fmt.Errorf(
-		"workflow.category=%q is not a valid value "+
-			"(the live backend could not be checked -- offline or an older backend; "+
-			"validated against this build's compiled-in list only). Valid: ACTION, EVALUATION, CONTACT, OTHER. "+
-			"Note: CUSTOMER and DEAL are workflow ENTITY TYPES (config.entityType), not categories.",
-		category,
-	)
+	warnUnverifiedVocabularyValue("workflow.category", category, "workflow-category")
+	return nil
 }
 
 // validRelKinds mirrors the backend relationships-kind Literal
@@ -4131,8 +4160,9 @@ func fetchServerRelationshipKinds(c *client.Client) map[string]bool {
 // checkRelationshipKind validates a relationships item's kind, consulting the
 // live backend at most once when the kind is absent from the compiled-in
 // mirror. `path` is the caller-formatted field prefix (e.g.
-// `node ref="x": relationshipsConfig.items[0]`). Mirrors
-// checkConditionOperator's live-fallback semantics.
+// `node ref="x": relationshipsConfig.items[0]`). Rejects only when a REACHABLE
+// backend also disowns the kind; an unverifiable kind warns and proceeds
+// (warnUnverifiedVocabularyValue).
 func checkRelationshipKind(kind, path string) error {
 	if validRelKinds[kind] {
 		return nil
@@ -4157,13 +4187,8 @@ func checkRelationshipKind(kind, path string) error {
 			path, kind, len(liveRelationshipKinds), sortedBoolMapKeys(liveRelationshipKinds),
 		)
 	}
-	return fmt.Errorf(
-		"%s.relationship=%q not in "+
-			"shareholder/employee/family/other/unspecified "+
-			"(the live backend could not be checked -- offline or an older backend; "+
-			"validated against this build's compiled-in list only)",
-		path, kind,
-	)
+	warnUnverifiedVocabularyValue(path+".relationship", kind, "relationship-kind")
+	return nil
 }
 
 // validAliasPattern matches the alias regex the backend treats as URL-safe.
@@ -4357,6 +4382,12 @@ func lintCanonicalEndNode(spec *composeSpec) {
 // 'array'"); the real enum is below. Used by preflight to reject typos in
 // inputSchema.<field>.type before the API round-trip. Only a mirror --
 // checkInputSchemaType consults the live backend once before rejecting.
+//
+// `secret` is how a node reads a stored tenant secret: declare
+// inputSchema.<field> = {type: "secret", default: "<secretId>"} and the runtime
+// swaps the secretId for the secret's value before the activity runs (see
+// resolved_secret_inputs in borrower-central's standard_class_activity.py).
+// It was missing here until it turned up as a false rejection.
 var validInputSchemaTypes = map[string]bool{
 	"string":  true,
 	"integer": true,
@@ -4364,6 +4395,7 @@ var validInputSchemaTypes = map[string]bool{
 	"boolean": true,
 	"object":  true,
 	"array":   true,
+	"secret":  true,
 }
 
 // fetchLiveInputSchemaTypes, when set, lazily returns the LIVE backend's
@@ -4408,7 +4440,8 @@ func fetchServerInputSchemaTypes(c *client.Client) map[string]bool {
 // backend at most once when the type is absent from the compiled-in mirror.
 // `path` is the caller-formatted field path (e.g. `workflow.inputVariables.x.type`
 // or `node ref="y": inputSchema.z.type`), so the `=%q` in the message reads as
-// `path=type`. Mirrors checkConditionOperator's live-fallback semantics.
+// `path=type`. Rejects only when a REACHABLE backend also disowns the type; an
+// unverifiable type warns and proceeds (warnUnverifiedVocabularyValue).
 func checkInputSchemaType(t, path string) error {
 	if validInputSchemaTypes[t] {
 		return nil
@@ -4433,13 +4466,8 @@ func checkInputSchemaType(t, path string) error {
 			path, t, len(liveInputSchemaTypes), sortedBoolMapKeys(liveInputSchemaTypes),
 		)
 	}
-	return fmt.Errorf(
-		"%s=%q is not a valid type "+
-			"(the live backend could not be checked -- offline or an older backend; "+
-			"validated against this build's compiled-in list only). "+
-			"Valid: string, integer, number, boolean, object, array.",
-		path, t,
-	)
+	warnUnverifiedVocabularyValue(path, t, "inputSchema-type")
+	return nil
 }
 
 // unknownConditionFields walks a ConditionGroup tree and returns every leaf

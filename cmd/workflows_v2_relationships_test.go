@@ -184,9 +184,26 @@ func TestPreflightTasks_RelationshipsTwoLegalReps(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsInvalidKind: relationship value not in the
-// allowed enum is rejected.
+// TestPreflightTasks_RelationshipsInvalidKind: a relationship value the BACKEND
+// disowns is rejected. The live hook is wired so preflight has real authority --
+// that is the only branch that rejects. With no hook the CLI cannot tell
+// "invalid" from "newer than this build", so it warns and proceeds (covered by
+// TestCheckRelationshipKind_LiveBackendFallback).
 func TestPreflightTasks_RelationshipsInvalidKind(t *testing.T) {
+	fetchLiveRelationshipKinds = func() map[string]bool {
+		return map[string]bool{
+			"shareholder": true, "employee": true, "family": true,
+			"other": true, "unspecified": true,
+		}
+	}
+	defer func() {
+		fetchLiveRelationshipKinds = nil
+		liveRelationshipKinds = nil
+		liveRelationshipKindsFetched = false
+	}()
+	liveRelationshipKinds = nil
+	liveRelationshipKindsFetched = false
+
 	spec := &composeSpec{
 		Label:      "Rel invalid kind",
 		Category:   "ACTION",
