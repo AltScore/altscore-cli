@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -164,8 +165,8 @@ func TestAcquireApplyLock_RefusesLiveSession(t *testing.T) {
 }
 
 // TestAcquireApplyLock_ReclaimsAbandonedApplyLock keeps the legitimate recovery:
-// apply stamps its own clientId prefix and never heartbeats, so renewCount 0
-// under that prefix is provably a crashed predecessor, not a live editor.
+// apply's own clientId prefix, never renewed, and old enough that no live run
+// could still be holding it.
 func TestAcquireApplyLock_ReclaimsAbandonedApplyLock(t *testing.T) {
 	var acquires, forceReleases int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -181,8 +182,8 @@ func TestAcquireApplyLock_ReclaimsAbandonedApplyLock(t *testing.T) {
 		case r.Method == "GET" && r.URL.Path == "/v2/workflows/kyb/lock":
 			_, _ = w.Write([]byte(`{"isLocked":true,"canEdit":true,"lock":{
 				"lockedBy":{"email":"axel@altscore.ai","clientId":"apply-1753900000"},
-				"lockedAt":"2026-07-31T05:00:00+00:00",
-				"expiresAt":"2026-07-31T05:05:00+00:00","renewCount":0}}`))
+				"lockedAt":"2020-01-01T00:00:00Z",
+				"expiresAt":"2020-01-01T00:05:00Z","renewCount":0}}`))
 		case r.Method == "DELETE" && r.URL.Path == "/v2/workflows/kyb/lock/force":
 			atomic.AddInt32(&forceReleases, 1)
 			_, _ = w.Write([]byte(`{"success":true,"released":true}`))
@@ -245,21 +246,31 @@ func TestAcquireApplyLock_ForceLockTakesLiveLock(t *testing.T) {
 }
 
 func TestIsAbandonedApplyLock(t *testing.T) {
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	stale := now.Add(-5 * time.Minute).Format(time.RFC3339)
+	fresh := now.Add(-10 * time.Second).Format(time.RFC3339)
+
 	cases := []struct {
 		name string
 		info *wfv2LockInfo
 		want bool
 	}{
 		{"nil", nil, false},
-		{"not locked", &wfv2LockInfo{IsLocked: false, ClientID: "apply-1"}, false},
-		{"apply lock never renewed", &wfv2LockInfo{IsLocked: true, ClientID: "apply-1753", RenewCount: 0}, true},
-		{"apply lock renewed", &wfv2LockInfo{IsLocked: true, ClientID: "apply-1753", RenewCount: 1}, false},
-		{"browser tab", &wfv2LockInfo{IsLocked: true, ClientID: "8f3c-2a1b", RenewCount: 0}, false},
-		{"agent lock", &wfv2LockInfo{IsLocked: true, ClientID: "agent-42", RenewCount: 0}, false},
+		{"not locked", &wfv2LockInfo{IsLocked: false, ClientID: "apply-1", LockedAt: stale}, false},
+		{"stale apply lock never renewed", &wfv2LockInfo{IsLocked: true, ClientID: "apply-1753", LockedAt: stale}, true},
+		{"apply lock renewed", &wfv2LockInfo{IsLocked: true, ClientID: "apply-1753", RenewCount: 1, LockedAt: stale}, false},
+		// A concurrent apply holds a lock it never renews either, so age is the
+		// only thing separating it from a crashed predecessor.
+		{"another apply still running", &wfv2LockInfo{IsLocked: true, ClientID: "apply-1753", LockedAt: fresh}, false},
+		{"browser tab", &wfv2LockInfo{IsLocked: true, ClientID: "8f3c-2a1b", LockedAt: stale}, false},
+		{"agent lock", &wfv2LockInfo{IsLocked: true, ClientID: "agent-42", LockedAt: stale}, false},
+		// Refusing costs a re-run; stealing costs someone's work.
+		{"unparseable lockedAt", &wfv2LockInfo{IsLocked: true, ClientID: "apply-1", LockedAt: "not-a-time"}, false},
+		{"missing lockedAt", &wfv2LockInfo{IsLocked: true, ClientID: "apply-1"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isAbandonedApplyLock(tc.info); got != tc.want {
+			if got := isAbandonedApplyLock(tc.info, now); got != tc.want {
 				t.Errorf("isAbandonedApplyLock() = %v, want %v", got, tc.want)
 			}
 		})
@@ -299,5 +310,74 @@ func TestIsLockConflictErr(t *testing.T) {
 	}
 	if isLockConflictErr(fmt.Errorf("HTTP 500 InternalError: boom")) {
 		t.Error("a 500 is not a lock conflict")
+	}
+}
+
+// TestAcquireApplyLock_RefusesConcurrentApplyRun closes the hole in the
+// prefix+renewCount rule: apply never heartbeats, so a run that is alive RIGHT
+// NOW also shows renewCount 0 under the apply- prefix. Two CI jobs on one alias
+// would rob each other, the loser having already force-recreated the draft the
+// winner is autosaving. Age is what separates them.
+func TestAcquireApplyLock_RefusesConcurrentApplyRun(t *testing.T) {
+	var forceReleases int32
+	fresh := time.Now().Add(-5 * time.Second).UTC().Format(time.RFC3339)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/v2/workflows/kyb/lock":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(lockConflictEnvelope("SELF_LOCK_CONFLICT")))
+		case r.Method == "GET" && r.URL.Path == "/v2/workflows/kyb/lock":
+			_, _ = w.Write([]byte(`{"isLocked":true,"canEdit":true,"lock":{
+				"lockedBy":{"email":"axel@altscore.ai","clientId":"apply-1753999999"},
+				"lockedAt":"` + fresh + `","expiresAt":"` + fresh + `","renewCount":0}}`))
+		case r.Method == "DELETE" && r.URL.Path == "/v2/workflows/kyb/lock/force":
+			atomic.AddInt32(&forceReleases, 1)
+			_, _ = w.Write([]byte(`{"success":true,"released":true}`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	cmd, _ := discardCmd()
+	if _, err := acquireApplyLock(newTestClient(t, srv.URL), cmd, "kyb", "apply-2", false); err == nil {
+		t.Fatal("expected apply to refuse a concurrent apply run's lock")
+	}
+	if got := atomic.LoadInt32(&forceReleases); got != 0 {
+		t.Errorf("force-released a running apply's lock %d time(s); want 0", got)
+	}
+}
+
+// TestAcquireApplyLock_RefusesWhenLockStatusUnreadable pins the fail-safe
+// direction: if we cannot see who holds the lock we must not take it. Falling
+// through to a steal here would be silent lock theft.
+func TestAcquireApplyLock_RefusesWhenLockStatusUnreadable(t *testing.T) {
+	var forceReleases int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/v2/workflows/kyb/lock":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(lockConflictEnvelope("LOCK_CONFLICT")))
+		case r.Method == "GET" && r.URL.Path == "/v2/workflows/kyb/lock":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"code":"InternalError","message":"boom"}`))
+		case r.Method == "DELETE" && r.URL.Path == "/v2/workflows/kyb/lock/force":
+			atomic.AddInt32(&forceReleases, 1)
+			_, _ = w.Write([]byte(`{"success":true,"released":true}`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	cmd, _ := discardCmd()
+	_, err := acquireApplyLock(newTestClient(t, srv.URL), cmd, "kyb", "apply-3", false)
+	if err == nil {
+		t.Fatal("expected apply to refuse when the lock status is unreadable")
+	}
+	if got := atomic.LoadInt32(&forceReleases); got != 0 {
+		t.Errorf("force-released with unknown holder %d time(s); want 0", got)
 	}
 }

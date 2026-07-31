@@ -63,7 +63,7 @@ Use `--diff` to preview changes against the current tenant state before mutating
 - If **no** ACTIVE workflow has that alias → **CREATE path**: POST `/v2/tasks` for every task (server picks each task's alias), POST `/v2/workflows`, optional publish (DRAFT by default unless `--publish`).
 - If exactly **one** ACTIVE workflow has that alias → **UPDATE path**: POST `/v2/tasks` for every task in the spec (old tasks orphan, accepted), acquire a lock (`client-id=apply-<ts>`), `create-draft --force-recreate`, autosave the new nodes/edges/variables/config/notes/category/status, then publish **carrying that lock token**. Same workflow id, same alias, version increments, schedules and downstream consumers survive.
   - The lock is taken **before** `create-draft`, which hard-deletes any existing draft and is not itself lock-gated: locking afterwards meant a refused apply had already destroyed someone's work-in-progress.
-  - When a lock blocks apply, it is only reclaimed if a previous apply run abandoned it (`apply-` clientId that was never renewed). Anything that looks like a live Hub tab is refused, naming the holder — close that tab, or pass `--force-lock` to take it and discard whatever is unsaved there.
+  - When a lock blocks apply, it is only reclaimed if a previous apply run abandoned it: its own `apply-` clientId, never renewed, AND older than 90s. apply does not heartbeat, so a run that is alive right now also shows `renewCount: 0` — age is the only thing separating the two, and without it two concurrent applies rob each other. Anything else is refused, naming the holder — close that Hub tab, or pass `--force-lock` to take it and discard whatever is unsaved there.
 
 Both paths share the same validation + normalize pipeline (`preflightTasks`, per-type normalize, `validateEntityWorkflowAliasMatch`, etc.) so a spec that passes against a fresh tenant also passes when re-applied later.
 
@@ -338,7 +338,7 @@ altscore workflows-v2 lock release my-wf --lock-token "$TOKEN"
 
 # Inspect / unstick
 altscore workflows-v2 lock get my-wf
-altscore workflows-v2 lock force-release my-wf       # admin only
+altscore workflows-v2 lock force-release my-wf       # destructive, not elevated: workflows.write
 ```
 
 `autosave` returning 409 means concurrent modification — re-fetch with `get`, merge, retry.

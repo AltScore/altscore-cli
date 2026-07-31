@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/AltScore/altscore-cli/internal/client"
 	"github.com/AltScore/altscore-cli/internal/output"
@@ -96,20 +97,39 @@ func getWfv2LockStatus(c *client.Client, alias string) (*wfv2LockInfo, error) {
 	}, nil
 }
 
+// abandonedApplyLockMinAge is how long a lock stamped by apply must have sat
+// unrenewed before another apply may reclaim it. apply never heartbeats, so
+// renewCount alone cannot separate a crashed predecessor from a run that is
+// alive right now -- and two applies racing on one alias (two CI jobs, say)
+// would rob each other, the loser having already force-recreated the draft the
+// winner is autosaving. An apply run reaches its own autosave in well under
+// this, so a lock still this young is treated as live.
+const abandonedApplyLockMinAge = 90 * time.Second
+
 // isAbandonedApplyLock reports whether a blocking lock is one a previous apply
 // run left behind, and is therefore safe to take.
 //
-// apply stamps applyLockClientIDPrefix and never heartbeats, so renewCount == 0
-// under that prefix cannot be a live editing session. Any other clientId, or any
-// renewCount above 0, may be a Hub tab keeping its own lock alive -- and BC
-// reports that case as SELF_LOCK_CONFLICT whenever it is the same person in a
-// browser, so "self conflict" alone never justified taking it. Stealing a live
-// tab's lock discards whatever is unsaved on that canvas.
-func isAbandonedApplyLock(info *wfv2LockInfo) bool {
+// Three things must hold: apply's own clientId prefix, a renewCount of 0 (any
+// renewal means something is keeping it alive -- a Hub tab heartbeats every 3
+// minutes), and a lockedAt older than abandonedApplyLockMinAge. Anything else
+// may be a live session, and BC reports a Hub tab belonging to the same person
+// as SELF_LOCK_CONFLICT, so "self conflict" alone never justified taking it:
+// stealing a live tab's lock discards whatever is unsaved on that canvas.
+//
+// An unparseable or absent lockedAt is treated as live -- refusing costs a
+// re-run, stealing costs someone's work.
+func isAbandonedApplyLock(info *wfv2LockInfo, now time.Time) bool {
 	if info == nil || !info.IsLocked {
 		return false
 	}
-	return strings.HasPrefix(info.ClientID, applyLockClientIDPrefix) && info.RenewCount == 0
+	if !strings.HasPrefix(info.ClientID, applyLockClientIDPrefix) || info.RenewCount != 0 {
+		return false
+	}
+	lockedAt, err := time.Parse(time.RFC3339, info.LockedAt)
+	if err != nil {
+		return false
+	}
+	return now.Sub(lockedAt) >= abandonedApplyLockMinAge
 }
 
 // isLockConflictErr reports whether an acquire failure was a lock conflict
@@ -168,8 +188,8 @@ func acquireApplyLock(c *client.Client, cmd *cobra.Command, alias, clientID stri
 	switch {
 	case forceLock:
 		fmt.Fprintf(cmd.ErrOrStderr(), "# --force-lock: taking the lock on %s (%s)\n", alias, lockHolderLabel(info))
-	case isAbandonedApplyLock(info):
-		fmt.Fprintf(cmd.ErrOrStderr(), "# abandoned apply lock on %s (client-id=%s, never renewed); force-releasing and retrying\n", alias, info.ClientID)
+	case isAbandonedApplyLock(info, time.Now()):
+		fmt.Fprintf(cmd.ErrOrStderr(), "# abandoned apply lock on %s (client-id=%s, never renewed, held since %s); force-releasing and retrying\n", alias, info.ClientID, info.LockedAt)
 	default:
 		return "", fmt.Errorf("acquire lock on %s: %w\n%s", alias, err, describeBlockingLock(alias, info))
 	}

@@ -472,7 +472,7 @@ func makeWfv2LockForceReleaseCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "force-release <alias-or-id>",
 		Short: "Force-release a stuck lock (admin)",
-		Long: `Use only when the lock holder is gone and a normal release is impossible. Requires admin permission.
+		Long: `Use only when the lock holder is gone and a normal release is impossible. Gated on workflows.write -- the same permission as acquiring a lock, so this is not an elevated operation, just a destructive one.
 
 Locks are keyed by workflow ALIAS, so a UUID argument is resolved to its alias
 first: force-releasing a raw id deleted a key nothing had ever written and still
