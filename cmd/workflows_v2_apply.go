@@ -1226,6 +1226,23 @@ var reservedMappingScopes = map[string]bool{
 	// roots). The CLI has no data-model catalog, so like the other reserved
 	// scopes it only recognises the leading segment and never validates deeper.
 	"entity": true,
+	// self.<field> is a node's OWN late-resolved output -- today End's pdf_url /
+	// pdf_error, which do not exist when the backend substitutes endConfig (the
+	// PDF is generated inside end_activity) and never reach task_outputs because
+	// End is data_producing=false. BC leaves the literal in place and resolves it
+	// in a second pass, so apply must not rewrite or reject it.
+	"self": true,
+}
+
+// reservedScopesList renders reservedMappingScopes for error messages, so the
+// hint can never drift from the map the validators actually consult.
+func reservedScopesList() string {
+	keys := make([]string, 0, len(reservedMappingScopes))
+	for k := range reservedMappingScopes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ", ")
 }
 
 // mappingDependencyRef returns the spec-local task ref that an inputMappings
@@ -1349,8 +1366,8 @@ func rewriteRefsInMappings(mappings map[string]any, refMap map[string]string) (m
 				} else if !isServerAlias(ref) {
 					return nil, fmt.Errorf(
 						"inputMappings[%q]=%q references task_outputs.%s.* but %q is not a known spec ref. "+
-							"Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type, entity.)",
-						k, v, ref, ref, sortedRefMapKeys(refMap))
+							"Known refs: %s. (Reserved scopes: %s.)",
+						k, v, ref, ref, sortedRefMapKeys(refMap), reservedScopesList())
 				}
 			}
 		} else if dot := strings.Index(s, "."); dot > 0 {
@@ -1368,8 +1385,8 @@ func rewriteRefsInMappings(mappings map[string]any, refMap map[string]string) (m
 					return nil, fmt.Errorf(
 						"inputMappings[%q]=%q has head %q which is neither a reserved namespace "+
 							"nor a known spec ref nor a server alias (slug-NNNNNN). "+
-							"Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type, entity.)",
-						k, v, head, sortedRefMapKeys(refMap))
+							"Known refs: %s. (Reserved scopes: %s.)",
+						k, v, head, sortedRefMapKeys(refMap), reservedScopesList())
 				}
 			}
 		}
@@ -1473,8 +1490,8 @@ func rewriteRefsInTemplate(s string, refMap map[string]string, localMappings map
 			}
 			if !isServerAlias(ref) {
 				firstErr = fmt.Errorf(
-					"template references task_outputs.%s.* but %q is not a known spec ref. Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type, entity.)",
-					ref, ref, sortedRefMapKeys(refMap))
+					"template references task_outputs.%s.* but %q is not a known spec ref. Known refs: %s. (Reserved scopes: %s.)",
+					ref, ref, sortedRefMapKeys(refMap), reservedScopesList())
 				return match
 			}
 			return match
@@ -1497,8 +1514,8 @@ func rewriteRefsInTemplate(s string, refMap map[string]string, localMappings map
 		// Unknown head -- error so the user sees the typo before runtime
 		// silently substitutes nothing.
 		firstErr = fmt.Errorf(
-			"template uses {{%s.<...>}} but %q is neither a reserved namespace nor a known spec ref nor a server alias. Known refs: %s. (Reserved scopes: inputs, custom, system, task_outputs, task_outputs_by_type, entity.)",
-			inner, head, sortedRefMapKeys(refMap))
+			"template uses {{%s.<...>}} but %q is neither a reserved namespace nor a known spec ref nor a server alias. Known refs: %s. (Reserved scopes: %s.)",
+			inner, head, sortedRefMapKeys(refMap), reservedScopesList())
 		return match
 	})
 	if firstErr != nil {
