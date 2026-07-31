@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -94,7 +95,7 @@ records. Sort and pagination flags work the same as 'altscore data-models list'.
 				params = append(params, fmt.Sprintf("page=%d", page))
 			}
 			if search != "" {
-				params = append(params, "search="+search)
+				params = append(params, "search="+url.QueryEscape(search))
 			}
 			if sortBy != "" {
 				params = append(params, "sort-by="+sortBy)

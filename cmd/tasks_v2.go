@@ -31,7 +31,8 @@ func registerTasksV2(parent *cobra.Command) {
 workflow node references a task by alias (and optionally pinned version).
 
 Common types: altdata-enrichment, evaluate-rules, http, conditional, wait,
-webhook, compute-variables, data-store, pdf-report, end. Each type has
+webhook, compute-variables, data-store-write, data-store-query, end.
+(PDF generation is endConfig on the end node, not a task type.) Each type has
 its own config fields (sourcesConfig for altdata, evaluatorAlias for
 evaluators, url+method for http, branches for conditional, etc.).
 

@@ -21,19 +21,18 @@ func registerExternalSourceConfigs() {
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "delete"},
 		Description: `Manage external source configs (tenant-level wrappers around
-AltData sources that add provider, label, status, and provider-specific settings).
+AltData sources that add a label, status, and source-specific settings).
 
 These configs back the "External Sources" page in the Hub settings. Each config
-references an AltData sourceId and adds a provider name, a human-readable label,
+references an AltData sourceId and adds a human-readable label,
 an active/inactive status, and a free-form settings object the runtime gateway
 consumes (auth credentials, endpoint overrides, header maps, etc.).`,
 		CreateSchema: `  sourceId: string    [required] AltData source ID this config wraps
-  provider: string    [required] Provider name (e.g. "experian", "custom-http")
   label: string       [required] Human-readable label
   country: string     Country code (optional)
   status: string      "active" | "inactive" (default: "inactive")
   settings: object    Provider-specific config (default: {})`,
-		ResponseSchema: `  id, sourceId, provider, label, country, status, settings,
+		ResponseSchema: `  id, sourceId, label, country, status, settings,
   createdAt, updatedAt`,
 	})
 

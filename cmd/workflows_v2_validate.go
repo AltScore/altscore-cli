@@ -173,7 +173,7 @@ func makeWfv2LintCmd() *cobra.Command {
 		Use:   "lint <id>",
 		Short: "Inspect an existing v2 workflow for orphan nodes, dangling edges, and missing start/end",
 		Long: `Lint a saved workflow. Reports:
-  - non-start/non-end nodes missing taskAlias/taskId (would fail to load in the Hub)
+  - ANY node missing taskAlias/taskId, start and end included (would fail to load in the Hub)
   - edges pointing at non-existent nodeIds
   - duplicate nodeIds
   - missing start or end nodes
@@ -360,12 +360,10 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 		// compute-variables, etc.) lets the operator click the right node.
 		nodeRef := fmt.Sprintf("nodeId=%q type=%q", id, nodeType)
 		if !incoming && !outgoing {
-			sev := "warning"
-			if nodeType == "comment" {
-				sev = "warning" // comments are decorative; warn but don't block
-			} else {
-				sev = "error" // any non-comment orphan is a real problem
-			}
+			// Every orphan is a real problem now: borrower-central removed the
+			// decorative `comment` task type (#1234), so standalone annotations
+			// live in the top-level `notes` array rather than as graph nodes.
+			sev := "error"
 			report.Issues = append(report.Issues, lintIssue{
 				Severity: sev,
 				NodeID:   id,
@@ -374,10 +372,7 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 			continue
 		}
 		if needsIn && !incoming {
-			sev := "warning"
-			if nodeType != "comment" {
-				sev = "error"
-			}
+			sev := "error"
 			report.Issues = append(report.Issues, lintIssue{
 				Severity: sev,
 				NodeID:   id,
@@ -385,10 +380,7 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 			})
 		}
 		if needsOut && !outgoing {
-			sev := "warning"
-			if nodeType != "comment" {
-				sev = "error"
-			}
+			sev := "error"
 			report.Issues = append(report.Issues, lintIssue{
 				Severity: sev,
 				NodeID:   id,

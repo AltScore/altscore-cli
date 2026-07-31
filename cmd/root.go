@@ -81,9 +81,9 @@ prospect. Borrowers have identities, documents, and can participate in deals.`,
   riskRating, repaymentRiskRating, currentStep{stepId, order, key, createdAt},
   cmsClientIds, createdAt, updatedAt`,
 		FilterHelp: `  persona               "individual" or "company"
-  external-id           External system ID
-  flag                  Flag value
   risk-rating           Risk rating value
+  current-step-key      Current step key
+  audiences             Comma-separated audiences
   tags                  Comma-separated tags
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
@@ -110,7 +110,6 @@ uniquely identify and deduplicate borrowers.`,
 		FilterHelp: `  borrower-id           Parent borrower ID
   key                   Identity type
   value                 Identity value
-  priority              Priority value
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
 	})
@@ -196,7 +195,9 @@ such as a vehicle, property, or piece of equipment.`,
   tags: [string]        Tags`,
 		ResponseSchema: `  id, dealId, key, label, tags, isTest, createdAt, updatedAt`,
 		FilterHelp: `  deal-id               Parent deal ID
-  key                   Asset type/key
+  borrower-id           Parent borrower ID
+  group                 Asset group
+  external-id           External system ID
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
 	})
@@ -284,7 +285,8 @@ associated with a borrower.`,
 		ResponseSchema: `  id, borrowerId, key, label, value, tags, isTest,
   isVerified, createdAt, updatedAt`,
 		FilterHelp: `  borrower-id           Parent borrower ID
-  key                   Contact type key
+  contact-method        Contact method (e.g. "email", "phone")
+  priority              Priority value
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
 	})
@@ -339,7 +341,10 @@ or other legal agreements. Supports digital signatures and OTP verification.`,
 		BasePath: "/v1/metrics",
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "update", "delete"},
-		HasTestMode: true,
+		// borrower-central exposes no PUT /v1/metrics/{id}/is-test. metrics was
+		// the only one of 18 HasTestMode resources without one, so `set-test`
+		// generated a call to a route that does not exist.
+		HasTestMode: false,
 		Description: `Manage metrics (computed values attached to borrowers).
 
 A metric is a key-value record that stores computed or derived data
@@ -376,7 +381,8 @@ version history.`,
   createdAt, updatedAt`,
 		FilterHelp: `  borrower-id           Parent borrower ID
   deal-id               Parent deal ID
-  key                   Artifact key
+  artifact-type         Artifact type
+  scope                 Artifact scope
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
 	})
@@ -809,7 +815,7 @@ reference.`,
                          it verbatim. Server still slugifies the label as the
                          display fallback either way.
   description: string   Free-form description
-  category: string      ACTION | EVALUATION | CONTACT | OTHER
+  category: string      ACTION | EVALUATION | CONTACT | RECOMMENDATION | OTHER
   status: string        DRAFT | ACTIVE (default DRAFT)
   nodes: array          Graph nodes (see schema-guide nodes)
   edges: array          Graph edges (see schema-guide edges)
@@ -817,14 +823,16 @@ reference.`,
   inputVariables: object  Workflow input parameter schemas
   customVariables: object Computed variables
   config: object        Task snapshots / scheduling defaults`,
-		UpdateSchema: `  label, description, category, status, nodes, edges, notes,
+		UpdateSchema: `  label, description, category, nodes, edges, notes,
   inputVariables, customVariables, config (any subset).
+  'status' is NOT patchable -- lifecycle transitions belong to the
+  publish/archive/restore endpoints, and BC ignores it silently.
   Note: prefer 'autosave' with --lock-token for conflict-safe edits.`,
 		ResponseSchema: `  id, tenant, alias, label, description, category, status, version,
   isLatest, nodes, edges, notes, inputVariables, customVariables, config,
   createdAt, updatedAt, lastModifiedBy`,
 		FilterHelp: `  search                Free-text search
-  category              ACTION | EVALUATION | CONTACT | OTHER
+  category              ACTION | EVALUATION | CONTACT | RECOMMENDATION | OTHER
   status                DRAFT | ACTIVE | ARCHIVED
   alias                 Filter by alias
   version               Filter by version
