@@ -310,12 +310,12 @@ func dimNote(w io.Writer, msg string) {
 // The posted workflow body is the validated body mutated in place by phase 4
 // alone, so it differs from what the validator saw ONLY by the ref -> server
 // alias identifier substitution.
-func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *composeSpec, publish, skipRescope, allowStealOwnership, noAutoDefaults bool) (map[string]any, error) {
+func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *composeSpec, publish, skipRescope, allowStealOwnership, noAutoDefaults, noLayout bool) (map[string]any, error) {
 	// Phase 1: assemble once. dryRun=false selects strict normalization -- the
 	// real apply must hard-fail on a bad source/entity, not stub it as a preview
 	// would. An assembly-level error surfaces here, before any /v2/tasks POST.
 	capture := newComposeCapture()
-	wf, err := composeWorkflowBody(c, spec, false, publish, !skipRescope, allowStealOwnership, !noAutoDefaults, capture)
+	wf, err := composeWorkflowBody(c, spec, false, publish, !skipRescope, allowStealOwnership, !noAutoDefaults, !noLayout, capture)
 	if err != nil {
 		return nil, err
 	}

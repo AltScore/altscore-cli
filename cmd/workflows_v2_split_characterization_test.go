@@ -151,7 +151,7 @@ func TestCharacterization_DryAssembly_RefPlaceholders(t *testing.T) {
 	capture := newComposeCapture()
 	// c=nil: the fixture uses only http/conditional/end/start types + a
 	// compiled-in operator ("gt"), so assembly needs no network.
-	wf, err := composeWorkflowBody(nil, richSplitSpec(), true, false, true, false, false, capture)
+	wf, err := composeWorkflowBody(nil, richSplitSpec(), true, false, true, false, false, true, capture)
 	if err != nil {
 		t.Fatalf("dry assembly failed: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestCharacterization_RealApply_AliasSubstitution(t *testing.T) {
 	cmd, _ := preflightTestCmd()
 
 	// noAutoDefaults=true keeps the end node deterministic (no borrower_id wiring).
-	wf, err := applyAssembleValidateAndPost(c, cmd, richSplitSpec(), false, false, false, true)
+	wf, err := applyAssembleValidateAndPost(c, cmd, richSplitSpec(), false, false, false, true, false)
 	if err != nil {
 		t.Fatalf("real apply failed: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestCharacterization_RealApply_AliasSubstitution(t *testing.T) {
 func TestCharacterization_ValidatedMatchesPostedModuloAlias(t *testing.T) {
 	// Validated artifacts (what the pre-flight sees).
 	dryCapture := newComposeCapture()
-	dryWf, err := composeWorkflowBody(nil, richSplitSpec(), true, false, true, false, false, dryCapture)
+	dryWf, err := composeWorkflowBody(nil, richSplitSpec(), true, false, true, false, false, true, dryCapture)
 	if err != nil {
 		t.Fatalf("dry assembly failed: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestCharacterization_ValidatedMatchesPostedModuloAlias(t *testing.T) {
 	defer srv.Close()
 	c := newTestClient(t, srv.URL)
 	cmd, _ := preflightTestCmd()
-	realWf, err := applyAssembleValidateAndPost(c, cmd, richSplitSpec(), false, false, false, true)
+	realWf, err := applyAssembleValidateAndPost(c, cmd, richSplitSpec(), false, false, false, true, false)
 	if err != nil {
 		t.Fatalf("real apply failed: %v", err)
 	}

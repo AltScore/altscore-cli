@@ -284,7 +284,7 @@ func TestApplyAssembleValidateAndPost_ErrorAbortsBeforeTaskCreate(t *testing.T) 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
 	if err == nil {
 		t.Fatal("expected apply to abort on error finding")
 	}
@@ -314,7 +314,7 @@ func TestApplyAssembleValidateAndPost_WarningProceedsAndPosts(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
 	if err != nil {
 		t.Fatalf("warnings must not block apply; got: %v", err)
 	}
@@ -342,7 +342,7 @@ func TestApplyAssembleValidateAndPost_404FailsOpenAndPosts(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
 	if err != nil {
 		t.Fatalf("404 must fail open and let apply proceed; got: %v", err)
 	}
@@ -375,7 +375,7 @@ func TestDryAssemblyValidation_PostsNoTasks(t *testing.T) {
 
 	// Mirror the RunE dry-run branch: dry compose + capture, then validate.
 	capture := newComposeCapture()
-	wf, err := composeWorkflowBody(c, minimalPreflightSpec(), true, false, true, false, true, capture)
+	wf, err := composeWorkflowBody(c, minimalPreflightSpec(), true, false, true, false, true, true, capture)
 	if err != nil {
 		t.Fatalf("dry compose failed: %v", err)
 	}
@@ -517,7 +517,7 @@ func TestApplyAssembleValidateAndPost_422LoudNoteProceedsAndPosts(t *testing.T) 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
 	if err != nil {
 		t.Fatalf("a 4xx from the oracle must not block apply; got: %v", err)
 	}

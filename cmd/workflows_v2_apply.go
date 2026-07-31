@@ -60,8 +60,10 @@ import (
 //  2. Build the graph: one node per spec.nodes entry (nodeId = ref, taskAlias
 //     = server-assigned alias for task-bearing nodes; start nodes are
 //     graph-only with no backing task).
-//  3. Auto-position nodes left-to-right (start first, then task-bearing
-//     nodes in spec order); the Hub UI re-lays them out anyway.
+//  3. Auto-layout the canvas: longest-path columns + barycenter row ordering,
+//     the same algorithm as the Hub builder's Align button (see
+//     autoLayoutNodes). Skipped by --no-layout, or when the spec pins
+//     `position` on any node.
 //  4. POST /v2/workflows with label, category, description, inputVariables,
 //     customVariables, nodes, edges, status (default DRAFT).
 //
@@ -177,6 +179,7 @@ func makeWfv2ApplyCmd() *cobra.Command {
 	var allowStealOwnership bool
 	var verify bool
 	var noAutoDefaults bool
+	var noLayout bool
 
 	cmd := &cobra.Command{
 		Use:     "apply",
@@ -369,7 +372,7 @@ End-node output (endConfig on the 'end' node):
 			switch {
 			case diffFlag:
 				// Read-only preview: assemble (no POSTs), skip the server pre-flight.
-				workflow, err = composeWorkflowBody(c, &spec, true, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, nil)
+				workflow, err = composeWorkflowBody(c, &spec, true, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, !noLayout, nil)
 				if err != nil {
 					return err
 				}
@@ -378,7 +381,7 @@ End-node output (endConfig on the 'end' node):
 				// print its findings. Advisory here -- dry-run mutates nothing and
 				// still prints the assembled body below regardless of findings.
 				capture := newComposeCapture()
-				workflow, err = composeWorkflowBody(c, &spec, true, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, capture)
+				workflow, err = composeWorkflowBody(c, &spec, true, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, !noLayout, capture)
 				if err != nil {
 					return err
 				}
@@ -386,7 +389,7 @@ End-node output (endConfig on the 'end' node):
 			default:
 				// Real apply (create OR update): validate before posting anything,
 				// abort on server errors.
-				workflow, err = applyAssembleValidateAndPost(c, cmd, &spec, publish, skipRescope, allowStealOwnership, noAutoDefaults)
+				workflow, err = applyAssembleValidateAndPost(c, cmd, &spec, publish, skipRescope, allowStealOwnership, noAutoDefaults, noLayout)
 				if err != nil {
 					return err
 				}
@@ -622,6 +625,7 @@ End-node output (endConfig on the 'end' node):
 	cmd.Flags().BoolVar(&allowStealOwnership, "allow-steal-ownership", false, "permit apply to transfer a credit-decisioning entity's workflowAlias when it is currently owned by ANOTHER workflow. Default: refuse and instruct the spec author to clone the entity with a new code. Use only for rare workflow rename / identity migration / decommissioning scenarios")
 	cmd.Flags().BoolVar(&verify, "verify", true, "after writing, read back the persisted tasks and warn (stderr, non-fatal) about any spec-set field the backend dropped or nulled. Pass --verify=false to skip the extra GETs")
 	cmd.Flags().BoolVar(&noAutoDefaults, "no-auto-defaults", false, "disable apply's opinionated convenience defaults: (1) end-node borrower_id/billable_id wired to the single customer node's borrower_id, (2) forced end-node PDF generation (pdfConfig.enabled+pdfGenerationRequired=true), (3) deal-contact identity_value back-filled from each contact's identity_key field (default tax_id). Each only fills an absent field; caller-supplied values always win")
+	cmd.Flags().BoolVar(&noLayout, "no-layout", false, "skip auto-layout of the canvas. By default apply positions nodes in left-to-right columns (the same algorithm as the Hub builder's Align button) so the graph opens readable; with this flag nodes ship on a single row at a 200px pitch and overlap until someone clicks Align. Auto-layout is also skipped when the spec pins `position` on any node")
 	return cmd
 }
 
@@ -2248,7 +2252,7 @@ func applyAutoEndDefaults(spec *composeSpec) {
 // capture, when non-nil, collects the per-node task bodies (keyed by placeholder)
 // + a placeholder->ref reverse map for readable findings, AND the ordered
 // post-plan the post phase consumes. --diff passes nil (it only needs the body).
-func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool, allowStealOwnership bool, autoDefaults bool, capture *composeCapture) (map[string]any, error) {
+func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool, allowStealOwnership bool, autoDefaults bool, autoLayout bool, capture *composeCapture) (map[string]any, error) {
 	if err := validateEntityTypeVsTaskTypes(spec); err != nil {
 		return nil, err
 	}
@@ -2408,6 +2412,11 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		applyAutoEndDefaults(spec)
 	}
 
+	// Sample author-pinned positions BEFORE the node loops run: the extraNode
+	// loop back-fills `position` onto the spec's own node maps, so asking after
+	// assembly always answers "yes" and auto-layout would never fire.
+	layoutPinned := specHasPinnedPositions(spec)
+
 	taskNodes := []map[string]any{}
 
 	// refMap: spec-local reference -> placeholder identifier used in the
@@ -2486,6 +2495,13 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		// Strip the spec-only `ref` field before posting; it's not part of the API.
 		delete(task, "ref")
 
+		// A pinned canvas position is a graph concern, not part of the task
+		// body: lift it onto the node below and keep it out of what we POST to
+		// /v2/tasks (which drops undeclared keys silently, so this was a
+		// no-op field that read as if it worked).
+		pinnedPos, hasPinnedPos := task["position"]
+		delete(task, "position")
+
 		// Rewrite every ref-bearing field (inputMappings, nested scorecard/
 		// rule-tree maps, mapping-table entries, {{...}} templates, conditional
 		// conditions) and run the residual-ref safety net. During assembly refMap
@@ -2523,6 +2539,8 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		})
 		refMap[ref] = placeholder
 
+		// Positions here are only a fallback for --no-layout / pinned-position
+		// specs; autoLayoutNodes overwrites them below on the default path.
 		node := map[string]any{
 			"nodeId":      placeholder,
 			"type":        taskType,
@@ -2531,6 +2549,9 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			"taskVersion": 1,
 			"position":    map[string]float64{"x": float64(200 * (i + 1)), "y": 0},
 			"data":        map[string]any{},
+		}
+		if hasPinnedPos {
+			node["position"] = pinnedPos
 		}
 		if mappings, ok := task["inputMappings"]; ok {
 			data := node["data"].(map[string]any)
@@ -2811,6 +2832,19 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			e["id"] = fmt.Sprintf("%s->%s", src, tgt)
 		}
 		allEdges = append(allEdges, e)
+	}
+
+	// Lay the canvas out now that nodes and edges are both resolved. Before
+	// this, every node shipped on y=0 at a 200px pitch -- narrower than the
+	// Hub's 250px card -- so a composed workflow opened as one overlapping row
+	// with every branch collapsed on top of itself, and the only fix was
+	// clicking Align by hand. This is the same algorithm that button runs.
+	if autoLayout {
+		if layoutPinned {
+			fmt.Fprintf(os.Stderr, "# Auto-layout skipped: spec pins node positions. Remove them to let the CLI lay the canvas out.\n")
+		} else {
+			autoLayoutNodes(allNodes, allEdges)
+		}
 	}
 
 	status := spec.Status
