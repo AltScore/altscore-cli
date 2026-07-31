@@ -166,7 +166,7 @@ Response fields:
 				version = resolved
 			}
 
-			path := fmt.Sprintf("/v1/documentation/data-dictionary?source_id=%s&version=%s", sourceID, version)
+			path := fmt.Sprintf("/v1/documentation/data-dictionary?sourceId=%s&version=%s", sourceID, version)
 
 			data, _, err := c.Do("GET", "borrower_central", path, nil)
 			if err != nil {
@@ -178,7 +178,7 @@ Response fields:
 }
 
 func makeAltdataSearchCmd() *cobra.Command {
-	var locale string
+	var country string
 
 	cmd := &cobra.Command{
 		Use:   "search <query>",
@@ -191,7 +191,7 @@ Response fields:
   sourceId, version, field, dataType, country,
   descriptions{en, es}`,
 		Example: `  altscore altdata search "credit score"
-  altscore altdata search "address" --locale es`,
+  altscore altdata search "address" --country MX`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
@@ -199,7 +199,15 @@ Response fields:
 				return err
 			}
 
-			path := fmt.Sprintf("/v1/documentation/data-dictionary/search?locale=%s&query=%s", locale, args[0])
+			// BC accepts query/country/sourceId/page/per-page -- there is no
+			// `locale`, so the old flag was silently dropped. The query MUST be
+			// escaped: a space makes Go emit a malformed request line and the
+			// server 400s before the handler runs -- which broke this command's
+			// own documented example, `altdata search "credit score"`.
+			path := "/v1/documentation/data-dictionary/search?query=" + url.QueryEscape(args[0])
+			if country != "" {
+				path += "&country=" + url.QueryEscape(country)
+			}
 
 			data, _, err := c.Do("GET", "borrower_central", path, nil)
 			if err != nil {
@@ -209,7 +217,7 @@ Response fields:
 		},
 	}
 
-	cmd.Flags().StringVar(&locale, "locale", "en", "search locale (en or es)")
+	cmd.Flags().StringVar(&country, "country", "", "filter by country code (e.g. MX, EC)")
 
 	return cmd
 }
@@ -248,7 +256,7 @@ Response fields:
 				version = resolved
 			}
 
-			path := fmt.Sprintf("/v1/documentation/output-example?source_id=%s&version=%s", sourceID, version)
+			path := fmt.Sprintf("/v1/documentation/output-example?sourceId=%s&version=%s", sourceID, version)
 
 			data, _, err := c.Do("GET", "borrower_central", path, nil)
 			if err != nil {

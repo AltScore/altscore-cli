@@ -103,15 +103,19 @@ Use --filter to apply field-based filters to list commands.
 
 Multiple filters can be applied:
 
-  altscore borrowers list --filter persona=individual --filter status=active
+  altscore borrowers list --filter persona=individual --filter risk-rating=high
 
 Filters are passed as query parameters to the API. The exact filter
 keys available depend on the resource. Common filters include:
 
   persona        Borrower persona (individual, company)
-  status         Resource status
-  label          Text label or name
-  created-after  ISO 8601 datetime
+  search         Free-text search
+  date-from      ISO 8601 datetime (lower bound)
+  date-to        ISO 8601 datetime (upper bound)
+
+Filter keys are per-resource -- run '<resource> list --help' for the exact
+set. An unrecognised key is silently ignored by the API, so a typo returns
+unfiltered results rather than an error.
 
 ## Combining with Pagination
 

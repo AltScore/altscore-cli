@@ -13,8 +13,6 @@ func makeExQueryOutputsCmd() *cobra.Command {
 	var filters []string
 	var perPage int
 	var page int
-	var includeTests bool
-	var testOnly bool
 
 	cmd := &cobra.Command{
 		Use:   "query-outputs",
@@ -31,7 +29,6 @@ Available filters (pass via --filter key=value):
   workflow-id           Workflow ID
   workflow-alias        Workflow alias
   billable-id           Billable ID
-  status                Execution status
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"
 
@@ -54,16 +51,6 @@ Response fields:
 			}
 
 			params := []string{}
-
-			if includeTests && testOnly {
-				return fmt.Errorf("--include-tests and --test-only are mutually exclusive")
-			}
-			if includeTests {
-				params = append(params, "include-tests=true")
-			}
-			if testOnly {
-				params = append(params, "test-only=true")
-			}
 
 			if perPage > 0 {
 				params = append(params, fmt.Sprintf("per-page=%d", perPage))
@@ -94,8 +81,6 @@ Response fields:
 	cmd.Flags().StringArrayVar(&filters, "filter", nil, "field filter in key=value format (repeatable)")
 	cmd.Flags().IntVar(&perPage, "per-page", 0, "items per page (default: from config)")
 	cmd.Flags().IntVar(&page, "page", 0, "page number (default: 1)")
-	cmd.Flags().BoolVar(&includeTests, "include-tests", false, "include test records in results")
-	cmd.Flags().BoolVar(&testOnly, "test-only", false, "return only test records")
 
 	return cmd
 }

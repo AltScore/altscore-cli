@@ -33,7 +33,6 @@ type ResourceDef struct {
 	Singular       string                                // "borrower"
 	BasePath       string                                // "/v1/borrowers"
 	Module         string                                // "borrower_central"
-	ParentFlag     string                                // "" or "borrower" (adds --borrower required flag)
 	Actions        []string                              // subset of: "list", "get", "create", "update", "delete"
 	Description    string                                // long description of the resource
 	CreateSchema   string                                // documents the JSON body for create
@@ -82,7 +81,6 @@ func makeListCmd(def ResourceDef) *cobra.Command {
 	var filters []string
 	var perPage int
 	var page int
-	var parentID string
 	var includeTests bool
 	var testOnly bool
 
@@ -122,13 +120,6 @@ Use --filter for field-based filters, --per-page and --page for pagination.`, de
 
 			path := def.BasePath
 			params := []string{}
-
-			if def.ParentFlag != "" {
-				if parentID == "" {
-					return fmt.Errorf("--%s is required", def.ParentFlag)
-				}
-				params = append(params, fmt.Sprintf("%s-id=%s", def.ParentFlag, parentID))
-			}
 
 			if hasTestFlags {
 				if includeTests && testOnly {
@@ -193,9 +184,6 @@ Use --filter for field-based filters, --per-page and --page for pagination.`, de
 	cmd.Flags().StringArrayVar(&filters, "filter", nil, "field filter in key=value format (repeatable)")
 	cmd.Flags().IntVar(&perPage, "per-page", 0, "items per page (default: from config)")
 	cmd.Flags().IntVar(&page, "page", 0, "page number (default: 1)")
-	if def.ParentFlag != "" {
-		cmd.Flags().StringVar(&parentID, def.ParentFlag, "", fmt.Sprintf("parent %s ID [required]", def.Singular))
-	}
 	if hasTestFlags {
 		cmd.Flags().BoolVar(&includeTests, "include-tests", false, "include test records in results")
 		cmd.Flags().BoolVar(&testOnly, "test-only", false, "return only test records")
@@ -233,7 +221,6 @@ func makeGetCmd(def ResourceDef) *cobra.Command {
 
 func makeCreateCmd(def ResourceDef) *cobra.Command {
 	var bodyFlag string
-	var parentID string
 	var isTest bool
 	var workflowAlias string
 
@@ -303,12 +290,6 @@ This allows piping JSON: echo '{"key":"value"}' | altscore %s create`, def.Singu
 			}
 
 			path := def.BasePath
-			if def.ParentFlag != "" {
-				if parentID == "" {
-					return fmt.Errorf("--%s is required", def.ParentFlag)
-				}
-				path += "?" + def.ParentFlag + "-id=" + parentID
-			}
 
 			data, _, err := c.Do("POST", def.Module, path, body)
 			if err != nil {
@@ -319,9 +300,6 @@ This allows piping JSON: echo '{"key":"value"}' | altscore %s create`, def.Singu
 	}
 
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON body (or pipe via stdin)")
-	if def.ParentFlag != "" {
-		cmd.Flags().StringVar(&parentID, def.ParentFlag, "", fmt.Sprintf("parent %s ID [required]", def.Singular))
-	}
 	if def.HasTestMode {
 		cmd.Flags().BoolVar(&isTest, "is-test", false, "create as a test record")
 	}
@@ -464,10 +442,14 @@ The file is sent as a multipart form upload to the document's attachment endpoin
 				pw.CloseWithError(w.Close())
 			}()
 
-			path := "/v1/documents/" + args[0] + "/attachment"
+			// POST .../attachments/upload -- the singular PUT .../attachment this
+			// used to send has never existed in borrower-central, so the command
+			// always failed. See app/api/documents/handler.py:172, which takes the
+			// same multipart "file" field.
+			path := "/v1/documents/" + args[0] + "/attachments/upload"
 			contentType := w.FormDataContentType()
 
-			respBody, _, err := c.DoRaw("PUT", "borrower_central", path, pr, contentType)
+			respBody, _, err := c.DoRaw("POST", "borrower_central", path, pr, contentType)
 			if err != nil {
 				return err
 			}

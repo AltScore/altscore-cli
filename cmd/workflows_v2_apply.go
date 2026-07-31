@@ -3025,7 +3025,7 @@ var dealHiddenTypes = map[string]bool{
 // any /v2/tasks rows. Without this check, a typo would orphan all earlier
 // tasks in the compose loop (no rollback path exists today).
 var validTaskTypes = map[string]bool{
-	"http": true, "conditional": true, "comment": true,
+	"http": true, "conditional": true,
 	"start": true, "end": true, "wait": true, "webhook": true,
 	"create-borrower": true, "update-borrower": true, "update-borrower-name": true,
 	"evaluate-rules": true, "altdata-enrichment": true, "create-identity": true,
@@ -3445,14 +3445,6 @@ func preflightTasks(spec *composeSpec) error {
 			}
 			if s, _ := task["secret"].(string); s == "" {
 				return fmt.Errorf("node ref=%q: webhook task requires 'secret'", ref)
-			}
-		case "comment":
-			if c, _ := task["comment"].(string); c == "" {
-				return fmt.Errorf(
-					"node ref=%q: comment task requires a non-empty 'comment' field "+
-						"(the canvas annotation body, distinct from 'label' which is the node header).",
-					ref,
-				)
 			}
 		case "data-store-write":
 			cfg := asMap(task["dataStoreWriteConfig"])
@@ -3897,15 +3889,12 @@ func preflightTasks(spec *composeSpec) error {
 	for i, task := range spec.Tasks {
 		ref := localRef(task, fmt.Sprintf("t%d", i))
 		taskType, _ := task["type"].(string)
-		// Comments are decorative -- they're allowed to be orphaned.
-		if taskType == "comment" {
-			continue
-		}
 		if !connected[ref] {
 			return fmt.Errorf(
 				"tasks[%d] (ref=%q, type=%q) has no incident edges -- it's unreachable. "+
 					"Add at least one 'edges' entry connecting %q to the rest of the graph, "+
-					"or remove the task. (Comment tasks are allowed to be orphaned; everything else isn't.)",
+					"or remove the task. (Standalone annotations belong in the top-level "+
+					"'notes' array, not as graph nodes.)",
 				i, ref, taskType, ref,
 			)
 		}
