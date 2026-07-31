@@ -180,6 +180,7 @@ func makeWfv2ApplyCmd() *cobra.Command {
 	var verify bool
 	var noAutoDefaults bool
 	var noLayout bool
+	var forceLock bool
 
 	cmd := &cobra.Command{
 		Use:     "apply",
@@ -440,7 +441,9 @@ End-node output (endConfig on the 'end' node):
 				resultJSON = data
 
 				if publish {
-					if err := lintAndPublish(c, cmd, wfID, skipLintOnPublish); err != nil {
+					// Create path holds no lock: a brand-new workflow has no
+					// alias lock, so there is no token to present.
+					if err := lintAndPublish(c, cmd, wfID, skipLintOnPublish, ""); err != nil {
 						return err
 					}
 				}
@@ -464,7 +467,26 @@ End-node output (endConfig on the 'end' node):
 				fmt.Fprintf(cmd.ErrOrStderr(), "# apply UPDATE path: workflow id=%s alias=%s status=%s lastKnownVersion=%d\n", wfID, targetAlias, existingStatus, lastKnownVersion)
 				printComposeSummary(cmd.ErrOrStderr(), workflow)
 
-				// 1) Obtain the draft to autosave onto.
+				// 1) Take the edit lock BEFORE touching anything. The next step
+				// (create-draft --force-recreate) HARD-DELETES an existing draft
+				// and is not itself lock-gated, so acquiring afterwards meant a
+				// blocked apply had already destroyed someone's work-in-progress
+				// before it discovered it was not allowed to proceed (HQ #1228).
+				// Locks are alias-keyed, so this works before the draft exists.
+				clientID := fmt.Sprintf("apply-%d", time.Now().UnixNano())
+				lockToken, err := acquireApplyLock(c, cmd, targetAlias, clientID, forceLock)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(cmd.ErrOrStderr(), "# acquired lock client-id=%s\n", clientID)
+				// Release when apply returns (after autosave + any publish). Each
+				// apply uses a fresh clientId, so a lock left dangling from a
+				// prior run makes the NEXT apply refuse until the 300s TTL
+				// expires. Best-effort: a successful publish already releases it
+				// server-side, in which case this DELETE is a harmless no-op.
+				defer releaseWfv2Lock(c, targetAlias, lockToken)
+
+				// 2) Obtain the draft to autosave onto.
 				//    - ACTIVE base: create-draft --force-recreate (clean draft
 				//      regardless of whether one already exists). Response is
 				//      wrapped: {created, message, workflow: {id, ...}}.
@@ -502,34 +524,6 @@ End-node output (endConfig on the 'end' node):
 					}
 					fmt.Fprintf(cmd.ErrOrStderr(), "# created draft %s (version %d)\n", draftID, draftVersion)
 				}
-
-				// 2) lock acquire (alias-keyed endpoint). acquireWfv2Lock wraps
-				// the POST + parse + token extraction.
-				clientID := fmt.Sprintf("apply-%d", time.Now().UnixNano())
-				lockToken, err := acquireWfv2Lock(c, targetAlias, clientID)
-				if err != nil && strings.Contains(err.Error(), "SELF_LOCK_CONFLICT") {
-					// A stale lock left by THIS principal -- e.g. a prior apply
-					// that died before releasing. Each apply uses a fresh
-					// clientId, so it can't reuse its own lock; force-release and
-					// retry once. We only do this for a self-conflict: a lock held
-					// by a different user surfaces as a non-self conflict and is
-					// left untouched so apply never stomps a live Hub editor.
-					fmt.Fprintf(cmd.ErrOrStderr(), "# stale self-lock on %s; force-releasing and retrying\n", targetAlias)
-					_, _, _ = c.Do("DELETE", "borrower_central", "/v2/workflows/"+targetAlias+"/lock/force", nil)
-					lockToken, err = acquireWfv2Lock(c, targetAlias, clientID)
-				}
-				if err != nil {
-					return fmt.Errorf("acquire lock on %s: %w", targetAlias, err)
-				}
-				fmt.Fprintf(cmd.ErrOrStderr(), "# acquired lock client-id=%s\n", clientID)
-				// Release the lock when apply returns (after autosave + any
-				// publish). Each apply uses a fresh clientId, so a lock left
-				// dangling from a prior apply makes the NEXT apply fail with a
-				// SELF_LOCK_CONFLICT until the 300s TTL expires -- especially on
-				// the DRAFT-adopt-without-publish path, which otherwise never
-				// clears it. Best-effort: publish may already release it
-				// server-side, in which case this DELETE is a harmless no-op.
-				defer releaseWfv2Lock(c, targetAlias, lockToken)
 
 				// 3) autosave the assembled body onto the draft
 				autosavePayload := map[string]any{
@@ -580,7 +574,7 @@ End-node output (endConfig on the 'end' node):
 				//      rather than surprising the author by going live. This
 				//      mirrors the CREATE path (DRAFT unless --publish).
 				if !adoptDraft || publish {
-					if err := lintAndPublish(c, cmd, draftID, skipLintOnPublish); err != nil {
+					if err := lintAndPublish(c, cmd, draftID, skipLintOnPublish, lockToken); err != nil {
 						return err
 					}
 				} else {
@@ -625,6 +619,7 @@ End-node output (endConfig on the 'end' node):
 	cmd.Flags().BoolVar(&allowStealOwnership, "allow-steal-ownership", false, "permit apply to transfer a credit-decisioning entity's workflowAlias when it is currently owned by ANOTHER workflow. Default: refuse and instruct the spec author to clone the entity with a new code. Use only for rare workflow rename / identity migration / decommissioning scenarios")
 	cmd.Flags().BoolVar(&verify, "verify", true, "after writing, read back the persisted tasks and warn (stderr, non-fatal) about any spec-set field the backend dropped or nulled. Pass --verify=false to skip the extra GETs")
 	cmd.Flags().BoolVar(&noAutoDefaults, "no-auto-defaults", false, "disable apply's opinionated convenience defaults: (1) end-node borrower_id/billable_id wired to the single customer node's borrower_id, (2) forced end-node PDF generation (pdfConfig.enabled+pdfGenerationRequired=true), (3) deal-contact identity_value back-filled from each contact's identity_key field (default tax_id). Each only fills an absent field; caller-supplied values always win")
+	cmd.Flags().BoolVar(&forceLock, "force-lock", false, "take the workflow's edit lock even when a live session holds it. By default apply only reclaims a lock a previous apply run abandoned (its own clientId prefix, never renewed) and refuses anything that looks like an open Hub tab, naming the holder. Forcing discards whatever that session has unsaved")
 	cmd.Flags().BoolVar(&noLayout, "no-layout", false, "skip auto-layout of the canvas. By default apply positions nodes in left-to-right columns (the same algorithm as the Hub builder's Align button) so the graph opens readable; with this flag nodes ship on a single row at a 200px pitch and overlap until someone clicks Align. Auto-layout is also skipped when the spec pins `position` on any node")
 	return cmd
 }
@@ -633,7 +628,12 @@ End-node output (endConfig on the 'end' node):
 // publishes it. Shared by both the create path (creates workflow + optional
 // publish) and the update path (always publishes after autosave). Mirrors
 // what compose used to do inline for create + publish.
-func lintAndPublish(c *client.Client, cmd *cobra.Command, wfID string, skipLintOnPublish bool) error {
+//
+// lockToken is the edit-lock token the caller holds, or "" when it holds none.
+// The backend's publish guard is token-strict: with a lock in place and no
+// token, publish answers 423 LOCKED even for that lock's own holder -- which is
+// what made every update-path apply die at this step (HQ #1228).
+func lintAndPublish(c *client.Client, cmd *cobra.Command, wfID string, skipLintOnPublish bool, lockToken string) error {
 	lintData, _, lerr := c.Do("GET", "borrower_central", "/v2/workflows/"+wfID, nil)
 	if lerr == nil {
 		var wfFull map[string]any
@@ -660,7 +660,7 @@ func lintAndPublish(c *client.Client, cmd *cobra.Command, wfID string, skipLintO
 			}
 		}
 	}
-	if _, _, err := c.Do("POST", "borrower_central", "/v2/workflows/"+wfID+"/publish", nil); err != nil {
+	if _, err := publishWorkflowV2(c, wfID, lockToken); err != nil {
 		return fmt.Errorf("workflow %s created but publish failed: %w", wfID, err)
 	}
 	fmt.Fprintf(cmd.OutOrStderr(), "# published workflow %s\n", wfID)

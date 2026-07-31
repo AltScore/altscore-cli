@@ -49,6 +49,143 @@ func releaseWfv2Lock(c *client.Client, alias, token string) {
 	_, _, _ = c.Do("DELETE", "borrower_central", "/v2/workflows/"+alias+"/lock", json.RawMessage(body))
 }
 
+// applyLockClientIDPrefix is the clientId every `apply` run stamps on the lock
+// it takes. It is also the marker that lets a later run recognise a lock one of
+// its own crashed predecessors left behind.
+const applyLockClientIDPrefix = "apply-"
+
+// wfv2LockInfo is the subset of GET /v2/workflows/{alias}/lock that callers
+// reason about when they are refused a lock.
+type wfv2LockInfo struct {
+	IsLocked   bool
+	ClientID   string
+	Email      string
+	LockedAt   string
+	ExpiresAt  string
+	RenewCount int
+}
+
+// getWfv2LockStatus reads who currently holds the edit lock on an alias.
+func getWfv2LockStatus(c *client.Client, alias string) (*wfv2LockInfo, error) {
+	raw, _, err := c.Do("GET", "borrower_central", "/v2/workflows/"+alias+"/lock", nil)
+	if err != nil {
+		return nil, fmt.Errorf("read lock status: %w", err)
+	}
+	var resp struct {
+		IsLocked bool `json:"isLocked"`
+		Lock     struct {
+			LockedBy struct {
+				ClientID string `json:"clientId"`
+				Email    string `json:"email"`
+			} `json:"lockedBy"`
+			LockedAt   string  `json:"lockedAt"`
+			ExpiresAt  string  `json:"expiresAt"`
+			RenewCount float64 `json:"renewCount"`
+		} `json:"lock"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("parse lock status: %w", err)
+	}
+	return &wfv2LockInfo{
+		IsLocked:   resp.IsLocked,
+		ClientID:   resp.Lock.LockedBy.ClientID,
+		Email:      resp.Lock.LockedBy.Email,
+		LockedAt:   resp.Lock.LockedAt,
+		ExpiresAt:  resp.Lock.ExpiresAt,
+		RenewCount: int(resp.Lock.RenewCount),
+	}, nil
+}
+
+// isAbandonedApplyLock reports whether a blocking lock is one a previous apply
+// run left behind, and is therefore safe to take.
+//
+// apply stamps applyLockClientIDPrefix and never heartbeats, so renewCount == 0
+// under that prefix cannot be a live editing session. Any other clientId, or any
+// renewCount above 0, may be a Hub tab keeping its own lock alive -- and BC
+// reports that case as SELF_LOCK_CONFLICT whenever it is the same person in a
+// browser, so "self conflict" alone never justified taking it. Stealing a live
+// tab's lock discards whatever is unsaved on that canvas.
+func isAbandonedApplyLock(info *wfv2LockInfo) bool {
+	if info == nil || !info.IsLocked {
+		return false
+	}
+	return strings.HasPrefix(info.ClientID, applyLockClientIDPrefix) && info.RenewCount == 0
+}
+
+// isLockConflictErr reports whether an acquire failure was a lock conflict
+// (LOCK_CONFLICT or SELF_LOCK_CONFLICT) rather than a transport/auth failure.
+func isLockConflictErr(err error) bool {
+	// SELF_LOCK_CONFLICT contains LOCK_CONFLICT, so one check covers both.
+	return err != nil && strings.Contains(err.Error(), "LOCK_CONFLICT")
+}
+
+// lockHolderLabel renders a short "who holds it" description for logs.
+func lockHolderLabel(info *wfv2LockInfo) string {
+	if info == nil || !info.IsLocked {
+		return "holder unknown"
+	}
+	who := info.Email
+	if who == "" {
+		who = "unknown user"
+	}
+	return fmt.Sprintf("%s, client-id=%s, renewCount=%d", who, info.ClientID, info.RenewCount)
+}
+
+// describeBlockingLock explains a refusal to take someone else's lock, and how
+// to proceed either way.
+func describeBlockingLock(alias string, info *wfv2LockInfo) string {
+	if info == nil || !info.IsLocked {
+		return fmt.Sprintf(
+			"could not determine who holds the lock on %s. Re-run to retry, "+
+				"or pass --force-lock to take the lock regardless (any unsaved "+
+				"work in the holding session is discarded).", alias)
+	}
+	return fmt.Sprintf(
+		"the lock on %s is held by %s and expires %s. That looks like a live "+
+			"editing session, not an abandoned one, so apply will not take it: "+
+			"close the Hub tab editing this workflow (or let its lock lapse) and "+
+			"re-run. Pass --force-lock to take it anyway -- anything unsaved in "+
+			"that session is discarded.",
+		alias, lockHolderLabel(info), info.ExpiresAt)
+}
+
+// acquireApplyLock takes the edit lock for an apply run, recovering only from a
+// lock its own crashed predecessor left behind unless forceLock is set.
+func acquireApplyLock(c *client.Client, cmd *cobra.Command, alias, clientID string, forceLock bool) (string, error) {
+	token, err := acquireWfv2Lock(c, alias, clientID)
+	if err == nil {
+		return token, nil
+	}
+	if !isLockConflictErr(err) {
+		return "", fmt.Errorf("acquire lock on %s: %w", alias, err)
+	}
+
+	info, statusErr := getWfv2LockStatus(c, alias)
+	if statusErr != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "# warning: could not read the lock on %s: %v\n", alias, statusErr)
+	}
+
+	switch {
+	case forceLock:
+		fmt.Fprintf(cmd.ErrOrStderr(), "# --force-lock: taking the lock on %s (%s)\n", alias, lockHolderLabel(info))
+	case isAbandonedApplyLock(info):
+		fmt.Fprintf(cmd.ErrOrStderr(), "# abandoned apply lock on %s (client-id=%s, never renewed); force-releasing and retrying\n", alias, info.ClientID)
+	default:
+		return "", fmt.Errorf("acquire lock on %s: %w\n%s", alias, err, describeBlockingLock(alias, info))
+	}
+
+	forcePath := "/v2/workflows/" + alias + "/lock/force"
+	_, _, ferr := c.Do("DELETE", "borrower_central", forcePath, nil)
+	if ferr != nil {
+		return "", fmt.Errorf("force-release lock on %s: %w", alias, ferr)
+	}
+	token, err = acquireWfv2Lock(c, alias, clientID)
+	if err != nil {
+		return "", fmt.Errorf("acquire lock on %s after force-release: %w", alias, err)
+	}
+	return token, nil
+}
+
 // mutateAndAutosaveV2 runs the lock-fetch-mutate-autosave-release dance.
 //
 // If lockToken is provided, the caller manages the lock (no acquire/release).
