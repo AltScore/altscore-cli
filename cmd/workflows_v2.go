@@ -54,12 +54,14 @@ func resolveWorkflowAlias(c *client.Client, aliasOrID string) (string, error) {
 	if err := json.Unmarshal(data, &wf); err != nil {
 		return "", fmt.Errorf("could not parse workflow %s: %w", aliasOrID, err)
 	}
-	alias, _ := wf["workflowAlias"].(string)
+	// `alias` is the field the workflow DTO actually carries; `workflowAlias`
+	// is accepted as a fallback for the shapes that nest it.
+	alias, _ := wf["alias"].(string)
 	if alias == "" {
-		alias, _ = wf["alias"].(string)
+		alias, _ = wf["workflowAlias"].(string)
 	}
 	if alias == "" {
-		return "", fmt.Errorf("workflow %s has no workflowAlias field", aliasOrID)
+		return "", fmt.Errorf("workflow %s has no alias field", aliasOrID)
 	}
 	return alias, nil
 }
@@ -67,25 +69,61 @@ func resolveWorkflowAlias(c *client.Client, aliasOrID string) (string, error) {
 // ===================== Lifecycle =====================
 
 func makeWfv2PublishCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:     "publish <id>",
-		Short:   "Publish a v2 workflow draft (DRAFT -> ACTIVE)",
-		Long:    `Publish a draft workflow. The workflow must be in DRAFT status and pass publish-time validation.`,
-		Example: `  altscore workflows-v2 publish <id>`,
-		Args:    cobra.ExactArgs(1),
+	var lockToken string
+
+	cmd := &cobra.Command{
+		Use:   "publish <id>",
+		Short: "Publish a v2 workflow draft (DRAFT -> ACTIVE)",
+		Long: `Publish a draft workflow. The workflow must be in DRAFT status and pass publish-time validation.
+
+Publish is gated on the edit lock: if ANY lock is held on the workflow's alias
+and you don't present its token, the backend answers 423 LOCKED -- including a
+lock you acquired yourself. Pass --lock-token whenever you hold one:
+
+    TOKEN=$(altscore workflows-v2 lock acquire my-wf --client-id cli-1 | jq -r .lockToken)
+    altscore workflows-v2 publish <draft-id> --lock-token "$TOKEN"
+
+A successful publish releases that lock server-side, so no separate release is
+needed afterwards.`,
+		Example: `  altscore workflows-v2 publish <id>
+  altscore workflows-v2 publish <id> --lock-token $TOKEN`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
 			if err != nil {
 				return err
 			}
-			path := fmt.Sprintf("/v2/workflows/%s/publish", args[0])
-			data, _, err := c.Do("POST", "borrower_central", path, nil)
+			data, err := publishWorkflowV2(c, args[0], lockToken)
 			if err != nil {
 				return err
 			}
 			return output.RawJSON(data)
 		},
 	}
+
+	cmd.Flags().StringVar(&lockToken, "lock-token", "", "lockToken from 'lock acquire'. Required whenever a lock is held on the workflow, or publish 423s")
+	return cmd
+}
+
+// publishWorkflowV2 POSTs the publish endpoint, carrying the edit-lock token
+// when the caller holds one. BC's publish guard is token-strict (it does not
+// fall back to the caller's user id the way PATCH does), so a held lock without
+// its token is a 423 even for the lock's own holder.
+func publishWorkflowV2(c *client.Client, workflowID, lockToken string) (json.RawMessage, error) {
+	path := fmt.Sprintf("/v2/workflows/%s/publish", workflowID)
+	var body any
+	if lockToken != "" {
+		raw, err := json.Marshal(map[string]string{"lockToken": lockToken})
+		if err != nil {
+			return nil, fmt.Errorf("encode publish body: %w", err)
+		}
+		body = json.RawMessage(raw)
+	}
+	data, _, err := c.Do("POST", "borrower_central", path, body)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 func makeWfv2CreateDraftCmd() *cobra.Command {
@@ -136,7 +174,7 @@ func makeWfv2RevertCmd() *cobra.Command {
 	var mode string
 
 	cmd := &cobra.Command{
-		Use:   "revert <alias> <version-id>",
+		Use:   "revert <alias-or-id> <version-id>",
 		Short: "Revert a v2 workflow draft to a prior version",
 		Long: `Revert a draft to the contents of a prior version. Mode controls whether
 the revert produces a new draft (default) or replaces the active version.`,
@@ -159,7 +197,11 @@ the revert produces a new draft (default) or replaces the active version.`,
 			if err != nil {
 				return fmt.Errorf("encode body: %w", err)
 			}
-			path := fmt.Sprintf("/v2/workflows/%s/revert/%s", args[0], args[1])
+			alias, err := resolveWorkflowAlias(c, args[0])
+			if err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/v2/workflows/%s/revert/%s", alias, args[1])
 			data, _, err := c.Do("POST", "borrower_central", path, json.RawMessage(raw))
 			if err != nil {
 				return err
@@ -270,7 +312,7 @@ heartbeat it periodically while editing, and release it when done.`,
 
 func makeWfv2LockGetCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "get <alias>",
+		Use:     "get <alias-or-id>",
 		Short:   "Inspect lock status for a v2 workflow",
 		Args:    cobra.ExactArgs(1),
 		Example: `  altscore workflows-v2 lock get my-wf`,
@@ -279,7 +321,11 @@ func makeWfv2LockGetCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			path := fmt.Sprintf("/v2/workflows/%s/lock", args[0])
+			alias, err := resolveWorkflowAlias(c, args[0])
+			if err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/v2/workflows/%s/lock", alias)
 			data, _, err := c.Do("GET", "borrower_central", path, nil)
 			if err != nil {
 				return err
@@ -293,9 +339,14 @@ func makeWfv2LockAcquireCmd() *cobra.Command {
 	var clientID string
 
 	cmd := &cobra.Command{
-		Use:     "acquire <alias>",
-		Short:   "Acquire an edit lock on a v2 workflow",
-		Long:    `Returns lockToken, expiresAt, and ttl. Save the lockToken; you will need it for heartbeat, autosave, and release.`,
+		Use:   "acquire <alias-or-id>",
+		Short: "Acquire an edit lock on a v2 workflow",
+		Long: `Returns lockToken, expiresAt, and ttl. Save the lockToken; you will need it for heartbeat, autosave, publish, and release.
+
+Locks are keyed by workflow ALIAS. A UUID argument is resolved to its alias
+first -- locking a raw id would create a lock nobody else looks at (the Hub and
+the autosave/publish guard both key by alias), leaving you unprotected while
+believing otherwise.`,
 		Args:    cobra.ExactArgs(1),
 		Example: `  altscore workflows-v2 lock acquire my-wf --client-id cli-$(uuidgen)`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -306,11 +357,15 @@ func makeWfv2LockAcquireCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			alias, err := resolveWorkflowAlias(c, args[0])
+			if err != nil {
+				return err
+			}
 			body, err := json.Marshal(map[string]string{"clientId": clientID})
 			if err != nil {
 				return fmt.Errorf("encode body: %w", err)
 			}
-			path := fmt.Sprintf("/v2/workflows/%s/lock", args[0])
+			path := fmt.Sprintf("/v2/workflows/%s/lock", alias)
 			data, _, err := c.Do("POST", "borrower_central", path, json.RawMessage(body))
 			if err != nil {
 				return err
@@ -327,7 +382,7 @@ func makeWfv2LockHeartbeatCmd() *cobra.Command {
 	var token string
 
 	cmd := &cobra.Command{
-		Use:     "heartbeat <alias>",
+		Use:     "heartbeat <alias-or-id>",
 		Short:   "Renew lock TTL via lockToken",
 		Args:    cobra.ExactArgs(1),
 		Example: `  altscore workflows-v2 lock heartbeat my-wf --token $TOKEN`,
@@ -339,11 +394,15 @@ func makeWfv2LockHeartbeatCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			alias, err := resolveWorkflowAlias(c, args[0])
+			if err != nil {
+				return err
+			}
 			body, err := json.Marshal(map[string]string{"lockToken": token})
 			if err != nil {
 				return fmt.Errorf("encode body: %w", err)
 			}
-			path := fmt.Sprintf("/v2/workflows/%s/lock/heartbeat", args[0])
+			path := fmt.Sprintf("/v2/workflows/%s/lock/heartbeat", alias)
 			data, _, err := c.Do("PUT", "borrower_central", path, json.RawMessage(body))
 			if err != nil {
 				return err
@@ -362,7 +421,7 @@ func makeWfv2LockReleaseCmd() *cobra.Command {
 	var token string
 
 	cmd := &cobra.Command{
-		Use:   "release <alias>",
+		Use:   "release <alias-or-id>",
 		Short: "Release a v2 workflow edit lock you hold",
 		Long: `Release an edit lock using the lockToken returned by 'lock acquire'.
 Only the holder can release this way -- the token proves ownership.
@@ -386,11 +445,15 @@ authenticates by token, not client id.`,
 			if err != nil {
 				return err
 			}
+			alias, err := resolveWorkflowAlias(c, args[0])
+			if err != nil {
+				return err
+			}
 			body, err := json.Marshal(map[string]string{"lockToken": token})
 			if err != nil {
 				return fmt.Errorf("encode body: %w", err)
 			}
-			path := fmt.Sprintf("/v2/workflows/%s/lock", args[0])
+			path := fmt.Sprintf("/v2/workflows/%s/lock", alias)
 			data, _, err := c.Do("DELETE", "borrower_central", path, json.RawMessage(body))
 			if err != nil {
 				return err
@@ -407,9 +470,17 @@ authenticates by token, not client id.`,
 
 func makeWfv2LockForceReleaseCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "force-release <alias>",
-		Short:   "Force-release a stuck lock (admin)",
-		Long:    `Use only when the lock holder is gone and a normal release is impossible. Requires admin permission.`,
+		Use:   "force-release <alias-or-id>",
+		Short: "Force-release a stuck lock (admin)",
+		Long: `Use only when the lock holder is gone and a normal release is impossible. Gated on workflows.write -- the same permission as acquiring a lock, so this is not an elevated operation, just a destructive one.
+
+Locks are keyed by workflow ALIAS, so a UUID argument is resolved to its alias
+first: force-releasing a raw id deleted a key nothing had ever written and still
+answered {"success": true}, leaving the real lock in place until its 300s TTL ran
+out (HQ #1228).
+
+When the response carries "released": false, no lock was held on that alias --
+whatever is blocking you is not a lock under that name.`,
 		Args:    cobra.ExactArgs(1),
 		Example: `  altscore workflows-v2 lock force-release my-wf`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -417,14 +488,36 @@ func makeWfv2LockForceReleaseCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			path := fmt.Sprintf("/v2/workflows/%s/lock/force", args[0])
+			alias, err := resolveWorkflowAlias(c, args[0])
+			if err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/v2/workflows/%s/lock/force", alias)
 			data, _, err := c.Do("DELETE", "borrower_central", path, nil)
 			if err != nil {
 				return err
 			}
+			if forceReleaseReportedNoLock(data) {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"# note: no lock was held on %s, so nothing was released\n", alias)
+			}
 			return output.RawJSON(data)
 		},
 	}
+}
+
+// forceReleaseReportedNoLock reports whether a force-release response explicitly
+// says no lock was removed. Older backends answer a bare {"success": true} for
+// every outcome -- deleted, nothing there, wrong key -- so an absent `released`
+// field means "cannot tell" and is NOT reported as an empty release.
+func forceReleaseReportedNoLock(data json.RawMessage) bool {
+	var ack struct {
+		Released *bool `json:"released"`
+	}
+	if err := json.Unmarshal(data, &ack); err != nil {
+		return false
+	}
+	return ack.Released != nil && !*ack.Released
 }
 
 // ===================== Editing =====================
@@ -617,7 +710,7 @@ a UUID to its alias via ` + "`GET /v2/workflows/{id}`" + ` first.`,
 
 func makeWfv2GetVersionCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "get-version <alias> <version>",
+		Use:     "get-version <alias-or-id> <version>",
 		Short:   "Fetch a specific v2 workflow version",
 		Long:    `Pass "latest" as <version> to get the most recent published version.`,
 		Args:    cobra.ExactArgs(2),
@@ -628,7 +721,11 @@ func makeWfv2GetVersionCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			path := fmt.Sprintf("/v2/workflows/%s/%s", args[0], args[1])
+			alias, err := resolveWorkflowAlias(c, args[0])
+			if err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/v2/workflows/%s/%s", alias, args[1])
 			data, _, err := c.Do("GET", "borrower_central", path, nil)
 			if err != nil {
 				return err
@@ -1608,9 +1705,13 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 			if len(args) == 2 {
 				version = args[1]
 			}
+			alias, err := resolveWorkflowAlias(c, args[0])
+			if err != nil {
+				return err
+			}
 			workflowID := ""
 			if wait.wait {
-				if wf, _, gerr := c.Do("GET", "borrower_central", fmt.Sprintf("/v2/workflows/%s/%s", args[0], version), nil); gerr == nil {
+				if wf, _, gerr := c.Do("GET", "borrower_central", fmt.Sprintf("/v2/workflows/%s/%s", alias, version), nil); gerr == nil {
 					var parsed map[string]any
 					if json.Unmarshal(wf, &parsed) == nil {
 						if id, ok := parsed["id"].(string); ok {
@@ -1619,10 +1720,10 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 					}
 				}
 				if workflowID == "" {
-					return fmt.Errorf("--wait: could not resolve workflow id for alias=%s version=%s", args[0], version)
+					return fmt.Errorf("--wait: could not resolve workflow id for alias=%s version=%s", alias, version)
 				}
 			}
-			path := fmt.Sprintf("/v2/workflows/%s/%s/execute", args[0], version)
+			path := fmt.Sprintf("/v2/workflows/%s/%s/execute", alias, version)
 			data, _, err := c.DoWithHeaders("POST", "borrower_central", path, body, headers.asMap())
 			if err != nil {
 				return err
@@ -1745,7 +1846,7 @@ func normalizeBatchBody(body json.RawMessage) (json.RawMessage, bool, error) {
 func makeWfv2ExecuteBatchByAliasCmd() *cobra.Command {
 	var bodyFlag string
 	cmd := &cobra.Command{
-		Use:     "execute-batch-by-alias <alias> <version>",
+		Use:     "execute-batch-by-alias <alias-or-id> <version>",
 		Short:   "Batch-execute a v2 workflow by alias and version",
 		Args:    cobra.ExactArgs(2),
 		Example: `  altscore workflows-v2 execute-batch-by-alias my-wf latest --body '{"inputs":[...]}'`,
@@ -1758,7 +1859,11 @@ func makeWfv2ExecuteBatchByAliasCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			path := fmt.Sprintf("/v2/workflows/%s/%s/execute-batch", args[0], args[1])
+			alias, err := resolveWorkflowAlias(c, args[0])
+			if err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/v2/workflows/%s/%s/execute-batch", alias, args[1])
 			data, _, err := c.Do("POST", "borrower_central", path, body)
 			if err != nil {
 				return err

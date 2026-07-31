@@ -61,7 +61,9 @@ Use `--diff` to preview changes against the current tenant state before mutating
 
 - `spec.alias` if set, otherwise `slugifyWorkflowLabel(spec.label)`.
 - If **no** ACTIVE workflow has that alias → **CREATE path**: POST `/v2/tasks` for every task (server picks each task's alias), POST `/v2/workflows`, optional publish (DRAFT by default unless `--publish`).
-- If exactly **one** ACTIVE workflow has that alias → **UPDATE path**: POST `/v2/tasks` for every task in the spec (old tasks orphan, accepted), `create-draft --force-recreate`, acquire a lock (`client-id=apply-<ts>`), autosave the new nodes/edges/variables/config/notes/category/status, then publish. Same workflow id, same alias, version increments, schedules and downstream consumers survive.
+- If exactly **one** ACTIVE workflow has that alias → **UPDATE path**: POST `/v2/tasks` for every task in the spec (old tasks orphan, accepted), acquire a lock (`client-id=apply-<ts>`), `create-draft --force-recreate`, autosave the new nodes/edges/variables/config/notes/category/status, then publish **carrying that lock token**. Same workflow id, same alias, version increments, schedules and downstream consumers survive.
+  - The lock is taken **before** `create-draft`, which hard-deletes any existing draft and is not itself lock-gated: locking afterwards meant a refused apply had already destroyed someone's work-in-progress.
+  - When a lock blocks apply, it is only reclaimed if a previous apply run abandoned it: its own `apply-` clientId, never renewed, AND older than 90s. apply does not heartbeat, so a run that is alive right now also shows `renewCount: 0` — age is the only thing separating the two, and without it two concurrent applies rob each other. Anything else is refused, naming the holder — close that Hub tab, or pass `--force-lock` to take it and discard whatever is unsaved there.
 
 Both paths share the same validation + normalize pipeline (`preflightTasks`, per-type normalize, `validateEntityWorkflowAliasMatch`, etc.) so a spec that passes against a fresh tenant also passes when re-applied later.
 
@@ -327,20 +329,39 @@ altscore workflows-v2 lock heartbeat my-wf --lock-token "$TOKEN"   # every ~60s 
 altscore workflows-v2 autosave <id> --lock-token "$TOKEN" --last-known-version 3 \
   --body '{"label":"Renamed","nodes":[...],"edges":[...]}'
 
+# Publishing while you hold the lock REQUIRES the token, or the backend answers
+# 423 LOCKED -- including for the lock's own holder. A successful publish
+# releases the lock server-side, so skip the release below in that case.
+altscore workflows-v2 publish <draft-id> --lock-token "$TOKEN"
+
 altscore workflows-v2 lock release my-wf --lock-token "$TOKEN"
 
 # Inspect / unstick
 altscore workflows-v2 lock get my-wf
-altscore workflows-v2 lock force-release my-wf       # admin only
+altscore workflows-v2 lock force-release my-wf       # destructive, not elevated: workflows.write
 ```
 
 `autosave` returning 409 means concurrent modification — re-fetch with `get`, merge, retry.
+
+**423 LOCKED on autosave or publish** means a lock exists whose token you did not
+present. Either pass `--lock-token`, or find out who holds it with `lock get`.
+Read `renewCount`, not `lockId`: a frozen `renewCount` with `expiresAt` at
+`lockedAt`+300s is an abandoned lock nothing is renewing, while a climbing one is
+a live Hub tab. `lockId` survives a same-tab re-acquire, so it never proves the
+lock is the same grant.
+
+All lock subcommands accept an alias **or** an id (an id is resolved to its alias
+first). Locks are alias-keyed, so addressing one by raw id used to hit a key
+nothing had written: `force-release` answered `{"success": true}` while the real
+lock stayed put until its TTL, and `lock get` reported a false all-clear
+(HQ #1228).
 
 #### Lifecycle
 
 ```bash
 altscore workflows-v2 create-draft <active-id>                   # branch off ACTIVE
-altscore workflows-v2 publish <draft-id>                         # DRAFT -> ACTIVE
+altscore workflows-v2 publish <draft-id>                         # DRAFT -> ACTIVE (no lock held)
+altscore workflows-v2 publish <draft-id> --lock-token "$TOKEN"    # when you hold the edit lock
 altscore workflows-v2 revert my-wf <version-id>                  # restore prior version into a draft
 altscore workflows-v2 revert my-wf <version-id> --mode publish   # replace ACTIVE directly
 altscore workflows-v2 archive <id>                               # archive all versions
