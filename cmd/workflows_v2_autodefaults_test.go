@@ -236,3 +236,74 @@ func TestComposeSpec_DescriptionPointerSemantics(t *testing.T) {
 		t.Errorf("omitted description should be nil, got %v", *omitted.Description)
 	}
 }
+
+// --- pdfConfig defaults are fill-only-if-absent, per key -----------------
+
+// --no-auto-defaults' help text promises "Each only fills an absent field;
+// caller-supplied values always win". pdfConfig used to break that promise by
+// stamping enabled/pdfGenerationRequired unconditionally, so an author who set
+// {"enabled": false} to make a smoke run side-effect-free got a real PDF anyway.
+// The granularity is the KEY, not the pdfConfig object: writing an unrelated
+// pdfConfig key expresses no opinion on `enabled` and still gets the default.
+func TestApplyAutoEndDefaults_PdfConfigFillsOnlyAbsentKeys(t *testing.T) {
+	// absent is the sentinel for "this key must not exist afterwards".
+	const absent = "<absent>"
+	cases := []struct {
+		name         string
+		pdf          map[string]any // nil = no pdfConfig key at all
+		wantEnabled  any
+		wantRequired any
+	}{
+		{"pdfConfig omitted entirely", nil, true, true},
+		{"pdfConfig present but empty", map[string]any{}, true, true},
+		{"unrelated key only -- no opinion on enabled", map[string]any{"title": "Custom"}, true, true},
+		{"explicit enabled=false wins", map[string]any{"enabled": false}, false, absent},
+		{"explicit enabled=false keeps an explicit required", map[string]any{"enabled": false, "pdfGenerationRequired": true}, false, true},
+		{"explicit enabled=true still defaults required", map[string]any{"enabled": true}, true, true},
+		{"explicit required=false wins", map[string]any{"pdfGenerationRequired": false}, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			spec := baseSpecWithCustomers(1)
+			end := endTask(spec)
+			if c.pdf != nil {
+				end["endConfig"] = map[string]any{"pdfConfig": c.pdf}
+			}
+
+			applyAutoEndDefaults(spec)
+
+			pdf := endTask(spec)["endConfig"].(map[string]any)["pdfConfig"].(map[string]any)
+			if got, has := pdf["enabled"]; !has || got != c.wantEnabled {
+				t.Errorf("pdfConfig.enabled = %v (present=%v), want %v", got, has, c.wantEnabled)
+			}
+			got, has := pdf["pdfGenerationRequired"]
+			if c.wantRequired == absent {
+				if has {
+					t.Errorf("pdfGenerationRequired must not be injected next to enabled=false, got %v", got)
+				}
+				return
+			}
+			if !has || got != c.wantRequired {
+				t.Errorf("pdfConfig.pdfGenerationRequired = %v (present=%v), want %v", got, has, c.wantRequired)
+			}
+		})
+	}
+}
+
+// Opting out of the PDF must not disturb the sibling borrower_id/billable_id
+// wiring -- the two defaults are independent.
+func TestApplyAutoEndDefaults_PdfOptOutKeepsBorrowerWiring(t *testing.T) {
+	spec := baseSpecWithCustomers(1)
+	endTask(spec)["endConfig"] = map[string]any{"pdfConfig": map[string]any{"enabled": false}}
+
+	applyAutoEndDefaults(spec)
+
+	end := endTask(spec)
+	im := end["inputMappings"].(map[string]any)
+	if im["borrower_id"] != "task_outputs.customer.borrower_id" {
+		t.Errorf("borrower_id wiring lost: %v", im["borrower_id"])
+	}
+	if pdf := end["endConfig"].(map[string]any)["pdfConfig"].(map[string]any); pdf["enabled"] != false {
+		t.Errorf("pdfConfig.enabled = %v, want false", pdf["enabled"])
+	}
+}

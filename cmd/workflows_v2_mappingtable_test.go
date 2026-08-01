@@ -159,3 +159,129 @@ func TestPublishSuffix(t *testing.T) {
 		t.Errorf("publishSuffix(false) = %q", publishSuffix(false))
 	}
 }
+
+// --- nested credit-decisioning entity scopes ----------------------------
+
+// seedEntities primes lookupEntity's memo so the normalizers resolve entities
+// with a nil client (no HTTP), and restores it when the test ends.
+func seedEntities(t *testing.T, entities map[string]map[string]any) {
+	t.Helper()
+	prev := entityCache
+	entityCache = entities
+	t.Cleanup(func() { entityCache = prev })
+}
+
+// reconcileEntityScopes re-stamps every mapping table a scorecard's rules link
+// to, but normalizeScorecardTask only ever checked the scorecard itself. A
+// cross-owned bucket table reachable ONLY through the scorecard therefore
+// cleared pre-flight, the workflow was created and published, and the re-stamp
+// was refused on stderr with everything already persisted -- leaving the table
+// on the old alias and invisible in the new workflow's Hub elements panel.
+func TestNormalizeScorecardTask_NestedMappingTableScope(t *testing.T) {
+	scorecardTask := func() map[string]any {
+		return map[string]any{
+			"type":            "scorecard",
+			"label":           "Score",
+			"scorecardConfig": map[string]any{"scorecardCode": "sc-code"},
+		}
+	}
+	cases := []struct {
+		name       string
+		mtAlias    string // the mapping table's current workflowAlias
+		allowSteal bool
+		wantErr    string // substring; "" = accepted
+	}{
+		{"nested table already owned by this workflow", "target-wf", false, ""},
+		{"nested table unscoped -- apply will claim it", "", false, ""},
+		{"nested table owned by another workflow", "other-wf", false, `mapping-tables "mt-code"`},
+		{"cross-owned but --allow-steal-ownership", "other-wf", true, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			seedEntities(t, map[string]map[string]any{
+				"scorecards|sc-code": {
+					"id": "sc-1", "code": "sc-code", "workflowAlias": "target-wf",
+					"rules": []any{map[string]any{"mappingTableCode": "mt-code"}},
+				},
+				"mapping-tables|mt-code": {
+					"id": "mt-1", "code": "mt-code", "workflowAlias": c.mtAlias,
+				},
+			})
+			opts := &composeNormalizeOpts{PredictedAlias: "target-wf", AllowStealOwnership: c.allowSteal}
+			err := normalizeScorecardTask(nil, scorecardTask(), opts, false)
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("a cross-owned nested mapping table must fail pre-flight, before any task is POSTed")
+			}
+			if !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("error should name the nested mapping table (%s), got: %v", c.wantErr, err)
+			}
+			if !strings.Contains(err.Error(), "rules[0]") {
+				t.Errorf("error should locate the offending rule, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "other-wf") {
+				t.Errorf("error should name the current owner, got: %v", err)
+			}
+		})
+	}
+}
+
+// Same invariant on the rule-tree side: reconcileEntityScopes re-stamps every
+// evaluation-rule the tree references, so pre-flight owns that set too. The
+// recursion existed but only checked decisionKey, never the workflow scope.
+func TestNormalizeRuleTreeTask_NestedEvaluationRuleScope(t *testing.T) {
+	ruleTreeTask := func() map[string]any {
+		return map[string]any{
+			"type":  "rule-tree",
+			"label": "Decide",
+			"ruleTreeConfig": map[string]any{
+				"ruleTreeCode":   "rt-code",
+				"outputVariable": "decision",
+			},
+		}
+	}
+	cases := []struct {
+		name      string
+		ruleAlias string
+		wantErr   string
+	}{
+		{"nested rule already owned by this workflow", "target-wf", ""},
+		{"nested rule unscoped", "", ""},
+		{"nested rule owned by another workflow", "other-wf", `evaluation-rules "er-code"`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			seedEntities(t, map[string]map[string]any{
+				"rule-trees|rt-code": {
+					"id": "rt-1", "code": "rt-code", "workflowAlias": "target-wf",
+					"rules": []any{map[string]any{"ruleCode": "er-code"}},
+				},
+				"evaluation-rules|er-code": {
+					"id": "er-1", "code": "er-code", "workflowAlias": c.ruleAlias,
+				},
+			})
+			opts := &composeNormalizeOpts{PredictedAlias: "target-wf"}
+			err := normalizeRuleTreeTask(nil, ruleTreeTask(), opts, false)
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("a cross-owned nested evaluation-rule must fail pre-flight")
+			}
+			if !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("error should name the nested rule (%s), got: %v", c.wantErr, err)
+			}
+			if !strings.Contains(err.Error(), "rules[0]") {
+				t.Errorf("error should locate the offending rule, got: %v", err)
+			}
+		})
+	}
+}

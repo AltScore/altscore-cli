@@ -20,8 +20,10 @@ import (
 // Central rejects graphs with conditional branch-handle problems at create /
 // publish (errorSubCodes CONDITIONAL_EDGE_MISSING_BRANCH_HANDLE since #1463,
 // CONDITIONAL_EDGE_BRANCH_MISMATCH since #1571). A rejected graph therefore
-// fails AFTER leaking task versions -- there is no rollback (tasks-v2 has no
-// DELETE; --rollback-tasks is a documented no-op).
+// fails AFTER leaking task versions, and there is no undo: DELETE
+// /v2/tasks/{alias} removes EVERY version of an alias, not the one this run
+// added, so apply exposes no rollback flag (see the note at the top of
+// workflows_v2_apply.go). Pre-flight is the only protection there is.
 //
 // This asks BC's POST /v2/workflows/validate to check the assembled definition
 // plus the inline task bodies BEFORE anything is persisted, and aborts apply on
