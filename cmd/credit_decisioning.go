@@ -16,25 +16,40 @@ import (
 // returns a *cobra.Command and is wired in cmd/root.go via .AddCommand on
 // the resource group.
 
-// stampWorkflowAliasOnArray walks a JSON array body and sets/overwrites
-// workflowAlias on each top-level object. Used by the import commands so a
-// single --workflow-alias flag can scope an entire bundle without editing
-// the source file.
+// normalizeImportBody prepares a bulk-import body for POST /v1/<resource>/import
+// and stamps workflowAlias on every record.
 //
-// When alias is empty AND the body's items don't already carry a
-// workflowAlias, prints a warning to stderr (mirrors the --workflow-alias
-// missing warning in resource.go::makeCreateCmd). entityKind is the resource
-// name in plural form, used in the warning text.
-func stampWorkflowAliasOnArray(body json.RawMessage, alias, entityKind string, warnWriter io.Writer) (json.RawMessage, error) {
+// All four credit-decisioning import endpoints take an OBJECT wrapper, not a bare
+// array -- BulkImportMappingTables{mappingTables}, BulkImportScorecards{scorecards},
+// BulkImportEvaluationRules{rules}, BulkImportRuleTrees{ruleTrees}, each plus an
+// optional skipExisting. A bare array is rejected with a 400 "value is not a valid
+// dict". wrapperKey is the resource's array field name.
+//
+// Both shapes are accepted here and normalised to the wrapper the endpoint requires:
+// a bare array is a natural thing to hand a command called "import", and rejecting it
+// only to have the server reject it more cryptically helps nobody.
+//
+// When alias is empty AND records don't already carry a workflowAlias, prints a
+// warning to stderr (mirrors the --workflow-alias missing warning in
+// resource.go::makeCreateCmd). entityKind is the resource name in plural form.
+func normalizeImportBody(body json.RawMessage, wrapperKey, alias, entityKind string, warnWriter io.Writer) (json.RawMessage, error) {
 	var items []map[string]json.RawMessage
+	wrapper := map[string]json.RawMessage{}
+
 	if err := json.Unmarshal(body, &items); err != nil {
-		// Body isn't a JSON array; let the API decide what to do (some import
-		// endpoints accept objects with an `items` key). No alias stamping
-		// possible without an array shape.
-		if alias != "" {
-			return nil, fmt.Errorf("--workflow-alias requires the import body to be a JSON array of objects: %w", err)
+		// Not a bare array -- expect the object wrapper.
+		if err := json.Unmarshal(body, &wrapper); err != nil {
+			return nil, fmt.Errorf("import body must be a JSON array of %s or an object with a %q array: %w",
+				entityKind, wrapperKey, err)
 		}
-		return body, nil
+		raw, ok := wrapper[wrapperKey]
+		if !ok {
+			return nil, fmt.Errorf("import body object has no %q key; %s import expects {%q: [...]}",
+				wrapperKey, entityKind, wrapperKey)
+		}
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return nil, fmt.Errorf("%q must be an array of objects: %w", wrapperKey, err)
+		}
 	}
 
 	if alias == "" {
@@ -58,17 +73,22 @@ func stampWorkflowAliasOnArray(body json.RawMessage, alias, entityKind string, w
 				"# warning: --workflow-alias not set and at least one imported %s has no \"workflowAlias\"; those records will not appear in any workflow builder.\n",
 				entityKind)
 		}
-		return body, nil
+	} else {
+		encoded, err := json.Marshal(alias)
+		if err != nil {
+			return nil, err
+		}
+		for i := range items {
+			items[i]["workflowAlias"] = encoded
+		}
 	}
 
-	encoded, err := json.Marshal(alias)
+	encodedItems, err := json.Marshal(items)
 	if err != nil {
 		return nil, err
 	}
-	for i := range items {
-		items[i]["workflowAlias"] = encoded
-	}
-	return json.Marshal(items)
+	wrapper[wrapperKey] = encodedItems
+	return json.Marshal(wrapper)
 }
 
 // ----- evaluation-rules -----
@@ -79,16 +99,17 @@ func makeErImportCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "import",
 		Short: "Bulk-import evaluation rules from a JSON bundle",
-		Long: `POST /v1/evaluation-rules/import. Body must be a top-level JSON
-ARRAY of rule definitions -- NOT an object wrapper. e.g.
-  [{"label": "Approve", "code": "approve", "conditions": {...}, ...}, ...]
-A bundle-shaped body like {"rules": [...]} or {"items": [...]} is rejected
-by the endpoint with an opaque parse error.
+		Long: `POST /v1/evaluation-rules/import. The endpoint takes an OBJECT
+wrapper (BulkImportEvaluationRules):
+  {"rules": [{"label": "Approve", "code": "approve", ...}, ...],
+   "skipExisting": true}
+A bare top-level array is rejected with 400 "value is not a valid dict".
+A bare array is still accepted here and wrapped for you.
 
 Use --workflow-alias <alias> to stamp every imported rule with the same
 workflowAlias. Without it the imports will not appear in the workflow's
 evaluate-rules picker.`,
-		Example: `  altscore evaluation-rules import --body @rules-array.json --workflow-alias underwriting-v1`,
+		Example: `  altscore evaluation-rules import --body @rules.json --workflow-alias underwriting-v1`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
 			if err != nil {
@@ -98,7 +119,7 @@ evaluate-rules picker.`,
 			if err != nil {
 				return err
 			}
-			body, err = stampWorkflowAliasOnArray(body, workflowAlias, "evaluation-rules", cmd.ErrOrStderr())
+			body, err = normalizeImportBody(body, "rules", workflowAlias, "evaluation-rules", cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
@@ -183,7 +204,8 @@ func makeRtImportCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "import",
 		Short: "Bulk-import rule trees from a JSON bundle",
-		Long: `POST /v1/rule-trees/import.
+		Long: `POST /v1/rule-trees/import. Takes an object wrapper
+{"ruleTrees": [...], "skipExisting": true}; a bare array is wrapped for you.
 
 Use --workflow-alias <alias> to stamp every imported rule tree with the
 same workflowAlias. Without it the imports will not appear in the workflow's
@@ -198,7 +220,7 @@ rule-tree picker.`,
 			if err != nil {
 				return err
 			}
-			body, err = stampWorkflowAliasOnArray(body, workflowAlias, "rule-trees", cmd.ErrOrStderr())
+			body, err = normalizeImportBody(body, "ruleTrees", workflowAlias, "rule-trees", cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
@@ -222,7 +244,8 @@ func makeMtImportCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "import",
 		Short: "Bulk-import mapping tables from a JSON bundle",
-		Long: `POST /v1/mapping-tables/import.
+		Long: `POST /v1/mapping-tables/import. Takes an object wrapper
+{"mappingTables": [...], "skipExisting": true}; a bare array is wrapped for you.
 
 Use --workflow-alias <alias> to stamp every imported mapping table with
 the same workflowAlias. Without it the imports will not appear in the
@@ -237,7 +260,7 @@ workflow's mapping-table picker.`,
 			if err != nil {
 				return err
 			}
-			body, err = stampWorkflowAliasOnArray(body, workflowAlias, "mapping-tables", cmd.ErrOrStderr())
+			body, err = normalizeImportBody(body, "mappingTables", workflowAlias, "mapping-tables", cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
@@ -261,7 +284,8 @@ func makeScImportCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "import",
 		Short: "Bulk-import scorecards from a JSON bundle",
-		Long: `POST /v1/scorecards/import.
+		Long: `POST /v1/scorecards/import. Takes an object wrapper
+{"scorecards": [...], "skipExisting": true}; a bare array is wrapped for you.
 
 Use --workflow-alias <alias> to stamp every imported scorecard with the
 same workflowAlias. Without it the imports will not appear in the workflow's
@@ -276,7 +300,7 @@ scorecard picker.`,
 			if err != nil {
 				return err
 			}
-			body, err = stampWorkflowAliasOnArray(body, workflowAlias, "scorecards", cmd.ErrOrStderr())
+			body, err = normalizeImportBody(body, "scorecards", workflowAlias, "scorecards", cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
