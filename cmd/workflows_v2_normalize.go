@@ -382,7 +382,7 @@ type composeNormalizeOpts struct {
 	AllowStealOwnership bool
 	// AutoDefaults -- when true (the default; disabled by --no-auto-defaults),
 	// apply injects opinionated convenience defaults: end-node borrower_id /
-	// billable_id wiring + forced PDF generation (see applyAutoEndDefaults),
+	// billable_id wiring + default PDF generation (see applyAutoEndDefaults),
 	// and deal-contact identity_value back-fill (see normalizeEntityWriteTask).
 	// Each is only applied when the field is absent -- caller-supplied values
 	// always win.
@@ -1526,6 +1526,42 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, opts *compose
 	if err := validateEntityWorkflowAliasMatch(opts, entity, predictedAlias, "scorecards", ref); err != nil {
 		return err
 	}
+	// Cross-check the workflow scope of every mapping table the scorecard's
+	// rules link to. reconcileEntityScopes re-stamps exactly this set after
+	// apply (see its scorecard case), so pre-flight has to validate exactly
+	// this set too: a cross-owned bucket table that is only reachable THROUGH
+	// the scorecard otherwise clears pre-flight, the workflow is created and
+	// published, and the re-stamp is refused on stderr with everything already
+	// persisted. The table keeps the previous owner's alias and vanishes from
+	// this workflow's Hub elements panel -- the exact drift
+	// validateEntityWorkflowAliasMatch exists to prevent. Mirrors the rule-tree
+	// recursion in normalizeRuleTreeTask.
+	if entity != nil {
+		if rules, ok := entity["rules"].([]any); ok {
+			for i, raw := range rules {
+				rm, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				mcode, _ := rm["mappingTableCode"].(string)
+				mid, _ := rm["mappingTableId"].(string)
+				mref := mcode
+				if mref == "" {
+					mref = mid
+				}
+				if mref == "" {
+					continue
+				}
+				mtEntity, _ := lookupEntity(c, "mapping-tables", mref, dryRun)
+				if mtEntity == nil {
+					continue
+				}
+				if err := validateEntityWorkflowAliasMatch(opts, mtEntity, predictedAlias, "mapping-tables", mref); err != nil {
+					return fmt.Errorf("scorecard %q rules[%d]: %w", ref, i, err)
+				}
+			}
+		}
+	}
 	// Default totalScoreVariable / breakdownVariable when omitted so the
 	// task body is self-consistent (the runtime activity reads them from
 	// here). BC's DerivedSchemaService picks up these values to build the
@@ -1614,6 +1650,14 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeN
 				ruleEntity, _ := lookupEntity(c, "evaluation-rules", rref, dryRun)
 				if ruleEntity == nil {
 					continue
+				}
+				// Same reasoning as the scorecard's nested mapping tables:
+				// reconcileEntityScopes re-stamps every rule this tree
+				// references, so pre-flight owns the same set. Without this the
+				// cross-ownership refusal only surfaces after the workflow is
+				// live, with the rule stranded on the old alias.
+				if err := validateEntityWorkflowAliasMatch(opts, ruleEntity, predictedAlias, "evaluation-rules", rref); err != nil {
+					return fmt.Errorf("rule-tree %q rules[%d]: %w", ref, i, err)
 				}
 				dk, _ := ruleEntity["decisionKey"].(string)
 				warnIfDecisionKeyUnknown(c, dk, rref, fmt.Sprintf("rule-tree %q rules[%d]", ref, i))

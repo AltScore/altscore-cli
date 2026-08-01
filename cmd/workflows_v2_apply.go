@@ -67,10 +67,19 @@ import (
 //  4. POST /v2/workflows with label, category, description, inputVariables,
 //     customVariables, nodes, edges, status (default DRAFT).
 //
-// On any task-create failure, the partial state is reported and the workflow
-// is not created. Use --rollback-tasks to cascade-delete created tasks on
-// failure (best-effort; tasks-v2 has no DELETE today, so this is a no-op
-// placeholder for future API support).
+// On any task-create failure the partial state is reported and the workflow is
+// NOT created -- and the tasks already POSTed stay on the tenant. There is no
+// rollback flag, and one cannot be built honestly: DELETE /v2/tasks/{alias}
+// exists but is ALIAS-scoped and hard-deletes every version of that alias, so on
+// the update path (which version-bumps existing aliases) "undo this run" would
+// destroy versions this run never created. Cleanup is therefore a deliberate,
+// case-by-case act -- `altscore tasks-v2 delete <alias>` per leaked alias, which
+// the create path's "created so far: [...]" line names for you.
+//
+// The pre-flight is what keeps that from happening: preflightTasks (local, this
+// file) and POST /v2/workflows/validate (the server oracle, see
+// workflows_v2_preflight_validate.go) both run BEFORE the first task POST.
+// Anything catchable belongs in one of those two, never in the POST loop.
 
 type composeSpec struct {
 	Label    string `json:"label"`
@@ -618,7 +627,7 @@ End-node output (endConfig on the 'end' node):
 	cmd.Flags().BoolVar(&skipRescope, "skip-rescope", false, "do not stamp referenced credit-decisioning entities (scorecards, rule-trees, etc.) to the workflow's alias after apply")
 	cmd.Flags().BoolVar(&allowStealOwnership, "allow-steal-ownership", false, "permit apply to transfer a credit-decisioning entity's workflowAlias when it is currently owned by ANOTHER workflow. Default: refuse and instruct the spec author to clone the entity with a new code. Use only for rare workflow rename / identity migration / decommissioning scenarios")
 	cmd.Flags().BoolVar(&verify, "verify", true, "after writing, read back the persisted tasks and warn (stderr, non-fatal) about any spec-set field the backend dropped or nulled. Pass --verify=false to skip the extra GETs")
-	cmd.Flags().BoolVar(&noAutoDefaults, "no-auto-defaults", false, "disable apply's opinionated convenience defaults: (1) end-node borrower_id/billable_id wired to the single customer node's borrower_id, (2) forced end-node PDF generation (pdfConfig.enabled+pdfGenerationRequired=true), (3) deal-contact identity_value back-filled from each contact's identity_key field (default tax_id). Each only fills an absent field; caller-supplied values always win")
+	cmd.Flags().BoolVar(&noAutoDefaults, "no-auto-defaults", false, "disable apply's opinionated convenience defaults: (1) end-node borrower_id/billable_id wired to the single customer node's borrower_id, (2) end-node PDF generation (pdfConfig.enabled+pdfGenerationRequired default to true), (3) deal-contact identity_value back-filled from each contact's identity_key field (default tax_id). Each only fills an absent field; caller-supplied values always win -- an explicit pdfConfig.enabled=false keeps the report off")
 	cmd.Flags().BoolVar(&forceLock, "force-lock", false, "take the workflow's edit lock even when a live session holds it. By default apply only reclaims a lock a previous apply run abandoned (its own clientId prefix, never renewed) and refuses anything that looks like an open Hub tab, naming the holder. Forcing discards whatever that session has unsaved")
 	cmd.Flags().BoolVar(&noLayout, "no-layout", false, "skip auto-layout of the canvas. By default apply positions nodes in left-to-right columns (the same algorithm as the Hub builder's Align button) so the graph opens readable; with this flag nodes ship on a single row at a 200px pitch and overlap until someone clicks Align. Auto-layout is also skipped when the spec pins `position` on any node")
 	return cmd
@@ -1730,6 +1739,19 @@ var residualSpecRefExcludedFields = map[string]bool{
 	"helpText":     true,
 	"hint":         true,
 	"tooltip":      true,
+	// mappingTableConfig.entries[].inputVariable is dual-mode at runtime, and
+	// only ONE of the two modes is a node reference. BC's resolve_context_field
+	// branches on the literal `task_outputs.` prefix: with it, the second dotted
+	// segment is a task alias; WITHOUT it the whole string is a flat key looked
+	// up in {workflow inputVariables + customVariables + this task's
+	// resolvedInputs}. rewriteTaskRefs already rewrites the dotted form via
+	// rewriteTaskOutputsRefsInString, and a dotted string can never be an exact
+	// match for a bare ref anyway -- so this validator only ever fires on the
+	// BARE form, which is provably a variable name and never a node ref.
+	// Flagging it is a false positive by construction, and it aborted a real
+	// migration mid-POST. checkRefVariableCollisions is what keeps the bare form
+	// honest, by refusing a spec where a ref and a variable share a name.
+	"inputVariable": true,
 }
 
 // validateNoResidualSpecRefs walks a composed task body and returns an error
@@ -2186,8 +2208,9 @@ func humanizeKey(key string) string {
 
 // applyAutoEndDefaults injects apply's opinionated end-node defaults into the
 // spec in place (gated by --no-auto-defaults). For every end node it:
-//   - forces endConfig.pdfConfig.enabled=true and pdfGenerationRequired=true so
-//     the runtime always renders a report (other pdfConfig fields are preserved);
+//   - defaults endConfig.pdfConfig.enabled and pdfGenerationRequired to true so
+//     the runtime renders a report unless the author said otherwise (other
+//     pdfConfig fields are preserved);
 //   - wires inputMappings.borrower_id and inputMappings.billable_id to the single
 //     customer node's borrower_id output, so the run is attributed to and billed
 //     for the deal owner. end_activity defaults billable_id->borrower_id, but we
@@ -2210,7 +2233,15 @@ func applyAutoEndDefaults(spec *composeSpec) {
 			continue
 		}
 
-		// Force PDF generation on.
+		// Default PDF generation on -- per KEY, and only when the key is
+		// absent, exactly like the borrower_id/billable_id wiring below and
+		// like --no-auto-defaults' own help text promises ("Each only fills an
+		// absent field; caller-supplied values always win"). The granularity is
+		// the key, not the pdfConfig object: an author who writes
+		// `pdfConfig: {"title": "..."}` expressed no opinion on `enabled` and
+		// still wants the report, while one who writes `{"enabled": false}` --
+		// to make a smoke run side-effect-free, say -- must not get a rendered
+		// report anyway.
 		endCfg, _ := t["endConfig"].(map[string]any)
 		if endCfg == nil {
 			endCfg = map[string]any{}
@@ -2219,8 +2250,18 @@ func applyAutoEndDefaults(spec *composeSpec) {
 		if pdf == nil {
 			pdf = map[string]any{}
 		}
-		pdf["enabled"] = true
-		pdf["pdfGenerationRequired"] = true
+		if _, has := pdf["enabled"]; !has {
+			pdf["enabled"] = true
+		}
+		// pdfGenerationRequired means "a failed render is fatal", which is
+		// incoherent with a report that is switched off. Default it only when
+		// the report is actually on, so the default can never author a
+		// self-contradictory pdfConfig. An explicit value still wins.
+		if enabled, _ := pdf["enabled"].(bool); enabled {
+			if _, has := pdf["pdfGenerationRequired"]; !has {
+				pdf["pdfGenerationRequired"] = true
+			}
+		}
 		endCfg["pdfConfig"] = pdf
 		t["endConfig"] = endCfg
 
@@ -3094,8 +3135,18 @@ func fetchServerTaskTypes(c *client.Client) map[string]bool {
 //  8. edge endpoints (from/to) must reference a known ref.
 //  9. duplicate edges and self-loops are rejected.
 func preflightTasks(spec *composeSpec) error {
-	// Spec-level checks: workflow category + inputVariables shape. These
-	// fail with opaque backend errors otherwise; surface here.
+	// Spec-level checks: workflow alias + category + inputVariables shape.
+	// These fail with opaque backend errors otherwise; surface here.
+	//
+	// The alias check has to live here, not at POST /v2/workflows: BC only
+	// rejects a non-kebab-case alias when the workflow itself is created,
+	// which is AFTER every task has been POSTed. Tasks cannot be un-created
+	// (see the rollback note at the top of this file), so without this the
+	// whole spec clears both pre-flights, leaks one task row per node, and
+	// dies on the last call.
+	if err := checkWorkflowAlias(spec.Alias); err != nil {
+		return err
+	}
 	if err := checkWorkflowCategory(spec.Category); err != nil {
 		return err
 	}
@@ -3194,6 +3245,9 @@ func preflightTasks(spec *composeSpec) error {
 		if nodeType == "start" {
 			startCount++
 		}
+	}
+	if err := checkRefVariableCollisions(spec, knownRefs); err != nil {
+		return err
 	}
 	if startCount == 0 {
 		return fmt.Errorf(
@@ -4106,6 +4160,91 @@ func warnUnverifiedVocabularyValue(path, value, vocabulary string) {
 			"%s on write and will reject it if it is genuinely wrong. "+
 			"Update altscore-cli to refresh its offline list.\n",
 		path, value, vocabulary, vocabulary,
+	)
+}
+
+// checkRefVariableCollisions rejects a spec where a node's ref is also the name
+// of a workflow variable. The two are separate scopes at RUNTIME -- a node's
+// output is `task_outputs.<ref>.*` while the variable is a bare name at the
+// context root -- so the collision is not itself a runtime bug. It is a compose
+// bug, because every ref rewriter in apply is an exact string match.
+//
+// The concrete failure is validateNoResidualSpecRefs, the safety net that flags
+// any string exactly equal to a spec-local ref as a missed rewrite. Fields that
+// legitimately hold a bare VARIABLE name -- mappingTableConfig.entries[].
+// inputVariable, compute-variables selectedVariables[], scorecardConfig.
+// totalScoreVariable, and so on -- then read as un-rewritten node refs and abort
+// apply. That abort happens in the POST loop, i.e. after tasks have already been
+// created, which is the one place apply must never fail.
+//
+// Excluding those fields one at a time (residualSpecRefExcludedFields) is a
+// losing race against the task schema. Keeping the two namespaces disjoint is
+// the precondition that makes the exact-match check sound in the first place, so
+// it is enforced here, before anything is POSTed.
+func checkRefVariableCollisions(spec *composeSpec, knownRefs map[string]bool) error {
+	type collision struct{ name, scope string }
+	var found []collision
+	for _, v := range []struct {
+		vars  map[string]any
+		scope string
+	}{
+		{spec.InputVariables, "inputVariables"},
+		{spec.CustomVariables, "customVariables"},
+	} {
+		for name := range v.vars {
+			if knownRefs[name] {
+				found = append(found, collision{name, v.scope})
+			}
+		}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].name < found[j].name })
+	names := make([]string, 0, len(found))
+	for _, f := range found {
+		names = append(names, fmt.Sprintf("%q (workflow.%s)", f.name, f.scope))
+	}
+	first := found[0].name
+	return fmt.Errorf(
+		"node ref/variable name collision: %s. A node ref and a workflow variable must not share a name. "+
+			"They are different scopes at runtime (the node's output is task_outputs.%s.*, the variable is a "+
+			"bare %q), but apply rewrites refs by exact string match, so any field holding the variable's bare "+
+			"name -- a mapping-table entry's inputVariable, a compute node's selectedVariables, a scorecard's "+
+			"totalScoreVariable -- looks like an un-rewritten node ref and aborts apply DURING the task POST "+
+			"loop, after some tasks already exist. Rename one of the two: e.g. ref %q, or a distinct variable name.",
+		strings.Join(names, ", "), first, first, first+"-node",
+	)
+}
+
+// checkWorkflowAlias validates the spec's explicit workflow alias against the
+// same shape the backend enforces at POST /v2/workflows ("alias must be
+// kebab-case: lowercase letters, digits, and hyphens; start with a letter or
+// digit; length 1-100 characters"). An empty alias is fine -- the server
+// slugifies the label instead, which always yields a conforming alias.
+//
+// Node refs and node aliases have been checked against validAliasPattern for a
+// while; the WORKFLOW alias was the one identifier nothing checked, and it is
+// the most expensive one to get wrong. It is the last field the create path
+// validates (workflow creation is the final call, after every task POST) and
+// the alias is also what every credit-decisioning entity gets stamped with, so
+// a rejected alias leaves both orphan task rows and, on a rename, entities
+// stamped with an alias no workflow will ever have.
+func checkWorkflowAlias(alias string) error {
+	if alias == "" {
+		return nil
+	}
+	if validAliasPattern.MatchString(alias) && len(alias) <= 100 {
+		return nil
+	}
+	return fmt.Errorf(
+		"workflow alias %q is not kebab-case. The server derives the workflow's URL paths from it, so it "+
+			"must be lowercase alphanumeric with internal dashes only (regex: ^[a-z0-9][a-z0-9-]*$) and at "+
+			"most 100 characters. Don't use spaces, underscores, slashes, uppercase, or other punctuation. "+
+			"Try %q. This is checked here because POST /v2/workflows is the LAST call apply makes: without "+
+			"it the spec clears both pre-flights, every task is created, and only then does the backend "+
+			"reject the alias -- leaving orphan task rows behind.",
+		alias, slugifyWorkflowLabel(alias),
 	)
 }
 

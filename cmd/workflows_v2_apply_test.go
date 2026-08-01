@@ -347,3 +347,219 @@ func TestValidateStandardOutputShape(t *testing.T) {
 		})
 	}
 }
+
+// --- workflow alias pre-flight ------------------------------------------
+
+// The workflow alias is the LAST thing the create path validates: BC only
+// rejects a non-kebab-case alias at POST /v2/workflows, after every task has
+// already been POSTed and cannot be un-created. checkWorkflowAlias moves that
+// rejection ahead of the first HTTP call.
+func TestCheckWorkflowAlias(t *testing.T) {
+	cases := []struct {
+		name    string
+		alias   string
+		wantErr string // substring; "" = accepted
+	}{
+		{"omitted -- server slugifies the label", "", ""},
+		{"kebab", "over-the-road-v2", ""},
+		{"single word", "kyb", ""},
+		{"leading digit", "0089-kyb", ""},
+		{"exactly 100 chars", strings.Repeat("a", 100), ""},
+		{"underscores", "over_the_road_v2", "over-the-road-v2"},
+		{"uppercase", "OverTheRoad", "not kebab-case"},
+		{"spaces", "over the road", "over-the-road"},
+		{"leading dash", "-otr", "not kebab-case"},
+		{"slash", "otr/v2", "otr-v2"},
+		{"101 chars", strings.Repeat("a", 101), "not kebab-case"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := checkWorkflowAlias(c.alias)
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("checkWorkflowAlias(%q) = %v, want nil", c.alias, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("checkWorkflowAlias(%q) = nil, want an error", c.alias)
+			}
+			if !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("error should contain %q, got: %v", c.wantErr, err)
+			}
+			// Every rejection must state the regex so the fix is obvious.
+			if !strings.Contains(err.Error(), "^[a-z0-9][a-z0-9-]*$") {
+				t.Errorf("error should quote the alias regex, got: %v", err)
+			}
+		})
+	}
+}
+
+// End-to-end guard: the underscore alias must die in preflightTasks, i.e.
+// before composeWorkflowBody POSTs anything. On the pre-change code this spec
+// cleared preflight entirely and leaked one task row per node.
+func TestPreflightTasks_RejectsNonKebabWorkflowAlias(t *testing.T) {
+	spec := &composeSpec{
+		Label:      "Over the road v2",
+		Alias:      "over_the_road_v2",
+		Category:   "EVALUATION",
+		ExtraNodes: startNode,
+		Tasks: []map[string]any{
+			{"ref": "end", "type": "end", "label": "End"},
+		},
+		Edges: []map[string]any{{"from": "start", "to": "end"}},
+	}
+	err := preflightTasks(spec)
+	if err == nil {
+		t.Fatalf("preflight must reject a non-kebab-case workflow alias before any task is POSTed")
+	}
+	if !strings.Contains(err.Error(), "over_the_road_v2") || !strings.Contains(err.Error(), "over-the-road-v2") {
+		t.Errorf("error should name the bad alias and suggest the kebab form, got: %v", err)
+	}
+}
+
+// --- node ref / workflow variable name collisions -----------------------
+
+// A node ref that is also a workflow variable name breaks apply's exact-string
+// ref rewriting: validateNoResidualSpecRefs then reads a field holding the
+// VARIABLE's bare name as an un-rewritten node ref and aborts in the POST loop,
+// after tasks exist. Catch it in phase 1 instead.
+func TestPreflightTasks_RefVariableCollision(t *testing.T) {
+	cases := []struct {
+		name    string
+		inputs  map[string]any
+		customs map[string]any
+		wantErr string // substring; "" = accepted
+	}{
+		{
+			name:    "no collision",
+			inputs:  map[string]any{"raw_score": map[string]any{"type": "number"}},
+			wantErr: "",
+		},
+		{
+			name:    "ref collides with an input variable",
+			inputs:  map[string]any{"score": map[string]any{"type": "number"}},
+			wantErr: `"score" (workflow.inputVariables)`,
+		},
+		{
+			name:    "ref collides with a custom variable",
+			customs: map[string]any{"score": map[string]any{"expression": "result = 1"}},
+			wantErr: `"score" (workflow.customVariables)`,
+		},
+		{
+			name:    "collision on a graph-only node ref",
+			inputs:  map[string]any{"start": map[string]any{"type": "string"}},
+			wantErr: `"start" (workflow.inputVariables)`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			spec := &composeSpec{
+				Label:           "Scoring engine",
+				Category:        "EVALUATION",
+				InputVariables:  c.inputs,
+				CustomVariables: c.customs,
+				ExtraNodes:      startNode,
+				Tasks: []map[string]any{
+					{"ref": "score", "type": "http", "label": "Score", "url": "https://x.test", "method": "GET"},
+					{"ref": "end", "type": "end", "label": "End"},
+				},
+				Edges: []map[string]any{
+					{"from": "start", "to": "score"},
+					{"from": "score", "to": "end"},
+				},
+			}
+			err := preflightTasks(spec)
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("preflight should accept a spec with no ref/variable collision, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("preflight must reject the ref/variable collision before any task is POSTed")
+			}
+			if !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("error should name the colliding name and its scope %q, got: %v", c.wantErr, err)
+			}
+			if !strings.Contains(err.Error(), "Rename one of the two") {
+				t.Errorf("error should tell the author how to fix it, got: %v", err)
+			}
+		})
+	}
+}
+
+// Both scopes colliding at once are reported together, in a deterministic order
+// (map iteration is random, so the message must be sorted).
+func TestCheckRefVariableCollisions_ReportsAllSorted(t *testing.T) {
+	spec := &composeSpec{
+		InputVariables:  map[string]any{"zeta": map[string]any{}},
+		CustomVariables: map[string]any{"alpha": map[string]any{}},
+	}
+	refs := map[string]bool{"alpha": true, "zeta": true, "unrelated": true}
+	for i := 0; i < 20; i++ {
+		err := checkRefVariableCollisions(spec, refs)
+		if err == nil {
+			t.Fatalf("both collisions must be reported")
+		}
+		want := `"alpha" (workflow.customVariables), "zeta" (workflow.inputVariables)`
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("collisions must be listed sorted; want %q in: %v", want, err)
+		}
+	}
+}
+
+// --- residual-ref safety net vs mapping-table inputVariable -------------
+
+// mappingTableConfig.entries[].inputVariable is dual-mode: BC resolves a
+// `task_outputs.`-prefixed value as a node reference and ANY other value as a
+// flat context key. rewriteTaskRefs rewrites the first form; the second is a
+// variable name and must survive untouched. Before the fix the bare form was
+// reported as a residual spec-local ref and killed apply mid-POST.
+func TestRewriteTaskRefs_MappingTableInputVariableModes(t *testing.T) {
+	refMap := map[string]string{"score": "score-service-49dcec"}
+	task := map[string]any{
+		"type":          "mapping-table",
+		"label":         "Band",
+		"inputMappings": map[string]any{"score": "task_outputs.score.weight"},
+		"mappingTableConfig": map[string]any{
+			"entries": []any{
+				// Bare name -> the workflow/task variable called "score".
+				map[string]any{"inputVariable": "score", "outputVariable": "risk_band"},
+				// Dotted name -> a genuine node reference, must be rewritten.
+				map[string]any{"inputVariable": "task_outputs.score.weight", "outputVariable": "weight_band"},
+			},
+		},
+	}
+	if err := rewriteTaskRefs(task, refMap, `node ref="metrics-a"`); err != nil {
+		t.Fatalf("a bare inputVariable is a context-variable name, not a residual ref: %v", err)
+	}
+	entries := task["mappingTableConfig"].(map[string]any)["entries"].([]any)
+	if got := entries[0].(map[string]any)["inputVariable"]; got != "score" {
+		t.Errorf("bare inputVariable must survive verbatim, got %v", got)
+	}
+	if got := entries[1].(map[string]any)["inputVariable"]; got != "task_outputs.score-service-49dcec.weight" {
+		t.Errorf("dotted inputVariable must be rewritten to the server alias, got %v", got)
+	}
+}
+
+// Excluding inputVariable must not blunt the safety net: a spec-local ref left
+// in a field the rewriter genuinely forgot is still a hard error.
+func TestValidateNoResidualSpecRefs_StillCatchesRealResidues(t *testing.T) {
+	refMap := map[string]string{"score": "score-service-49dcec"}
+	body := map[string]any{
+		"type": "end",
+		"endConfig": map[string]any{
+			"pdfConfig": map[string]any{
+				"someFutureField": "score",
+			},
+		},
+	}
+	err := validateNoResidualSpecRefs(body, refMap, `node ref="end"`)
+	if err == nil {
+		t.Fatalf("an un-rewritten ref at an unknown path must still fail loudly")
+	}
+	if !strings.Contains(err.Error(), "someFutureField") {
+		t.Errorf("error should name the offending path, got: %v", err)
+	}
+}
