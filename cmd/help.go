@@ -108,7 +108,7 @@ Multiple filters can be applied:
 Filters are passed as query parameters to the API. The exact filter
 keys available depend on the resource. Common filters include:
 
-  persona        Borrower persona (individual, company)
+  persona        Borrower persona (business, individual)
   search         Free-text search
   date-from      ISO 8601 datetime (lower bound)
   date-to        ISO 8601 datetime (upper bound)

@@ -69,7 +69,7 @@ func registerResources() {
 
 A borrower represents an individual or company that is a customer or
 prospect. Borrowers have identities, documents, and can participate in deals.`,
-		CreateSchema: `  persona: string       [required] "individual" or "company"
+		CreateSchema: `  persona: string       [required] "business" or "individual"
   label: string         Display name
   externalId: string    External system ID
   riskRating: string    Risk rating value
@@ -80,7 +80,7 @@ prospect. Borrowers have identities, documents, and can participate in deals.`,
 		ResponseSchema: `  id, persona, label, externalId, avatarUrl, tags, flag, isTest,
   riskRating, repaymentRiskRating, currentStep{stepId, order, key, createdAt},
   cmsClientIds, createdAt, updatedAt`,
-		FilterHelp: `  persona               "individual" or "company"
+		FilterHelp: `  persona               "business", "individual" or "all"
   risk-rating           Risk rating value
   current-step-key      Current step key
   audiences             Comma-separated audiences
