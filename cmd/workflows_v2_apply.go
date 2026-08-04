@@ -3895,7 +3895,7 @@ func preflightTasks(spec *composeSpec) error {
 				if !reservedMappingScopes[head] && !knownRefs[head] {
 					return fmt.Errorf(
 						"node ref=%q: inputMappings[%q]=%q has unknown leading segment %q. "+
-							"Valid namespaces: inputs, custom, system, task_outputs, task_outputs_by_type, entity. "+
+							"Valid namespaces: "+reservedScopesList()+". "+
 							"Or use a spec-local ref (one of: %s) which compose rewrites to task_outputs.<alias>. "+
 							"Without one of these the runtime resolver fails with 'Unknown variable namespace' at execution.",
 						ref, k, s, head, strings.Join(sortedKeys(knownRefs), ", "),

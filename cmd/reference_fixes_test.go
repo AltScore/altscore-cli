@@ -154,3 +154,22 @@ func TestParentFlagIsGone(t *testing.T) {
 		t.Error("ParentFlag was dead code and should stay removed")
 	}
 }
+
+func TestInputMappingErrorListsEveryReservedScope(t *testing.T) {
+	// The message hardcoded six namespaces while reservedMappingScopes held seven --
+	// `self` (added with the End node's own-output scope, cli#92) was missing, so the
+	// error told authors a valid namespace was invalid. Derive it from the map instead.
+	src := readCmdSource(t, "workflows_v2_apply.go")
+	if strings.Contains(src, "Valid namespaces: inputs, custom, system, task_outputs, task_outputs_by_type, entity") {
+		t.Error("inputMappings error still hardcodes the namespace list; derive it from reservedMappingScopes")
+	}
+	listed := reservedScopesList()
+	for scope := range reservedMappingScopes {
+		if !strings.Contains(listed, scope) {
+			t.Errorf("reservedScopesList() omits %q", scope)
+		}
+	}
+	if !strings.Contains(listed, "self") {
+		t.Error("`self` must be listed: compute-variable dependencies and End's own outputs use it")
+	}
+}
