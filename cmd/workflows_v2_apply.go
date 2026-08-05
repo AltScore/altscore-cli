@@ -360,6 +360,11 @@ End-node output (endConfig on the 'end' node):
 				fmt.Fprintf(cmd.ErrOrStderr(), "# warning: alias lookup for %q failed (%v); falling back to create path\n", targetAlias, lookupErr)
 			}
 
+			// A declared type binds the value only for variables this apply is ADDING.
+			// Needs the existing workflow, so it happens here rather than inside
+			// composeWorkflowBody, which never sees it.
+			stampEnforceTypeOnNewVariables(spec.CustomVariables, liveCustomVariables(existing), cmd.ErrOrStderr())
+
 			// Assemble the workflow body. composeWorkflowBody POSTs nothing: it
 			// builds the graph with spec-local refs standing in for the not-yet-
 			// minted server aliases, and (via capture) records the task bodies to
