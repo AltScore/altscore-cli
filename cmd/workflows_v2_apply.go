@@ -3082,7 +3082,54 @@ var validTaskTypes = map[string]bool{
 	"customer": true, "deal": true, "credit-line": true,
 	"list-of-similars": true, "asset": true, "relationships": true,
 	"package-io": true, "sftp": true, "notices": true,
-	"contact": true,
+	"contact": true, "document-extraction": true,
+}
+
+// camelToSnake converts a camelCase wire field to its snake_case spelling.
+// document-extraction's runtime-resolvable fields are accepted by the backend
+// activity under either spelling, so preflight has to recognise both before it
+// can claim a document source is missing.
+func camelToSnake(field string) string {
+	var out strings.Builder
+	for i, r := range field {
+		if r >= 'A' && r <= 'Z' {
+			if i > 0 {
+				out.WriteByte('_')
+			}
+			out.WriteRune(r - 'A' + 'a')
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
+}
+
+// firstNestedSchemaProperty returns the name of the first top-level property of
+// a JSON Schema that is an object, or an array of objects, else "". Used to
+// refuse a schema the ocr-tools provider cannot satisfy: its extraction targets
+// are scalars and list[string] only, so a nested shape there yields nothing
+// rather than failing loudly.
+func firstNestedSchemaProperty(schema map[string]any) string {
+	props := asMap(schema["properties"])
+	names := make([]string, 0, len(props))
+	for name := range props {
+		names = append(names, name)
+	}
+	// Deterministic report: map iteration order would otherwise name a
+	// different field on each run for a schema with several nested entries.
+	sort.Strings(names)
+	for _, name := range names {
+		prop := asMap(props[name])
+		switch t, _ := prop["type"].(string); t {
+		case "object":
+			return name
+		case "array":
+			if it, _ := asMap(prop["items"])["type"].(string); it == "object" {
+				return name
+			}
+		}
+	}
+	return ""
 }
 
 // fetchLiveTaskTypes, when set, lazily returns the LIVE backend's task-type
@@ -3514,6 +3561,67 @@ func preflightTasks(spec *composeSpec) error {
 			cfg := asMap(task["dataStoreQueryConfig"])
 			if t, _ := cfg["tableName"].(string); t == "" {
 				return fmt.Errorf("node ref=%q: data-store-query task requires dataStoreQueryConfig.tableName", ref)
+			}
+		case "document-extraction":
+			// Worth checking here rather than leaving it to the backend: BC
+			// validates documentExtractionConfig at RUN time only (a
+			// half-authored node must stay saveable in the builder), so an
+			// apply that ships one of these mistakes returns 201 and only
+			// fails when a workflow executes it.
+			cfg := asMap(task["documentExtractionConfig"])
+			if len(asMap(cfg["extractionSchema"])) == 0 {
+				return fmt.Errorf(
+					"node ref=%q: document-extraction task requires a non-empty "+
+						"documentExtractionConfig.extractionSchema (a JSON Schema with type 'object' "+
+						"and at least one entry in 'properties') -- it is the contract the provider "+
+						"is asked to fill, and an empty one fails at run time, not on write",
+					ref,
+				)
+			}
+			// The document source is runtime resolvable, so it legitimately
+			// arrives EITHER as a config value or as an inputMappings entry
+			// (either spelling). Count both, or the recommended wiring would
+			// be reported as a missing source.
+			mappings, _ := task["inputMappings"].(map[string]any)
+			sources := []string{}
+			for _, field := range []string{"documentUrl", "documentBase64", "rawText"} {
+				if s, _ := cfg[field].(string); s != "" {
+					sources = append(sources, field)
+					continue
+				}
+				if _, mapped := mappings[field]; mapped {
+					sources = append(sources, field)
+					continue
+				}
+				if _, mapped := mappings[camelToSnake(field)]; mapped {
+					sources = append(sources, field)
+				}
+			}
+			if len(sources) == 0 {
+				return fmt.Errorf(
+					"node ref=%q: document-extraction task requires exactly one document source. "+
+						"Set documentUrl, documentBase64 or rawText in documentExtractionConfig, or wire "+
+						"one of those keys through inputMappings to an upstream output",
+					ref,
+				)
+			}
+			if len(sources) > 1 {
+				return fmt.Errorf(
+					"node ref=%q: document-extraction task has %d document sources (%s) but they are "+
+						"mutually exclusive. Keep one and remove the others, counting both the config "+
+						"values and any inputMappings entries",
+					ref, len(sources), strings.Join(sources, ", "),
+				)
+			}
+			if p, _ := cfg["provider"].(string); p == "ocr-tools" {
+				if field := firstNestedSchemaProperty(asMap(cfg["extractionSchema"])); field != "" {
+					return fmt.Errorf(
+						"node ref=%q: document-extraction field %q is a nested shape, which provider "+
+							"'ocr-tools' cannot extract (its targets are scalars and list[string] only). "+
+							"Use provider 'llm' for nested objects or arrays of objects",
+						ref, field,
+					)
+				}
 			}
 		case "exception":
 			// Canonical wire name is 'errorMessage'. Both the BC API
