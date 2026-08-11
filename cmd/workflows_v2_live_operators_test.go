@@ -37,11 +37,13 @@ func TestValidateConditionGroup_LiveBackendOperatorFallback(t *testing.T) {
 	defer resetLiveConditionOperators()
 
 	// No hook (unit-test / offline mode): an operator absent from the mirror
-	// stays fatal, and the message names the offline fallback. "equals" is a
-	// real canonical backend operator the mirror happens to lack -- exactly the
-	// false-rejection the live fetch is meant to cure when a backend IS present.
+	// stays fatal, and the message names the offline fallback. This used to use
+	// "equals" -- a canonical backend operator the mirror lacked, i.e. the
+	// false rejection the live fetch exists to cure. #101 put all 55 accepted
+	// spellings in the mirror, so only an operator no backend has ever served
+	// can stand in here.
 	resetLiveConditionOperators()
-	err := validateConditionGroup(condGroupWith("equals"), "branches[0].conditions")
+	err := validateConditionGroup(condGroupWith("bigger_than_ish"), "branches[0].conditions")
 	if err == nil || !strings.Contains(err.Error(), "not a known condition operator") {
 		t.Fatalf("without live hook, unknown operator must be fatal, got: %v", err)
 	}
@@ -61,14 +63,16 @@ func TestValidateConditionGroup_LiveBackendOperatorFallback(t *testing.T) {
 	}
 
 	// Hook reports the operator: validation accepts (warn-only), and the live
-	// list is fetched exactly once even though two leaf items reference it.
+	// list is fetched exactly once even though two leaf items reference it. The
+	// operator has to be one this build does NOT know, which is the case a
+	// newer backend produces.
 	resetLiveConditionOperators()
 	calls := 0
 	fetchLiveConditionOperators = func() map[string]bool {
 		calls++
-		return map[string]bool{"equals": true, "greater_than": true}
+		return map[string]bool{"matches_regex": true, "greater_than": true}
 	}
-	if err := validateConditionGroup(condGroupWith("equals"), "branches[0].conditions"); err != nil {
+	if err := validateConditionGroup(condGroupWith("matches_regex"), "branches[0].conditions"); err != nil {
 		t.Fatalf("live-known operator must be accepted, got: %v", err)
 	}
 	if calls != 1 {

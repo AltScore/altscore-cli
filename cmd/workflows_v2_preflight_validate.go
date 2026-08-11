@@ -83,9 +83,14 @@ type validationFinding struct {
 
 // validationResponse is the /v2/workflows/validate 200 body (returned 200 even
 // when the graph is invalid; `valid` and `findings` carry the verdict).
+// skippedNodeIds names the nodes whose task body the server could not resolve,
+// so a clean verdict can be told apart from one whose interesting parts were
+// never checked. apply's pre-flight has them inline and ignores it; `lint`
+// reports it, because there the bodies come from the persisted repository.
 type validationResponse struct {
-	Valid    bool                `json:"valid"`
-	Findings []validationFinding `json:"findings"`
+	Valid          bool                `json:"valid"`
+	Findings       []validationFinding `json:"findings"`
+	SkippedNodeIDs []string            `json:"skippedNodeIds"`
 }
 
 // serverPreflightValidate POSTs the assembled workflow body plus the per-node
