@@ -3,10 +3,12 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
 
+	"github.com/AltScore/altscore-cli/internal/client"
 	"github.com/AltScore/altscore-cli/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -165,23 +167,57 @@ func renameToCamel(m map[string]any, shortKey, camelKey, context string) (bool, 
 	return true, nil
 }
 
-// makeWfv2LintCmd inspects an existing workflow for the same set of issues
-// validateWorkflowV2Body checks at write time, plus structural problems that
-// only show up after save (orphan edges, duplicate node ids, missing start/end).
+// makeWfv2LintCmd inspects an existing workflow. Two sources, merged into one
+// report: borrower-central's validation oracle (POST /v2/workflows/validate --
+// the same one apply's pre-flight and the Hub builder call) plus the local
+// structural checks that cover what the oracle does not (orphan nodes,
+// duplicate nodeIds, malformed edge endpoints).
+//
+// Until #101 this command was local-only, and that was the defect: the oracle
+// owns every reference-integrity rule (dangling `task_outputs.<alias>` in
+// inputMappings, PDF sources, outputJson, task config; unconsumed input
+// variables; identity keys), so `lint` reported a clean workflow while the Hub
+// builder -- which does call it -- listed the real problems. A Bolivariano KYB
+// review hit exactly that: `lint` clean, five live defects, one of them a
+// dangling task ref that had survived 47 versions.
 func makeWfv2LintCmd() *cobra.Command {
-	return &cobra.Command{
+	var localOnly bool
+	cmd := &cobra.Command{
 		Use:   "lint <id>",
-		Short: "Inspect an existing v2 workflow for orphan nodes, dangling edges, and missing start/end",
-		Long: `Lint a saved workflow. Reports:
-  - ANY node missing taskAlias/taskId, start and end included (would fail to load in the Hub)
-  - edges pointing at non-existent nodeIds
-  - duplicate nodeIds
-  - missing start or end nodes
-  - tasks referenced by nodes that no longer exist on the tenant (best-effort)
+		Short: "Inspect an existing v2 workflow: the server validation oracle plus local structural checks",
+		Long: `Lint a saved workflow.
 
-Exits with non-zero status if any issue is found.`,
-		Example: `  altscore workflows-v2 lint <id>`,
-		Args:    cobra.ExactArgs(1),
+From the server oracle (POST /v2/workflows/validate, one call, task bodies
+resolved server-side from the persisted repository honoring this version's
+status):
+  - references to a task alias that is not in the graph, or not upstream
+    (inputMappings, entity fields, PDF sources, PDF HTML body, standard output,
+    outputJson, task config)
+  - conditional branch / edge handle coherence, per-item handle mismatches
+  - input variables never consumed, source inputs never fed, identity keys not
+    mapped or not registered
+
+Locally (the checks the oracle does not make):
+  - ANY node missing taskAlias/taskId, start and end included (would fail to load in the Hub)
+  - edges with an empty or unmatched sourceNodeId/targetNodeId
+  - duplicate nodeIds
+  - orphan nodes, and nodes with no incoming or no outgoing edge
+  - missing start / end, or more than one end
+
+Each issue carries "source": "server" or "local", and a server finding also
+carries its "code". A local finding is dropped when the oracle already reported
+the same thing, so the two sources never double-report.
+
+"serverValidation" is "ok", "skipped" (oracle unreachable -- older backend,
+offline, or a 5xx; the local checks still ran) or "local-only" (--local-only).
+"skippedNodeIds" names nodes whose task body the oracle could not resolve: a
+clean report that skipped nodes is not a clean bill of health.
+
+Exits with non-zero status if any issue is found, from either source. Pass
+--local-only for the pre-#101 behaviour.`,
+		Example: `  altscore workflows-v2 lint <id>
+  altscore workflows-v2 lint <id> --local-only`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
 			if err != nil {
@@ -197,6 +233,22 @@ Exits with non-zero status if any issue is found.`,
 			}
 
 			report := lintWorkflowV2(wf)
+			switch {
+			case localOnly:
+				report.ServerValidation = lintServerLocalOnly
+			default:
+				resp, reason := fetchWorkflowValidation(c, wf)
+				if resp == nil {
+					// Fail open, exactly like apply's pre-flight: the oracle's
+					// health never turns lint into an error of its own.
+					report.ServerValidation = lintServerSkipped
+					dimNote(cmd.ErrOrStderr(), "server validation skipped: "+reason+"; reporting local checks only")
+					break
+				}
+				report.ServerValidation = lintServerOK
+				report.SkippedNodeIDs = resp.SkippedNodeIDs
+				mergeServerFindings(&report, resp.Findings)
+			}
 			// Non-blocking advisory: flag customVariables that are pure
 			// pass-through extraction probes (a compute-variables node + a
 			// custom var whose expression merely extracts a scoped scalar).
@@ -221,27 +273,64 @@ Exits with non-zero status if any issue is found.`,
 				return err
 			}
 			if len(report.Issues) > 0 {
-				return fmt.Errorf("workflow has %d issue(s)", len(report.Issues))
+				errs := 0
+				for _, issue := range report.Issues {
+					if issue.Severity == "error" {
+						errs++
+					}
+				}
+				return fmt.Errorf("workflow has %d issue(s): %d error(s), %d warning(s)",
+					len(report.Issues), errs, len(report.Issues)-errs)
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&localOnly, "local-only", false,
+		"skip the server validation oracle and report only the local structural checks. "+
+			"The oracle owns every reference-integrity rule, so this hides dangling task refs, "+
+			"unfed source inputs and unconsumed input variables -- use it only when a script "+
+			"cannot tolerate the wider finding set")
+	return cmd
 }
+
+// lintServerValidation values for lintReport.ServerValidation.
+const (
+	lintServerOK        = "ok"
+	lintServerSkipped   = "skipped"
+	lintServerLocalOnly = "local-only"
+)
 
 type lintIssue struct {
 	Severity string `json:"severity"` // "error" or "warning"
-	NodeID   string `json:"nodeId,omitempty"`
-	EdgeID   string `json:"edgeId,omitempty"`
-	Message  string `json:"message"`
+	// Source is "local" (this binary's structural pass) or "server" (a
+	// /v2/workflows/validate finding), so a reader knows which half to trust
+	// when only one of them ran.
+	Source string `json:"source"`
+	// Code is the server finding code (MISSING_START_NODE,
+	// TASK_REFERENCE_NOT_IN_GRAPH, ...). Empty on a local issue.
+	Code   string `json:"code,omitempty"`
+	NodeID string `json:"nodeId,omitempty"`
+	EdgeID string `json:"edgeId,omitempty"`
+	// serverCode is the finding code the oracle emits for this same problem, or
+	// "" when the check is local-only. Not serialized: it exists so
+	// mergeServerFindings can drop the local copy when the oracle answered.
+	serverCode string
+	Message    string `json:"message"`
 }
 
 type lintReport struct {
-	WorkflowID string      `json:"workflowId"`
-	Alias      string      `json:"alias,omitempty"`
-	Status     string      `json:"status,omitempty"`
-	NodeCount  int         `json:"nodeCount"`
-	EdgeCount  int         `json:"edgeCount"`
-	Issues     []lintIssue `json:"issues"`
+	WorkflowID string `json:"workflowId"`
+	Alias      string `json:"alias,omitempty"`
+	Status     string `json:"status,omitempty"`
+	NodeCount  int    `json:"nodeCount"`
+	EdgeCount  int    `json:"edgeCount"`
+	// ServerValidation is "ok", "skipped" or "local-only" -- never absent, so a
+	// clean report can always be told apart from one whose oracle never ran.
+	ServerValidation string `json:"serverValidation"`
+	// SkippedNodeIDs are the nodes whose task body the oracle could not resolve
+	// and therefore did not check.
+	SkippedNodeIDs []string    `json:"skippedNodeIds,omitempty"`
+	Issues         []lintIssue `json:"issues"`
 }
 
 func lintWorkflowV2(wf map[string]any) lintReport {
@@ -282,9 +371,10 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 		tid, _ := nm["taskId"].(string)
 		if ta == "" && tid == "" {
 			report.Issues = append(report.Issues, lintIssue{
-				Severity: "error",
-				NodeID:   id,
-				Message:  fmt.Sprintf("type=%q has no taskAlias/taskId -- Hub will hit GET /v2/tasks/null", nodeType),
+				Severity:   "error",
+				NodeID:     id,
+				serverCode: "NODE_MISSING_TASK_REFERENCE",
+				Message:    fmt.Sprintf("type=%q has no taskAlias/taskId -- Hub will hit GET /v2/tasks/null", nodeType),
 			})
 		}
 	}
@@ -300,18 +390,19 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 	}
 
 	if !hasStart {
-		report.Issues = append(report.Issues, lintIssue{Severity: "warning", Message: "no node of type 'start'"})
+		report.Issues = append(report.Issues, lintIssue{Severity: "warning", serverCode: "MISSING_START_NODE", Message: "no node of type 'start'"})
 	}
 	if !hasEnd {
-		report.Issues = append(report.Issues, lintIssue{Severity: "warning", Message: "no node of type 'end'"})
+		report.Issues = append(report.Issues, lintIssue{Severity: "warning", serverCode: "NO_END_NODES", Message: "no node of type 'end'"})
 	}
 	// A workflow must converge to exactly one end node. Conditional branches and
 	// parallel fan-out (e.g. relationship per-item handles) must all converge to
 	// a single end rather than terminating at separate end nodes.
 	if endCount > 1 {
 		report.Issues = append(report.Issues, lintIssue{
-			Severity: "error",
-			Message:  fmt.Sprintf("%d 'end' nodes -- a workflow must have exactly one end node; converge all paths (conditional branches, relationship handles) to a single end", endCount),
+			Severity:   "error",
+			serverCode: "MULTIPLE_END_NODES",
+			Message:    fmt.Sprintf("%d 'end' nodes -- a workflow must have exactly one end node; converge all paths (conditional branches, relationship handles) to a single end", endCount),
 		})
 	}
 
@@ -327,14 +418,14 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 		if src == "" {
 			report.Issues = append(report.Issues, lintIssue{Severity: "error", EdgeID: eid, Message: fmt.Sprintf("edges[%d]: missing sourceNodeId", i)})
 		} else if _, ok := seenIDs[src]; !ok {
-			report.Issues = append(report.Issues, lintIssue{Severity: "error", EdgeID: eid, Message: fmt.Sprintf("sourceNodeId %q does not match any node", src)})
+			report.Issues = append(report.Issues, lintIssue{Severity: "error", EdgeID: eid, serverCode: "EDGE_REFERENCES_MISSING_NODE", Message: fmt.Sprintf("sourceNodeId %q does not match any node", src)})
 		} else {
 			hasOutgoing[src] = true
 		}
 		if tgt == "" {
 			report.Issues = append(report.Issues, lintIssue{Severity: "error", EdgeID: eid, Message: fmt.Sprintf("edges[%d]: missing targetNodeId", i)})
 		} else if _, ok := seenIDs[tgt]; !ok {
-			report.Issues = append(report.Issues, lintIssue{Severity: "error", EdgeID: eid, Message: fmt.Sprintf("targetNodeId %q does not match any node", tgt)})
+			report.Issues = append(report.Issues, lintIssue{Severity: "error", EdgeID: eid, serverCode: "EDGE_REFERENCES_MISSING_NODE", Message: fmt.Sprintf("targetNodeId %q does not match any node", tgt)})
 		} else {
 			hasIncoming[tgt] = true
 		}
@@ -389,7 +480,114 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 		}
 	}
 
+	// Stamped in one place rather than on each literal above, so a check added
+	// later cannot ship without its source.
+	for i := range report.Issues {
+		report.Issues[i].Source = "local"
+	}
 	return report
+}
+
+// fetchWorkflowValidation asks borrower-central's validation oracle about an
+// already-persisted definition. `wf` is the GET /v2/workflows/{id} body posted
+// verbatim: the request schema ignores the extra keys (id, status, timestamps)
+// and it NEEDS `status`, because the oracle resolves each node's task body from
+// the persisted repository under the drafts-float / published-pin rule for that
+// status. No `tasks` map is sent for the same reason -- the server resolving
+// them is the whole point, and it is one request instead of N.
+//
+// Returns (nil, reason) on anything unusable, mirroring apply's pre-flight
+// fail-open policy: the oracle's health must never turn a lint into an error of
+// its own. The reason is already human-readable.
+func fetchWorkflowValidation(c *client.Client, wf map[string]any) (*validationResponse, string) {
+	if c == nil || wf == nil {
+		return nil, "no client"
+	}
+	body, err := json.Marshal(map[string]any{"workflow": wf})
+	if err != nil {
+		return nil, fmt.Sprintf("could not encode the workflow (%v)", err)
+	}
+	data, status, derr := c.Do("POST", "borrower_central", "/v2/workflows/validate", json.RawMessage(body))
+	switch {
+	case status == http.StatusNotFound:
+		return nil, "POST /v2/workflows/validate not found (older backend)"
+	case status >= 500:
+		return nil, fmt.Sprintf("the server answered HTTP %d", status)
+	case status >= 400:
+		// The endpoint is there and rejected the request: a contract mismatch,
+		// not an old backend. Say so plainly instead of blaming the deploy.
+		detail := preflightResponseDetail(data, derr, status)
+		if detail != "" {
+			return nil, fmt.Sprintf("the server rejected the validation request (HTTP %d) -- possible contract mismatch: %s", status, detail)
+		}
+		return nil, fmt.Sprintf("the server rejected the validation request (HTTP %d) -- possible contract mismatch", status)
+	case derr != nil:
+		return nil, fmt.Sprintf("%v", derr)
+	case status < 200 || status >= 300, len(data) == 0:
+		return nil, fmt.Sprintf("unexpected response (HTTP %d, %d bytes)", status, len(data))
+	}
+	var resp validationResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, "unrecognized /v2/workflows/validate response"
+	}
+	return &resp, ""
+}
+
+// mergeServerFindings folds the oracle's findings into the report and drops the
+// local issues it already covers.
+//
+// Dropping is deliberate and narrow: only a local issue that declared a
+// serverCode, and only when the oracle reported that same code for the same
+// node or edge (or for the graph as a whole, where neither side carries an id).
+// The server is the oracle for those checks -- that is this codebase's rule, not
+// a preference -- and reporting one problem twice under two wordings is the kind
+// of noise that teaches people to skim past a lint report.
+func mergeServerFindings(report *lintReport, findings []validationFinding) {
+	if report == nil {
+		return
+	}
+	covered := func(issue lintIssue) bool {
+		if issue.serverCode == "" {
+			return false
+		}
+		for _, f := range findings {
+			if f.Code != issue.serverCode {
+				continue
+			}
+			// A graph-wide finding (no ids on either side) matches; otherwise the
+			// ids must agree, so one node's problem never silences another's.
+			if f.NodeID == issue.NodeID && f.EdgeID == issue.EdgeID {
+				return true
+			}
+			if f.NodeID == "" && f.EdgeID == "" {
+				return true
+			}
+		}
+		return false
+	}
+
+	kept := make([]lintIssue, 0, len(report.Issues)+len(findings))
+	for _, issue := range report.Issues {
+		if covered(issue) {
+			continue
+		}
+		kept = append(kept, issue)
+	}
+	for _, f := range findings {
+		severity := "warning"
+		if strings.EqualFold(f.Severity, "error") {
+			severity = "error"
+		}
+		kept = append(kept, lintIssue{
+			Severity: severity,
+			Source:   "server",
+			Code:     f.Code,
+			NodeID:   f.NodeID,
+			EdgeID:   f.EdgeID,
+			Message:  f.Message,
+		})
+	}
+	report.Issues = kept
 }
 
 // extractionProbeRe matches the body of a pure pass-through extraction custom
