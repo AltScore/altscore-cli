@@ -26,23 +26,58 @@ func newUUIDv4() string {
 
 // conditionOperators is the compiled-in operator vocabulary used by conditional
 // task branches and evaluation rules -- the fast path and the offline fallback.
-// It is only a mirror of borrower-central's WORKFLOW_CONDITION_OPERATORS table
-// (app/service/condition_evaluator.py), served at
-// GET /v1/meta/workflows-v2-schema?section=conditionOperators. The server table
-// is a superset (canonical long forms like "equals"/"greater_than", plus
-// "is_true"/"is_false"/"is_empty"/"not_contains") whose aliases this mirror only
-// partially carries, so an operator absent here may still be perfectly valid.
+// It mirrors EVERY spelling borrower-central's write boundary accepts: the 26
+// canonical names, grouped one per line with their aliases beside them.
+//
+// Two server sources, unioned, because they differ:
+//   - app/service/condition_evaluator.py, WORKFLOW_CONDITION_OPERATORS
+//     (CONDITION_OPERATORS + WORKFLOW_ONLY_CONDITION_OPERATORS), which is what
+//     GET /v1/meta/workflows-v2-schema?section=conditionOperators serves and so
+//     what fetchServerConditionOperators returns: 26 canonical + 21 aliases.
+//   - app/model/evaluation_rules/condition_operators.py, whose registry backs
+//     the write gate (_reject_unknown_condition_operators on the shared v2 task
+//     write schema) and additionally accepts the 8 symbol aliases
+//     = == != <> < <= > >=, which ConditionItem repairs to canonical on write.
+//
+// Until #101 this list held 21 entries, ALL of them aliases, overlapping BC's
+// canonical set on three names only (contains, between, in). Since BC
+// canonicalises on read, every `get`/`export` returns canonical spellings, so
+// the round trip export -> apply warned on every operator of every conditional
+// -- 23 of 26 canonical names -- and five (not_contains, is_true, is_false,
+// is_empty, is_not_empty) had no accepted spelling at all, making them a hard
+// apply failure whenever the meta endpoint was unreachable. Widening is purely
+// additive: every form accepted before is still here.
+//
 // checkConditionOperator consults the live backend once before rejecting, so a
-// stale mirror can no longer cause a FALSE REJECTION of a valid workflow.
+// mirror that falls behind still cannot cause a FALSE REJECTION of a valid
+// workflow. Regenerate from the two files above; do not hand-edit one spelling.
 var conditionOperators = map[string]bool{
-	"eq": true, "neq": true,
-	"gt": true, "gte": true, "lt": true, "lte": true,
-	"contains": true, "startsWith": true, "endsWith": true,
-	"in": true, "notIn": true, "between": true,
-	"isNull": true, "isNotNull": true,
-	"isAltdataEmpty": true, "isAltdataNotCalculated": true,
-	"isAltdataError": true, "isAltdataNull": true, "isNotAltdataNull": true,
-	"arrayContainsAny": true, "arrayContainsAll": true,
+	"array_contains_all": true, "arrayContainsAll": true,
+	"array_contains_any": true, "arrayContainsAny": true,
+	"between":   true,
+	"contains":  true,
+	"ends_with": true, "endsWith": true,
+	"equals": true, "=": true, "==": true, "eq": true,
+	"greater_than": true, ">": true, "gt": true,
+	"greater_than_or_equals": true, ">=": true, "gte": true,
+	"in":               true,
+	"is_altdata_empty": true, "isAltdataEmpty": true,
+	"is_altdata_error": true, "isAltdataError": true,
+	"is_altdata_not_calculated": true, "isAltdataNotCalculated": true,
+	"is_altdata_null": true, "isAltdataNull": true,
+	"is_empty":            true,
+	"is_false":            true,
+	"is_not_altdata_null": true, "isNotAltdataNull": true,
+	"is_not_empty": true,
+	"is_not_null":  true, "isNotNull": true, "is_set": true,
+	"is_null": true, "isNull": true, "not_set": true,
+	"is_true":   true,
+	"less_than": true, "<": true, "lt": true,
+	"less_than_or_equals": true, "<=": true, "lte": true,
+	"not_contains": true,
+	"not_equals":   true, "!=": true, "<>": true, "ne": true, "neq": true,
+	"not_in": true, "notIn": true,
+	"starts_with": true, "startsWith": true,
 }
 
 // fetchLiveConditionOperators, when set, lazily returns the LIVE backend's
