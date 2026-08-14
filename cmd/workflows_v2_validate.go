@@ -213,6 +213,20 @@ offline, or a 5xx; the local checks still ran) or "local-only" (--local-only).
 "skippedNodeIds" names nodes whose task body the oracle could not resolve: a
 clean report that skipped nodes is not a clean bill of health.
 
+Separately, and to stderr only, lint emits a HANDOFF READABILITY advisory: the
+things that decide whether the analyst who inherits this workflow can read it.
+A workflow that trips all of them runs identically, which is why nothing else
+catches them:
+  - custom variables with no "title" (the Hub falls back to the raw name)
+  - PDF sections with no title, and htmlBlock bodies that are a single
+    {placeholder} fed by a Python expression (the markup is not editable
+    without Python)
+  - evaluation rules whose description is blank or records the rule's
+    provenance ("Ported from ...") rather than what it checks
+Findings are aggregated -- one line per practice with a capped sample, never
+one line per variable. It NEVER contributes an issue and never moves the exit
+code. See 'altscore workflows-v2 schema-guide handoffReadability'.
+
 Exits with non-zero status if any issue is found, from either source. Pass
 --local-only for the pre-#101 behaviour.`,
 		Example: `  altscore workflows-v2 lint <id>
@@ -257,6 +271,17 @@ Exits with non-zero status if any issue is found, from either source. Pass
 			if cv, ok := wf["customVariables"].(map[string]any); ok {
 				adviseExtractionProbes(cv, asSlice(wf["nodes"]))
 			}
+			// Non-blocking readability advisory for client handoff: variable
+			// titles, PDF section titles / Python-built HTML, rule descriptions.
+			// Same construction as the probe advisory above -- stderr only, never
+			// an Issue. Both enrichment fetches fail open, so a workflow whose end
+			// task or rules cannot be read reports FEWER practices rather than
+			// reporting them wrongly.
+			wfAlias, _ := wf["alias"].(string)
+			adviseHandoffReadability(wf,
+				fetchEndTaskBodies(c, asSlice(wf["nodes"])),
+				fetchWorkflowRules(c, wfAlias),
+				cmd.ErrOrStderr())
 			// (Silent-PDF lint removed: borrower-central's end_activity
 			// now auto-resolves PDF sources from the ancestor graph at
 			// runtime when pdfConfig.enabled=true but sourcesConfig is
