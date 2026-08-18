@@ -1297,6 +1297,12 @@ func mappingDependencyRef(s string) string {
 // mappingDependencyRef but scans {{...}} placeholders across known template
 // fields per task type. Empty when the task type has no template fields or
 // all references are reserved scopes / unknown heads.
+//
+// Keep this in step with rewriteRefsInTaskTemplates. A template field the
+// rewriter walks but this function does not is ordered wrong: the consumer can
+// be POSTed before the task it references, refMap has no alias for that ref
+// yet, and the rewrite silently leaves the spec ref in place -- the exact
+// failure the rewriter was added to prevent.
 func templateDependencyRefs(task map[string]any) []string {
 	taskType, _ := task["type"].(string)
 	var fields []string
@@ -1317,21 +1323,61 @@ func templateDependencyRefs(task map[string]any) []string {
 		if s, ok := task["errorMessage"].(string); ok && s != "" {
 			fields = append(fields, s)
 		}
+	case "data-store-write":
+		if cfg, _ := task["dataStoreWriteConfig"].(map[string]any); cfg != nil {
+			for _, m := range asMapSlice(cfg["columnMappings"]) {
+				if s, ok := m["valueTemplate"].(string); ok && s != "" {
+					fields = append(fields, s)
+				}
+			}
+			if s, ok := cfg["batchSource"].(string); ok && s != "" {
+				fields = append(fields, s)
+			}
+		}
+	case "data-store-query":
+		if cfg, _ := task["dataStoreQueryConfig"].(map[string]any); cfg != nil {
+			if s, ok := cfg["sql"].(string); ok && s != "" {
+				fields = append(fields, s)
+			}
+			if params, ok := cfg["sqlParameters"].(map[string]any); ok {
+				for _, v := range params {
+					if s, ok := v.(string); ok && s != "" {
+						fields = append(fields, s)
+					}
+				}
+			}
+			for _, m := range asMapSlice(cfg["filters"]) {
+				if s, ok := m["valueTemplate"].(string); ok && s != "" {
+					fields = append(fields, s)
+				}
+			}
+		}
 	}
 	if len(fields) == 0 {
 		return nil
 	}
 	out := []string{}
 	seen := map[string]bool{}
+	add := func(ref string) {
+		if ref == "" || seen[ref] {
+			return
+		}
+		seen[ref] = true
+		out = append(out, ref)
+	}
 	for _, s := range fields {
+		if !strings.Contains(s, "{{") {
+			// Bare `task_outputs.<ref>.<path>` -- the shape data-store
+			// batchSource / sqlParameters are usually authored in, and the only
+			// shape resolve_context_field accepts. mappingDependencyRef on a
+			// non-path literal returns "" or an unknown head, and
+			// topologicalTaskOrder ignores a ref that names no task, so a plain
+			// SQL string or an item key costs nothing here.
+			add(mappingDependencyRef(s))
+			continue
+		}
 		for _, m := range templatePlaceholderRegex.FindAllStringSubmatch(s, -1) {
-			inner := strings.TrimSpace(m[1])
-			ref := mappingDependencyRef(inner)
-			if ref == "" || seen[ref] {
-				continue
-			}
-			seen[ref] = true
-			out = append(out, ref)
+			add(mappingDependencyRef(strings.TrimSpace(m[1])))
 		}
 	}
 	return out
@@ -1541,16 +1587,32 @@ func rewriteRefsInTemplate(s string, refMap map[string]string, localMappings map
 // rewriteRefsInTaskTemplates applies the template rewrite to every string
 // field on a task body that the runtime treats as a {{...}}-substituting
 // template. Today that's:
-//   - http: url, body, headers
-//   - end: endConfig.outputJson
+//   - http / webhook: url, body, headers
+//   - end: endConfig.outputJson, endConfig.standardOutput.*,
+//     endConfig.pdfConfig.sourcesConfig[].taskAlias
+//   - exception: errorMessage
+//   - conditional: variable-typed condition values
+//   - child-workflow: inputExpression
+//   - data-store-write: dataStoreWriteConfig.columnMappings[].valueTemplate,
+//     dataStoreWriteConfig.batchSource
+//   - data-store-query: dataStoreQueryConfig.sql,
+//     dataStoreQueryConfig.sqlParameters[*],
+//     dataStoreQueryConfig.filters[].valueTemplate
 //
 // The function mutates `task` in place and returns an error from the first
 // failed rewrite, with the field name in the error context.
 //
 // New task types that introduce template fields should be added here AND in
-// mappingDependencyRef -- otherwise topologicalTaskOrder won't see the
+// templateDependencyRefs -- otherwise topologicalTaskOrder won't see the
 // inputMappings-style dep and a forward reference inside a template will
 // fail at rewrite time instead of being ordered correctly.
+//
+// This switch is an ALLOWLIST and a generic walk was deliberately not put in
+// its place: only the typed cases can substitute a bare head, expand a bare
+// {{token}} through inputMappings, and reject an unknown head as a typo. A
+// blind body-wide rewrite would do the easy two thirds of the job while
+// silencing validateNoResidualSpecRefs, which is the thing that tells anyone
+// the next field is missing. The guard is the net; this switch is the fix.
 func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) error {
 	taskType, _ := task["type"].(string)
 	// The task's inputMappings map short tokens (e.g. "borrower_id") to
@@ -1565,6 +1627,21 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 			return "", fmt.Errorf("%s: %w", fieldPath, err)
 		}
 		return out, nil
+	}
+	// rewriteTemplateOrPath handles a field the runtime accepts in EITHER form:
+	// a {{...}} template (resolved by graph_workflow's generic
+	// _resolve_dict_variables walk) or a BARE `task_outputs.<alias>.<path>`
+	// (resolved by the activity itself via resolve_context_field, which requires
+	// that literal prefix and does NOT accept the bare `<alias>.<field>`
+	// shortcut). rewriteRefsInTemplate early-returns on a string with no "{{",
+	// so the bare form needs the substring rewriter -- data-store batchSource
+	// and sqlParameters are commonly authored bare, which is exactly how the
+	// spec ref used to survive.
+	rewriteTemplateOrPath := func(fieldPath string, value string) (string, error) {
+		if strings.Contains(value, "{{") {
+			return rewriteField(fieldPath, value)
+		}
+		return rewriteTaskOutputsRefsInString(value, refMap), nil
 	}
 	switch taskType {
 	case "http", "webhook":
@@ -1709,6 +1786,111 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 		if s, ok := task["inputExpression"].(string); ok && s != "" {
 			task["inputExpression"] = rewriteTaskOutputsRefsInString(s, refMap)
 		}
+	case "data-store-write":
+		// FIVE ref-bearing template surfaces live under the two data-store
+		// configs and NONE of them was walked, so a spec-local ref shipped
+		// verbatim to the database. Three of the five fail SILENTLY, which is
+		// why this is data corruption rather than a broken run:
+		//
+		//   columnMappings[].valueTemplate  SILENT -- graph_workflow's generic
+		//     _resolve_dict_variables walk leaves an unresolvable {{...}}
+		//     as its LITERAL (variable_resolver.resolve_variables, json_mode
+		//     off), and _execute_single_write binds value_template straight
+		//     into named_args. The row is written, the node reports success,
+		//     and the cell holds the template text.
+		//   batchSource  LOUD -- _execute_batch_write resolve_field()s it and
+		//     raises "Batch source must resolve to a list, got str".
+		//
+		// In BATCH mode valueTemplate is a KEY into each item dict rather than
+		// a template (`item.get(key, key)`), which is why the substring
+		// rewriter is the right tool: it only ever touches
+		// "task_outputs.<ref>." and leaves a plain item key alone.
+		if cfg, _ := task["dataStoreWriteConfig"].(map[string]any); cfg != nil {
+			if cols, ok := cfg["columnMappings"].([]any); ok {
+				for idx, cm := range cols {
+					m, _ := cm.(map[string]any)
+					if m == nil {
+						continue
+					}
+					s, _ := m["valueTemplate"].(string)
+					if s == "" {
+						continue
+					}
+					out, err := rewriteTemplateOrPath(
+						fmt.Sprintf("dataStoreWriteConfig.columnMappings[%d].valueTemplate", idx), s)
+					if err != nil {
+						return err
+					}
+					m["valueTemplate"] = out
+					cols[idx] = m
+				}
+				cfg["columnMappings"] = cols
+			}
+			if s, ok := cfg["batchSource"].(string); ok && s != "" {
+				out, err := rewriteTemplateOrPath("dataStoreWriteConfig.batchSource", s)
+				if err != nil {
+					return err
+				}
+				cfg["batchSource"] = out
+			}
+			task["dataStoreWriteConfig"] = cfg
+		}
+	case "data-store-query":
+		// The other three of the five (see data-store-write above):
+		//
+		//   sql  LOUD -- _execute_sql_query passes it verbatim, so the literal
+		//     {{...}} is interpolated into the SQL text and Turso rejects the
+		//     statement with a syntax error.
+		//   sqlParameters[*]  SILENT -- bound as a named arg, so the query
+		//     runs with the template text as the parameter value.
+		//   filters[].valueTemplate  SILENT -- _execute_simple_query binds it
+		//     into the WHERE clause, the filter matches nothing, and the node
+		//     succeeds with an empty result set.
+		if cfg, _ := task["dataStoreQueryConfig"].(map[string]any); cfg != nil {
+			if s, ok := cfg["sql"].(string); ok && s != "" {
+				out, err := rewriteTemplateOrPath("dataStoreQueryConfig.sql", s)
+				if err != nil {
+					return err
+				}
+				cfg["sql"] = out
+			}
+			if params, ok := cfg["sqlParameters"].(map[string]any); ok {
+				for k, v := range params {
+					s, _ := v.(string)
+					if s == "" {
+						continue
+					}
+					out, err := rewriteTemplateOrPath(
+						fmt.Sprintf("dataStoreQueryConfig.sqlParameters[%q]", k), s)
+					if err != nil {
+						return err
+					}
+					params[k] = out
+				}
+				cfg["sqlParameters"] = params
+			}
+			if filters, ok := cfg["filters"].([]any); ok {
+				for idx, f := range filters {
+					m, _ := f.(map[string]any)
+					if m == nil {
+						continue
+					}
+					s, _ := m["valueTemplate"].(string)
+					if s == "" {
+						continue
+					}
+					out, err := rewriteTemplateOrPath(
+						fmt.Sprintf("dataStoreQueryConfig.filters[%d].valueTemplate", idx), s)
+					if err != nil {
+						return err
+					}
+					m["valueTemplate"] = out
+					filters[idx] = m
+				}
+				cfg["filters"] = filters
+			}
+			task["dataStoreQueryConfig"] = cfg
+		}
 	}
 	return nil
 }
@@ -1771,16 +1953,45 @@ var residualSpecRefExcludedFields = map[string]bool{
 // rewriter isn't updated, compose fails loudly with the offending JSON path
 // instead of letting the bad task body ship to the server.
 //
-// Exact-string-match (not substring) keeps the check high-signal:
-// "score" inside a label "Final score breakdown" doesn't match the key
-// "score". When a legitimate user literal collides with a ref name, the
-// agent can either rename the ref or add the field to
-// residualSpecRefExcludedFields -- the error message names the field, so
-// the remediation is obvious.
+// TWO shapes are checked, and the second is the one that matters:
+//
+//  1. The BARE ref: the whole string equals a refMap key (e.g. a
+//     `taskAlias: "score"`). Exact-match keeps this high-signal -- "score"
+//     inside a label "Final score breakdown" doesn't match the key "score".
+//  2. The EMBEDDED ref: the string CONTAINS "task_outputs.<ref>." anywhere
+//     (e.g. `{{task_outputs.score.total}}`, or a bare
+//     `task_outputs.score.rows` in a field the runtime resolves with
+//     resolve_context_field). This is the only form authors actually write,
+//     and for a long time the validator could not see it: shape 1 alone
+//     passed a body whose data-store `valueTemplate` still carried
+//     `{{task_outputs.q1.rows[0].uno}}`, which the runtime leaves as a
+//     LITERAL and the node then writes to Turso as text, reporting success.
+//     Checking the substring is what converts every FUTURE missed template
+//     surface from silent-in-production into loud-at-apply.
+//
+// A string that only contains "task_outputs.<server-alias>." is not a match:
+// the refMap key is the spec ref, the trailing dot pins the boundary, and
+// identity entries (refMap[ref] == ref, which is what the assembly phase
+// passes) are skipped -- so an already-rewritten field never trips this.
+//
+// When a legitimate user literal collides with a ref name, the agent can
+// either rename the ref or add the field to residualSpecRefExcludedFields --
+// the error message names the field, so the remediation is obvious.
 func validateNoResidualSpecRefs(body map[string]any, refMap map[string]string, ctx string) error {
 	if len(refMap) == 0 {
 		return nil
 	}
+	// Sorted so a body carrying several residual refs always names the same
+	// one: map iteration order would otherwise make the error non-deterministic
+	// and the failure look flaky across runs.
+	embedded := make([]string, 0, len(refMap))
+	for ref, server := range refMap {
+		if ref == server {
+			continue
+		}
+		embedded = append(embedded, ref)
+	}
+	sort.Strings(embedded)
 	var walk func(node any, path string) error
 	walk = func(node any, path string) error {
 		switch v := node.(type) {
@@ -1826,10 +2037,40 @@ func validateNoResidualSpecRefs(body map[string]any, refMap map[string]string, c
 						"literal is genuinely user-authored text).",
 					ctx, v, path, server, last)
 			}
+			// Embedded form -- see the shape-2 note on this function. A
+			// template surface the rewriter doesn't walk keeps the spec ref
+			// inside the string, which no exact match can ever see.
+			for _, ref := range embedded {
+				if !strings.Contains(v, "task_outputs."+ref+".") {
+					continue
+				}
+				return fmt.Errorf(
+					"%s: residual spec-local ref %q embedded in a template at path %q: %q still contains "+
+						"%q (expected server-assigned alias %q). This means rewriteRefsInTaskTemplates "+
+						"doesn't yet walk this field for the task type -- at runtime the reference resolves "+
+						"to nothing and the literal is persisted/used as-is. Add the field to the rewriter "+
+						"AND to templateDependencyRefs (or add %q to residualSpecRefExcludedFields if the "+
+						"text is genuinely user-authored prose).",
+					ctx, ref, path, truncateForError(v), "task_outputs."+ref+".", refMap[ref], last)
+			}
 		}
 		return nil
 	}
 	return walk(body, "")
+}
+
+// truncateForError shortens a value for an error message. Residual refs turn up
+// in SQL bodies and JSON templates that are far too long to quote whole, and an
+// error nobody reads to the end names the path for nothing.
+// Counted in runes, not bytes: task labels and aliases carry accented
+// characters, and slicing mid-rune would print a replacement glyph.
+func truncateForError(s string) string {
+	const max = 160
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "..."
 }
 
 // standardOutputSectionKeys are the whole-section bindings on
