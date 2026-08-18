@@ -3558,9 +3558,22 @@ func preflightTasks(spec *composeSpec) error {
 				return fmt.Errorf("node ref=%q: data-store-write task requires dataStoreWriteConfig.tableName", ref)
 			}
 		case "data-store-query":
+			// Mode-aware, mirroring the Hub plugin's own validator and the
+			// runtime: _execute_sql_query reads `sql` and never looks at
+			// tableName, while _execute_simple_query requires tableName.
+			// Demanding tableName unconditionally rejected the only correct
+			// way to author a SQL-mode node.
 			cfg := asMap(task["dataStoreQueryConfig"])
-			if t, _ := cfg["tableName"].(string); t == "" {
-				return fmt.Errorf("node ref=%q: data-store-query task requires dataStoreQueryConfig.tableName", ref)
+			mode, _ := cfg["queryMode"].(string)
+			if mode == "" {
+				mode = "simple"
+			}
+			if mode == "sql" {
+				if s, _ := cfg["sql"].(string); strings.TrimSpace(s) == "" {
+					return fmt.Errorf("node ref=%q: data-store-query task in sql mode requires dataStoreQueryConfig.sql", ref)
+				}
+			} else if t, _ := cfg["tableName"].(string); t == "" {
+				return fmt.Errorf("node ref=%q: data-store-query task in simple mode requires dataStoreQueryConfig.tableName", ref)
 			}
 		case "document-extraction":
 			// Worth checking here rather than leaving it to the backend: BC
