@@ -217,7 +217,7 @@ Canonical shape:
 
 If the agent asks for help building or updating a workflow, default to apply. Other paths exist for special cases:
 
-- **Clone-and-modify** (highest success when a similar workflow exists): `export <similar-id>` → edit JSON → `validate-rules` → `import --new-label "..."`
+- **Clone-and-modify** (highest success when a similar workflow exists): `export <similar-id>` → edit JSON → `import --new-label "..."`. Import validates the bundle against the destination tenant before writing and refuses if it references a scorecard/rule-tree/mapping-table/evaluation-rule that is neither there nor in the bundle.
 - **Incremental edit on an existing workflow**: hold a lock + use `add-node`/`add-edge`/`set-mapping`/`set-variable` helpers (see Helpers section below)
 - **Manual** (only if you need explicit control): `tasks-v2 create` per task, then `workflows-v2 create --body @workflow.json` with hand-built nodes
 
@@ -400,7 +400,6 @@ altscore workflows-v2 schedule delete <id> --individual    # or --batch, or both
 
 ```bash
 altscore workflows-v2 export <id> > my-wf.json
-altscore workflows-v2 validate-rules --body @my-wf.json     # which referenced rules already exist?
 altscore workflows-v2 import --body @my-wf.json --new-label "Imported Copy"
 altscore workflows-v2 import --body @my-wf.json --new-label "Light" --skip-evaluation-rules --skip-scorecards
 ```
