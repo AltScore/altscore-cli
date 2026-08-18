@@ -164,16 +164,7 @@ func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[
 		return nil
 	}
 
-	var errs, warns []validationFinding
-	for _, f := range resp.Findings {
-		// Severity is lowercase "error"/"warning" today; match robustly in case
-		// that ever shifts case.
-		if strings.EqualFold(f.Severity, "error") {
-			errs = append(errs, f)
-		} else {
-			warns = append(warns, f)
-		}
-	}
+	errs, warns := partitionFindings(resp.Findings)
 
 	// The server's `valid` verdict is authoritative: honor it even when no
 	// error-severity finding is attached. A false verdict with only warnings (or
@@ -182,9 +173,7 @@ func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[
 
 	if len(warns) > 0 {
 		fmt.Fprintf(errOut, "# server validation: %d warning(s):\n", len(warns))
-		for _, f := range warns {
-			fmt.Fprintf(errOut, "#   [WARN] %s\n", formatValidationFinding(f, capture))
-		}
+		printFindingLines(errOut, "WARN", warns, capture)
 		// The branch-specific claim only holds when that specific finding is
 		// present -- other warnings get no branch claim.
 		if hasFindingCode(warns, "CONDITIONAL_BRANCH_WITHOUT_EDGE") {
@@ -194,9 +183,7 @@ func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[
 
 	if len(errs) > 0 {
 		fmt.Fprintf(errOut, "# server validation FAILED: %d error(s):\n", len(errs))
-		for _, f := range errs {
-			fmt.Fprintf(errOut, "#   [ERROR] %s\n", formatValidationFinding(f, capture))
-		}
+		printFindingLines(errOut, "ERROR", errs, capture)
 	}
 
 	if invalid {

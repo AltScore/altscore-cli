@@ -880,7 +880,6 @@ already have a hand-assembled body and know exactly what you are sending.`
 	wfv2Group.AddCommand(makeWfv2ExportCmd())
 	wfv2Group.AddCommand(makeWfv2DiffCmd())
 	wfv2Group.AddCommand(makeWfv2ImportCmd())
-	wfv2Group.AddCommand(makeWfv2ValidateRulesCmd())
 	wfv2Group.AddCommand(makeWfv2ExecuteCmd())
 	wfv2Group.AddCommand(makeWfv2ExecuteByAliasCmd())
 	wfv2Group.AddCommand(makeWfv2ExecuteBatchCmd())

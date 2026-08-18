@@ -10,7 +10,7 @@
 
 ## Project Structure
 
-`cmd/` holds 67 `.go` files (40 non-test, 27 test). This is a subsystem map, not a full tree.
+`cmd/` holds 76 `.go` files (44 non-test, 32 test). This is a subsystem map, not a full tree.
 
 ```
 altscore-cli/
@@ -19,11 +19,13 @@ altscore-cli/
 │   ├── root.go                            # registerResources(), rootCmd wiring
 │   ├── resource.go                        # ResourceDef + registerResource() generic CRUD
 │   ├── workflows.go                       # v1 group: execute, execute-by-alias, input-schema-guide, update-schema; ResourceDef Name:"workflows" in root.go
-│   ├── workflows_v2.go                    # 27 of the 36 wfv2 subcommands: all but the 7 graph edits, apply and lint
+│   ├── workflows_v2.go                    # 25 of the 36 wfv2 subcommands: all but the 7 graph edits, apply, lint and import
 │   ├── workflows_v2_apply.go              # makeWfv2ApplyCmd: composeSpec + build pipeline
 │   ├── workflows_v2_apply_verify.go       # post-apply verification
 │   ├── workflows_v2_apply_diff.go         # --diff renderer
 │   ├── workflows_v2_apply_enforce_type.go # type coercion on apply
+│   ├── workflows_v2_import.go             # makeWfv2ImportCmd + the findings it reports
+│   ├── workflows_v2_findings.go           # shared finding partition/render (apply + import)
 │   ├── workflows_v2_preflight_validate.go # POST /v2/workflows/validate (server oracle)
 │   ├── workflows_v2_validate.go           # local spec validation + makeWfv2LintCmd
 │   ├── workflows_v2_normalize.go          # normalization + autodefaults
@@ -60,7 +62,7 @@ A ResourceDef group (`cmd/root.go`, `Name: "workflows-v2"`, `BasePath: /v2/workf
 | Lifecycle | `publish`, `create-draft`, `revert`, `archive`, `restore`, `versions`, `get-version` |
 | Locking | `lock` (group), `autosave` |
 | Execution | `execute`, `execute-by-alias`, `execute-batch`, `execute-batch-by-alias`, `batch`, `executions`, `download`, `schedule` |
-| Introspection | `schema-guide`, `validate-rules`, `sources-status`, `external-sources-status`, `ai` |
+| Introspection | `schema-guide`, `sources-status`, `external-sources-status`, `ai` |
 
 Each of the 7 graph-edit helpers wraps lock + fetch + mutate + autosave + release, via `mutateAndAutosaveV2` in `cmd/workflows_v2_helpers.go`. The two mapping endpoints do not: `makeWfv2UpdateMappingCmd` and `makeWfv2ResolveMappingsCmd` live in `cmd/workflows_v2.go` and are single bare calls (PUT `/v2/workflows/{id}/update_mapping_workflow`, GET `/v2/workflows/{id}/resolve-mappings`) with no lock and no autosave.
 
