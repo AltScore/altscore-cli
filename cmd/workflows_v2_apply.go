@@ -1069,7 +1069,9 @@ var htmlSectionVarRegex = regexp.MustCompile(`\{(\w+)\}`)
 //   - content: the raw HTML string with {var} interpolation tokens
 //   - context: visual treatment "none" | "info" | "warning" | "success" |
 //     "danger" (default "none")
-//   - pageBreak: whether to start a new PDF page (default true)
+//   - pageBreak: whether to start a new PDF page before this section, which
+//     also repeats the report header on it (default false -- a break is opt-in,
+//     so a report reads as one continuous document unless asked otherwise)
 func buildHTMLSections(sections []map[string]any, inputVars, customVars map[string]any) (
 	built []map[string]any,
 	schema map[string]any,
@@ -1087,7 +1089,7 @@ func buildHTMLSections(sections []map[string]any, inputVars, customVars map[stri
 		if ctx == "" {
 			ctx = "none"
 		}
-		pageBreak := true
+		pageBreak := false
 		if v, has := s["pageBreak"].(bool); has {
 			pageBreak = v
 		}
