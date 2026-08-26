@@ -700,14 +700,22 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 
 	inputKeys := asMap(task["inputKeys"])
 
-	// Default packageAlias / dataAge on each sourcesConfig entry.
+	// Default packageAlias on each sourcesConfig entry.
+	//
+	// dataAge is deliberately NOT defaulted. An absent dataAge means "use the
+	// freshness this source publishes" (cacheMaxSeconds, read from the altdata
+	// catalog by the runtime), and that is the right answer for almost every
+	// node: it runs from 24h to 15 days depending on the source. Stamping 30 here
+	// made that unreachable, because an authored dataAge overrides the published
+	// policy, so every applied workflow quietly asked for a half-hourly refresh
+	// of data its source says is good for days.
+	//
+	// An author who wants a specific window still sets one and it is honoured as
+	// written. See borrower-central app/model/altdata/source_cache_policy.py.
 	for i, s := range sources {
 		sm, ok := s.(map[string]any)
 		if !ok {
 			continue
-		}
-		if _, has := sm["dataAge"]; !has {
-			sm["dataAge"] = 30
 		}
 		if _, has := sm["packageAlias"]; !has {
 			if sid, _ := sm["sourceId"].(string); sid != "" {
