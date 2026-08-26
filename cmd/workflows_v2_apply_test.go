@@ -93,8 +93,8 @@ func TestValidateNoResidualSpecRefs(t *testing.T) {
 		// Simulate a hypothetical future ref-bearing field the rewriter
 		// doesn't know about. The validator should flag it by path.
 		body := map[string]any{
-			"type":             "end",
-			"someNewRefField":  "score", // not excluded; not rewritten
+			"type":            "end",
+			"someNewRefField": "score", // not excluded; not rewritten
 		}
 		err := validateNoResidualSpecRefs(body, refMap, "test")
 		if err == nil {
@@ -110,9 +110,9 @@ func TestValidateNoResidualSpecRefs(t *testing.T) {
 	})
 	t.Run("excluded user-text fields pass", func(t *testing.T) {
 		body := map[string]any{
-			"label":       "score",            // legitimate user text
-			"description": "Computes score",   // legitimate user text
-			"comment":     "fetch upstream",   // legitimate user text
+			"label":       "score",          // legitimate user text
+			"description": "Computes score", // legitimate user text
+			"comment":     "fetch upstream", // legitimate user text
 			"endConfig": map[string]any{
 				"pdfConfig": map[string]any{
 					"title":    "score breakdown",
@@ -688,6 +688,9 @@ var refBearingTaskBodies = map[string]map[string]any{
 	"notices":                 {},
 	"contact":                 {},
 	"document-extraction":     {},
+	// Same as document-extraction: fileUrl/fileBase64 are authored literals or
+	// arrive through inputMappings, so the config carries no task_outputs ref.
+	"spreadsheet-extraction": {},
 }
 
 // Every task type the CLI accepts needs a representative body. A new type with

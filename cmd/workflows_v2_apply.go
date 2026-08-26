@@ -3326,6 +3326,7 @@ var validTaskTypes = map[string]bool{
 	"list-of-similars": true, "asset": true, "relationships": true,
 	"package-io": true, "sftp": true, "notices": true,
 	"contact": true, "document-extraction": true,
+	"spreadsheet-extraction": true,
 }
 
 // camelToSnake converts a camelCase wire field to its snake_case spelling.
@@ -3878,6 +3879,44 @@ func preflightTasks(spec *composeSpec) error {
 						ref, field,
 					)
 				}
+			}
+		case "spreadsheet-extraction":
+			// Same reason as document-extraction above: BC validates
+			// spreadsheetExtractionConfig at RUN time only, so an apply that
+			// ships a fileless node returns 201 and only fails when a
+			// workflow executes it.
+			cfg := asMap(task["spreadsheetExtractionConfig"])
+			mappings, _ := task["inputMappings"].(map[string]any)
+			sources := []string{}
+			for _, field := range []string{"fileUrl", "fileBase64"} {
+				if s, _ := cfg[field].(string); s != "" {
+					sources = append(sources, field)
+					continue
+				}
+				if _, mapped := mappings[field]; mapped {
+					sources = append(sources, field)
+					continue
+				}
+				if _, mapped := mappings[camelToSnake(field)]; mapped {
+					sources = append(sources, field)
+				}
+			}
+			if len(sources) == 0 {
+				return fmt.Errorf(
+					"node ref=%q: spreadsheet-extraction task requires exactly one file source. "+
+						"Set fileUrl or fileBase64 in spreadsheetExtractionConfig, or wire one of "+
+						"those keys through inputMappings to an upstream output (an http download "+
+						"node returns base64 for a binary body)",
+					ref,
+				)
+			}
+			if len(sources) > 1 {
+				return fmt.Errorf(
+					"node ref=%q: spreadsheet-extraction task has %d file sources (%s) but they are "+
+						"mutually exclusive. Keep one and remove the other, counting both the config "+
+						"values and any inputMappings entries",
+					ref, len(sources), strings.Join(sources, ", "),
+				)
 			}
 		case "exception":
 			// Canonical wire name is 'errorMessage'. Both the BC API
