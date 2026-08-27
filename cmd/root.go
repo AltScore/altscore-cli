@@ -906,6 +906,8 @@ already have a hand-assembled body and know exactly what you are sending.`
 
 	registerExternalSourceConfigs()
 
+	registerSourceTestCases()
+
 	// --- LMS resources (credit-accounts, payment-orders / disbursements, dpas) ---
 	rootCmd.AddCommand(makeCreditAccountsGroupCmd())
 	rootCmd.AddCommand(makePaymentOrdersGroupCmd("payment-orders"))
