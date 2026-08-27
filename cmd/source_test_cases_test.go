@@ -27,7 +27,10 @@ func TestSourceTestCasesGroupExposesEveryAction(t *testing.T) {
 
 	want := map[string]bool{
 		"list": false, "get": false, "create": false, "update": false, "delete": false,
-		"from-package": false, "set-content": false, "body-help": false,
+		// get-content is not redundant with get: the generic get sends no query
+		// parameters, so it cannot ask for the body. Losing it would leave the read half
+		// of read-adjust-write on `altscore api` while the write half had a command.
+		"from-package": false, "get-content": false, "set-content": false, "body-help": false,
 	}
 	for _, sub := range group.Commands() {
 		name := strings.Fields(sub.Use)[0]

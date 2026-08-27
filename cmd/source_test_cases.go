@@ -77,8 +77,59 @@ be served your mock as if it were real data.`,
 	})
 
 	group.AddCommand(makeSourceTestCaseFromPackageCmd())
+	group.AddCommand(makeSourceTestCaseGetContentCmd())
 	group.AddCommand(makeSourceTestCaseSetContentCmd())
 	group.AddCommand(makeSourceTestCaseBodyHelpCmd())
+}
+
+// makeSourceTestCaseGetContentCmd prints just the stored body.
+//
+// The generic `get` returns metadata only -- it sends no query parameters, so it cannot
+// ask for the body. Without this, the read half of "read it, adjust it, write it back"
+// would mean dropping to `altscore api` while the write half had a real command, and that
+// asymmetry is exactly where someone reaches for the wrong endpoint. Prints the body
+// alone rather than the envelope so the output pipes straight back into set-content.
+func makeSourceTestCaseGetContentCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "get-content <id>",
+		Short: "Print a test case's stored response body",
+		Long: `Print the response body a test case returns, on its own -- not wrapped in the
+case's metadata -- so it pipes directly into set-content:
+
+  altscore source-test-cases get-content <id> \
+    | jq '.data.score = 720' \
+    | altscore source-test-cases set-content <id>
+
+Use 'get' instead for the metadata (name, testCaseRef, packageId, provenance).`,
+		Example: `  altscore source-test-cases get-content <id>
+  altscore source-test-cases get-content <id> | jq '.isSuccess'`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := loadClient()
+			if err != nil {
+				return err
+			}
+			path := "/v1/documentation/source-test-cases/" + args[0] + "?includeContent=true"
+			data, _, err := c.Do("GET", "borrower_central", path, nil)
+			if err != nil {
+				return err
+			}
+
+			// Unwrap to `content`. A case with no readable body is a broken pair rather
+			// than an empty one, so say that instead of printing `null` and letting it
+			// flow into a set-content that would store the word "null".
+			var envelope struct {
+				Content json.RawMessage `json:"content"`
+			}
+			if err := json.Unmarshal(data, &envelope); err != nil {
+				return fmt.Errorf("decode test case %s: %w", args[0], err)
+			}
+			if len(envelope.Content) == 0 || string(envelope.Content) == "null" {
+				return fmt.Errorf("test case %s has no readable body; its package may have been deleted", args[0])
+			}
+			return output.RawJSON(envelope.Content)
+		},
+	}
 }
 
 // makeSourceTestCaseFromPackageCmd hits POST /from-package/{packageId}: record the body
