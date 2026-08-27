@@ -692,22 +692,23 @@ func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bo
 	return nil
 }
 
-func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) error {
-	sources := asSlice(task["sourcesConfig"])
-	if len(sources) == 0 {
-		return nil
-	}
-
-	inputKeys := asMap(task["inputKeys"])
-
-	// Default packageAlias / dataAge on each sourcesConfig entry.
+// applyAltdataSourceDefaults fills packageAlias on each sourcesConfig entry.
+//
+// dataAge is deliberately NOT defaulted, and a test asserts it stays that way.
+// An absent dataAge means "use the freshness this source publishes"
+// (cacheMaxSeconds, read from the altdata catalog by the runtime), which is the
+// right answer for almost every node: it runs from 24h to 15 days depending on
+// the source. Stamping 30 here made that unreachable, because an authored
+// dataAge overrides the published policy, so every applied workflow quietly
+// asked for a half-hourly refresh of data its source says is good for days.
+//
+// An author who wants a specific window still sets one and it is honoured as
+// written. See borrower-central app/model/altdata/source_cache_policy.py.
+func applyAltdataSourceDefaults(sources []any) []any {
 	for i, s := range sources {
 		sm, ok := s.(map[string]any)
 		if !ok {
 			continue
-		}
-		if _, has := sm["dataAge"]; !has {
-			sm["dataAge"] = 30
 		}
 		if _, has := sm["packageAlias"]; !has {
 			if sid, _ := sm["sourceId"].(string); sid != "" {
@@ -716,7 +717,18 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 		}
 		sources[i] = sm
 	}
-	task["sourcesConfig"] = sources
+	return sources
+}
+
+func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) error {
+	sources := asSlice(task["sourcesConfig"])
+	if len(sources) == 0 {
+		return nil
+	}
+
+	inputKeys := asMap(task["inputKeys"])
+
+	task["sourcesConfig"] = applyAltdataSourceDefaults(sources)
 
 	// inputKeys auto-fill (different concern from inputSchema fill that
 	// moved to BC's DerivedSchemaService): the runtime activity reads the
