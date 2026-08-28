@@ -420,20 +420,9 @@ func substituteWorkflowAliases(wf map[string]any, refMap map[string]string, vers
 			if !ok {
 				continue
 			}
-			if s, _ := v["expression"].(string); s != "" {
-				v["expression"] = rewriteTaskOutputsRefsInString(s, refMap)
-			}
-			if s, _ := v["returnValue"].(string); s != "" {
-				v["returnValue"] = rewriteTaskOutputsRefsInString(s, refMap)
-			}
-			if deps, ok := v["dependencies"].([]any); ok {
-				for i, d := range deps {
-					if ds, ok := d.(string); ok {
-						deps[i] = rewriteTaskOutputsRefsInString(ds, refMap)
-					}
-				}
-				v["dependencies"] = deps
-			}
+			// This is the EFFECTIVE site: refMap holds real server aliases
+			// here, unlike the assembly pass in apply where it is the identity.
+			rewriteCustomVariableRefs(v, refMap)
 			cvs[name] = v
 		}
 	}

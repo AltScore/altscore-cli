@@ -1482,9 +1482,150 @@ func rewriteTaskOutputsRefsInString(s string, refMap map[string]string) string {
 		if ref == alias {
 			continue
 		}
-		s = strings.ReplaceAll(s, "task_outputs."+ref+".", "task_outputs."+alias+".")
+		s = replaceTaskOutputsRef(s, ref, alias)
 	}
 	return s
+}
+
+// replaceTaskOutputsRef swaps `task_outputs.<ref>` for `task_outputs.<alias>`
+// wherever the ref ends on a real boundary.
+//
+// The boundary used to be a required trailing dot, which quietly missed every
+// reference that does not continue with a field: a bare `task_outputs.tablas`,
+// and the bracket forms `task_outputs.tablas[0].x` / `task_outputs.a.arr[].f`.
+// Bracket indexing is legal in the Hub's formula syntax, so those references
+// stayed on the spec-local ref and the variable pointed at a node that does not
+// exist. A dot is still A boundary -- it is just no longer the only one.
+//
+// The ref must not be followed by a word char or a hyphen, so a ref `tabla`
+// cannot match inside `task_outputs.tablas`. Go's RE2 has no lookahead, so the
+// check is a manual peek at the next byte, which is also cheaper than a regex
+// per ref per string.
+func replaceTaskOutputsRef(s, ref, alias string) string {
+	needle := "task_outputs." + ref
+	if !strings.Contains(s, needle) {
+		return s
+	}
+	var b strings.Builder
+	for {
+		i := strings.Index(s, needle)
+		if i < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		end := i + len(needle)
+		if end < len(s) && isRefNameByte(s[end]) {
+			// A longer ref starts here (tabla vs tablas): copy past this
+			// candidate and keep scanning.
+			b.WriteString(s[:end])
+			s = s[end:]
+			continue
+		}
+		b.WriteString(s[:i])
+		b.WriteString("task_outputs." + alias)
+		s = s[end:]
+	}
+}
+
+// isRefNameByte reports whether c can continue a spec-local ref name. Refs are
+// lowercase alphanumeric with internal dashes, so anything else -- a dot, a
+// bracket, a quote, whitespace, end of string -- terminates one.
+func isRefNameByte(c byte) bool {
+	return c == '-' || c == '_' ||
+		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+// dependencyTypesKey is the one custom-variable field whose refs live in map
+// KEYS rather than values, so the generic value walk must skip it.
+const dependencyTypesKey = "dependencyTypes"
+
+// rewriteRefStringsDeep returns o with every string VALUE reachable from it
+// rewritten, at any depth. Maps are walked in place; `dependencyTypes` is left
+// to its own key-aware pass.
+func rewriteRefStringsDeep(o any, refMap map[string]string) any {
+	switch t := o.(type) {
+	case string:
+		return rewriteTaskOutputsRefsInString(t, refMap)
+	case []any:
+		for i, e := range t {
+			t[i] = rewriteRefStringsDeep(e, refMap)
+		}
+		return t
+	case map[string]any:
+		for k, e := range t {
+			if k == dependencyTypesKey {
+				continue
+			}
+			t[k] = rewriteRefStringsDeep(e, refMap)
+		}
+		return t
+	}
+	return o
+}
+
+// rewriteCustomVariableRefs rewrites every spec-local ref inside ONE compute
+// variable definition, in place. It is the single definition of that rewrite so
+// the two sites that need it -- the spec assembly in apply and the pre-flight
+// alias substitution -- cannot drift.
+//
+// `dependencyTypes` is keyed BY the dependency string, so it is the one field
+// here where the ref lives in a map KEY rather than a value. Every other
+// rewriter in this file walks values only, which is exactly why the field was
+// missed: a variable landed with correct `dependencies` and an `expression` and
+// a `dependencyTypes` map still keyed by the pre-rewrite refs. Two silent
+// consequences on the server -- the runtime's dependency coercion looks up by
+// the REAL name and misses, so a declared scalar type on an array-map
+// dependency loses its None-slot-drop-and-unwrap; and the builder's
+// reference-integrity scan stringifies the variable and matches
+// `task_outputs.<alias>`, so every stale key renders as a phantom "references a
+// node that no longer exists" warning on a workflow that is wired correctly.
+//
+// An entry already under the destination key wins: it names a dependency the
+// author declared directly, and overwriting it with a carried-over type would
+// replace a correct declaration with a stale one.
+func rewriteCustomVariableRefs(v map[string]any, refMap map[string]string) {
+	if v == nil {
+		return
+	}
+	// Every string VALUE, at any depth. Naming the fields one by one is what let
+	// `simpleConfig.formulaText` go stale while `expression` and `dependencies`
+	// rewrote correctly: the CLI never mentions simpleConfig anywhere, so the
+	// formula the client reads in the Hub kept pointing at spec-local refs. The
+	// compiled expression was right, so the workflow RAN correctly -- until
+	// someone opened that formula and saved, at which point the Hub recompiled
+	// the stale text and the variable silently resolved to nothing.
+	//
+	// Walking values means the next field added to a custom variable is covered
+	// without anyone remembering to come back here.
+	for k, e := range v {
+		if k == dependencyTypesKey {
+			continue // keyed BY the ref -- the pass below owns it
+		}
+		v[k] = rewriteRefStringsDeep(e, refMap)
+	}
+	if types, ok := v[dependencyTypesKey].(map[string]any); ok {
+		rewritten := make(map[string]any, len(types))
+		// Pass 1: keys the rewrite leaves alone. These name a dependency the
+		// author declared directly, so they own their slot.
+		for key, declared := range types {
+			if rewriteTaskOutputsRefsInString(key, refMap) == key {
+				rewritten[key] = declared
+			}
+		}
+		// Pass 2: move the rest onto their destination, never over an existing
+		// entry. Doing this second is what makes the outcome independent of Go's
+		// non-deterministic map iteration order.
+		for key, declared := range types {
+			newKey := rewriteTaskOutputsRefsInString(key, refMap)
+			if newKey == key {
+				continue
+			}
+			if _, taken := rewritten[newKey]; !taken {
+				rewritten[newKey] = declared
+			}
+		}
+		v["dependencyTypes"] = rewritten
+	}
 }
 
 // rewriteRefsInTemplate rewrites every {{...}} placeholder in s whose inner
@@ -3242,22 +3383,12 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		// stress run (Argentine SMB workflow with refs like
 		// "task_outputs.enrich.ARG-PUB-0001..." that compose persisted
 		// without rewriting `enrich` to the server alias).
-		expression, _ = v["expression"].(string)
-		returnValue, _ = v["returnValue"].(string)
-		if expression != "" {
-			v["expression"] = rewriteTaskOutputsRefsInString(expression, refMap)
-		}
-		if returnValue != "" {
-			v["returnValue"] = rewriteTaskOutputsRefsInString(returnValue, refMap)
-		}
-		if deps, ok := v["dependencies"].([]any); ok {
-			for i, d := range deps {
-				if ds, ok := d.(string); ok {
-					deps[i] = rewriteTaskOutputsRefsInString(ds, refMap)
-				}
-			}
-			v["dependencies"] = deps
-		}
+		// NOTE: in this phase refMap is the identity map, so this call is a
+		// no-op by construction -- the real substitution happens in the
+		// pre-flight pass once server aliases exist. Kept so the two sites
+		// share one definition and a future change here is not silently
+		// half-applied.
+		rewriteCustomVariableRefs(v, refMap)
 
 		customVars[name] = v
 	}
