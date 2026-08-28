@@ -64,7 +64,15 @@ func richSplitSpec() *composeSpec {
 			"risk": map[string]any{"type": "number",
 				"expression":   "risk = task_outputs.fetch.amount * 2",
 				"returnValue":  "risk",
-				"dependencies": []any{"task_outputs.fetch.amount"}},
+				"dependencies": []any{"task_outputs.fetch.amount"},
+				// Formula mode: the Hub recompiles formulaText on save, so a ref
+				// left here breaks the variable the moment a human edits it.
+				"editorMode": "simple",
+				"simpleConfig": map[string]any{
+					"type":        "formula",
+					"formulaText": "$task_outputs.fetch.amount * 2",
+				},
+				"dependencyTypes": map[string]any{"task_outputs.fetch.amount": "number"}},
 		},
 		Edges: []map[string]any{
 			{"from": "start", "to": "fetch"},
@@ -319,6 +327,16 @@ func TestCharacterization_RealApply_AliasSubstitution(t *testing.T) {
 	}
 	if cv["dependencies"].([]any)[0] != "task_outputs.srv-task-1.amount" {
 		t.Errorf("risk dependency not substituted: %v", cv["dependencies"])
+	}
+	// The formula the client reads has to agree with the expression that runs.
+	sc, _ := cv["simpleConfig"].(map[string]any)
+	if got, _ := sc["formulaText"].(string); got != "$task_outputs.srv-task-1.amount * 2" {
+		t.Errorf("risk formulaText not substituted: %v", got)
+	}
+	// dependencyTypes carries the ref in the KEY, not the value.
+	dt, _ := cv["dependencyTypes"].(map[string]any)
+	if _, ok := dt["task_outputs.srv-task-1.amount"]; !ok {
+		t.Errorf("risk dependencyTypes key not substituted: %v", dt)
 	}
 
 	// The POSTED task bodies are fully substituted -- no residual spec refs.
