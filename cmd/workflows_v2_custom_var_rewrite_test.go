@@ -192,3 +192,37 @@ func TestRewriteCustomVariableRefs_NestedUnknownField(t *testing.T) {
 		t.Errorf("non-string values mangled: %v", lista)
 	}
 }
+
+// containsTaskOutputsRef is the detector behind validateNoResidualSpecRefs, the
+// guard whose whole job is catching a field the rewriter forgot to walk. It has
+// to agree with replaceTaskOutputsRef: a boundary the detector does not
+// recognise is a residual ref that ships silently, because the safety net would
+// be blind in exactly the shapes the rewriter was.
+func TestContainsTaskOutputsRef_AgreesWithReplace(t *testing.T) {
+	cases := []struct {
+		in   string
+		ref  string
+		want bool
+	}{
+		{"task_outputs.tablas.gasto", "tablas", true},
+		{"task_outputs.tablas", "tablas", true},
+		{"task_outputs.tablas[0].x", "tablas", true},
+		{"$task_outputs.tablas.a", "tablas", true},
+		{"task_outputs.tablas.a", "tabla", false}, // prefix must not match
+		{"task_outputs.tabla.a", "tabla", true},
+		{"inputs.tablas", "tablas", false}, // other scope
+		{"", "tablas", false},
+	}
+	for _, c := range cases {
+		if got := containsTaskOutputsRef(c.in, c.ref); got != c.want {
+			t.Errorf("containsTaskOutputsRef(%q, %q) = %v, want %v", c.in, c.ref, got, c.want)
+		}
+		// The pair must never disagree: if the detector sees the ref, replacing
+		// must change the string, and if it does not, nothing may change.
+		changed := replaceTaskOutputsRef(c.in, c.ref, "srv-alias") != c.in
+		if changed != c.want {
+			t.Errorf("detector/replacer disagree on (%q, %q): contains=%v changed=%v",
+				c.in, c.ref, c.want, changed)
+		}
+	}
+}

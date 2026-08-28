@@ -1502,10 +1502,10 @@ func rewriteTaskOutputsRefsInString(s string, refMap map[string]string) string {
 // check is a manual peek at the next byte, which is also cheaper than a regex
 // per ref per string.
 func replaceTaskOutputsRef(s, ref, alias string) string {
-	needle := "task_outputs." + ref
-	if !strings.Contains(s, needle) {
+	if !containsTaskOutputsRef(s, ref) {
 		return s
 	}
+	needle := "task_outputs." + ref
 	var b strings.Builder
 	for {
 		i := strings.Index(s, needle)
@@ -1524,6 +1524,27 @@ func replaceTaskOutputsRef(s, ref, alias string) string {
 		b.WriteString(s[:i])
 		b.WriteString("task_outputs." + alias)
 		s = s[end:]
+	}
+}
+
+// containsTaskOutputsRef reports whether s references ref on a real boundary.
+// It is the read-only twin of replaceTaskOutputsRef and must agree with it:
+// validateNoResidualSpecRefs exists to catch a field the rewriter forgot to
+// walk, so a boundary the detector does not recognise is a residual ref that
+// ships silently -- the guard would be blind in exactly the shapes the rewriter
+// is blind to.
+func containsTaskOutputsRef(s, ref string) bool {
+	needle := "task_outputs." + ref
+	for i := 0; ; {
+		j := strings.Index(s[i:], needle)
+		if j < 0 {
+			return false
+		}
+		end := i + j + len(needle)
+		if end >= len(s) || !isRefNameByte(s[end]) {
+			return true
+		}
+		i = end
 	}
 }
 
@@ -2184,7 +2205,7 @@ func validateNoResidualSpecRefs(body map[string]any, refMap map[string]string, c
 			// template surface the rewriter doesn't walk keeps the spec ref
 			// inside the string, which no exact match can ever see.
 			for _, ref := range embedded {
-				if !strings.Contains(v, "task_outputs."+ref+".") {
+				if !containsTaskOutputsRef(v, ref) {
 					continue
 				}
 				return fmt.Errorf(
