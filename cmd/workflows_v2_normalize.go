@@ -54,6 +54,7 @@ func newUUIDv4() string {
 var conditionOperators = map[string]bool{
 	"array_contains_all": true, "arrayContainsAll": true,
 	"array_contains_any": true, "arrayContainsAny": true,
+	"array_contains_none": true, "arrayContainsNone": true,
 	"between":   true,
 	"contains":  true,
 	"ends_with": true, "endsWith": true,
