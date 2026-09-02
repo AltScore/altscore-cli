@@ -151,3 +151,29 @@ func TestFetchServerConditionOperators_Parse(t *testing.T) {
 		t.Fatalf("expected 8 flattened strings from the workflow subsection, got %d: %v", len(got), sortedBoolMapKeys(got))
 	}
 }
+
+// The mirror is only a fast path -- an operator missing from it is still
+// accepted after one live fetch -- so this does not guard correctness. It
+// guards the round trip: `array_contains_none` is the operator that makes "has
+// records, none of them disqualifying" authorable, and every rule using it is
+// applied by `altscore workflows-v2 apply`. Absent here, each such condition
+// costs a call to /v1/meta/workflows-v2-schema before it validates, and against
+// a backend that predates the operator it is rejected outright.
+func TestConditionOperators_MirrorCarriesTheArrayFamily(t *testing.T) {
+	defer resetLiveConditionOperators()
+	resetLiveConditionOperators()
+
+	fetchLiveConditionOperators = func() map[string]bool {
+		t.Fatalf("compiled-in operator must not trigger a live fetch")
+		return nil
+	}
+	for _, operator := range []string{
+		"array_contains_any", "arrayContainsAny",
+		"array_contains_none", "arrayContainsNone",
+		"array_contains_all", "arrayContainsAll",
+	} {
+		if err := validateConditionGroup(condGroupWith(operator), "branches[0].conditions"); err != nil {
+			t.Fatalf("%s must validate offline from the mirror, got: %v", operator, err)
+		}
+	}
+}
