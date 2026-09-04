@@ -347,6 +347,32 @@ func validateTaskV2BodyStructural(body json.RawMessage) error {
 		if outVar, _ := cfg["outputVariable"].(string); outVar == "" {
 			return fmt.Errorf("rule-tree task requires ruleTreeConfig.outputVariable")
 		}
+	case "category":
+		cfg := asMap(task["categoryConfig"])
+		if key, _ := cfg["categoryKey"].(string); strings.TrimSpace(key) == "" {
+			return fmt.Errorf("category task requires categoryConfig.categoryKey -- the node resolves the tenant's category by KEY (e.g. \"segmentation\") and never takes a category id")
+		}
+		switch op, _ := cfg["operation"].(string); op {
+		case "read", "assign":
+		case "":
+			return fmt.Errorf("category task requires categoryConfig.operation: \"read\" or \"assign\"")
+		default:
+			return fmt.Errorf("category task has categoryConfig.operation %q; must be \"read\" or \"assign\"", op)
+		}
+		switch vf, _ := cfg["valueFormat"].(string); vf {
+		case "", "string":
+		case "json":
+			if len(asSlice(cfg["valueFields"])) == 0 {
+				return fmt.Errorf("category task with categoryConfig.valueFormat=\"json\" requires categoryConfig.valueFields: the object's keys, in order (they also fix the join order of the node's `codes` output)")
+			}
+		default:
+			return fmt.Errorf("category task has categoryConfig.valueFormat %q; must be \"string\" or \"json\"", vf)
+		}
+		switch root, _ := cfg["entityRoot"].(string); root {
+		case "", "borrower", "deal":
+		default:
+			return fmt.Errorf("category task has categoryConfig.entityRoot %q; must be \"borrower\" or \"deal\"", root)
+		}
 	case "child-workflow":
 		// Batch mode supplies per-element inputs by resolving inputExpression
 		// (e.g. "inputs.cuit_list") to a list. Without it the BC runtime has
@@ -565,7 +591,25 @@ func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNorma
 		return normalizeRuleTreeTask(c, task, opts, dryRun)
 	case "child-workflow":
 		return normalizeChildWorkflowTask(c, task, dryRun)
+	case "category":
+		return normalizeCategoryTask(task)
 	}
+	return nil
+}
+
+// normalizeCategoryTask covers the category task type. The node takes no
+// entity reference to rewrite (it resolves its category by KEY at runtime), so
+// the only gap worth closing offline is the inputMappings placement: the value
+// being assigned is supplied through inputMappings, and an author copying the
+// nested form out of schema-guide writes it under categoryConfig while the
+// runtime reads the top-level map. Mirroring both ways is the same fix
+// scorecard and rule-tree already carry.
+func normalizeCategoryTask(task map[string]any) error {
+	cfg := asMap(task["categoryConfig"])
+	if cfg == nil {
+		return nil
+	}
+	mirrorNestedInputMappings(task, cfg, "categoryConfig")
 	return nil
 }
 

@@ -635,6 +635,16 @@ var refBearingTaskBodies = map[string]map[string]any{
 			"inputMappings": map[string]any{"score": "task_outputs.a.total"},
 		},
 	},
+	// The value being assigned arrives through inputMappings, and normalize
+	// mirrors the top-level map into categoryConfig -- so the nested leg is a
+	// real ref-bearing surface, same as scorecard/rule-tree.
+	"category": {
+		"categoryConfig": map[string]any{
+			"operation":     "assign",
+			"categoryKey":   "segmentation",
+			"inputMappings": map[string]any{"subcanal": "task_outputs.a.subcanal"},
+		},
+	},
 	"data-store-write": {
 		"dataStoreWriteConfig": map[string]any{
 			"tableName": "rows",

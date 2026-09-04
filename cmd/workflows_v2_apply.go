@@ -2307,6 +2307,14 @@ func validateStandardOutputShape(stdOut map[string]any) error {
 	return nil
 }
 
+// nestedInputMappingConfigKeys lists the task-config objects that carry their
+// OWN inputMappings map, which the runtime resolves instead of (scorecard,
+// rule-tree) or in addition to (category) the top-level one. Both the rewriter
+// and the dependency scanner walk this list; keeping it in one place is what
+// stops a new nested-mapping node type from being wired into one and missed by
+// the other -- the failure there is silent (refs resolve to None at runtime).
+var nestedInputMappingConfigKeys = []string{"scorecardConfig", "ruleTreeConfig", "categoryConfig"}
+
 // rewriteTaskRefs applies every ref->alias rewrite a task-node body needs, in
 // the order the runtime resolver expects: top-level inputMappings, the nested
 // scorecardConfig/ruleTreeConfig inputMappings (resolved from their own map),
@@ -2333,7 +2341,9 @@ func rewriteTaskRefs(task map[string]any, refMap map[string]string, ctx string) 
 	// ruleTreeConfig) -- see graph_workflow's per-task-type branches in
 	// _resolve_task_variables. Rewrite those too, or every rule field resolves
 	// to None at runtime (scorecard total=0, rule-tree falls to default).
-	for _, nested := range []string{"scorecardConfig", "ruleTreeConfig"} {
+	// categoryConfig joins them because normalize mirrors the top-level map
+	// into it, so an unrewritten ref there assigns an empty category value.
+	for _, nested := range nestedInputMappingConfigKeys {
 		cfg, _ := task[nested].(map[string]any)
 		if cfg == nil {
 			continue
@@ -2497,7 +2507,7 @@ func topologicalTaskOrder(tasks []map[string]any, edges []map[string]any) ([]int
 	for i, t := range tasks {
 		mappings, _ := t["inputMappings"].(map[string]any)
 		collectMappingDeps(i, mappings)
-		for _, nested := range []string{"scorecardConfig", "ruleTreeConfig"} {
+		for _, nested := range nestedInputMappingConfigKeys {
 			if cfg, _ := t[nested].(map[string]any); cfg != nil {
 				if nm, _ := cfg["inputMappings"].(map[string]any); nm != nil {
 					collectMappingDeps(i, nm)
@@ -3478,7 +3488,7 @@ var validTaskTypes = map[string]bool{
 	"list-of-similars": true, "asset": true, "relationships": true,
 	"package-io": true, "sftp": true, "notices": true,
 	"contact": true, "document-extraction": true,
-	"spreadsheet-extraction": true,
+	"spreadsheet-extraction": true, "category": true,
 }
 
 // camelToSnake converts a camelCase wire field to its snake_case spelling.
