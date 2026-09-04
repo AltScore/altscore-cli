@@ -291,6 +291,7 @@ Per-type config (full reference: `schema-guide tasks`):
 | `data-store` | `dataStoreWriteConfig` or `dataStoreQueryConfig` |
 | `pdf-report` / `end` | `endConfig: {title, subtitle, brand_logo}` |
 | `customer` / `deal` / `asset` | `operation` (`write`/`read`), `lookupBy`, `key`/`identityKey`, `inputSchema`, `inputMappings`, `sourcesConfig` |
+| `category` | `categoryConfig: {operation (read/assign), categoryKey, entityRoot, valueFormat, valueFields, createMissing}` -- every field nests INSIDE `categoryConfig`; a top-level `operation` is silently swallowed by the customer/deal/asset field of the same name |
 
 For `customer` / `deal` / `asset` write tasks the `sourcesConfig` entries map each persisted attribute to a context key. Common entry shapes:
 
