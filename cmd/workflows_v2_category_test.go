@@ -16,6 +16,29 @@ func TestCategory_MirrorCarriesTheTaskType(t *testing.T) {
 	}
 }
 
+// The transform vocabulary is mirrored by hand from
+// borrower-central/app/usecase/workflows_v2/category_node.py VALUE_TRANSFORMS.
+// Pinned as a set rather than only through the accept/reject cases above so
+// that adding a transform to the backend without teaching the CLI about it
+// fails here, instead of at `apply` time after earlier tasks were created.
+func TestCategory_MirrorCarriesEveryValueTransform(t *testing.T) {
+	backend := []string{"none", "trim", "upper", "lower"}
+	for _, tr := range backend {
+		cfg := map[string]any{"operation": "read", "categoryKey": "segmentation", "valueTransform": tr}
+		if err := validateTaskV2BodyStructural(categoryBody(cfg)); err != nil {
+			t.Errorf("valueTransform %q is accepted by the backend but rejected here: %v", tr, err)
+		}
+	}
+	// And the reverse: the CLI must not wave through a spelling the backend's
+	// Literal would refuse, which would turn an offline typo into a 400.
+	for _, tr := range []string{"uppercase", "UPPER", "strip", "titlecase"} {
+		cfg := map[string]any{"operation": "read", "categoryKey": "segmentation", "valueTransform": tr}
+		if err := validateTaskV2BodyStructural(categoryBody(cfg)); err == nil {
+			t.Errorf("valueTransform %q is not a backend value but passed validation", tr)
+		}
+	}
+}
+
 func categoryBody(cfg map[string]any) json.RawMessage {
 	body, _ := json.Marshal(map[string]any{"type": "category", "categoryConfig": cfg})
 	return body
@@ -64,6 +87,20 @@ func TestCategory_StructuralValidation(t *testing.T) {
 			name:    "an unknown entityRoot is rejected",
 			cfg:     map[string]any{"operation": "read", "categoryKey": "segmentation", "entityRoot": "asset"},
 			wantErr: "categoryConfig.entityRoot",
+		},
+		{
+			name: "every transform the backend accepts is accepted here",
+			cfg: map[string]any{
+				"operation": "assign", "categoryKey": "segmentation",
+				"valueTransform": "upper", "requireValue": false,
+			},
+		},
+		{
+			name: "an unknown transform is rejected",
+			cfg: map[string]any{
+				"operation": "read", "categoryKey": "segmentation", "valueTransform": "uppercase",
+			},
+			wantErr: "categoryConfig.valueTransform",
 		},
 	}
 	for _, tc := range cases {
