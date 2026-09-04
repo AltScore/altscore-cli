@@ -373,6 +373,14 @@ func validateTaskV2BodyStructural(body json.RawMessage) error {
 		default:
 			return fmt.Errorf("category task has categoryConfig.entityRoot %q; must be \"borrower\" or \"deal\"", root)
 		}
+		// Caught offline because the failure mode when it is wrong is quiet:
+		// the value is assigned verbatim, which misses the rows a normalized
+		// category already holds and creates a near-duplicate of each one.
+		switch tr, _ := cfg["valueTransform"].(string); tr {
+		case "", "none", "trim", "upper", "lower":
+		default:
+			return fmt.Errorf("category task has categoryConfig.valueTransform %q; must be \"none\", \"trim\", \"upper\" or \"lower\"", tr)
+		}
 	case "child-workflow":
 		// Batch mode supplies per-element inputs by resolving inputExpression
 		// (e.g. "inputs.cuit_list") to a list. Without it the BC runtime has
