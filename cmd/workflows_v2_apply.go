@@ -2103,6 +2103,17 @@ var residualSpecRefExcludedFields = map[string]bool{
 	// migration mid-POST. checkRefVariableCollisions is what keeps the bare form
 	// honest, by refusing a spec where a ref and a variable share a name.
 	"inputVariable": true,
+	// categoryConfig.categoryKey names one of the TENANT's categories and
+	// categoryConfig.valueFields names the keys of the object being assigned.
+	// Both are user-authored literals resolved server-side at run time, never
+	// node references -- the category node deliberately takes no id of any kind.
+	// A spec is perfectly entitled to have a node ref that reads the same as a
+	// category key ("segmentation" is a natural name for both), and flagging
+	// that is a false positive by construction. It is also an expensive one:
+	// this validator runs inside the POST loop, so the abort lands after tasks
+	// have already been created and there is no rollback.
+	"categoryKey": true,
+	"valueFields": true,
 }
 
 // validateNoResidualSpecRefs walks a composed task body and returns an error

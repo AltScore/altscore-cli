@@ -124,3 +124,43 @@ func TestCategory_NormalizeMirrorsInputMappingsBothWays(t *testing.T) {
 		}
 	})
 }
+
+// A node ref and a category key are separate namespaces, and "segmentation" is
+// a natural name in both. The residual-ref validator runs INSIDE the POST loop,
+// so a false positive there aborts after tasks have already been created and
+// nothing rolls them back -- which is the one failure apply must never have.
+func TestCategory_KeyAndValueFieldsAreNotTreatedAsResidualRefs(t *testing.T) {
+	body := map[string]any{
+		"type": "category",
+		"categoryConfig": map[string]any{
+			"operation":   "assign",
+			"categoryKey": "segmentation",
+			"valueFields": []any{"subcanal", "grupo_precio_comercial"},
+		},
+	}
+	refMap := map[string]string{
+		"segmentation":           "segmentation-server-1234",
+		"subcanal":               "subcanal-server-5678",
+		"grupo_precio_comercial": "grupo-server-9012",
+	}
+	if err := validateNoResidualSpecRefs(body, refMap, "compose"); err != nil {
+		t.Fatalf("a category key or value field that reads like a node ref must not abort apply, got: %v", err)
+	}
+}
+
+// The exclusion must not blind the validator to a real residual ref elsewhere
+// in the same body: inputMappings still has to be rewritten.
+func TestCategory_AResidualRefInInputMappingsStillAborts(t *testing.T) {
+	body := map[string]any{
+		"type": "category",
+		"categoryConfig": map[string]any{
+			"operation":   "assign",
+			"categoryKey": "segmentation",
+		},
+		"inputMappings": map[string]any{"subcanal": "lookup"},
+	}
+	refMap := map[string]string{"lookup": "lookup-server-1234"}
+	if err := validateNoResidualSpecRefs(body, refMap, "compose"); err == nil {
+		t.Fatal("an unrewritten node ref in inputMappings must still abort")
+	}
+}
