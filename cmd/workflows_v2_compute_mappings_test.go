@@ -58,6 +58,35 @@ func TestPreflightTasks_ComputeMappingsToRealReferencesDoNotWarn(t *testing.T) {
 	}
 }
 
+// `__static__::<json>` carries no dot and DOES resolve: `resolve` handles it
+// before `_split_reference`, `task_schemas` accepts it explicitly as the literal
+// escape, and the Hub generates it. A per-node constant is exactly the
+// shared-variable case this change exists for, so warning on it would be a
+// second false warning in the place the first one was removed from.
+func TestPreflightTasks_StaticLiteralMappingDoesNotWarn(t *testing.T) {
+	for _, literal := range []string{`__static__::true`, `__static__::"CONYUGE"`, `__static__::5`} {
+		stderr := captureStderr(t, func() {
+			_ = preflightTasks(computeMappingSpec(map[string]any{"flag": literal}))
+		})
+		if strings.Contains(stderr, "compute-variables inputMappings") {
+			t.Errorf("%s must not warn, got: %q", literal, stderr)
+		}
+	}
+}
+
+// The lenient bare-alias form resolves too (`ScopedWorkflowContext.resolve`
+// rewrites `<alias>.<field>` to `task_outputs.<alias>.<field>`), and apply emits
+// it deliberately. It carries a dot so the dotless rule already covers it --
+// pinned anyway, because it is the form most likely to look wrong to a reader.
+func TestPreflightTasks_BareAliasMappingDoesNotWarn(t *testing.T) {
+	stderr := captureStderr(t, func() {
+		_ = preflightTasks(computeMappingSpec(map[string]any{"src": "fetch.ECU-PUB-0023.sourceData"}))
+	})
+	if strings.Contains(stderr, "compute-variables inputMappings") {
+		t.Errorf("bare-alias form must not warn, got: %q", stderr)
+	}
+}
+
 // The shape that IS dead, and that the old blanket warning buried in noise: a
 // value naming no namespace. ScopedWorkflowContext._split_reference returns an
 // empty root_key for a dotless reference and resolve() returns None without

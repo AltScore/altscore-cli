@@ -4181,13 +4181,22 @@ func preflightTasks(spec *composeSpec) error {
 				sort.Strings(keys)
 				for _, k := range keys {
 					v, _ := im[k].(string)
-					if v == "" || strings.Contains(v, ".") || strings.HasPrefix(strings.TrimSpace(v), "{{") {
+					vv := strings.TrimSpace(v)
+					// `__static__::<json>` is the literal escape: no dot, and
+					// `resolve` handles it BEFORE `_split_reference`, so it does
+					// resolve. A per-node constant is precisely the shared-variable
+					// case this check exists for -- warning on it would be a second
+					// false warning in the place the first one was removed from.
+					if v == "" || strings.Contains(v, ".") || strings.HasPrefix(vv, "{{") || strings.HasPrefix(vv, "__static__::") {
 						continue
 					}
 					fmt.Fprintf(os.Stderr,
-						"# warning: tasks[%d] (ref=%q): compute-variables inputMappings[%q]=%q names no namespace, so it resolves to null on every run "+
-							"and a dependency %q reads nothing. "+
-							"Point it at entity.<root>.<group>.<key>, task_outputs.<alias>.<field>, or inputs.<name>.\n",
+						"# warning: tasks[%d] (ref=%q): compute-variables inputMappings[%q]=%q names no namespace. "+
+							"POST /v2/tasks rejects a mapping value with no path separator, so this fails at task "+
+							"creation rather than running -- and if it ever reached the runtime it would resolve to "+
+							"null on every run, leaving a dependency %q reading nothing. "+
+							"Point it at entity.<root>.<group>.<key>, task_outputs.<alias>.<field>, inputs.<name>, "+
+							"or __static__::<json> for a constant.\n",
 						i, ref, k, v, k)
 				}
 			}
