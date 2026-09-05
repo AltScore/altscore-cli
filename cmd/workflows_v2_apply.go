@@ -4148,19 +4148,48 @@ func preflightTasks(spec *composeSpec) error {
 					ref, fp)
 			}
 		case "compute-variables":
-			// compute-variables expressions live in the customVariables DSL
-			// scope; the runtime evaluates them against the workflow's
-			// customVariables dict, NOT the task's inputMappings. Wiring
-			// inputs via inputMappings on this task type is a no-op:
-			// inputMappings populates task_outputs.<this-task>.<field>
-			// AFTER the expression runs (which is itself silently
-			// useless since the DSL doesn't see them).
+			// A compute-variables node's inputMappings keys ARE names in that
+			// node's own activity context, so a custom variable may declare one
+			// as a BARE dependency and read it with inputs.get("<key>").
+			// GraphWorkflow._resolve_task_variables resolves each mapping into
+			// task_logic.resolvedInputs, StandardActivity.run merges those into
+			// the context it hands the method (resolving any entity.* reference
+			// against the database on the way), and
+			// ComputeVariablesActivity._collect_dependencies tests the declared
+			// dependency against that context FIRST.
+			//
+			// This is the ONLY way to read an entity field -- no dependency
+			// namespace addresses one -- and the only way for ONE custom
+			// variable to be shared by several nodes that each map a different
+			// source to the same key, which is how four copied per-persona
+			// expressions become one definition.
+			//
+			// What does NOT work is a value naming no namespace at all, and
+			// that one is worth saying out loud because the check below skips
+			// it (`dot <= 0` continues) and it looks deliberate on the page.
+			// ScopedWorkflowContext._split_reference returns an empty root_key
+			// for a dotless reference and resolve() then returns None without
+			// raising, so the key never reaches resolvedInputs and the variable
+			// is null on EVERY run with nothing to see. The common way to
+			// produce it is the identity projection `k -> k`, which the Hub
+			// writes for a dependency it cannot classify -- a typo included.
 			if im, _ := task["inputMappings"].(map[string]any); len(im) > 0 {
-				fmt.Fprintf(os.Stderr,
-					"# warning: tasks[%d] (ref=%q): compute-variables has inputMappings but those are NOT visible to the expression DSL. "+
-						"The DSL evaluates against the workflow's customVariables dict; reference values via the customVariable names directly. "+
-						"Wire upstream values into customVariables via the workflow body, not into this task's inputMappings.\n",
-					i, ref)
+				keys := make([]string, 0, len(im))
+				for k := range im {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				for _, k := range keys {
+					v, _ := im[k].(string)
+					if v == "" || strings.Contains(v, ".") || strings.HasPrefix(strings.TrimSpace(v), "{{") {
+						continue
+					}
+					fmt.Fprintf(os.Stderr,
+						"# warning: tasks[%d] (ref=%q): compute-variables inputMappings[%q]=%q names no namespace, so it resolves to null on every run "+
+							"and a dependency %q reads nothing. "+
+							"Point it at entity.<root>.<group>.<key>, task_outputs.<alias>.<field>, or inputs.<name>.\n",
+						i, ref, k, v, k)
+				}
 			}
 		case "customer", "deal", "asset":
 			// sourcesConfig entries control which fields are written/read.
