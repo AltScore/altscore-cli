@@ -1,0 +1,392 @@
+package cmd
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+
+	"github.com/AltScore/altscore-cli/internal/client"
+	"github.com/AltScore/altscore-cli/internal/output"
+	"github.com/spf13/cobra"
+)
+
+// Server-side apply: POST /v2/workflows/apply.
+//
+// Borrower Central accepts the flat authoring spec verbatim and does what this
+// CLI used to do in `postCapturedTasks` + `substituteWorkflowAliases` + the
+// lock / draft / autosave / publish dance: it resolves every spec-local ref to
+// a task alias BEFORE writing, validates the assembled graph with the oracle
+// publish uses, creates or version-bumps the tasks by (workflowAlias, specRef),
+// then creates / drafts+autosaves / publishes the workflow under the edit
+// lock. A rejected spec writes nothing; a mid-write infrastructure failure is
+// unwound server-side. `dryRun` returns the plan (exact ref -> alias map,
+// assembled graph, findings) without taking the lock.
+//
+// The CLI still owns authoring sugar and rendering: it parses, normalizes and
+// assembles exactly as before (composeWorkflowBody, posting nothing), then
+// rebuilds the flat spec from the assembled graph plus the captured task bodies
+// and sends it once. References inside bodies are already in the canonical
+// long form (`task_outputs.<ref>`) after assembly with the identity map.
+//
+// Availability. An older backend answers 404 (or 405: POST on a path that only
+// exists as GET /{workflow_id}) and apply falls back to the client-side
+// pipeline unchanged. That fallback is deleted one release after the endpoint
+// has been live.
+
+const serverApplyPath = "/v2/workflows/apply"
+
+// errServerApplyUnavailable is returned by applyViaServer when the backend
+// predates the endpoint; the caller falls back to the client-side pipeline.
+var errServerApplyUnavailable = errors.New("server-side apply is not available on this backend")
+
+// serverOwnedTaskKeys are body keys the server assigns or derives from the node
+// entry itself. Sending them is either rejected (alias, nodeId, taskId,
+// taskVersion) or pointless (specRef / workflowAlias: the server stamps its own;
+// position: lifted onto the node).
+var serverOwnedTaskKeys = map[string]bool{
+	"alias": true, "nodeId": true, "taskId": true, "taskVersion": true,
+	"specRef": true, "workflowAlias": true, "position": true,
+}
+
+type serverApplyOptions struct {
+	DryRun bool
+	// nil selects the server's default policy: an update over an ACTIVE version
+	// publishes, a create or an adopted DRAFT stays DRAFT.
+	Publish   *bool
+	ForceLock bool
+	ClientID  string
+}
+
+// serverApplyTask is one entry of the response's tasks[]: what happened to the
+// task behind a spec ref. action is created | bumped | unchanged | referenced.
+type serverApplyTask struct {
+	Ref           string   `json:"ref"`
+	Alias         string   `json:"alias"`
+	TaskID        string   `json:"taskId"`
+	Version       int      `json:"version"`
+	Action        string   `json:"action"`
+	DroppedFields []string `json:"droppedFields"`
+}
+
+type serverApplyResult struct {
+	Mode          string             `json:"mode"`
+	DryRun        bool               `json:"dryRun"`
+	WorkflowAlias string             `json:"workflowAlias"`
+	Workflow      json.RawMessage    `json:"workflow"`
+	Tasks         []serverApplyTask  `json:"tasks"`
+	Validation    validationResponse `json:"validation"`
+	Publish       struct {
+		Requested bool     `json:"requested"`
+		Published bool     `json:"published"`
+		Errors    []string `json:"errors"`
+	} `json:"publish"`
+	Lock struct {
+		Acquired bool `json:"acquired"`
+		Released bool `json:"released"`
+	} `json:"lock"`
+}
+
+// buildFlatSpecForServer rebuilds the flat authoring spec the server accepts
+// from the assembled graph (nodes keyed by their spec-local placeholder) and the
+// task bodies the assembly pass captured. ok is false when the spec cannot go
+// through the server path: an explicit node `alias` (the placeholder differs
+// from the ref; the server rejects that key) or a node with neither a captured
+// body nor a taskAlias.
+func buildFlatSpecForServer(assembled map[string]any, capture *composeCapture, targetAlias string) (map[string]any, bool) {
+	if capture == nil {
+		return nil, false
+	}
+	nodes := []map[string]any{}
+	for _, n := range asMapSlice(assembled["nodes"]) {
+		placeholder, _ := n["nodeId"].(string)
+		if placeholder == "" {
+			return nil, false
+		}
+		if ref, ok := capture.refByNodeID[placeholder]; ok && ref != "" && ref != placeholder {
+			// Explicit node alias: server-assigned on the new path.
+			return nil, false
+		}
+		flat := map[string]any{"ref": placeholder, "type": n["type"], "label": n["label"]}
+		if pos, ok := n["position"]; ok && pos != nil {
+			flat["position"] = pos
+		}
+		if raw, ok := capture.tasks[placeholder]; ok {
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				return nil, false
+			}
+			for k, v := range body {
+				if serverOwnedTaskKeys[k] || k == "type" || k == "label" {
+					continue
+				}
+				flat[k] = v
+			}
+		} else if ta, _ := n["taskAlias"].(string); ta != "" {
+			// Backed by a task that already exists: the server references it
+			// without writing it.
+			flat["taskAlias"] = ta
+		} else {
+			return nil, false
+		}
+		nodes = append(nodes, flat)
+	}
+
+	edges := []map[string]any{}
+	for _, e := range asMapSlice(assembled["edges"]) {
+		src, _ := e["sourceNodeId"].(string)
+		tgt, _ := e["targetNodeId"].(string)
+		if src == "" || tgt == "" {
+			return nil, false
+		}
+		flat := map[string]any{"from": src, "to": tgt}
+		for _, k := range []string{"sourceHandle", "targetHandle", "label"} {
+			if v, ok := e[k]; ok && v != nil {
+				flat[k] = v
+			}
+		}
+		// An auto-generated id tracks its endpoints; the server generates the
+		// same one (plus the handle). Only an explicit id travels.
+		if id, _ := e["id"].(string); id != "" && id != src+"->"+tgt {
+			flat["id"] = id
+		}
+		edges = append(edges, flat)
+	}
+
+	flat := map[string]any{
+		"alias": targetAlias,
+		"label": assembled["label"],
+		"nodes": nodes,
+		"edges": edges,
+	}
+	for _, k := range []string{"category", "description", "inputVariables", "customVariables", "config", "notes"} {
+		if v, ok := assembled[k]; ok {
+			flat[k] = v
+		}
+	}
+	return flat, true
+}
+
+// applyViaServer sends the flat spec to POST /v2/workflows/apply. It returns
+// errServerApplyUnavailable on a 404/405 (older backend) so the caller can fall
+// back, prints the server's findings for a 400/422 and returns a one-line
+// error, and returns the parsed result on 2xx.
+func applyViaServer(c *client.Client, cmd *cobra.Command, flat map[string]any, opts serverApplyOptions) (*serverApplyResult, error) {
+	req := map[string]any{
+		"spec":      flat,
+		"dryRun":    opts.DryRun,
+		"forceLock": opts.ForceLock,
+	}
+	if opts.Publish != nil {
+		req["publish"] = *opts.Publish
+	}
+	if opts.ClientID != "" {
+		req["clientId"] = opts.ClientID
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode apply request: %w", err)
+	}
+	data, status, err := c.DoKeepBody("POST", "borrower_central", serverApplyPath, json.RawMessage(body))
+	if err != nil {
+		return nil, fmt.Errorf("server apply: %w", err)
+	}
+	switch {
+	case status == http.StatusNotFound || status == http.StatusMethodNotAllowed:
+		return nil, errServerApplyUnavailable
+	case status >= 200 && status < 300:
+		var res serverApplyResult
+		if err := json.Unmarshal(data, &res); err != nil {
+			return nil, fmt.Errorf("server apply: unreadable %d response: %w", status, err)
+		}
+		return &res, nil
+	}
+	return nil, describeServerApplyError(cmd.ErrOrStderr(), status, data)
+}
+
+// serverErrorEnvelope is Borrower Central's error body.
+type serverErrorEnvelope struct {
+	Code    string         `json:"code"`
+	Message string         `json:"message"`
+	Details map[string]any `json:"details"`
+}
+
+// describeServerApplyError prints what the server found (findings, publish
+// errors, the lock holder) and returns the error apply exits with. The subcode
+// decides the rendering; unknown shapes fall back to the envelope's message.
+func describeServerApplyError(w io.Writer, status int, data json.RawMessage) error {
+	var env serverErrorEnvelope
+	if err := json.Unmarshal(data, &env); err != nil || env.Code == "" {
+		detail := strings.TrimSpace(string(data))
+		if len(detail) > 400 {
+			detail = detail[:400] + "..."
+		}
+		if detail == "" {
+			return fmt.Errorf("server apply: HTTP %d", status)
+		}
+		return fmt.Errorf("server apply: HTTP %d: %s", status, detail)
+	}
+	subCode, _ := env.Details["errorSubCode"].(string)
+
+	switch {
+	case subCode == "APPLY_SPEC_INVALID":
+		findings := findingsFromAny(env.Details["findings"])
+		printFindingLines(w, "ERROR", findings, nil)
+		return fmt.Errorf("server rejected the spec with %d finding(s) (see above); nothing was created", len(findings))
+
+	case subCode == "APPLY_VALIDATION_FAILED":
+		validation, _ := env.Details["validation"].(map[string]any)
+		findings := findingsFromAny(validation["findings"])
+		errs, warns := partitionFindings(findings)
+		printFindingLines(w, "ERROR", errs, nil)
+		printFindingLines(w, "WARN", warns, nil)
+		return fmt.Errorf("server pre-write validation failed with %d error(s) (see above); nothing was created", len(errs))
+
+	case subCode == "APPLY_PUBLISH_REJECTED":
+		applied, _ := env.Details["applied"].(map[string]any)
+		wfID, _ := applied["workflowId"].(string)
+		var lines []string
+		if raw, ok := env.Details["errors"].([]any); ok {
+			for _, e := range raw {
+				lines = append(lines, fmt.Sprintf("  - %v", e))
+			}
+		}
+		fmt.Fprintf(w, "# publish rejected the workflow; tasks and DRAFT %s were written and left in place:\n%s\n", wfID, strings.Join(lines, "\n"))
+		return fmt.Errorf("workflow saved as DRAFT %s but publish rejected it (%d error(s), see above); fix the spec and re-apply, or fix the draft in the builder", wfID, len(lines))
+
+	case env.Code == "LOCK_CONFLICT" || env.Code == "SELF_LOCK_CONFLICT":
+		holder := "another session"
+		since := ""
+		if by, ok := env.Details["lockedBy"].(map[string]any); ok {
+			if email, _ := by["email"].(string); email != "" {
+				holder = email
+			}
+		}
+		if at, _ := env.Details["lockedAt"].(string); at != "" {
+			since = " since " + at
+		}
+		return fmt.Errorf("%s (held by %s%s). Ask them to close the builder tab, or pass --force-lock to take the lock -- that discards whatever that session has unsaved", env.Message, holder, since)
+
+	case subCode == "APPLY_FAILED":
+		rolledBack, _ := env.Details["rolledBack"].(bool)
+		detail, _ := env.Details["error"].(string)
+		if rolledBack {
+			return fmt.Errorf("server apply failed mid-write and was rolled back (%s); nothing remains, retry", detail)
+		}
+		return fmt.Errorf("server apply failed mid-write and could NOT be fully rolled back (%s); inspect the tenant before retrying: %v", detail, env.Details["applied"])
+	}
+
+	msg := fmt.Sprintf("server apply: HTTP %d %s", status, env.Code)
+	if env.Message != "" {
+		msg += ": " + env.Message
+	}
+	if subCode != "" {
+		msg += " [errorSubCode=" + subCode + "]"
+	}
+	return errors.New(msg)
+}
+
+// findingsFromAny decodes a findings list that arrived inside a generic error
+// envelope (map[string]any values) into validationFinding.
+func findingsFromAny(v any) []validationFinding {
+	raw, err := json.Marshal(v)
+	if err != nil || len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var findings []validationFinding
+	if err := json.Unmarshal(raw, &findings); err != nil {
+		return nil
+	}
+	return findings
+}
+
+// printServerApplySummary writes the plan / outcome the server reported: one
+// line per task (ref -> alias, what happened, version), dropped fields, warning
+// findings, and the publish outcome.
+func printServerApplySummary(w io.Writer, res *serverApplyResult) {
+	counts := map[string]int{}
+	for _, t := range res.Tasks {
+		counts[t.Action]++
+	}
+	actions := make([]string, 0, len(counts))
+	for action := range counts {
+		actions = append(actions, action)
+	}
+	sort.Strings(actions)
+	parts := make([]string, 0, len(actions))
+	for _, action := range actions {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[action], action))
+	}
+	verb := "apply"
+	if res.DryRun {
+		verb = "plan"
+	}
+	fmt.Fprintf(w, "# server %s: mode=%s alias=%s tasks: %s\n", verb, res.Mode, res.WorkflowAlias, strings.Join(parts, ", "))
+	for _, t := range res.Tasks {
+		version := ""
+		if t.Version > 0 {
+			version = fmt.Sprintf(", v%d", t.Version)
+		}
+		fmt.Fprintf(w, "#   %s -> %s (%s%s)\n", t.Ref, t.Alias, t.Action, version)
+		if len(t.DroppedFields) > 0 {
+			fmt.Fprintf(w, "#     WARNING: the server dropped field(s) the task schema does not declare: %s\n", strings.Join(t.DroppedFields, ", "))
+		}
+	}
+	_, warns := partitionFindings(res.Validation.Findings)
+	if len(warns) > 0 {
+		fmt.Fprintf(w, "# server validation: %d warning(s) (apply proceeds):\n", len(warns))
+		printFindingLines(w, "WARN", warns, nil)
+	}
+	if res.DryRun {
+		return
+	}
+	switch {
+	case res.Publish.Requested && res.Publish.Published:
+		fmt.Fprintln(w, "# published")
+	case res.Publish.Requested:
+		fmt.Fprintf(w, "# publish requested but not published: %s\n", strings.Join(res.Publish.Errors, "; "))
+	default:
+		fmt.Fprintln(w, "# left as DRAFT (pass --publish to go live)")
+	}
+}
+
+// finishServerApply renders a successful server round trip for the three
+// modes: --diff (exact-identity diff against the tenant), --dry-run (plan +
+// the assembled graph with resolved aliases) and a real apply (summary, entity
+// re-scope, the persisted workflow on stdout).
+func finishServerApply(c *client.Client, cmd *cobra.Command, spec *composeSpec, res *serverApplyResult, existing map[string]any, targetAlias string, diffFlag, dryRun, skipRescope, allowStealOwnership bool) error {
+	errOut := cmd.ErrOrStderr()
+	var planned map[string]any
+	if len(res.Workflow) > 0 {
+		if err := json.Unmarshal(res.Workflow, &planned); err != nil {
+			return fmt.Errorf("server apply: unreadable workflow in response: %w", err)
+		}
+	}
+
+	if diffFlag {
+		printServerApplySummary(errOut, res)
+		// The server resolved every ref to its real alias (existing tasks keep
+		// theirs), so nodes are matched by alias, not by the label heuristic.
+		return diffWorkflowWith(c, cmd, spec, planned, existing, targetAlias, diffIdentityByAlias)
+	}
+
+	if dryRun {
+		printServerApplySummary(errOut, res)
+		fmt.Fprintf(cmd.OutOrStderr(), "# DRY RUN (server plan) -- %s path for alias=%s; nothing written. Body below is the graph the server would persist.\n", res.Mode, res.WorkflowAlias)
+		return output.RawJSON(res.Workflow)
+	}
+
+	printServerApplySummary(errOut, res)
+	if !skipRescope {
+		if err := reconcileEntityScopes(c, spec, targetAlias, allowStealOwnership, errOut); err != nil {
+			fmt.Fprintf(errOut, "# warning: entity-scope reconciliation hit an issue: %v (workflow itself is fine; re-scope failed entities manually with `altscore <resource> update <id> --workflow-alias %s`)\n", err, targetAlias)
+		}
+	}
+	wfID, _ := planned["id"].(string)
+	status, _ := planned["status"].(string)
+	fmt.Fprintf(cmd.OutOrStderr(), "# applied workflow %s (alias=%s, status=%s)\n", wfID, targetAlias, status)
+	return output.RawJSON(res.Workflow)
+}

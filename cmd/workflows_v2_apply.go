@@ -388,35 +388,60 @@ End-node output (endConfig on the 'end' node):
 				composeAllowSteal = true
 			}
 
-			// dryRun=true selects PREVIEW assembly (tolerant normalization + a
-			// "Would POST" echo of each body); the real apply path assembles
-			// strictly, validates the assembled graph against BC's server-side
-			// pre-flight, and only then POSTs -- a graph BC would reject at
-			// create/publish otherwise leaks task versions with no rollback.
-			var workflow map[string]any
+			// Assemble ONCE, posting nothing. Preview modes (--diff / --dry-run)
+			// assemble tolerantly (stubbed lookups + a "Would POST" echo); the
+			// real apply assembles strictly. compose mutates the spec in place,
+			// so every path below reuses this one assembly.
+			previewAssembly := diffFlag || dryRun
+			capture := newComposeCapture()
+			workflow, err := composeWorkflowBody(c, &spec, previewAssembly, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, !noLayout, capture)
+			if err != nil {
+				return err
+			}
+
+			// Server-side apply first: POST /v2/workflows/apply takes the flat
+			// spec and owns ref resolution, validation, task identity, the lock
+			// and publish, all-or-nothing. Only a backend that predates the
+			// endpoint (404/405) falls through to the client-side pipeline below,
+			// which is deleted one release after the endpoint has been live.
+			if flat, ok := buildFlatSpecForServer(workflow, capture, targetAlias); ok {
+				var publishOpt *bool
+				if publish {
+					yes := true
+					publishOpt = &yes
+				}
+				res, serr := applyViaServer(c, cmd, flat, serverApplyOptions{
+					DryRun:    diffFlag || dryRun,
+					Publish:   publishOpt,
+					ForceLock: forceLock,
+					ClientID:  fmt.Sprintf("apply-%d", time.Now().UnixNano()),
+				})
+				switch {
+				case serr == nil:
+					return finishServerApply(c, cmd, &spec, res, existing, targetAlias, diffFlag, dryRun, skipRescope, allowStealOwnership)
+				case serr == errServerApplyUnavailable:
+					dimNote(cmd.ErrOrStderr(), "server-side apply is not available on this backend; using the client-side pipeline")
+				default:
+					return serr
+				}
+			} else {
+				dimNote(cmd.ErrOrStderr(), "spec sets an explicit node alias, which the server-side apply does not accept; using the client-side pipeline")
+			}
+
+			// === Client-side pipeline (older backend) ===
 			switch {
 			case diffFlag:
-				// Read-only preview: assemble (no POSTs), skip the server pre-flight.
-				workflow, err = composeWorkflowBody(c, &spec, true, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, !noLayout, nil)
-				if err != nil {
-					return err
-				}
+				// Read-only preview: the assembly above is all it needs.
 			case dryRun:
-				// Dry-run: assemble (no POSTs), then run the server pre-flight and
-				// print its findings. Advisory here -- dry-run mutates nothing and
-				// still prints the assembled body below regardless of findings.
-				capture := newComposeCapture()
-				workflow, err = composeWorkflowBody(c, &spec, true, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, !noLayout, capture)
-				if err != nil {
-					return err
-				}
+				// Run the server pre-flight and print its findings. Advisory here:
+				// dry-run mutates nothing and still prints the assembled body
+				// below regardless of findings.
 				_ = serverPreflightValidate(c, cmd, workflow, capture, false, allowUnvalidated)
 			default:
 				// Real apply (create OR update): validate before posting anything,
 				// abort on server errors -- and on an unusable oracle, unless
 				// --allow-unvalidated.
-				workflow, err = applyAssembleValidateAndPost(c, cmd, &spec, publish, skipRescope, allowStealOwnership, noAutoDefaults, noLayout, allowUnvalidated)
-				if err != nil {
+				if err := applyValidateAndPost(c, cmd, workflow, capture, allowUnvalidated); err != nil {
 					return err
 				}
 			}
@@ -653,16 +678,16 @@ End-node output (endConfig on the 'end' node):
 		},
 	}
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON spec (or pipe via stdin)")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the assembled workflow body without making API calls")
-	cmd.Flags().BoolVar(&diffFlag, "diff", false, "preview structural changes against the current tenant state. Fetches the existing workflow (if any), assembles the spec body in memory, and prints a human-readable diff. No API mutations. Mutually exclusive with --dry-run and --publish")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview: assemble the spec, ask the server for its plan (every ref resolved to its task alias, created/bumped/unchanged per task, validation findings) and print the graph that would be persisted. Reads only; nothing is written and no lock is taken")
+	cmd.Flags().BoolVar(&diffFlag, "diff", false, "preview structural changes against the current tenant state. Fetches the existing workflow (if any), obtains the server's plan for the spec, and prints a human-readable diff keyed by real task alias. No API mutations. Mutually exclusive with --dry-run and --publish")
 	cmd.Flags().BoolVar(&publish, "publish", false, "publish the workflow after creation (CREATE path only; UPDATE path always publishes the draft it produced)")
 	cmd.Flags().BoolVar(&skipLintOnPublish, "skip-lint-on-publish", false, "skip the pre-publish topology lint that refuses to publish on errors")
 	cmd.Flags().BoolVar(&skipRescope, "skip-rescope", false, "do not stamp referenced credit-decisioning entities (scorecards, rule-trees, etc.) to the workflow's alias after apply")
 	cmd.Flags().BoolVar(&allowStealOwnership, "allow-steal-ownership", false, "permit apply to transfer a credit-decisioning entity's workflowAlias when it is currently owned by ANOTHER workflow. Default: refuse and instruct the spec author to clone the entity with a new code. Use only for rare workflow rename / identity migration / decommissioning scenarios")
-	cmd.Flags().BoolVar(&verify, "verify", true, "after writing, read back the persisted tasks and warn (stderr, non-fatal) about any spec-set field the backend dropped or nulled. Pass --verify=false to skip the extra GETs")
+	cmd.Flags().BoolVar(&verify, "verify", true, "client-side pipeline only: after writing, read back the persisted tasks and warn (stderr, non-fatal) about any spec-set field the backend dropped or nulled. The server-side apply reports dropped fields per task in its response instead. Pass --verify=false to skip the extra GETs")
 	cmd.Flags().BoolVar(&noAutoDefaults, "no-auto-defaults", false, "disable apply's opinionated convenience defaults: (1) end-node borrower_id/billable_id wired to the single customer node's borrower_id, (2) end-node PDF generation (pdfConfig.enabled+pdfGenerationRequired default to true), (3) deal-contact identity_value back-filled from each contact's identity_key field (default tax_id). Each only fills an absent field; caller-supplied values always win -- an explicit pdfConfig.enabled=false keeps the report off")
 	cmd.Flags().BoolVar(&forceLock, "force-lock", false, "take the workflow's edit lock even when a live session holds it. By default apply only reclaims a lock a previous apply run abandoned (its own clientId prefix, never renewed) and refuses anything that looks like an open Hub tab, naming the holder. Forcing discards whatever that session has unsaved")
-	cmd.Flags().BoolVar(&allowUnvalidated, "allow-unvalidated", false, "proceed when the server pre-flight (POST /v2/workflows/validate) cannot be used: a 5xx, a rejected request, a transport error or an unreadable response. Default: refuse, because a graph the server later rejects leaks /v2/tasks rows that cannot be deleted. A 404 from a backend that predates the endpoint always proceeds")
+	cmd.Flags().BoolVar(&allowUnvalidated, "allow-unvalidated", false, "client-side pipeline only (backends without POST /v2/workflows/apply): proceed when the server pre-flight (POST /v2/workflows/validate) cannot be used: a 5xx, a rejected request, a transport error or an unreadable response. Default: refuse, because a graph the server later rejects leaks /v2/tasks rows that cannot be deleted. A 404 from a backend that predates the endpoint always proceeds")
 	cmd.Flags().BoolVar(&noLayout, "no-layout", false, "skip auto-layout of the canvas. By default apply positions nodes in left-to-right columns (the same algorithm as the Hub builder's Align button) so the graph opens readable; with this flag nodes ship on a single row at a 200px pitch and overlap until someone clicks Align. Auto-layout is also skipped when the spec pins `position` on any node")
 	return cmd
 }

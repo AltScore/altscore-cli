@@ -136,7 +136,59 @@ func (c *Client) ModuleBaseURL(module string) (string, error) {
 	return c.moduleURL(module)
 }
 
+// doOnce performs one request and applies the CLI's default status policy: a
+// 401 comes back as (nil, 401, nil) for the caller's refresh, any other >=400
+// is folded into err (data nil), an empty 2xx body is nil.
 func (c *Client) doOnce(method, module, path string, body any, headers map[string]string) (json.RawMessage, int, error) {
+	respBody, status, err := c.doRequest(method, module, path, body, headers)
+	if err != nil {
+		return nil, status, err
+	}
+
+	if status == http.StatusUnauthorized {
+		return nil, status, nil
+	}
+
+	if status >= 400 {
+		return nil, status, formatHTTPError(status, respBody)
+	}
+
+	// Some endpoints return no body (204, etc.)
+	if len(respBody) == 0 {
+		return nil, status, nil
+	}
+
+	return json.RawMessage(respBody), status, nil
+}
+
+// DoKeepBody is Do for callers that read a STRUCTURED error body: the response
+// body comes back for every status and a >=400 status is not folded into err,
+// which is non-nil only for transport failures. The 401 auto-refresh still
+// applies. `workflows-v2 apply` uses it to render the server's per-node
+// findings from a 422 instead of a flattened one-line error.
+func (c *Client) DoKeepBody(method, module, path string, body any) (json.RawMessage, int, error) {
+	respBody, status, err := c.doRequest(method, module, path, body, nil)
+	if err != nil {
+		return nil, status, err
+	}
+	if status == http.StatusUnauthorized {
+		if c.Verbose {
+			fmt.Fprintln(os.Stderr, "Token expired, refreshing...")
+		}
+		if err := c.refreshToken(); err != nil {
+			return nil, status, fmt.Errorf("token refresh failed: %w", err)
+		}
+		respBody, status, err = c.doRequest(method, module, path, body, nil)
+		if err != nil {
+			return nil, status, err
+		}
+	}
+	return json.RawMessage(respBody), status, nil
+}
+
+// doRequest is the transport: build, send, read. It returns the body for every
+// status and leaves the status policy to its callers.
+func (c *Client) doRequest(method, module, path string, body any, headers map[string]string) ([]byte, int, error) {
 	baseURL, err := c.moduleURL(module)
 	if err != nil {
 		return nil, 0, err
@@ -197,20 +249,7 @@ func (c *Client) doOnce(method, module, path string, body any, headers map[strin
 		fmt.Fprintf(os.Stderr, "HTTP %d (%d bytes)\n", resp.StatusCode, len(respBody))
 	}
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, resp.StatusCode, nil
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, resp.StatusCode, formatHTTPError(resp.StatusCode, respBody)
-	}
-
-	// Some endpoints return no body (204, etc.)
-	if len(respBody) == 0 {
-		return nil, resp.StatusCode, nil
-	}
-
-	return json.RawMessage(respBody), resp.StatusCode, nil
+	return respBody, resp.StatusCode, nil
 }
 
 func (c *Client) refreshToken() error {

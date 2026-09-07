@@ -96,7 +96,44 @@ func normalizeMappings(m map[string]any) map[string]any {
 // RunE) returns nil and Cobra prints nothing extra; the diff itself goes to
 // stdout so it composes with `| less` / `> /tmp/foo`.
 func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assembled map[string]any, existing map[string]any, targetAlias string) error {
+	return diffWorkflowWith(c, cmd, spec, assembled, existing, targetAlias, diffIdentityByLabel)
+}
+
+// diffIdentity is how nodes on the two sides of a diff are matched.
+//
+//   - diffIdentityByLabel: the client-side pipeline's heuristic. The assembled
+//     body carries spec-local refs (nothing was posted), the tenant carries
+//     hash-suffixed aliases, so the label slug is the only stable key and refs
+//     are mapped to live aliases by that same key (diffRefMap).
+//   - diffIdentityByAlias: the server-side plan. POST /v2/workflows/apply with
+//     dryRun resolved every ref to its REAL alias (existing tasks keep theirs),
+//     so nodes match by alias and a relabel is `~`, never `-`/`+`.
+type diffIdentity int
+
+const (
+	diffIdentityByLabel diffIdentity = iota
+	diffIdentityByAlias
+)
+
+func (d diffIdentity) keyFn() func(map[string]any) string {
+	if d == diffIdentityByAlias {
+		return nodeAliasKey
+	}
+	return nodeDiffKey
+}
+
+// nodeAliasKey is the exact identity: the task alias, else the node id.
+func nodeAliasKey(n map[string]any) string {
+	if alias, _ := n["taskAlias"].(string); alias != "" {
+		return alias
+	}
+	id, _ := n["nodeId"].(string)
+	return id
+}
+
+func diffWorkflowWith(c *client.Client, cmd *cobra.Command, spec *composeSpec, assembled map[string]any, existing map[string]any, targetAlias string, identity diffIdentity) error {
 	out := cmd.OutOrStdout()
+	keyFn := identity.keyFn()
 
 	// === CREATE preview ===
 	if existing == nil {
@@ -144,8 +181,11 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 	// live aliases. Resolve each spec node to its live counterpart by the label
 	// identity the node diff already uses, and rewrite the assembled body's
 	// references with that map; otherwise every custom variable that reads a
-	// task output shows as changed on a no-op re-apply.
-	assembled = resolveAssembledRefsForDiff(assembled, current)
+	// task output shows as changed on a no-op re-apply. The server-side plan
+	// arrives with real aliases already, so it skips this.
+	if identity == diffIdentityByLabel {
+		assembled = resolveAssembledRefsForDiff(assembled, current)
+	}
 
 	// Header. Slice the id to 8 chars to keep the header compact -- the full
 	// UUID is already in the GET URL above so the agent can copy it.
@@ -187,8 +227,8 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 
 	// Nodes diff: keyed by taskAlias (start nodes have no taskAlias, so we
 	// fall back to nodeId for graph-only entries).
-	specNodes := indexNodesByKey(toMapSlice(assembled["nodes"]))
-	currNodes := indexNodesByKey(toMapSlice(current["nodes"]))
+	specNodes := indexNodesBy(toMapSlice(assembled["nodes"]), keyFn)
+	currNodes := indexNodesBy(toMapSlice(current["nodes"]), keyFn)
 	added, removed, changed := diffNodeIndex(specNodes, currNodes)
 	for _, key := range added {
 		n := specNodes[key]
@@ -218,8 +258,8 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 	// Edges diff: keyed by (diff-source, sourceHandle, diff-target) where
 	// diff-source/target use the same identity rule as indexNodesByKey
 	// (slugified label, falling back to stripped alias).
-	specNodeKeys := buildNodeKeyByID(toMapSlice(assembled["nodes"]))
-	currNodeKeys := buildNodeKeyByID(toMapSlice(current["nodes"]))
+	specNodeKeys := buildNodeKeyByIDWith(toMapSlice(assembled["nodes"]), keyFn)
+	currNodeKeys := buildNodeKeyByIDWith(toMapSlice(current["nodes"]), keyFn)
 	specEdges := indexEdges(toMapSlice(assembled["edges"]), specNodeKeys)
 	currEdges := indexEdges(toMapSlice(current["edges"]), currNodeKeys)
 	for k := range specEdges {
@@ -282,9 +322,14 @@ type nodeChange struct {
 //  2. stripped taskAlias -- for nodes without labels (rare).
 //  3. raw nodeId -- last resort.
 func indexNodesByKey(nodes []map[string]any) map[string]map[string]any {
+	return indexNodesBy(nodes, nodeDiffKey)
+}
+
+// indexNodesBy is indexNodesByKey under an explicit identity rule.
+func indexNodesBy(nodes []map[string]any, keyFn func(map[string]any) string) map[string]map[string]any {
 	out := map[string]map[string]any{}
 	for _, n := range nodes {
-		key := nodeDiffKey(n)
+		key := keyFn(n)
 		if key == "" {
 			continue
 		}
@@ -472,6 +517,13 @@ func indexEdges(edges []map[string]any, nodeKeyByID map[string]string) map[edgeK
 // buildNodeKeyByID returns {nodeId -> diff-key} for a node slice. Used to
 // translate edge endpoints into the same key space indexNodesByKey uses.
 func buildNodeKeyByID(nodes []map[string]any) map[string]string {
+	return buildNodeKeyByIDWith(nodes, nodeDiffKey)
+}
+
+// buildNodeKeyByIDWith maps each node's graph id to its diff identity under an
+// explicit identity rule (the same one indexNodesBy used for the node section,
+// so edge endpoints and node keys agree).
+func buildNodeKeyByIDWith(nodes []map[string]any, keyFn func(map[string]any) string) map[string]string {
 	out := map[string]string{}
 	for _, n := range nodes {
 		nodeID, _ := n["nodeId"].(string)
@@ -481,18 +533,9 @@ func buildNodeKeyByID(nodes []map[string]any) map[string]string {
 		if nodeID == "" {
 			continue
 		}
-		key := ""
-		if label, _ := n["label"].(string); label != "" {
-			key = slugifyWorkflowLabel(label)
+		if key := keyFn(n); key != "" {
+			out[nodeID] = key
 		}
-		if key == "" {
-			alias, _ := n["taskAlias"].(string)
-			if alias == "" {
-				alias = nodeID
-			}
-			key = stripHashSuffix(alias)
-		}
-		out[nodeID] = key
 	}
 	return out
 }

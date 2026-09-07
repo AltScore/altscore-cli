@@ -328,23 +328,31 @@ func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *co
 	if err != nil {
 		return nil, err
 	}
+	if err := applyValidateAndPost(c, cmd, wf, capture, allowUnvalidated); err != nil {
+		return nil, err
+	}
+	return wf, nil
+}
 
+// applyValidateAndPost is phases 2-4 of the client-side pipeline on an already
+// assembled graph: server pre-flight, task POSTs, alias substitution in place.
+// Split from the assembly so the server-side apply path (which assembles once
+// and sends the spec) can fall back here on an older backend without
+// re-running the assembly -- compose mutates the spec, so it must run once.
+func applyValidateAndPost(c *client.Client, cmd *cobra.Command, wf map[string]any, capture *composeCapture, allowUnvalidated bool) error {
 	// Phase 2: validate the exact artifacts we are about to post.
 	if abortErr := serverPreflightValidate(c, cmd, wf, capture, true, allowUnvalidated); abortErr != nil {
-		return nil, abortErr
+		return abortErr
 	}
 
 	// Phase 3: post the task bodies, minting the real aliases + versions.
 	refMap, versionMap, err := postCapturedTasks(c, capture)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// Phase 4: the only change between the validated body and the posted body.
-	if err := substituteWorkflowAliases(wf, refMap, versionMap); err != nil {
-		return nil, err
-	}
-	return wf, nil
+	return substituteWorkflowAliases(wf, refMap, versionMap)
 }
 
 // postCapturedTasks POSTs every task body the assembly pass recorded, in the
