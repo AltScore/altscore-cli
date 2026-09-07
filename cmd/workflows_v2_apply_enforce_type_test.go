@@ -46,6 +46,41 @@ func TestStampEnforceTypeOnlyTouchesNewTypedVariables(t *testing.T) {
 	}
 }
 
+// A re-apply must not weaken a variable's contract: the live enforceType is
+// carried forward when the spec is silent, whatever its value.
+func TestStampEnforceTypeCarriesLiveEnforcementForward(t *testing.T) {
+	spec := map[string]any{
+		"enforced":   varDef("number"),
+		"relaxed":    varDef("number"),
+		"unstamped":  varDef("number"),
+		"overridden": map[string]any{"type": "number", "enforceType": false},
+	}
+	existing := map[string]any{
+		"enforced":   map[string]any{"type": "number", "enforceType": true},
+		"relaxed":    map[string]any{"type": "number", "enforceType": false},
+		"unstamped":  varDef("number"),
+		"overridden": map[string]any{"type": "number", "enforceType": true},
+	}
+	var warn bytes.Buffer
+	stampEnforceTypeOnNewVariables(spec, existing, &warn)
+
+	if spec["enforced"].(map[string]any)["enforceType"] != true {
+		t.Error("a live enforceType:true must survive a re-apply that omits the field")
+	}
+	if spec["relaxed"].(map[string]any)["enforceType"] != false {
+		t.Error("a live enforceType:false must be carried forward as-is, not upgraded")
+	}
+	if _, ok := spec["unstamped"].(map[string]any)["enforceType"]; ok {
+		t.Error("a live variable that never had enforceType must not gain one")
+	}
+	if spec["overridden"].(map[string]any)["enforceType"] != false {
+		t.Error("an explicit spec value still wins over the live one")
+	}
+	if warn.Len() != 0 {
+		t.Errorf("carrying live state forward is not a stamp and must not be reported, got %q", warn.String())
+	}
+}
+
 func TestStampEnforceTypeOnCreatePathStampsEverythingTyped(t *testing.T) {
 	spec := map[string]any{"a": varDef("number"), "b": varDef("boolean")}
 	stampEnforceTypeOnNewVariables(spec, nil, nil)
