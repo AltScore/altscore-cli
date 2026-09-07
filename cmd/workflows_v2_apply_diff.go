@@ -139,6 +139,14 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 		return fmt.Errorf("diff: parse current workflow %s: %w", existingID, err)
 	}
 
+	// The assembled body still names spec-local refs: diff posts no tasks, so
+	// no server alias was ever minted. The tenant's variables and mappings name
+	// live aliases. Resolve each spec node to its live counterpart by the label
+	// identity the node diff already uses, and rewrite the assembled body's
+	// references with that map; otherwise every custom variable that reads a
+	// task output shows as changed on a no-op re-apply.
+	assembled = resolveAssembledRefsForDiff(assembled, current)
+
 	// Header. Slice the id to 8 chars to keep the header compact -- the full
 	// UUID is already in the GET URL above so the agent can copy it.
 	shortID := existingID
@@ -276,21 +284,109 @@ type nodeChange struct {
 func indexNodesByKey(nodes []map[string]any) map[string]map[string]any {
 	out := map[string]map[string]any{}
 	for _, n := range nodes {
-		key := ""
-		if label, _ := n["label"].(string); label != "" {
-			key = slugifyWorkflowLabel(label)
-		}
-		if key == "" {
-			alias, _ := n["taskAlias"].(string)
-			if alias == "" {
-				alias, _ = n["nodeId"].(string)
-			}
-			key = stripHashSuffix(alias)
-		}
+		key := nodeDiffKey(n)
 		if key == "" {
 			continue
 		}
 		out[key] = n
+	}
+	return out
+}
+
+// nodeDiffKey is the identity rule indexNodesByKey documents, for one node.
+func nodeDiffKey(n map[string]any) string {
+	if label, _ := n["label"].(string); label != "" {
+		if key := slugifyWorkflowLabel(label); key != "" {
+			return key
+		}
+	}
+	alias, _ := n["taskAlias"].(string)
+	if alias == "" {
+		alias, _ = n["nodeId"].(string)
+	}
+	return stripHashSuffix(alias)
+}
+
+// diffRefMap maps each assembled node's placeholder (the spec-local ref that
+// stands in for a task alias while nothing has been posted) to the alias of
+// the live node with the same diff identity. Nodes the tenant does not have
+// yet are absent from the map and keep their spec-local ref, which is what a
+// genuinely new reference should look like in the diff.
+func diffRefMap(specNodes, currNodes []map[string]any) map[string]string {
+	currByKey := indexNodesByKey(currNodes)
+	refMap := map[string]string{}
+	for _, n := range specNodes {
+		ref, _ := n["taskAlias"].(string)
+		if ref == "" {
+			ref, _ = n["nodeId"].(string)
+		}
+		if ref == "" {
+			continue
+		}
+		cn, ok := currByKey[nodeDiffKey(n)]
+		if !ok {
+			continue
+		}
+		if alias, _ := cn["taskAlias"].(string); alias != "" && alias != ref {
+			refMap[ref] = alias
+		}
+	}
+	return refMap
+}
+
+// resolveAssembledRefsForDiff returns a copy of the assembled body whose
+// customVariables and node inputMappings name the tenant's live aliases in
+// place of spec-local refs, using diffRefMap. The long form is rewritten with
+// the same pass apply's post phase uses; the bare `<ref>.<field>` mapping head
+// is substituted here without the typo check, since an unknown head in diff
+// mode is simply a node the tenant does not have yet. The input is not mutated.
+func resolveAssembledRefsForDiff(assembled, current map[string]any) map[string]any {
+	refMap := diffRefMap(toMapSlice(assembled["nodes"]), toMapSlice(current["nodes"]))
+	if len(refMap) == 0 {
+		return assembled
+	}
+	raw, err := json.Marshal(assembled)
+	if err != nil {
+		return assembled
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return assembled
+	}
+	if cvs, ok := out["customVariables"].(map[string]any); ok {
+		rewriteTaskOutputsRefsDeep(cvs, refMap, nil)
+	}
+	for _, n := range toMapSlice(out["nodes"]) {
+		for _, holder := range []map[string]any{n, toMap(n["data"])} {
+			if m, ok := holder["inputMappings"].(map[string]any); ok {
+				holder["inputMappings"] = rewriteMappingHeadsLenient(m, refMap)
+			}
+		}
+	}
+	return out
+}
+
+// rewriteMappingHeadsLenient substitutes spec-local refs in mapping values --
+// the long `task_outputs.<ref>.<f>` form and the bare `<ref>.<f>` head --
+// leaving anything it does not recognize untouched. Returns a fresh map.
+func rewriteMappingHeadsLenient(m map[string]any, refMap map[string]string) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		s, ok := v.(string)
+		if !ok {
+			out[k] = v
+			continue
+		}
+		if strings.HasPrefix(s, "task_outputs.") {
+			out[k] = rewriteTaskOutputsRefsInString(s, refMap)
+			continue
+		}
+		if dot := strings.Index(s, "."); dot > 0 {
+			if alias, found := refMap[s[:dot]]; found {
+				s = alias + s[dot:]
+			}
+		}
+		out[k] = s
 	}
 	return out
 }

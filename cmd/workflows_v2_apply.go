@@ -446,6 +446,10 @@ End-node output (endConfig on the 'end' node):
 
 			var resultJSON []byte
 			var wfID string
+			// publishedID is the id that went ACTIVE in this run: the created
+			// workflow on the CREATE path, the draft on the UPDATE path. Empty
+			// when nothing was published.
+			var publishedID string
 
 			if existing == nil {
 				// === CREATE path ===
@@ -468,9 +472,14 @@ End-node output (endConfig on the 'end' node):
 				if publish {
 					// Create path holds no lock: a brand-new workflow has no
 					// alias lock, so there is no token to present.
-					if err := lintAndPublish(c, cmd, wfID, skipLintOnPublish, ""); err != nil {
+					published, err := lintAndPublish(c, cmd, wfID, skipLintOnPublish, "")
+					if err != nil {
 						return err
 					}
+					if len(published) > 0 {
+						resultJSON = published
+					}
+					publishedID = wfID
 				}
 			} else {
 				// === UPDATE path ===
@@ -599,9 +608,17 @@ End-node output (endConfig on the 'end' node):
 				//      rather than surprising the author by going live. This
 				//      mirrors the CREATE path (DRAFT unless --publish).
 				if !adoptDraft || publish {
-					if err := lintAndPublish(c, cmd, draftID, skipLintOnPublish, lockToken); err != nil {
+					// Publishing the draft makes ITS id the live version and archives
+					// the one we looked up, so from here on the draft id is the
+					// workflow apply produced.
+					published, err := lintAndPublish(c, cmd, draftID, skipLintOnPublish, lockToken)
+					if err != nil {
 						return err
 					}
+					if len(published) > 0 {
+						resultJSON = published
+					}
+					publishedID = draftID
 				} else {
 					fmt.Fprintf(cmd.OutOrStderr(), "# updated DRAFT workflow %s (alias=%s); not published (pass --publish to go live)\n", draftID, targetAlias)
 				}
@@ -629,8 +646,8 @@ End-node output (endConfig on the 'end' node):
 				verifyAppliedTasks(c, &spec, workflow, cmd.ErrOrStderr())
 			}
 
-			if wfID != "" && publish {
-				fmt.Fprintf(cmd.OutOrStderr(), "# applied workflow %s (alias=%s)\n", wfID, targetAlias)
+			if publishedID != "" {
+				fmt.Fprintf(cmd.OutOrStderr(), "# applied workflow %s (alias=%s)\n", publishedID, targetAlias)
 			}
 			return output.RawJSON(resultJSON)
 		},
@@ -659,7 +676,7 @@ End-node output (endConfig on the 'end' node):
 // The backend's publish guard is token-strict: with a lock in place and no
 // token, publish answers 423 LOCKED even for that lock's own holder -- which is
 // what made every update-path apply die at this step (HQ #1228).
-func lintAndPublish(c *client.Client, cmd *cobra.Command, wfID string, skipLintOnPublish bool, lockToken string) error {
+func lintAndPublish(c *client.Client, cmd *cobra.Command, wfID string, skipLintOnPublish bool, lockToken string) (json.RawMessage, error) {
 	lintData, _, lerr := c.Do("GET", "borrower_central", "/v2/workflows/"+wfID, nil)
 	if lerr == nil {
 		var wfFull map[string]any
@@ -677,7 +694,7 @@ func lintAndPublish(c *client.Client, cmd *cobra.Command, wfID string, skipLintO
 						"# WARNING: pre-publish lint found %d topology error(s) but --skip-lint-on-publish was set; publishing anyway:\n%s\n",
 						len(errs), strings.Join(errs, "\n"))
 				} else {
-					return fmt.Errorf(
+					return nil, fmt.Errorf(
 						"workflow %s created but pre-publish lint found %d topology error(s); refusing to publish:\n%s\n"+
 							"Fix the spec, run 'altscore workflows-v2 publish %s' manually after editing, or pass --skip-lint-on-publish.",
 						wfID, len(errs), strings.Join(errs, "\n"), wfID,
@@ -686,11 +703,19 @@ func lintAndPublish(c *client.Client, cmd *cobra.Command, wfID string, skipLintO
 			}
 		}
 	}
-	if _, err := publishWorkflowV2(c, wfID, lockToken); err != nil {
-		return fmt.Errorf("workflow %s created but publish failed: %w", wfID, err)
+	published, err := publishWorkflowV2(c, wfID, lockToken)
+	if err != nil {
+		return nil, fmt.Errorf("workflow %s created but publish failed: %w", wfID, err)
 	}
 	fmt.Fprintf(cmd.OutOrStderr(), "# published workflow %s\n", wfID)
-	return nil
+	// Re-read the workflow so the caller prints it as it now IS -- status
+	// ACTIVE, bumped version -- rather than the create/autosave echo it holds,
+	// which still says DRAFT. Falls back to the publish response if the read
+	// fails; the publish itself already succeeded.
+	if data, _, gerr := c.Do("GET", "borrower_central", "/v2/workflows/"+wfID, nil); gerr == nil && len(data) > 0 {
+		return data, nil
+	}
+	return published, nil
 }
 
 // findWorkflowByAlias resolves the workflow apply should reconcile against:
