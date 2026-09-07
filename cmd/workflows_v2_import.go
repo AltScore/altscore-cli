@@ -2,19 +2,16 @@ package cmd
 
 // `workflows-v2 import` and the findings it surfaces.
 //
-// There is deliberately NO client-side pre-flight here, unlike `apply`. Apply
-// POSTs N task versions before the workflow and cannot roll them back
-// (DELETE /v2/tasks/{alias} removes every version of an alias, not this run's),
-// so pre-flight is the only protection it has. Import is a SINGLE request that
-// validates against the destination tenant inside its own boundary and either
-// writes or refuses, so a client pre-flight would buy nothing, add a round trip
-// and open a TOCTOU window.
+// There is deliberately NO client-side pre-flight here. Like `apply`, import
+// is a SINGLE request that validates against the destination tenant inside its
+// own boundary and either writes or refuses, so a client pre-flight would buy
+// nothing, add a round trip and open a TOCTOU window.
 //
 // It would also be wrong. The server's availability set is
 // (already on tenant) UNION (carried by this bundle); reproducing that in Go
 // would mean re-implementing the import backend, and the house rule is stated
-// plainly in workflows_v2_preflight_validate.go: the server is the single
-// oracle, the rules are not re-implemented here.
+// plainly in workflows_v2_validation.go: the server is the single oracle, the
+// rules are not re-implemented here.
 
 import (
 	"encoding/json"

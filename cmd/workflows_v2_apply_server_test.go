@@ -68,9 +68,9 @@ func TestBuildFlatSpecForServer_RoundTripsTheAssembly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compose: %v", err)
 	}
-	flat, ok := buildFlatSpecForServer(wf, capture, "smoke-apply")
-	if !ok {
-		t.Fatal("buildFlatSpecForServer refused an ordinary spec")
+	flat, err := buildFlatSpecForServer(wf, capture, "smoke-apply")
+	if err != nil {
+		t.Fatalf("buildFlatSpecForServer refused an ordinary spec: %v", err)
 	}
 	if flat["alias"] != "smoke-apply" || flat["label"] != "Smoke Apply" || flat["category"] != "EVALUATION" {
 		t.Errorf("top-level fields: %v %v %v", flat["alias"], flat["label"], flat["category"])
@@ -148,8 +148,8 @@ func TestBuildFlatSpecForServer_RoundTripsTheAssembly(t *testing.T) {
 	}
 }
 
-// An explicit node alias is server-assigned on the new path, so such a spec
-// stays on the client-side pipeline instead of being rejected by the server.
+// Task aliases are server-assigned: a spec that sets one on a node is refused
+// before any request, naming the node and pointing at `taskAlias`.
 func TestBuildFlatSpecForServer_RefusesExplicitNodeAlias(t *testing.T) {
 	spec := serverApplySpec()
 	spec.Tasks[0]["alias"] = "fetch-explicit"
@@ -158,16 +158,29 @@ func TestBuildFlatSpecForServer_RefusesExplicitNodeAlias(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compose: %v", err)
 	}
-	if _, ok := buildFlatSpecForServer(wf, capture, "smoke-apply"); ok {
-		t.Fatal("expected the explicit node alias to refuse the server path")
+	flat, err := buildFlatSpecForServer(wf, capture, "smoke-apply")
+	if err == nil {
+		t.Fatal("expected the explicit node alias to be refused")
+	}
+	if flat != nil {
+		t.Errorf("a refused spec must produce no request body, got %v", flat)
+	}
+	for _, want := range []string{"fetch-explicit", "server-assigned", "taskAlias"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q; got: %v", want, err)
+		}
 	}
 }
 
 // 404 and 405 (POST on a path an older backend only knows as GET /{id}) mean
-// the endpoint does not exist: the sentinel lets the caller fall back.
+// the endpoint does not exist. There is no client-side fallback any more: the
+// error names the missing endpoint and the last release that had one, and
+// exactly one request was made.
 func TestApplyViaServer_UnavailableOnOlderBackend(t *testing.T) {
 	for _, status := range []int{http.StatusNotFound, http.StatusMethodNotAllowed} {
+		var calls int32
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&calls, 1)
 			w.WriteHeader(status)
 			_, _ = w.Write([]byte(`{"code":"NotFound","message":"Method not allowed or the endpoint does not exist"}`))
 		}))
@@ -175,8 +188,11 @@ func TestApplyViaServer_UnavailableOnOlderBackend(t *testing.T) {
 		cmd, _, _ := serverApplyTestCmd()
 		_, err := applyViaServer(c, cmd, map[string]any{"alias": "a"}, serverApplyOptions{})
 		srv.Close()
-		if err != errServerApplyUnavailable {
-			t.Errorf("status %d: expected errServerApplyUnavailable, got %v", status, err)
+		if err == nil || !strings.Contains(err.Error(), "no POST /v2/workflows/apply") || !strings.Contains(err.Error(), "v0.34.x") {
+			t.Errorf("status %d: expected the missing-endpoint error, got %v", status, err)
+		}
+		if got := atomic.LoadInt32(&calls); got != 1 {
+			t.Errorf("status %d: expected exactly one request, got %d", status, got)
 		}
 	}
 }
@@ -292,8 +308,8 @@ func TestApplyViaServer_DryRunValidationFailureReturnsThePlan(t *testing.T) {
 }
 
 // A 404 that the endpoint ITSELF produced (APPLY_* subcode) is not "older
-// backend" and must not fall through to the client-side writing pipeline.
-func TestApplyViaServer_404WithApplyEnvelopeIsNotFallback(t *testing.T) {
+// backend": it is rendered as the server's own error, not as a missing endpoint.
+func TestApplyViaServer_404WithApplyEnvelopeIsARealError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"code":"NotFound","message":"x","details":{"errorSubCode":"APPLY_FAILED","rolledBack":true,"error":"gone"}}`))
@@ -302,8 +318,8 @@ func TestApplyViaServer_404WithApplyEnvelopeIsNotFallback(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, _, _ := serverApplyTestCmd()
 	_, err := applyViaServer(c, cmd, map[string]any{"alias": "a"}, serverApplyOptions{})
-	if err == nil || err == errServerApplyUnavailable {
-		t.Fatalf("expected a terminal error, got %v", err)
+	if err == nil || strings.Contains(err.Error(), "no POST /v2/workflows/apply") {
+		t.Fatalf("expected the server's own error, got %v", err)
 	}
 }
 
@@ -316,9 +332,9 @@ func TestBuildFlatSpecForServer_DropsEmptyCategory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compose: %v", err)
 	}
-	flat, ok := buildFlatSpecForServer(wf, capture, "smoke-apply")
-	if !ok {
-		t.Fatal("refused")
+	flat, err := buildFlatSpecForServer(wf, capture, "smoke-apply")
+	if err != nil {
+		t.Fatalf("refused: %v", err)
 	}
 	if _, has := flat["category"]; has {
 		t.Errorf("empty category must not travel: %v", flat["category"])
@@ -384,8 +400,8 @@ func TestDescribeServerApplyError_PublishRejected(t *testing.T) {
 }
 
 // With the server plan both sides carry real aliases: a relabel is `~`, not
-// `-` + `+`, and the ref-map heuristic is skipped.
-func TestDiffWorkflowWith_AliasIdentityKeepsRelabelAsChange(t *testing.T) {
+// `-` + `+`.
+func TestDiffWorkflow_AliasIdentityKeepsRelabelAsChange(t *testing.T) {
 	var gets int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" && r.URL.Path == "/v2/workflows/wf-1" {
@@ -416,7 +432,7 @@ func TestDiffWorkflowWith_AliasIdentityKeepsRelabelAsChange(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, out, _ := serverApplyTestCmd()
 	spec := &composeSpec{Alias: "smoke-apply", Label: "Smoke Apply"}
-	if err := diffWorkflowWith(c, cmd, spec, planned, map[string]any{"id": "wf-1"}, "smoke-apply", diffIdentityByAlias); err != nil {
+	if err := diffWorkflow(c, cmd, spec, planned, map[string]any{"id": "wf-1"}, "smoke-apply"); err != nil {
 		t.Fatalf("diff: %v", err)
 	}
 	got := out.String()

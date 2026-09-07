@@ -151,15 +151,6 @@ func TestLastDotSegment(t *testing.T) {
 	}
 }
 
-func TestPublishSuffix(t *testing.T) {
-	if !strings.Contains(publishSuffix(true), "publish") {
-		t.Errorf("publishSuffix(true) = %q", publishSuffix(true))
-	}
-	if !strings.Contains(publishSuffix(false), "DRAFT") {
-		t.Errorf("publishSuffix(false) = %q", publishSuffix(false))
-	}
-}
-
 // --- nested credit-decisioning entity scopes ----------------------------
 
 // seedEntities primes lookupEntity's memo so the normalizers resolve entities

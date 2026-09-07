@@ -288,6 +288,20 @@ func fetchEndTaskBodies(c *client.Client, nodes []any) []map[string]any {
 	return out
 }
 
+// fetchPersistedTask GETs the latest version of a task by alias and returns its
+// body as a generic map.
+func fetchPersistedTask(c *client.Client, alias string) (map[string]any, error) {
+	data, _, err := c.Do("GET", "borrower_central", "/v2/tasks/"+alias, nil)
+	if err != nil {
+		return nil, err
+	}
+	var task map[string]any
+	if err := json.Unmarshal(data, &task); err != nil {
+		return nil, fmt.Errorf("parse task: %w", err)
+	}
+	return task, nil
+}
+
 func fetchWorkflowRules(c *client.Client, alias string) []any {
 	if c == nil || alias == "" {
 		return nil

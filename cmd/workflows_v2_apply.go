@@ -12,20 +12,20 @@ import (
 	"time"
 
 	"github.com/AltScore/altscore-cli/internal/client"
-	"github.com/AltScore/altscore-cli/internal/output"
 	"github.com/spf13/cobra"
 )
 
 // apply takes a single agent-friendly spec and reconciles it against the
-// tenant: if no ACTIVE workflow shares the spec's alias, it creates one
-// (POST /v2/tasks per task + POST /v2/workflows + optional publish); if a
-// match exists, it updates in place (fresh /v2/tasks + create-draft +
-// lock + autosave + publish, same workflow id and alias retained). After
-// either path, every referenced credit-decisioning entity (scorecards,
-// rule-trees, evaluation-rules, mapping-tables, and their nested rules)
-// is re-stamped to the workflow's alias so the Hub elements panel stays
-// in sync. One verb, one validation pipeline, no fork-vs-update branch
-// for the caller.
+// tenant through POST /v2/workflows/apply: if no workflow shares the spec's
+// alias, Borrower Central creates one; if one exists, it drafts, autosaves
+// and (over an ACTIVE version) publishes in place, same workflow id and
+// alias retained. Tasks are identified by (workflowAlias, specRef): an
+// unchanged body is left alone, a changed one is version-bumped under the
+// same alias, a new ref gets a fresh alias. After the apply, every
+// referenced credit-decisioning entity (scorecards, rule-trees,
+// evaluation-rules, mapping-tables, and their nested rules) is re-stamped
+// to the workflow's alias so the Hub elements panel stays in sync. One
+// verb, one validation pipeline, no fork-vs-update branch for the caller.
 //
 // Spec shape (any field omitted falls through to API defaults):
 //
@@ -55,31 +55,22 @@ import (
 //	}
 //
 // Behavior:
-//  1. POST /v2/tasks for each task-bearing entry in spec.nodes (everything
-//     except type=="start"), capturing the returned alias.
-//  2. Build the graph: one node per spec.nodes entry (nodeId = ref, taskAlias
-//     = server-assigned alias for task-bearing nodes; start nodes are
-//     graph-only with no backing task).
-//  3. Auto-layout the canvas: longest-path columns + barycenter row ordering,
+//  1. Parse, normalize and assemble the spec locally, posting nothing:
+//     offline structural checks (preflightTasks), per-type normalization,
+//     every reference kept in the canonical `task_outputs.<ref>` form.
+//  2. Auto-layout the canvas: longest-path columns + barycenter row ordering,
 //     the same algorithm as the Hub builder's Align button (see
 //     autoLayoutNodes). Skipped by --no-layout, or when the spec pins
 //     `position` on any node.
-//  4. POST /v2/workflows with label, category, description, inputVariables,
-//     customVariables, nodes, edges, status (default DRAFT).
+//  3. Send the flat spec ONCE (buildFlatSpecForServer + applyViaServer, see
+//     workflows_v2_apply_server.go). The server resolves every ref to a task
+//     alias before writing, validates the graph with the oracle publish uses,
+//     writes tasks and workflow under its own edit lock, all-or-nothing, and
+//     reports what happened per ref.
 //
-// On any task-create failure the partial state is reported and the workflow is
-// NOT created -- and the tasks already POSTed stay on the tenant. There is no
-// rollback flag, and one cannot be built honestly: DELETE /v2/tasks/{alias}
-// exists but is ALIAS-scoped and hard-deletes every version of that alias, so on
-// the update path (which version-bumps existing aliases) "undo this run" would
-// destroy versions this run never created. Cleanup is therefore a deliberate,
-// case-by-case act -- `altscore tasks-v2 delete <alias>` per leaked alias, which
-// the create path's "created so far: [...]" line names for you.
-//
-// The pre-flight is what keeps that from happening: preflightTasks (local, this
-// file) and POST /v2/workflows/validate (the server oracle, see
-// workflows_v2_preflight_validate.go) both run BEFORE the first task POST.
-// Anything catchable belongs in one of those two, never in the POST loop.
+// A rejected spec writes nothing (400 / 422 carrying the server's findings); a
+// mid-write failure is unwound server-side. Anything catchable locally belongs
+// in preflightTasks or the normalizers, which run before the request.
 
 type composeSpec struct {
 	Label    string `json:"label"`
@@ -183,14 +174,11 @@ func makeWfv2ApplyCmd() *cobra.Command {
 	var dryRun bool
 	var diffFlag bool
 	var publish bool
-	var skipLintOnPublish bool
 	var skipRescope bool
 	var allowStealOwnership bool
-	var verify bool
 	var noAutoDefaults bool
 	var noLayout bool
 	var forceLock bool
-	var allowUnvalidated bool
 
 	cmd := &cobra.Command{
 		Use:     "apply",
@@ -201,18 +189,20 @@ covers both greenfield create and update-in-place. Same validation pipeline
 for both paths -- specs that pass apply against a fresh tenant also pass
 when re-applied against a tenant that already has the workflow. Also available
 as 'compose' (alias) -- both invocations are identical. Preview changes before
-mutating with --dry-run (prints the assembled body) or --diff (shows a per-
+mutating with --dry-run (prints the server's plan) or --diff (shows a per-
 section diff against the current tenant state).
 
 The target workflow is resolved by alias:
   - spec.alias if set, otherwise slugifyWorkflowLabel(spec.label).
-  - If no ACTIVE workflow has that alias -> create path:
-    POST /v2/tasks for every task, POST /v2/workflows, optional publish.
-  - If exactly one ACTIVE workflow has that alias -> update path:
-    Create fresh tasks (old tasks orphan, that's accepted), open a clean
-    draft via create-draft --force-recreate, acquire the lock, autosave the
-    new nodes/edges/variables/config, then publish. Same workflow id, same
-    alias, version increments, schedules / entity-scope survive.
+  - No workflow has that alias -> create path: the server creates the
+    tasks and the workflow (DRAFT unless --publish).
+  - A workflow has that alias -> update path: the server drafts, autosaves
+    and (over an ACTIVE version) publishes in place. Same workflow id, same
+    alias, version increments, schedules / entity-scope survive. Tasks are
+    matched by ref: an unchanged body is left alone, a changed one is
+    version-bumped under its existing alias.
+The whole apply is ONE request (POST /v2/workflows/apply) under the server's
+edit lock, all-or-nothing: a rejected spec writes nothing.
 
 After either path apply walks the spec's dependency graph and stamps every
 referenced credit-decisioning entity (scorecards, rule-trees, evaluation-
@@ -232,16 +222,18 @@ DRAFT vs publish: the create path saves the workflow in DRAFT by default,
 mirror of the Hub editor's save-then-publish flow. A DRAFT executes its full
 graph faithfully (so you can test it by id before publishing) -- it simply
 isn't the version the alias serves until published. Pass --publish to publish
-immediately; that's the common case when applying from the CLI. The update path
-always publishes (autosave -> publish), because the underlying assumption of
-"apply" is the spec is the desired state.
+immediately; that's the common case when applying from the CLI. An update over
+an ACTIVE workflow always publishes, because the underlying assumption of
+"apply" is the spec is the desired state; an update that adopts an existing
+DRAFT stays DRAFT unless --publish.
 
-Use --dry-run to print what would be sent without making any API calls.
+Use --dry-run to get the server's plan (every ref resolved to its task
+alias, created / bumped / unchanged per task, validation findings) and the
+graph that would be persisted. Nothing is written and no lock is taken.
 Use --diff to preview structural changes against the current tenant state:
 apply fetches the existing workflow (if any) and prints a per-section diff
 of metadata, tasks, edges, inputVariables, customVariables, and any entity-
-scope conflicts. No API mutations. Pairs well with the UPDATE path -- see
-exactly what version-bump will change before pulling the trigger.
+scope conflicts, keyed by real task alias. No API mutations.
 
 Spec format (see file header for full reference):
   - label, alias?, category, description, status (DRAFT default)
@@ -365,7 +357,7 @@ End-node output (endConfig on the 'end' node):
 			// prior un-published apply is updated in place rather than forked.
 			// dry-run still does the lookup so the agent sees which branch will
 			// fire when they un-dry the run.
-			existing, existingStatus, lookupErr := findWorkflowByAlias(c, targetAlias)
+			existing, _, lookupErr := findWorkflowByAlias(c, targetAlias)
 			if lookupErr != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "# warning: alias lookup for %q failed (%v); falling back to create path\n", targetAlias, lookupErr)
 			}
@@ -376,13 +368,13 @@ End-node output (endConfig on the 'end' node):
 			stampEnforceTypeOnNewVariables(spec.CustomVariables, liveCustomVariables(existing), cmd.ErrOrStderr())
 
 			// Assemble the workflow body. composeWorkflowBody POSTs nothing: it
-			// builds the graph with spec-local refs standing in for the not-yet-
-			// minted server aliases, and (via capture) records the task bodies to
-			// post later. The create AND update paths both mint fresh tasks; old
-			// tasks orphan on update (no /v2/tasks DELETE exists). In diff mode we
-			// force allowStealOwnership=true so cross-owned entities don't abort
-			// assembly -- they surface in the diff output as "would RE-STAMP"
-			// instead, which is the whole point of a preview tool.
+			// builds the graph with spec-local refs standing in for the server
+			// aliases and (via capture) records each node's task body; the server
+			// resolves refs to aliases and decides per task whether to create,
+			// bump or leave it. In diff mode we force allowStealOwnership=true so
+			// cross-owned entities don't abort assembly -- they surface in the
+			// diff output as "would RE-STAMP" instead, which is the whole point
+			// of a preview tool.
 			composeAllowSteal := allowStealOwnership
 			if diffFlag {
 				composeAllowSteal = true
@@ -399,356 +391,44 @@ End-node output (endConfig on the 'end' node):
 				return err
 			}
 
-			// Server-side apply first: POST /v2/workflows/apply takes the flat
-			// spec and owns ref resolution, validation, task identity, the lock
-			// and publish, all-or-nothing. Only a backend that predates the
-			// endpoint (404/405) falls through to the client-side pipeline below,
-			// which is deleted one release after the endpoint has been live.
-			if flat, ok := buildFlatSpecForServer(workflow, capture, targetAlias); ok {
-				var publishOpt *bool
-				if publish {
-					yes := true
-					publishOpt = &yes
-				}
-				res, serr := applyViaServer(c, cmd, flat, serverApplyOptions{
-					DryRun:    diffFlag || dryRun,
-					Publish:   publishOpt,
-					ForceLock: forceLock,
-					ClientID:  fmt.Sprintf("apply-%d", time.Now().UnixNano()),
-				})
-				switch {
-				case serr == nil:
-					return finishServerApply(c, cmd, &spec, res, existing, targetAlias, diffFlag, dryRun, skipRescope, allowStealOwnership)
-				case serr == errServerApplyUnavailable:
-					dimNote(cmd.ErrOrStderr(), "server-side apply is not available on this backend; using the client-side pipeline")
-				default:
-					return serr
-				}
-			} else {
-				dimNote(cmd.ErrOrStderr(), "spec uses a node shape the server-side apply does not accept (an explicit node alias, or a node with neither a body nor taskAlias); using the client-side pipeline")
-			}
-
-			// === Client-side pipeline (older backend) ===
-			switch {
-			case diffFlag:
-				// Read-only preview: the assembly above is all it needs.
-			case dryRun:
-				// Run the server pre-flight and print its findings. Advisory here:
-				// dry-run mutates nothing and still prints the assembled body
-				// below regardless of findings.
-				_ = serverPreflightValidate(c, cmd, workflow, capture, false, allowUnvalidated)
-			default:
-				// Real apply (create OR update): validate before posting anything,
-				// abort on server errors -- and on an unusable oracle, unless
-				// --allow-unvalidated.
-				if err := applyValidateAndPost(c, cmd, workflow, capture, allowUnvalidated); err != nil {
-					return err
-				}
-			}
-
-			wfBody, err := json.Marshal(workflow)
+			// POST /v2/workflows/apply takes the flat spec and owns ref
+			// resolution, validation, task identity, the lock and publish,
+			// all-or-nothing. The CLI's job ends at assembly: a spec the server
+			// path cannot express (an explicit node alias) is refused here,
+			// before any request.
+			flat, err := buildFlatSpecForServer(workflow, capture, targetAlias)
 			if err != nil {
 				return err
 			}
-
-			if diffFlag {
-				return diffWorkflow(c, cmd, &spec, workflow, existing, targetAlias)
+			var publishOpt *bool
+			if publish {
+				yes := true
+				publishOpt = &yes
 			}
-
-			if dryRun {
-				if existing != nil {
-					existingID, _ := existing["id"].(string)
-					if existingStatus == "DRAFT" {
-						fmt.Fprintf(cmd.OutOrStderr(), "# DRY RUN -- apply UPDATE path: would adopt existing DRAFT id=%s alias=%s (lock + autosave%s)\n", existingID, targetAlias, publishSuffix(publish))
-					} else {
-						fmt.Fprintf(cmd.OutOrStderr(), "# DRY RUN -- apply UPDATE path: would draft + autosave + publish ACTIVE workflow id=%s alias=%s\n", existingID, targetAlias)
-					}
-				} else {
-					fmt.Fprintln(cmd.OutOrStderr(), "# DRY RUN -- apply CREATE path: would POST /v2/workflows with the body below")
-				}
-				return output.RawJSON(json.RawMessage(wfBody))
+			res, err := applyViaServer(c, cmd, flat, serverApplyOptions{
+				DryRun:    diffFlag || dryRun,
+				Publish:   publishOpt,
+				ForceLock: forceLock,
+				ClientID:  fmt.Sprintf("apply-%d", time.Now().UnixNano()),
+			})
+			if err != nil {
+				return err
 			}
-
-			var resultJSON []byte
-			var wfID string
-			// publishedID is the id that went ACTIVE in this run: the created
-			// workflow on the CREATE path, the draft on the UPDATE path. Empty
-			// when nothing was published.
-			var publishedID string
-
-			if existing == nil {
-				// === CREATE path ===
-				data, _, err := c.Do("POST", "borrower_central", "/v2/workflows", json.RawMessage(wfBody))
-				if err != nil {
-					return fmt.Errorf("create workflow: %w", err)
-				}
-				printComposeSummary(cmd.ErrOrStderr(), workflow)
-
-				var created map[string]any
-				if err := json.Unmarshal(data, &created); err != nil {
-					return fmt.Errorf("parse created workflow response: %w", err)
-				}
-				wfID, _ = created["id"].(string)
-				if wfID == "" {
-					return fmt.Errorf("apply create: response had no 'id' field")
-				}
-				resultJSON = data
-
-				if publish {
-					// Create path holds no lock: a brand-new workflow has no
-					// alias lock, so there is no token to present.
-					published, err := lintAndPublish(c, cmd, wfID, skipLintOnPublish, "")
-					if err != nil {
-						return err
-					}
-					if len(published) > 0 {
-						resultJSON = published
-					}
-					publishedID = wfID
-				}
-			} else {
-				// === UPDATE path ===
-				existingID, _ := existing["id"].(string)
-				if existingID == "" {
-					return fmt.Errorf("apply update: existing workflow %q has no id field", targetAlias)
-				}
-				wfID = existingID
-
-				// Pull last-known-version BEFORE creating the draft so the
-				// autosave can pass it for optimistic concurrency. Drafting
-				// bumps the version; we want the pre-draft number.
-				lastKnownVersion := 0
-				if v, ok := existing["version"].(float64); ok {
-					lastKnownVersion = int(v)
-				}
-
-				adoptDraft := existingStatus == "DRAFT"
-				fmt.Fprintf(cmd.ErrOrStderr(), "# apply UPDATE path: workflow id=%s alias=%s status=%s lastKnownVersion=%d\n", wfID, targetAlias, existingStatus, lastKnownVersion)
-				printComposeSummary(cmd.ErrOrStderr(), workflow)
-
-				// 1) Take the edit lock BEFORE touching anything. The next step
-				// (create-draft --force-recreate) HARD-DELETES an existing draft
-				// and is not itself lock-gated, so acquiring afterwards meant a
-				// blocked apply had already destroyed someone's work-in-progress
-				// before it discovered it was not allowed to proceed (HQ #1228).
-				// Locks are alias-keyed, so this works before the draft exists.
-				clientID := fmt.Sprintf("apply-%d", time.Now().UnixNano())
-				lockToken, err := acquireApplyLock(c, cmd, targetAlias, clientID, forceLock)
-				if err != nil {
-					return err
-				}
-				fmt.Fprintf(cmd.ErrOrStderr(), "# acquired lock client-id=%s\n", clientID)
-				// Release when apply returns (after autosave + any publish). Each
-				// apply uses a fresh clientId, so a lock left dangling from a
-				// prior run makes the NEXT apply refuse until the 300s TTL
-				// expires. Best-effort: a successful publish already releases it
-				// server-side, in which case this DELETE is a harmless no-op.
-				defer releaseWfv2Lock(c, targetAlias, lockToken)
-
-				// 2) Obtain the draft to autosave onto.
-				//    - ACTIVE base: create-draft --force-recreate (clean draft
-				//      regardless of whether one already exists). Response is
-				//      wrapped: {created, message, workflow: {id, ...}}.
-				//    - DRAFT base: the workflow IS already a draft (a prior
-				//      un-published apply). Adopt it directly -- create-draft
-				//      requires an ACTIVE base and would fail here -- so we lock
-				//      and autosave onto this id, exactly as the Hub editor does
-				//      when you re-open an unpublished draft.
-				var draftID string
-				draftVersion := lastKnownVersion
-				if adoptDraft {
-					draftID = wfID
-					fmt.Fprintf(cmd.ErrOrStderr(), "# adopting existing draft %s (version %d)\n", draftID, draftVersion)
-				} else {
-					draftBody, _ := json.Marshal(map[string]any{"forceRecreate": true})
-					draftResp, _, err := c.Do("POST", "borrower_central", "/v2/workflows/"+wfID+"/create-draft", json.RawMessage(draftBody))
-					if err != nil {
-						return fmt.Errorf("create draft for %s: %w", wfID, err)
-					}
-					var draftWrap map[string]any
-					if err := json.Unmarshal(draftResp, &draftWrap); err != nil {
-						return fmt.Errorf("parse create-draft response: %w", err)
-					}
-					draft, _ := draftWrap["workflow"].(map[string]any)
-					if draft == nil {
-						// Fallback for an unwrapped shape.
-						draft = draftWrap
-					}
-					draftID, _ = draft["id"].(string)
-					if draftID == "" {
-						return fmt.Errorf("create-draft for %s returned no workflow.id", wfID)
-					}
-					if v, ok := draft["version"].(float64); ok {
-						draftVersion = int(v)
-					}
-					fmt.Fprintf(cmd.ErrOrStderr(), "# created draft %s (version %d)\n", draftID, draftVersion)
-				}
-
-				// 3) autosave the assembled body onto the draft
-				autosavePayload := map[string]any{
-					"label":           workflow["label"],
-					"category":        workflow["category"],
-					"status":          "DRAFT", // remain DRAFT until publish
-					"inputVariables":  workflow["inputVariables"],
-					"customVariables": workflow["customVariables"],
-					"nodes":           workflow["nodes"],
-					"edges":           workflow["edges"],
-					"lockToken":       lockToken,
-				}
-				if draftVersion > 0 {
-					autosavePayload["lastKnownVersion"] = draftVersion
-				}
-				if v, ok := workflow["alias"]; ok {
-					autosavePayload["alias"] = v
-				}
-				if v, ok := workflow["description"]; ok {
-					autosavePayload["description"] = v
-				}
-				if v, ok := workflow["config"]; ok {
-					autosavePayload["config"] = v
-				}
-				if v, ok := workflow["notes"]; ok {
-					autosavePayload["notes"] = v
-				}
-				autosaveBytes, _ := json.Marshal(autosavePayload)
-				autosaveRaw := json.RawMessage(autosaveBytes)
-				if err := validateWorkflowV2Body(&autosaveRaw); err != nil {
-					return fmt.Errorf("autosave body validation failed: %w", err)
-				}
-				autoResp, _, err := c.Do("PUT", "borrower_central", "/v2/workflows/"+draftID+"/autosave", autosaveRaw)
-				if err != nil {
-					return fmt.Errorf("autosave draft %s: %w", draftID, err)
-				}
-				resultJSON = autoResp
-				fmt.Fprintf(cmd.ErrOrStderr(), "# autosaved draft %s\n", draftID)
-
-				// 4) publish decision.
-				//    - ACTIVE base: always publish. The workflow is already live,
-				//      so the spec-as-desired-state contract means republish the
-				//      updated graph (unchanged behavior). Pre-publish lint gates.
-				//    - DRAFT base (adopt): publish only when --publish is set,
-				//      otherwise leave it a draft. The workflow was never live; a
-				//      prior apply deliberately (or incidentally) left it in
-				//      DRAFT, so re-applying without --publish keeps it editable
-				//      rather than surprising the author by going live. This
-				//      mirrors the CREATE path (DRAFT unless --publish).
-				if !adoptDraft || publish {
-					// Publishing the draft makes ITS id the live version and archives
-					// the one we looked up, so from here on the draft id is the
-					// workflow apply produced.
-					published, err := lintAndPublish(c, cmd, draftID, skipLintOnPublish, lockToken)
-					if err != nil {
-						return err
-					}
-					if len(published) > 0 {
-						resultJSON = published
-					}
-					publishedID = draftID
-				} else {
-					fmt.Fprintf(cmd.OutOrStderr(), "# updated DRAFT workflow %s (alias=%s); not published (pass --publish to go live)\n", draftID, targetAlias)
-				}
-			}
-
-			// === Entity-scope reconciliation ===
-			// After either path, walk the spec's referenced credit-decisioning
-			// entities and stamp them to targetAlias. Without this, an update
-			// from workflow A to workflow A-v2 (or a fresh create that pulls
-			// a scorecard scoped to a sibling) leaves nested entities pointing
-			// at the old alias and the Hub's elements panel goes empty.
-			if !skipRescope {
-				if err := reconcileEntityScopes(c, &spec, targetAlias, allowStealOwnership, cmd.ErrOrStderr()); err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "# warning: entity-scope reconciliation hit an issue: %v (workflow itself is fine; re-scope failed entities manually with `altscore <resource> update <id> --workflow-alias %s`)\n", err, targetAlias)
-				}
-			}
-
-			// Read-back verification: confirm the backend actually persisted
-			// every field the spec set on each task. Catches silent
-			// server-side field drops (e.g. a `contacts` array the task schema
-			// doesn't model). Best-effort and non-fatal -- the workflow is
-			// already applied; this only warns. Skipped on dry-run/diff (both
-			// returned above). Disable with --verify=false.
-			if verify {
-				verifyAppliedTasks(c, &spec, workflow, cmd.ErrOrStderr())
-			}
-
-			if publishedID != "" {
-				fmt.Fprintf(cmd.OutOrStderr(), "# applied workflow %s (alias=%s)\n", publishedID, targetAlias)
-			}
-			return output.RawJSON(resultJSON)
+			return finishServerApply(c, cmd, &spec, res, existing, targetAlias, diffFlag, dryRun, skipRescope, allowStealOwnership)
 		},
 	}
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON spec (or pipe via stdin)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview: assemble the spec, ask the server for its plan (every ref resolved to its task alias, created/bumped/unchanged per task, validation findings) and print the graph that would be persisted. Reads only; nothing is written and no lock is taken")
 	cmd.Flags().BoolVar(&diffFlag, "diff", false, "preview structural changes against the current tenant state. Fetches the existing workflow (if any), obtains the server's plan for the spec, and prints a human-readable diff keyed by real task alias. No API mutations. Mutually exclusive with --dry-run and --publish")
 	cmd.Flags().BoolVar(&publish, "publish", false, "publish the workflow after creation (CREATE path only; UPDATE path always publishes the draft it produced)")
-	cmd.Flags().BoolVar(&skipLintOnPublish, "skip-lint-on-publish", false, "skip the pre-publish topology lint that refuses to publish on errors")
 	cmd.Flags().BoolVar(&skipRescope, "skip-rescope", false, "do not stamp referenced credit-decisioning entities (scorecards, rule-trees, etc.) to the workflow's alias after apply")
 	cmd.Flags().BoolVar(&allowStealOwnership, "allow-steal-ownership", false, "permit apply to transfer a credit-decisioning entity's workflowAlias when it is currently owned by ANOTHER workflow. Default: refuse and instruct the spec author to clone the entity with a new code. Use only for rare workflow rename / identity migration / decommissioning scenarios")
-	cmd.Flags().BoolVar(&verify, "verify", true, "client-side pipeline only: after writing, read back the persisted tasks and warn (stderr, non-fatal) about any spec-set field the backend dropped or nulled. The server-side apply reports dropped fields per task in its response instead. Pass --verify=false to skip the extra GETs")
 	cmd.Flags().BoolVar(&noAutoDefaults, "no-auto-defaults", false, "disable apply's opinionated convenience defaults: (1) end-node borrower_id/billable_id wired to the single customer node's borrower_id, (2) end-node PDF generation (pdfConfig.enabled+pdfGenerationRequired default to true), (3) deal-contact identity_value back-filled from each contact's identity_key field (default tax_id). Each only fills an absent field; caller-supplied values always win -- an explicit pdfConfig.enabled=false keeps the report off")
-	cmd.Flags().BoolVar(&forceLock, "force-lock", false, "take the workflow's edit lock even when a live session holds it. By default apply only reclaims a lock a previous apply run abandoned (its own clientId prefix, never renewed) and refuses anything that looks like an open Hub tab, naming the holder. Forcing discards whatever that session has unsaved")
-	cmd.Flags().BoolVar(&allowUnvalidated, "allow-unvalidated", false, "client-side pipeline only (backends without POST /v2/workflows/apply): proceed when the server pre-flight (POST /v2/workflows/validate) cannot be used: a 5xx, a rejected request, a transport error or an unreadable response. Default: refuse, because a graph the server later rejects leaks /v2/tasks rows that cannot be deleted. A 404 from a backend that predates the endpoint always proceeds")
+	cmd.Flags().BoolVar(&forceLock, "force-lock", false, "take the workflow's edit lock even when a live session holds it. The server holds the lock only for the duration of the request; by default a lock held by an open Hub tab makes apply refuse, naming the holder. Forcing discards whatever that session has unsaved")
 	cmd.Flags().BoolVar(&noLayout, "no-layout", false, "skip auto-layout of the canvas. By default apply positions nodes in left-to-right columns (the same algorithm as the Hub builder's Align button) so the graph opens readable; with this flag nodes ship on a single row at a 200px pitch and overlap until someone clicks Align. Auto-layout is also skipped when the spec pins `position` on any node")
 	return cmd
 }
 
-// lintAndPublish runs the pre-publish topology lint on a workflow and then
-// publishes it. Shared by both the create path (creates workflow + optional
-// publish) and the update path (always publishes after autosave). Mirrors
-// what compose used to do inline for create + publish.
-//
-// lockToken is the edit-lock token the caller holds, or "" when it holds none.
-// The backend's publish guard is token-strict: with a lock in place and no
-// token, publish answers 423 LOCKED even for that lock's own holder -- which is
-// what made every update-path apply die at this step (HQ #1228).
-func lintAndPublish(c *client.Client, cmd *cobra.Command, wfID string, skipLintOnPublish bool, lockToken string) (json.RawMessage, error) {
-	lintData, _, lerr := c.Do("GET", "borrower_central", "/v2/workflows/"+wfID, nil)
-	if lerr == nil {
-		var wfFull map[string]any
-		if err := json.Unmarshal(lintData, &wfFull); err == nil {
-			report := lintWorkflowV2(wfFull)
-			errs := []string{}
-			for _, issue := range report.Issues {
-				if issue.Severity == "error" {
-					errs = append(errs, "  - "+issue.Message)
-				}
-			}
-			if len(errs) > 0 {
-				if skipLintOnPublish {
-					fmt.Fprintf(cmd.OutOrStderr(),
-						"# WARNING: pre-publish lint found %d topology error(s) but --skip-lint-on-publish was set; publishing anyway:\n%s\n",
-						len(errs), strings.Join(errs, "\n"))
-				} else {
-					return nil, fmt.Errorf(
-						"workflow %s created but pre-publish lint found %d topology error(s); refusing to publish:\n%s\n"+
-							"Fix the spec, run 'altscore workflows-v2 publish %s' manually after editing, or pass --skip-lint-on-publish.",
-						wfID, len(errs), strings.Join(errs, "\n"), wfID,
-					)
-				}
-			}
-		}
-	}
-	published, err := publishWorkflowV2(c, wfID, lockToken)
-	if err != nil {
-		return nil, fmt.Errorf("workflow %s created but publish failed: %w", wfID, err)
-	}
-	fmt.Fprintf(cmd.OutOrStderr(), "# published workflow %s\n", wfID)
-	// Re-read the workflow so the caller prints it as it now IS -- status
-	// ACTIVE, bumped version -- rather than the create/autosave echo it holds,
-	// which still says DRAFT. Falls back to the publish response if the read
-	// fails; the publish itself already succeeded.
-	if data, _, gerr := c.Do("GET", "borrower_central", "/v2/workflows/"+wfID, nil); gerr == nil && len(data) > 0 {
-		return data, nil
-	}
-	return published, nil
-}
-
-// findWorkflowByAlias resolves the workflow apply should reconcile against:
-// the ACTIVE version, else the latest DRAFT. Returns the workflow, its status
-// ("ACTIVE"|"DRAFT"), or (nil, "", nil) when nothing matches. The DRAFT
-// fallback keeps apply an idempotent upsert: a prior apply WITHOUT --publish
-// leaves a DRAFT that an ACTIVE-only lookup can't see, so the next apply would
-// otherwise fork a duplicate instead of adopting it.
 func findWorkflowByAlias(c *client.Client, alias string) (map[string]any, string, error) {
 	active, err := queryLatestWorkflowByAliasStatus(c, alias, "ACTIVE")
 	if err != nil {
@@ -1255,43 +935,6 @@ func printComposeSummary(w io.Writer, workflow map[string]any) {
 	}
 }
 
-// postTask creates a task via POST /v2/tasks and returns the server-assigned
-// alias and version. Called by the task post phase (postCapturedTasks) once the
-// assembled graph has cleared the server pre-flight -- assembly itself POSTs
-// nothing. The previous two-phase create (postTaskWithMultiDotFallback) is
-// gone: CreateTaskV2's strict-vs-lenient distinction was relaxed in the backend
-// -- the input_mappings validator now just returns its argument unchanged (see
-// borrower-central/app/model/workflows_v2/task_schemas.py). Multi-dot
-// inputMappings now land at version 1 in a single POST.
-func postTask(c *client.Client, body map[string]any, label string) (alias string, version int, err error) {
-	bytes, err := json.Marshal(body)
-	if err != nil {
-		return "", 0, fmt.Errorf("encode %s: %w", label, err)
-	}
-
-	data, _, err := c.Do("POST", "borrower_central", "/v2/tasks", json.RawMessage(bytes))
-	if err != nil {
-		return "", 0, err
-	}
-	var created map[string]any
-	if err := json.Unmarshal(data, &created); err != nil {
-		return "", 0, fmt.Errorf("parse %s response: %w", label, err)
-	}
-	if a, _ := created["alias"].(string); a != "" {
-		alias = a
-	} else {
-		return "", 0, fmt.Errorf("%s: server returned no alias", label)
-	}
-	if v, ok := created["version"].(float64); ok {
-		version = int(v)
-	} else {
-		version = 1
-	}
-	return alias, version, nil
-}
-
-// reservedMappingScopes are the leading segments in a mapping value that are
-// NOT spec-local refs and must not be rewritten.
 var reservedMappingScopes = map[string]bool{
 	"inputs":               true,
 	"custom":               true,
@@ -2473,13 +2116,11 @@ var nestedInputMappingConfigKeys = []string{"scorecardConfig", "ruleTreeConfig",
 // mappingTableConfig entry inputVariables, then {{...}} templates + conditional
 // condition values, and finally the residual-ref safety net.
 //
-// It is run TWICE across the assemble/post split, and is designed to be a no-op
-// on the second run for the identifiers it already resolved: once during
-// assembly with an identity ref->placeholder map (validates the graph and pins
-// placeholders in place) and once during the post phase with the real
-// placeholder->server-alias map (the actual substitution). Because both the
-// assembly loop and postCapturedTasks call this single function, the validated
-// task body and the posted task body can only differ by that substitution.
+// It runs once, during assembly, with an identity ref->placeholder map: that
+// validates the graph (an unknown head is a typo) and leaves every reference in
+// the canonical `task_outputs.<ref>` form the server substitutes for the real
+// alias. It is designed to be a no-op on identifiers it already resolved, so
+// running it again with a real alias map is safe.
 func rewriteTaskRefs(task map[string]any, refMap map[string]string, ctx string) error {
 	if mappings, ok := task["inputMappings"].(map[string]any); ok {
 		rewritten, rerr := rewriteRefsInMappings(mappings, refMap)
@@ -2880,27 +2521,25 @@ func applyAutoEndDefaults(spec *composeSpec) {
 }
 
 // composeWorkflowBody assembles the workflow body. It POSTs NOTHING: every task
-// node is recorded on `capture`'s ordered post-plan (with a substitution
-// closure) and the graph is built with PLACEHOLDER identifiers -- the spec-local
-// ref (or an explicit `alias` on the body). postCapturedTasks POSTs the bodies
-// afterward and substituteWorkflowAliases swaps placeholders for the
-// server-minted aliases. Splitting assembly from posting lets the caller
-// validate the exact artifacts it will post BEFORE the first /v2/tasks POST.
+// node's body is recorded on `capture` and the graph is built with PLACEHOLDER
+// identifiers -- the spec-local ref (or an explicit `alias` on the body).
+// buildFlatSpecForServer turns the result into the flat spec that
+// POST /v2/workflows/apply accepts; the server swaps placeholders for the
+// server-minted aliases.
 //
-// dryRun selects PREVIEW behavior, not posting behavior (there is no posting
-// here): tolerant normalization (offline-friendly source/entity lookups) plus a
-// "# Would POST /v2/tasks ..." echo of each assembled body. --dry-run / --diff
-// pass true; the real apply assembly passes false for strict normalization.
+// dryRun selects PREVIEW behavior (there is no posting here): tolerant
+// normalization (offline-friendly source/entity lookups) plus a "# task body
+// ..." echo of each assembled body. --dry-run / --diff pass true; the real
+// apply assembly passes false for strict normalization.
 //
 // Reference resolution: each task/extraNode has a spec-local "ref" (taken from
 // the explicit `ref` field, falling back to `alias`/`nodeId`, falling back to a
 // generated `t<idx>`). Edges and inputMappings reference tasks by ref; assembly
-// rewrites them to the placeholder identifier, and the post phase then rewrites
-// the placeholder to the server alias.
+// rewrites them to the placeholder identifier, and the server then rewrites the
+// placeholder to the real alias.
 //
 // capture, when non-nil, collects the per-node task bodies (keyed by placeholder)
-// + a placeholder->ref reverse map for readable findings, AND the ordered
-// post-plan the post phase consumes. --diff passes nil (it only needs the body).
+// + a placeholder->ref reverse map for readable findings.
 func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publish bool, autoRescopeEntities bool, allowStealOwnership bool, autoDefaults bool, autoLayout bool, capture *composeCapture) (map[string]any, error) {
 	if err := validateEntityTypeVsTaskTypes(spec); err != nil {
 		return nil, err
@@ -3070,24 +2709,22 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 
 	// refMap: spec-local reference -> placeholder identifier used in the
 	// assembled graph. Assembly POSTs nothing, so the placeholder is the ref
-	// (or an explicit `alias` on the body), not a server-minted alias;
-	// postCapturedTasks maps each placeholder to its real alias afterward.
+	// (or an explicit `alias` on the body), not a server-minted alias; the
+	// server maps each ref to its real alias.
 	refMap := map[string]string{}
 
-	// registerTask records a fully-assembled task body for the post phase and
-	// returns the placeholder identifier the graph should use for it. Assembly
-	// never POSTs: it captures the body (for the pre-flight payload) and appends
-	// to the ordered post-plan -- each entry re-runs `substitute` with the real
-	// alias map, then POSTs. In preview mode (--dry-run / --diff) it also echoes
-	// the body that WOULD be posted. `substitute` is nil for trivial bodies.
-	registerTask := func(body map[string]any, ref, label string, substitute func(map[string]string) error) string {
+	// registerTask records a fully-assembled task body and returns the
+	// placeholder identifier the graph should use for it. Assembly never POSTs:
+	// the captured body is what the server receives inline on the node. In
+	// preview mode (--dry-run / --diff) it also echoes that body.
+	registerTask := func(body map[string]any, ref, label string) string {
 		placeholder := ref
 		if a, _ := body["alias"].(string); a != "" {
 			placeholder = a
 		}
 		if dryRun {
 			if snap, err := json.Marshal(body); err == nil {
-				fmt.Fprintf(os.Stderr, "# Would POST /v2/tasks (%s): %s\n", label, string(snap))
+				fmt.Fprintf(os.Stderr, "# task body (%s): %s\n", label, string(snap))
 			}
 		}
 		if capture != nil {
@@ -3095,12 +2732,6 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				capture.tasks[placeholder] = snap
 				capture.refByNodeID[placeholder] = ref
 			}
-			capture.postPlan = append(capture.postPlan, &capturedTask{
-				placeholder: placeholder,
-				body:        body,
-				label:       label,
-				substitute:  substitute,
-			})
 		}
 		return placeholder
 	}
@@ -3153,12 +2784,12 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 
 		// Rewrite every ref-bearing field (inputMappings, nested scorecard/
 		// rule-tree maps, mapping-table entries, {{...}} templates, conditional
-		// conditions) and run the residual-ref safety net. During assembly refMap
-		// is identity (ref->placeholder), so this validates the graph and leaves
-		// refs in place; postCapturedTasks re-runs the SAME function with the real
-		// alias map to substitute. Topological ordering above guarantees every
-		// dependency is already in refMap, so an "unknown ref" here always means a
-		// typo or a reference to a task that simply isn't in spec.tasks.
+		// conditions) and run the residual-ref safety net. refMap is identity
+		// (ref->placeholder), so this validates the graph and leaves refs in the
+		// canonical form the server substitutes. Topological ordering above
+		// guarantees every dependency is already in refMap, so an "unknown ref"
+		// here always means a typo or a reference to a task that simply isn't in
+		// spec.tasks.
 		ctx := fmt.Sprintf("node ref=%q", ref)
 		if err := rewriteTaskRefs(task, refMap, ctx); err != nil {
 			return nil, err
@@ -3178,14 +2809,10 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			return nil, fmt.Errorf("node ref=%q: %w", ref, err)
 		}
 
-		// Assemble (do NOT post): record the body + its substitution closure for
-		// the post phase and take a placeholder identifier for the graph. The
-		// closure re-runs the exact same rewriters with the real alias map once
-		// prior tasks have been posted; substituteWorkflowAliases then stamps the
-		// server alias + version onto the node.
-		placeholder := registerTask(task, ref, ctx, func(rm map[string]string) error {
-			return rewriteTaskRefs(task, rm, ctx)
-		})
+		// Assemble (do NOT post): record the body and take a placeholder
+		// identifier for the graph. The server rewrites the refs to the real
+		// aliases and stamps alias + version onto the node.
+		placeholder := registerTask(task, ref, ctx)
 		refMap[ref] = placeholder
 
 		// Positions here are only a fallback for --no-layout / pinned-position
@@ -3390,21 +3017,9 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				}
 			}
 
-			// Assemble (do NOT post): record the backing task body for the post
-			// phase and take a placeholder identifier. Only `end` bodies carry
-			// ref-bearing templates (endConfig.outputJson), so only they need a
-			// substitution closure; start / other trivial bodies need none.
-			var substitute func(map[string]string) error
-			if strings.ToLower(nodeType) == "end" {
-				substitute = func(rm map[string]string) error {
-					if err := rewriteRefsInTaskTemplates(taskBody, rm); err != nil {
-						return fmt.Errorf("node ref=%q: %w", ref, err)
-					}
-					rewriteTaskOutputsRefsDeep(taskBody, rm, residualSpecRefExcludedFields)
-					return validateNoResidualSpecRefs(taskBody, rm, fmt.Sprintf("node ref=%q", ref))
-				}
-			}
-			taskAlias = registerTask(taskBody, ref, fmt.Sprintf("node ref=%q (extra-node backing)", ref), substitute)
+			// Assemble (do NOT post): record the backing task body and take a
+			// placeholder identifier.
+			taskAlias = registerTask(taskBody, ref, fmt.Sprintf("node ref=%q (extra-node backing)", ref))
 			n["taskAlias"] = taskAlias
 			n["taskVersion"] = 1
 		}
