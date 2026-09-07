@@ -10,7 +10,7 @@
 
 ## Project Structure
 
-`cmd/` holds 76 `.go` files (44 non-test, 32 test). This is a subsystem map, not a full tree.
+`cmd/` holds 86 `.go` files (44 non-test, 42 test; ~21.7k source lines, ~9.6k test lines). This is a subsystem map, not a full tree. The workflows-v2 files are two thirds of the source; `workflows_v2_apply.go` alone is a quarter.
 
 ```
 altscore-cli/
@@ -23,11 +23,14 @@ altscore-cli/
 │   ├── workflows_v2_apply.go              # makeWfv2ApplyCmd: composeSpec + build pipeline
 │   ├── workflows_v2_apply_verify.go       # post-apply verification
 │   ├── workflows_v2_apply_diff.go         # --diff renderer
-│   ├── workflows_v2_apply_enforce_type.go # type coercion on apply
+│   ├── workflows_v2_apply_enforce_type.go # enforceType stamping on new custom variables, carry-forward on live ones
+│   ├── workflows_v2_diff.go               # `diff <a> <b>`: two EXISTING versions (task bodies + specRef census); not `apply --diff`
 │   ├── workflows_v2_import.go             # makeWfv2ImportCmd + the findings it reports
 │   ├── workflows_v2_findings.go           # shared finding partition/render (apply + import)
-│   ├── workflows_v2_preflight_validate.go # POST /v2/workflows/validate (server oracle)
+│   ├── workflows_v2_preflight_validate.go # POST /v2/workflows/validate (server oracle) + the assemble/post split
 │   ├── workflows_v2_validate.go           # local spec validation + makeWfv2LintCmd
+│   ├── workflows_v2_readability.go        # lint's handoff readability advisories
+│   ├── workflows_v2_vocabulary_cache.go   # 24h disk cache of the meta vocabulary sections (fetchMetaSection)
 │   ├── workflows_v2_normalize.go          # normalization + autodefaults
 │   ├── workflows_v2_layout.go             # auto graph layout
 │   ├── workflows_v2_export_apply_spec.go  # live workflow -> apply spec
@@ -56,7 +59,7 @@ A ResourceDef group (`cmd/root.go`, `Name: "workflows-v2"`, `BasePath: /v2/workf
 
 | Group | Commands |
 | --- | --- |
-| Authoring | `apply` (alias `compose`), `lint`, `import`, `export`, `duplicate` |
+| Authoring | `apply` (alias `compose`), `diff`, `lint`, `import`, `export`, `duplicate` |
 | Graph edits (the 7 helpers) | `add-node`, `remove-node`, `add-edge`, `remove-edge`, `set-variable`, `unset-variable`, `set-mapping` |
 | Mapping endpoints | `update-mapping`, `resolve-mappings` |
 | Lifecycle | `publish`, `create-draft`, `revert`, `archive`, `restore`, `versions`, `get-version` |
@@ -76,6 +79,31 @@ Each of the 7 graph-edit helpers wraps lock + fetch + mutate + autosave + releas
 - `execute --test` injects the literal `test` tag so borrower-central marks the run `is_test=true` (non-billable, hidden from metrics and default lists). Side effects still run: it is NOT a dry run. Matching is on the exact `test` element, so `parity-test` does not trigger it. `--test-task-id` is a different thing: it tests one node in isolation. For a real preview use `apply --dry-run` or `--diff`.
 - Local validate and `POST /v2/workflows/validate` both run BEFORE the first task POST. Anything catchable belongs in one of those two, never in the POST loop.
 - Every v2 node EXCEPT `type: "start"` gets a backing `/v2/tasks` record and is referenced by alias. `start` is graph-only with no task and no alias; `end` DOES get a task. See the `composeSpec` comment and the split loop in `cmd/workflows_v2_apply.go`: `type=="start" -> ExtraNodes (graph-only); everything else (including end) -> Tasks`. PDF generation is `endConfig.pdfConfig` on the end node, not a task type.
+
+### How `apply` works
+
+Read this before touching `cmd/workflows_v2_apply.go`. `makeWfv2ApplyCmd` runs ONE pipeline; `--dry-run` and `--diff` leave it before the first write. Function names below are the anchors to grep for.
+
+1. **Parse.** `composeSpec` (typed), `detectLegacySpecShape`, then the `nodes[]` split above.
+2. **Target.** `spec.alias`, else the label slug via `slugifyWorkflowLabel` with a WARNING on stderr. A relabel without an alias creates a second workflow; a future release requires the field. `findWorkflowByAlias` prefers ACTIVE, else the latest DRAFT.
+3. **`stampEnforceTypeOnNewVariables`.** A new typed custom variable gets `enforceType: true`; a live one carries its live value forward (autosave sends `customVariables` wholesale, so a silent spec used to strip it).
+4. **Assemble, posting nothing.** `composeWorkflowBody`: `preflightTasks` (offline structural checks), per-type `normalizeTaskBody` (memoized live lookups: sources, entities by code, latest child workflow), `applyAutoEndDefaults` (off with `--no-auto-defaults`), `topologicalTaskOrder`, `rewriteTaskRefs` per task with the identity map, `autoLayoutNodes` (off with `--no-layout`). Each task body is recorded in `composeCapture` with a substitution closure.
+5. **Server oracle.** `serverPreflightValidate` posts the assembled graph to `POST /v2/workflows/validate`. Only a 404 (older backend) fails open. A 5xx, a non-404 4xx, a transport error or an unreadable body REFUSES unless `--allow-unvalidated`. There is no rollback for task rows, so anything catchable must fail here or earlier.
+6. **Post.** `postCapturedTasks` posts to `/v2/tasks` in plan order, re-running each closure with the real alias map; `substituteWorkflowAliases` rewrites the workflow body.
+7. **Write.** CREATE: `POST /v2/workflows`, then `lintAndPublish` with `--publish`. UPDATE: `acquireApplyLock` FIRST (create-draft with `forceRecreate` hard-deletes an existing draft and is not lock-gated), then create-draft or adopt the DRAFT, autosave, `lintAndPublish` (always, except when adopting a DRAFT without `--publish`). Publishing makes the DRAFT id the live version and archives the id that was looked up; stdout is the workflow re-read after publish.
+8. **After.** `reconcileEntityScopes` stamps referenced decisioning entities (off with `--skip-rescope`); `verifyAppliedTasks` reads back every task (off with `--verify=false`).
+
+**Refs.** A spec-local `ref` becomes a server alias. Two rewrite layers, split by grammar, and both run twice (identity map during assembly, real map at post time):
+- The typed allowlist, `rewriteRefsInTaskTemplates` and `rewriteRefsInMappings`, handles what only a typed case can: a bare `<ref>.<field>` head, a bare `{{token}}` expanded through `inputMappings`, an unknown head rejected as a typo. A new task type that uses the BARE form needs a case there and in `templateDependencyRefs`.
+- The generic pass, `rewriteTaskOutputsRefsDeep`, handles the unambiguous long form `task_outputs.<ref>` in every non-prose string and map key of a body (prose is `residualSpecRefExcludedFields`); `deepTaskOutputsRefs` feeds `topologicalTaskOrder` the same surface. A new field that uses the long form needs no CLI change.
+- `validateNoResidualSpecRefs` is the safety net for bare identifiers. An embedded residual after the generic pass is a bug in that pass, not a missing allowlist entry.
+- Every task carries `specRef` and `workflowAlias`; Borrower Central's stable-alias path version-bumps a match instead of minting a new alias. A ref removed from the spec orphans its task (there is no per-version delete).
+
+**`--diff`.** `diffWorkflow` matches nodes by label slug (`nodeDiffKey`), derives ref-to-live-alias from that (`diffRefMap`), rewrites a COPY of the assembled body (`resolveAssembledRefsForDiff`), then compares. Known gap: a spec that pins `status: DRAFT` diffs dirty against an ACTIVE workflow even though the update path publishes regardless.
+
+**Vocabularies.** Task types, condition operators, categories, relationship kinds and inputSchema types are compiled-in mirrors consulted first. On a miss the live section comes through `fetchMetaSection` (24h disk cache under the config dir, keyed by backend URL; a failed fetch is never cached). Live-known: warn and accept. Live-unknown: reject. Unreachable: warn and proceed, EXCEPT condition operators, which stay strict because the backend evaluates an unknown operator to False silently.
+
+**Locks.** `isAbandonedApplyLock` reclaims only an `apply-` clientId with `renewCount == 0` older than 90s; anything else refuses unless `--force-lock`. Publish carries the lock token, because the backend's guard is token-strict.
 
 ## Architecture
 
