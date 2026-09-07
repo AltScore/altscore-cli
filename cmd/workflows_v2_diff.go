@@ -166,7 +166,10 @@ func loadSideForDiff(c clientDoer, id string) (map[string]any, sideSummary, erro
 		return nil, sideSummary{}, fmt.Errorf("diff: export %s: %w", id, err)
 	}
 
-	spec, err := bundleToApplySpec(raw)
+	// Alias identity: a task keeps its alias across version bumps, while its
+	// specRef appears the first time the CLI applies over a Hub-authored task,
+	// so alias keeps the two sides of that boundary matched.
+	spec, err := bundleToApplySpec(raw, refFromAlias)
 	if err != nil {
 		return nil, sideSummary{}, fmt.Errorf("diff: flatten %s: %w", id, err)
 	}

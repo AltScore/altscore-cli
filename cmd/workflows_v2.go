@@ -1064,13 +1064,12 @@ scorecards, rule trees, and mapping tables. Suitable for piping to a file:
                        altscore workflows-v2 export <id> --format apply-spec \
                          | altscore workflows-v2 apply
 
-REF LIMITATION (apply-spec): the export bundle does not retain the spec-local
-refs the workflow was originally applied with -- it only has server-assigned
-task aliases (slug-NNNNNN). apply-spec therefore emits each node's real server
-alias as its 'ref'. 'apply' tolerates this (a ref that is already a server
-alias is left as-is and resolved against task_outputs at runtime), so the spec
-round-trips. The only visible difference from a hand-authored spec is that
-refs read like 'fetch-ecu-a1b2c3' instead of 'fetch'.`,
+REFS (apply-spec): a task the CLI applied carries its original spec-local ref
+as specRef, and that is what each node's 'ref' becomes, so applying the export
+back reports every task unchanged. A task authored in the Hub has no specRef
+and falls back to its server alias (slug-NNNNNN) as the ref; applying that
+creates a fresh task under a new alias. Edge endpoints are mapped from node ids
+to refs; node positions are kept, so apply leaves the canvas as it was.`,
 		Args:    cobra.ExactArgs(1),
 		Example: `  altscore workflows-v2 export <id> > my-wf.json
   altscore workflows-v2 export <id> --format apply-spec > spec.json
@@ -1093,7 +1092,7 @@ refs read like 'fetch-ecu-a1b2c3' instead of 'fetch'.`,
 			if format == "bundle" {
 				return output.RawJSON(data)
 			}
-			spec, err := bundleToApplySpec(data)
+			spec, err := bundleToApplySpec(data, refFromSpecRef)
 			if err != nil {
 				return err
 			}
