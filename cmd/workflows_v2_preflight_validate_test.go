@@ -65,7 +65,7 @@ func TestServerPreflightValidate_ErrorAborts(t *testing.T) {
 	cmd, errb := preflightTestCmd()
 	capture := newComposeCapture()
 
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true, false)
 	if err == nil {
 		t.Fatal("expected abort error on error-severity finding, got nil")
 	}
@@ -95,7 +95,7 @@ func TestServerPreflightValidate_WarningProceeds(t *testing.T) {
 	capture := newComposeCapture()
 	capture.refByNodeID["route"] = "route"
 
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true, false)
 	if err != nil {
 		t.Fatalf("warnings must not abort; got: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestServerPreflightValidate_404FailsOpen(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false)
 	if err != nil {
 		t.Fatalf("404 must fail open (nil error); got: %v", err)
 	}
@@ -132,8 +132,11 @@ func TestServerPreflightValidate_404FailsOpen(t *testing.T) {
 	}
 }
 
-// A non-JSON 200 body is treated as an older/foreign backend: fail open.
-func TestServerPreflightValidate_NonJSONFailsOpen(t *testing.T) {
+// A non-JSON 200 body means the oracle did not answer (a proxy page, a foreign
+// server). The real apply path refuses: it cannot tell a valid graph from one
+// the server would reject, and the task rows it would post next have no undo.
+// --allow-unvalidated restores the old proceed-with-a-note behavior.
+func TestServerPreflightValidate_NonJSONFailsClosed(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("not json at all"))
@@ -143,12 +146,53 @@ func TestServerPreflightValidate_NonJSONFailsOpen(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
-	if err != nil {
-		t.Fatalf("non-JSON must fail open (nil error); got: %v", err)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false)
+	if err == nil {
+		t.Fatal("non-JSON must fail closed on the real apply path")
 	}
-	if out := errb.String(); !strings.Contains(out, "skipped") {
-		t.Errorf("expected fail-open note; got:\n%s", out)
+	if !strings.Contains(err.Error(), "--allow-unvalidated") || !strings.Contains(err.Error(), "nothing was created") {
+		t.Errorf("error must name the escape hatch and state nothing was created; got: %v", err)
+	}
+	if out := errb.String(); !strings.Contains(out, "refusing to apply") {
+		t.Errorf("expected a refusal note on stderr; got:\n%s", out)
+	}
+
+	cmd2, errb2 := preflightTestCmd()
+	if err := serverPreflightValidate(c, cmd2, map[string]any{"label": "x"}, newComposeCapture(), true, true); err != nil {
+		t.Fatalf("--allow-unvalidated must proceed; got: %v", err)
+	}
+	if out := errb2.String(); !strings.Contains(out, "skipped") {
+		t.Errorf("expected the proceed note; got:\n%s", out)
+	}
+}
+
+// A 5xx from the oracle fails closed on the real apply path and stays a note
+// on dry-run, which mutates nothing and only reports.
+func TestServerPreflightValidate_5xxFailsClosedOnApplyOnly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv.URL)
+
+	cmd, errb := preflightTestCmd()
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false)
+	if err == nil {
+		t.Fatal("a 5xx must fail closed on the real apply path")
+	}
+	if !strings.Contains(err.Error(), "503") {
+		t.Errorf("error must carry the status; got: %v", err)
+	}
+	if out := errb.String(); strings.Contains(out, "older backend") {
+		t.Errorf("a 5xx must not be misattributed to an older backend; got:\n%s", out)
+	}
+
+	cmd2, errb2 := preflightTestCmd()
+	if err := serverPreflightValidate(c, cmd2, map[string]any{"label": "x"}, newComposeCapture(), false, false); err != nil {
+		t.Fatalf("dry-run must never abort on availability; got: %v", err)
+	}
+	if out := errb2.String(); !strings.Contains(out, "skipped") {
+		t.Errorf("dry-run should note the skip; got:\n%s", out)
 	}
 }
 
@@ -168,7 +212,7 @@ func TestServerPreflightValidate_NodeIDMappedToRef(t *testing.T) {
 	// Server assigned "conditional-1a2b3c"; the author's spec called it "route".
 	capture.refByNodeID["conditional-1a2b3c"] = "route"
 
-	_ = serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true)
+	_ = serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, capture, true, false)
 	out := errb.String()
 	if !strings.Contains(out, `node "route"`) {
 		t.Errorf("expected finding rendered with mapped ref 'route'; got:\n%s", out)
@@ -196,7 +240,7 @@ func TestServerPreflightValidate_UnknownCodeRenderedGenerically(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false)
 	if err == nil {
 		t.Fatal("unknown error-severity code must still abort")
 	}
@@ -221,7 +265,7 @@ func TestServerPreflightValidate_DryRunNeverAborts(t *testing.T) {
 	defer srvErr.Close()
 	c := newTestClient(t, srvErr.URL)
 	cmd, errb := preflightTestCmd()
-	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), false); err != nil {
+	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), false, false); err != nil {
 		t.Fatalf("dry-run must never abort; got: %v", err)
 	}
 	if !strings.Contains(errb.String(), "MULTIPLE_END_NODES") {
@@ -236,7 +280,7 @@ func TestServerPreflightValidate_DryRunNeverAborts(t *testing.T) {
 	defer srvOK.Close()
 	c2 := newTestClient(t, srvOK.URL)
 	cmd2, errb2 := preflightTestCmd()
-	if err := serverPreflightValidate(c2, cmd2, map[string]any{"label": "x"}, newComposeCapture(), false); err != nil {
+	if err := serverPreflightValidate(c2, cmd2, map[string]any{"label": "x"}, newComposeCapture(), false, false); err != nil {
 		t.Fatalf("clean pass must not error; got: %v", err)
 	}
 	if !strings.Contains(errb2.String(), "no issues found") {
@@ -284,7 +328,7 @@ func TestApplyAssembleValidateAndPost_ErrorAbortsBeforeTaskCreate(t *testing.T) 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false, false)
 	if err == nil {
 		t.Fatal("expected apply to abort on error finding")
 	}
@@ -314,7 +358,7 @@ func TestApplyAssembleValidateAndPost_WarningProceedsAndPosts(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false, false)
 	if err != nil {
 		t.Fatalf("warnings must not block apply; got: %v", err)
 	}
@@ -342,7 +386,7 @@ func TestApplyAssembleValidateAndPost_404FailsOpenAndPosts(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false, false)
 	if err != nil {
 		t.Fatalf("404 must fail open and let apply proceed; got: %v", err)
 	}
@@ -379,7 +423,7 @@ func TestDryAssemblyValidation_PostsNoTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dry compose failed: %v", err)
 	}
-	serverPreflightValidate(c, cmd, wf, capture, false)
+	serverPreflightValidate(c, cmd, wf, capture, false, false)
 
 	if got := atomic.LoadInt32(&taskCalls); got != 0 {
 		t.Errorf("dry-run must not POST any /v2/tasks; got %d", got)
@@ -417,7 +461,7 @@ func TestServerPreflightValidate_ValidFalseWithoutErrorAborts(t *testing.T) {
 			c := newTestClient(t, srv.URL)
 			cmd, errb := preflightTestCmd()
 
-			err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
+			err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false)
 			if err == nil {
 				t.Fatal("valid:false must abort even with no error-severity finding")
 			}
@@ -444,7 +488,7 @@ func TestServerPreflightValidate_ValidFalseStillPrintsWarnings(t *testing.T) {
 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
-	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true); err == nil {
+	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false); err == nil {
 		t.Fatal("expected abort")
 	}
 	if out := errb.String(); !strings.Contains(out, "[WARN]") || !strings.Contains(out, "SOME_ADVISORY") {
@@ -464,7 +508,7 @@ func TestServerPreflightValidate_UppercaseSeverityAborts(t *testing.T) {
 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
-	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true)
+	err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false)
 	if err == nil {
 		t.Fatal("uppercase ERROR severity must be treated as an error and abort")
 	}
@@ -492,7 +536,7 @@ func TestServerPreflightValidate_BranchBannerOnlyForBranchCode(t *testing.T) {
 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
-	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true); err != nil {
+	if err := serverPreflightValidate(c, cmd, map[string]any{"label": "x"}, newComposeCapture(), true, false); err != nil {
 		t.Fatalf("warning must not abort; got: %v", err)
 	}
 	out := errb.String()
@@ -504,12 +548,12 @@ func TestServerPreflightValidate_BranchBannerOnlyForBranchCode(t *testing.T) {
 	}
 }
 
-// --- fail-open split: non-404 4xx is loud (finding 2) -----------------------
+// --- availability policy: only a 404 fails open ------------------------------
 
-// A 422 means the endpoint IS there and rejected the request -- it must produce
-// a LOUD "contract mismatch" note (not the dim "older backend" one), then let
-// apply proceed and POST every node's task.
-func TestApplyAssembleValidateAndPost_422LoudNoteProceedsAndPosts(t *testing.T) {
+// A 422 means the endpoint IS there and rejected the request: a contract
+// mismatch between this CLI and the backend. It is named LOUDLY (not the dim
+// "older backend" note) and apply refuses before any /v2/tasks POST.
+func TestApplyAssembleValidateAndPost_422FailsClosedBeforeTaskCreate(t *testing.T) {
 	var validateCalls, taskCalls int32
 	srv := applyServerHandler(t, http.StatusUnprocessableEntity, "", &validateCalls, &taskCalls)
 	defer srv.Close()
@@ -517,15 +561,12 @@ func TestApplyAssembleValidateAndPost_422LoudNoteProceedsAndPosts(t *testing.T) 
 	c := newTestClient(t, srv.URL)
 	cmd, errb := preflightTestCmd()
 
-	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false)
-	if err != nil {
-		t.Fatalf("a 4xx from the oracle must not block apply; got: %v", err)
+	_, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false, false)
+	if err == nil {
+		t.Fatal("a rejected validation request must block apply")
 	}
-	if wf == nil {
-		t.Fatal("expected an assembled workflow body after a loud fail-open")
-	}
-	if got := atomic.LoadInt32(&taskCalls); got != 3 {
-		t.Errorf("expected 3 /v2/tasks POSTs after fail-open; got %d", got)
+	if got := atomic.LoadInt32(&taskCalls); got != 0 {
+		t.Errorf("no /v2/tasks POST may happen when the oracle is unusable; got %d", got)
 	}
 	if got := atomic.LoadInt32(&validateCalls); got != 1 {
 		t.Errorf("expected 1 validate attempt, got %d", got)
@@ -536,5 +577,52 @@ func TestApplyAssembleValidateAndPost_422LoudNoteProceedsAndPosts(t *testing.T) 
 	}
 	if strings.Contains(out, "older backend") {
 		t.Errorf("a 422 must NOT be misattributed to an older backend; got:\n%s", out)
+	}
+}
+
+// --allow-unvalidated is the one way past an unusable oracle: the loud note
+// still prints, then every node's task is posted as before the policy change.
+func TestApplyAssembleValidateAndPost_422AllowUnvalidatedPostsWithLoudNote(t *testing.T) {
+	var validateCalls, taskCalls int32
+	srv := applyServerHandler(t, http.StatusUnprocessableEntity, "", &validateCalls, &taskCalls)
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	cmd, errb := preflightTestCmd()
+
+	wf, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false, true)
+	if err != nil {
+		t.Fatalf("--allow-unvalidated must let apply proceed; got: %v", err)
+	}
+	if wf == nil {
+		t.Fatal("expected an assembled workflow body")
+	}
+	if got := atomic.LoadInt32(&taskCalls); got != 3 {
+		t.Errorf("expected 3 /v2/tasks POSTs; got %d", got)
+	}
+	out := errb.String()
+	if !strings.Contains(out, "contract mismatch") || !strings.Contains(out, "skipped") {
+		t.Errorf("expected the loud note and the proceed note; got:\n%s", out)
+	}
+}
+
+// A 5xx from the oracle blocks apply before any /v2/tasks POST.
+func TestApplyAssembleValidateAndPost_5xxFailsClosedBeforeTaskCreate(t *testing.T) {
+	var validateCalls, taskCalls int32
+	srv := applyServerHandler(t, http.StatusBadGateway, "", &validateCalls, &taskCalls)
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	cmd, errb := preflightTestCmd()
+
+	_, err := applyAssembleValidateAndPost(c, cmd, minimalPreflightSpec(), false, false, false, false, false, false)
+	if err == nil {
+		t.Fatal("a 5xx from the oracle must block apply")
+	}
+	if got := atomic.LoadInt32(&taskCalls); got != 0 {
+		t.Errorf("no /v2/tasks POST may happen when the oracle is down; got %d", got)
+	}
+	if !strings.Contains(errb.String(), "502") {
+		t.Errorf("the note must carry the status; got:\n%s", errb.String())
 	}
 }

@@ -59,13 +59,17 @@ Use `--diff` to preview changes against the current tenant state before mutating
 
 **Create vs update semantics.** apply resolves the target by alias:
 
-- `spec.alias` if set, otherwise `slugifyWorkflowLabel(spec.label)`.
+- `spec.alias` if set, otherwise `slugifyWorkflowLabel(spec.label)`. **Always set `alias`.** Without it the label is the workflow's identity: relabel it and apply creates a second workflow instead of updating the first. apply warns on every run that lacks one and prints the slug to paste in; a future release requires it.
 - If **no** ACTIVE workflow has that alias → **CREATE path**: POST `/v2/tasks` for every task (server picks each task's alias), POST `/v2/workflows`, optional publish (DRAFT by default unless `--publish`).
 - If exactly **one** ACTIVE workflow has that alias → **UPDATE path**: POST `/v2/tasks` for every task in the spec (old tasks orphan, accepted), acquire a lock (`client-id=apply-<ts>`), `create-draft --force-recreate`, autosave the new nodes/edges/variables/config/notes/category/status, then publish **carrying that lock token**. Same workflow id, same alias, version increments, schedules and downstream consumers survive.
   - The lock is taken **before** `create-draft`, which hard-deletes any existing draft and is not itself lock-gated: locking afterwards meant a refused apply had already destroyed someone's work-in-progress.
   - When a lock blocks apply, it is only reclaimed if a previous apply run abandoned it: its own `apply-` clientId, never renewed, AND older than 90s. apply does not heartbeat, so a run that is alive right now also shows `renewCount: 0` — age is the only thing separating the two, and without it two concurrent applies rob each other. Anything else is refused, naming the holder — close that Hub tab, or pass `--force-lock` to take it and discard whatever is unsaved there.
 
 Both paths share the same validation + normalize pipeline (`preflightTasks`, per-type normalize, `validateEntityWorkflowAliasMatch`, etc.) so a spec that passes against a fresh tenant also passes when re-applied later.
+
+**Server pre-flight is required, not advisory.** Before the first `/v2/tasks` POST, apply sends the assembled graph to `POST /v2/workflows/validate`. If that call cannot be used (a 5xx, a rejected request, a transport error, an unreadable body) apply refuses and creates nothing: there is no rollback for task rows, so it will not post them on the strength of a check that did not run. Retry, or pass `--allow-unvalidated` to accept that risk for one run. Only a 404 from a backend that predates the endpoint proceeds on its own. `--dry-run` reports and never aborts.
+
+**Long-form refs are rewritten everywhere.** A `task_outputs.<ref>` reference in any non-prose field of a task body (values and map keys, at any depth) is ordered and rewritten to the server alias, including fields the CLI has never heard of. Bare `<ref>.<field>` heads and bare `{{token}}` placeholders are still handled per task type, so a new task type that uses the bare form needs a CLI update; one that uses the long form does not.
 
 **Entity-scope reconciliation (auto-restamp).** After apply succeeds, it walks the spec's referenced credit-decisioning entities and stamps each one's `workflowAlias` to the workflow's alias via `PATCH /v1/{resource}/{id}`. Walked:
 

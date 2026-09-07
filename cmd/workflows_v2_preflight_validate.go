@@ -29,9 +29,17 @@ import (
 // plus the inline task bodies BEFORE anything is persisted, and aborts apply on
 // errors so no task rows leak. The validation rules are NOT re-implemented in
 // Go: the server is the single oracle. Unknown finding codes are rendered
-// generically. The endpoint is new and may be absent (built in parallel, not
-// yet deployed), so a 404 / connection error / non-JSON response FAILS OPEN --
-// apply proceeds exactly as it did before this check existed.
+// generically.
+//
+// Availability policy. A 404 means an older backend without the endpoint and
+// FAILS OPEN: apply proceeds exactly as it did before this check existed.
+// Anything else that leaves the oracle unusable -- a 5xx, a non-404 4xx, a
+// transport error, an empty or non-JSON body -- FAILS CLOSED on the real apply
+// path: proceeding would post task rows that a later create/publish rejection
+// cannot take back, on the strength of a check that did not run. The
+// --allow-unvalidated flag restores the old proceed-anyway behavior for the one
+// run where the author accepts that risk. --dry-run only reports, so it never
+// aborts on availability.
 
 // composeCapture is what the single assembly pass hands to the two phases that
 // follow it: the server pre-flight validator and the task-posting phase.
@@ -109,11 +117,24 @@ type validationResponse struct {
 // error-severity finding to pin it to. Warnings never abort: they print
 // prominently and apply continues. When abortOnError is false (--dry-run) it
 // never returns an error -- it only prints results.
-func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[string]any, capture *composeCapture, abortOnError bool) error {
+func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[string]any, capture *composeCapture, abortOnError, allowUnvalidated bool) error {
 	if c == nil || workflow == nil || capture == nil {
 		return nil
 	}
 	errOut := cmd.ErrOrStderr()
+
+	// unusable is every "the oracle could not be used" outcome except a 404.
+	// Dry-run and --allow-unvalidated note it and proceed; the real apply path
+	// refuses, because there is no undo for the task rows it would post next.
+	unusable := func(reason string) error {
+		if !abortOnError || allowUnvalidated {
+			dimNote(errOut, "server pre-flight skipped: "+reason+"; proceeding without it")
+			return nil
+		}
+		fmt.Fprintf(errOut, "# server pre-flight unavailable: %s.\n", reason)
+		fmt.Fprintln(errOut, "# refusing to apply: a graph the server later rejects leaks /v2/tasks rows that cannot be deleted, and the check that prevents that did not run. Retry, or pass --allow-unvalidated to proceed anyway.")
+		return fmt.Errorf("server pre-flight validation unavailable (%s); nothing was created. Retry, or pass --allow-unvalidated to apply without it", reason)
+	}
 
 	tasks := capture.tasks
 	if tasks == nil {
@@ -125,43 +146,37 @@ func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		// Best-effort: if we can't even encode the payload, fail open.
-		dimNote(errOut, fmt.Sprintf("server pre-flight skipped: could not encode validation payload (%v); proceeding without it", err))
-		return nil
+		return unusable(fmt.Sprintf("could not encode validation payload (%v)", err))
 	}
 
 	data, status, derr := c.Do("POST", "borrower_central", "/v2/workflows/validate", json.RawMessage(body))
 	switch {
 	case status == http.StatusNotFound:
-		// Endpoint absent -> older backend that doesn't have it yet. Fail open.
+		// Endpoint absent -> older backend that doesn't have it yet. The only
+		// fail-open branch: the check never existed for this backend.
 		dimNote(errOut, preflightUnavailableNote)
 		return nil
 	case status >= 500:
-		// Server-side trouble -- never block apply on the oracle's health.
-		dimNote(errOut, preflightUnavailableNote)
-		return nil
+		return unusable(fmt.Sprintf("POST /v2/workflows/validate answered HTTP %d", status))
 	case status >= 400:
 		// A non-404 4xx (400 / 401 / 403 / 422 / ...): the endpoint IS there and
 		// rejected the request -- a likely request/response contract mismatch.
-		// Flag it LOUDLY (not the dim "older backend" note) but never block apply
-		// on it. The client folds a >=400 body into derr (data is nil).
-		fmt.Fprintf(errOut, "# warning: server rejected the validation request (HTTP %d) -- possible contract mismatch; proceeding without pre-flight.\n", status)
+		// Flag it LOUDLY (not the dim "older backend" note). The client folds a
+		// >=400 body into derr (data is nil).
+		fmt.Fprintf(errOut, "# warning: server rejected the validation request (HTTP %d) -- possible contract mismatch between this CLI and the backend.\n", status)
 		if detail := preflightResponseDetail(data, derr, status); detail != "" {
 			fmt.Fprintf(errOut, "#   response: %s\n", detail)
 		}
-		return nil
-	case derr != nil, status < 200 || status >= 300, len(data) == 0:
-		// Transport error (no HTTP status), an unexpected non-2xx (e.g. a
-		// surfaced 3xx), or an empty body -> nothing usable. Fail open.
-		dimNote(errOut, preflightUnavailableNote)
-		return nil
+		return unusable(fmt.Sprintf("the validation request was rejected (HTTP %d)", status))
+	case derr != nil:
+		return unusable(fmt.Sprintf("POST /v2/workflows/validate failed (%v)", derr))
+	case status < 200 || status >= 300, len(data) == 0:
+		return unusable(fmt.Sprintf("POST /v2/workflows/validate answered HTTP %d with no usable body", status))
 	}
 
 	var resp validationResponse
 	if jerr := json.Unmarshal(data, &resp); jerr != nil {
-		// Non-JSON / unexpected shape -> treat as an older/foreign backend, fail open.
-		dimNote(errOut, "server pre-flight skipped: unrecognized /v2/workflows/validate response; proceeding without it")
-		return nil
+		return unusable("unrecognized /v2/workflows/validate response (not the findings JSON)")
 	}
 
 	errs, warns := partitionFindings(resp.Findings)
@@ -209,8 +224,8 @@ func serverPreflightValidate(c *client.Client, cmd *cobra.Command, workflow map[
 	return nil
 }
 
-// preflightUnavailableNote is the dim fail-open note shared by every "the oracle
-// isn't usable" branch (404 / 5xx / transport error / non-2xx / empty body).
+// preflightUnavailableNote is the dim fail-open note for the one branch that
+// still fails open: a 404 from a backend that predates the endpoint.
 const preflightUnavailableNote = "server pre-flight skipped: POST /v2/workflows/validate unavailable (older backend); proceeding without it"
 
 // hasFindingCode reports whether any finding carries the given code.
@@ -304,7 +319,7 @@ func dimNote(w io.Writer, msg string) {
 // The posted workflow body is the validated body mutated in place by phase 4
 // alone, so it differs from what the validator saw ONLY by the ref -> server
 // alias identifier substitution.
-func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *composeSpec, publish, skipRescope, allowStealOwnership, noAutoDefaults, noLayout bool) (map[string]any, error) {
+func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *composeSpec, publish, skipRescope, allowStealOwnership, noAutoDefaults, noLayout, allowUnvalidated bool) (map[string]any, error) {
 	// Phase 1: assemble once. dryRun=false selects strict normalization -- the
 	// real apply must hard-fail on a bad source/entity, not stub it as a preview
 	// would. An assembly-level error surfaces here, before any /v2/tasks POST.
@@ -315,7 +330,7 @@ func applyAssembleValidateAndPost(c *client.Client, cmd *cobra.Command, spec *co
 	}
 
 	// Phase 2: validate the exact artifacts we are about to post.
-	if abortErr := serverPreflightValidate(c, cmd, wf, capture, true); abortErr != nil {
+	if abortErr := serverPreflightValidate(c, cmd, wf, capture, true, allowUnvalidated); abortErr != nil {
 		return nil, abortErr
 	}
 
