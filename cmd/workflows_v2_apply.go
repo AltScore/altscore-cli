@@ -425,7 +425,7 @@ End-node output (endConfig on the 'end' node):
 					return serr
 				}
 			} else {
-				dimNote(cmd.ErrOrStderr(), "spec sets an explicit node alias, which the server-side apply does not accept; using the client-side pipeline")
+				dimNote(cmd.ErrOrStderr(), "spec uses a node shape the server-side apply does not accept (an explicit node alias, or a node with neither a body nor taskAlias); using the client-side pipeline")
 			}
 
 			// === Client-side pipeline (older backend) ===

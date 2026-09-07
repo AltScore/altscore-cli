@@ -99,6 +99,10 @@ type validationResponse struct {
 	Valid          bool                `json:"valid"`
 	Findings       []validationFinding `json:"findings"`
 	SkippedNodeIDs []string            `json:"skippedNodeIds"`
+	// alias -> spec-local ref, sent by POST /v2/workflows/apply so findings
+	// that name a minted alias can be shown with the author's own name.
+	// Absent (nil) on /validate responses.
+	Refs map[string]string `json:"refs"`
 }
 
 // serverPreflightValidate POSTs the assembled workflow body plus the per-node

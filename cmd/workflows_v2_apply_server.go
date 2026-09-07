@@ -163,9 +163,18 @@ func buildFlatSpecForServer(assembled map[string]any, capture *composeCapture, t
 		"edges": edges,
 	}
 	for _, k := range []string{"category", "description", "inputVariables", "customVariables", "config", "notes"} {
-		if v, ok := assembled[k]; ok {
-			flat[k] = v
+		v, ok := assembled[k]
+		if !ok {
+			continue
 		}
+		// The assembly always emits `category`, "" when the spec has none; the
+		// server takes absence, not an empty enum value.
+		if k == "category" {
+			if s, _ := v.(string); s == "" {
+				continue
+			}
+		}
+		flat[k] = v
 	}
 	return flat, true
 }
@@ -195,7 +204,9 @@ func applyViaServer(c *client.Client, cmd *cobra.Command, flat map[string]any, o
 		return nil, fmt.Errorf("server apply: %w", err)
 	}
 	switch {
-	case status == http.StatusNotFound || status == http.StatusMethodNotAllowed:
+	case (status == http.StatusNotFound || status == http.StatusMethodNotAllowed) && !isApplyErrorEnvelope(data):
+		// The route itself is missing (a 404/405 the endpoint produced would
+		// carry an APPLY_* subcode); an older backend.
 		return nil, errServerApplyUnavailable
 	case status >= 200 && status < 300:
 		var res serverApplyResult
@@ -203,6 +214,14 @@ func applyViaServer(c *client.Client, cmd *cobra.Command, flat map[string]any, o
 			return nil, fmt.Errorf("server apply: unreadable %d response: %w", status, err)
 		}
 		return &res, nil
+	}
+	if opts.DryRun {
+		// A preview never aborts on findings: the server attaches the plan it
+		// would have returned to a validation failure, so render it with the
+		// errors instead of failing the preview.
+		if res := planFromValidationFailure(data); res != nil {
+			return res, nil
+		}
 	}
 	return nil, describeServerApplyError(cmd.ErrOrStderr(), status, data)
 }
@@ -214,12 +233,80 @@ type serverErrorEnvelope struct {
 	Details map[string]any `json:"details"`
 }
 
+func parseServerErrorEnvelope(data json.RawMessage) (serverErrorEnvelope, bool) {
+	var env serverErrorEnvelope
+	if err := json.Unmarshal(data, &env); err != nil || env.Code == "" {
+		return serverErrorEnvelope{}, false
+	}
+	return env, true
+}
+
+// isApplyErrorEnvelope reports whether a response body is an error the apply
+// endpoint itself produced (an APPLY_* subcode), as opposed to the framework's
+// answer for a route that does not exist.
+func isApplyErrorEnvelope(data json.RawMessage) bool {
+	env, ok := parseServerErrorEnvelope(data)
+	if !ok {
+		return false
+	}
+	subCode, _ := env.Details["errorSubCode"].(string)
+	return strings.HasPrefix(subCode, "APPLY_")
+}
+
+// planFromValidationFailure turns a 422 APPLY_VALIDATION_FAILED that carries
+// `details.plan` (a dry run's plan) into a result the preview renderers accept,
+// with the failing validation attached. nil when the body is anything else.
+func planFromValidationFailure(data json.RawMessage) *serverApplyResult {
+	env, ok := parseServerErrorEnvelope(data)
+	if !ok {
+		return nil
+	}
+	if subCode, _ := env.Details["errorSubCode"].(string); subCode != "APPLY_VALIDATION_FAILED" {
+		return nil
+	}
+	planRaw, err := json.Marshal(env.Details["plan"])
+	if err != nil || env.Details["plan"] == nil {
+		return nil
+	}
+	var plan struct {
+		Mode          string            `json:"mode"`
+		WorkflowAlias string            `json:"workflowAlias"`
+		Workflow      json.RawMessage   `json:"workflow"`
+		Tasks         []serverApplyTask `json:"tasks"`
+	}
+	if err := json.Unmarshal(planRaw, &plan); err != nil {
+		return nil
+	}
+	res := &serverApplyResult{
+		Mode:          plan.Mode,
+		DryRun:        true,
+		WorkflowAlias: plan.WorkflowAlias,
+		Workflow:      plan.Workflow,
+		Tasks:         plan.Tasks,
+	}
+	if validationRaw, err := json.Marshal(env.Details["validation"]); err == nil {
+		_ = json.Unmarshal(validationRaw, &res.Validation)
+	}
+	res.Validation.Valid = false
+	return res
+}
+
+// captureFromRefs builds the alias -> ref map printFindingLines uses to show
+// the author's spec-local names instead of the minted aliases the server's
+// findings carry.
+func captureFromRefs(refs map[string]string) *composeCapture {
+	if len(refs) == 0 {
+		return nil
+	}
+	return &composeCapture{refByNodeID: refs}
+}
+
 // describeServerApplyError prints what the server found (findings, publish
 // errors, the lock holder) and returns the error apply exits with. The subcode
 // decides the rendering; unknown shapes fall back to the envelope's message.
 func describeServerApplyError(w io.Writer, status int, data json.RawMessage) error {
-	var env serverErrorEnvelope
-	if err := json.Unmarshal(data, &env); err != nil || env.Code == "" {
+	env, ok := parseServerErrorEnvelope(data)
+	if !ok {
 		detail := strings.TrimSpace(string(data))
 		if len(detail) > 400 {
 			detail = detail[:400] + "..."
@@ -241,8 +328,9 @@ func describeServerApplyError(w io.Writer, status int, data json.RawMessage) err
 		validation, _ := env.Details["validation"].(map[string]any)
 		findings := findingsFromAny(validation["findings"])
 		errs, warns := partitionFindings(findings)
-		printFindingLines(w, "ERROR", errs, nil)
-		printFindingLines(w, "WARN", warns, nil)
+		capture := captureFromRefs(refsFromAny(validation["refs"]))
+		printFindingLines(w, "ERROR", errs, capture)
+		printFindingLines(w, "WARN", warns, capture)
 		return fmt.Errorf("server pre-write validation failed with %d error(s) (see above); nothing was created", len(errs))
 
 	case subCode == "APPLY_PUBLISH_REJECTED":
@@ -287,6 +375,21 @@ func describeServerApplyError(w io.Writer, status int, data json.RawMessage) err
 		msg += " [errorSubCode=" + subCode + "]"
 	}
 	return errors.New(msg)
+}
+
+// refsFromAny decodes the validation payload's alias -> ref map.
+func refsFromAny(v any) map[string]string {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for alias, ref := range m {
+		if s, ok := ref.(string); ok && s != "" {
+			out[alias] = s
+		}
+	}
+	return out
 }
 
 // findingsFromAny decodes a findings list that arrived inside a generic error
@@ -335,10 +438,15 @@ func printServerApplySummary(w io.Writer, res *serverApplyResult) {
 			fmt.Fprintf(w, "#     WARNING: the server dropped field(s) the task schema does not declare: %s\n", strings.Join(t.DroppedFields, ", "))
 		}
 	}
-	_, warns := partitionFindings(res.Validation.Findings)
+	errs, warns := partitionFindings(res.Validation.Findings)
+	capture := captureFromRefs(res.Validation.Refs)
+	if len(errs) > 0 {
+		fmt.Fprintf(w, "# server validation: %d error(s) -- a real apply would be REFUSED and write nothing:\n", len(errs))
+		printFindingLines(w, "ERROR", errs, capture)
+	}
 	if len(warns) > 0 {
 		fmt.Fprintf(w, "# server validation: %d warning(s) (apply proceeds):\n", len(warns))
-		printFindingLines(w, "WARN", warns, nil)
+		printFindingLines(w, "WARN", warns, capture)
 	}
 	if res.DryRun {
 		return
@@ -375,7 +483,11 @@ func finishServerApply(c *client.Client, cmd *cobra.Command, spec *composeSpec, 
 
 	if dryRun {
 		printServerApplySummary(errOut, res)
-		fmt.Fprintf(cmd.OutOrStderr(), "# DRY RUN (server plan) -- %s path for alias=%s; nothing written. Body below is the graph the server would persist.\n", res.Mode, res.WorkflowAlias)
+		verdict := "nothing written"
+		if !res.Validation.Valid {
+			verdict = "the server would REFUSE this spec (errors above); nothing written"
+		}
+		fmt.Fprintf(cmd.OutOrStderr(), "# DRY RUN (server plan) -- %s path for alias=%s; %s. Body below is the graph the server would persist.\n", res.Mode, res.WorkflowAlias, verdict)
 		return output.RawJSON(res.Workflow)
 	}
 

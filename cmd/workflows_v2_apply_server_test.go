@@ -244,10 +244,84 @@ func TestApplyViaServer_ValidationFailurePrintsFindings(t *testing.T) {
 		t.Fatalf("expected a validation error naming the count, got %v", err)
 	}
 	out := errb.String()
+	// No refs map in this envelope: the alias is shown as-is.
 	for _, want := range []string{"[ERROR] NO_END_NODES", "[WARN] SOURCE_INPUT_NOT_FED", `(node "fetch-a1")`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stderr missing %q; got:\n%s", want, out)
 		}
+	}
+}
+
+// A preview never aborts on findings: the 422 carries the plan the server
+// would have returned, and the renderer gets it with the failing validation.
+func TestApplyViaServer_DryRunValidationFailureReturnsThePlan(t *testing.T) {
+	body := `{"code":"UnprocessableEntity","message":"rejected","details":{"errorSubCode":"APPLY_VALIDATION_FAILED",
+		"validation":{"valid":false,"skippedNodeIds":[],"refs":{"fetch-a1b2c3":"fetch"},"findings":[
+			{"code":"TASK_REFERENCE_NOT_UPSTREAM","severity":"error","nodeId":"fetch-a1b2c3","edgeId":null,"params":{},"message":"not upstream"}]},
+		"plan":{"mode":"update_active","workflowAlias":"smoke-apply","workflow":{"nodes":[],"edges":[]},
+			"tasks":[{"ref":"fetch","alias":"fetch-a1b2c3","taskId":"t1","version":4,"action":"bumped","droppedFields":[]}]}}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv.URL)
+
+	cmd, _, errb := serverApplyTestCmd()
+	res, err := applyViaServer(c, cmd, map[string]any{"alias": "smoke-apply"}, serverApplyOptions{DryRun: true})
+	if err != nil {
+		t.Fatalf("dry run must not abort on findings: %v", err)
+	}
+	if res.Mode != "update_active" || !res.DryRun || res.Validation.Valid || len(res.Tasks) != 1 || res.Tasks[0].Action != "bumped" {
+		t.Errorf("plan not carried: %+v", res)
+	}
+	printServerApplySummary(errb, res)
+	out := errb.String()
+	// The finding names the minted alias; the rendering maps it back to the ref.
+	for _, want := range []string{"would be REFUSED", `[ERROR] TASK_REFERENCE_NOT_UPSTREAM (node "fetch")`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary missing %q; got:\n%s", want, out)
+		}
+	}
+
+	// The same 422 on a real apply is an error.
+	cmd, _, _ = serverApplyTestCmd()
+	if _, err := applyViaServer(c, cmd, map[string]any{"alias": "smoke-apply"}, serverApplyOptions{}); err == nil {
+		t.Fatal("a real apply must fail on APPLY_VALIDATION_FAILED")
+	}
+}
+
+// A 404 that the endpoint ITSELF produced (APPLY_* subcode) is not "older
+// backend" and must not fall through to the client-side writing pipeline.
+func TestApplyViaServer_404WithApplyEnvelopeIsNotFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"code":"NotFound","message":"x","details":{"errorSubCode":"APPLY_FAILED","rolledBack":true,"error":"gone"}}`))
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv.URL)
+	cmd, _, _ := serverApplyTestCmd()
+	_, err := applyViaServer(c, cmd, map[string]any{"alias": "a"}, serverApplyOptions{})
+	if err == nil || err == errServerApplyUnavailable {
+		t.Fatalf("expected a terminal error, got %v", err)
+	}
+}
+
+// An empty category is "not set", never the empty enum value.
+func TestBuildFlatSpecForServer_DropsEmptyCategory(t *testing.T) {
+	spec := serverApplySpec()
+	spec.Category = ""
+	capture := newComposeCapture()
+	wf, err := composeWorkflowBody(nil, spec, true, false, true, false, false, true, capture)
+	if err != nil {
+		t.Fatalf("compose: %v", err)
+	}
+	flat, ok := buildFlatSpecForServer(wf, capture, "smoke-apply")
+	if !ok {
+		t.Fatal("refused")
+	}
+	if _, has := flat["category"]; has {
+		t.Errorf("empty category must not travel: %v", flat["category"])
 	}
 }
 
