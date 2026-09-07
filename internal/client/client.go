@@ -128,6 +128,14 @@ func (c *Client) moduleURL(module string) (string, error) {
 	return ModuleURL(c.Profile.Environment, module)
 }
 
+// ModuleBaseURL returns the base URL requests for module will hit, honoring
+// --base-url overrides. Callers use it as a cache key that tells one backend
+// from another (production vs staging vs a local server), which the profile's
+// environment alone cannot once an override is in play.
+func (c *Client) ModuleBaseURL(module string) (string, error) {
+	return c.moduleURL(module)
+}
+
 func (c *Client) doOnce(method, module, path string, body any, headers map[string]string) (json.RawMessage, int, error) {
 	baseURL, err := c.moduleURL(module)
 	if err != nil {

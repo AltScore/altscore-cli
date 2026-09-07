@@ -190,6 +190,7 @@ func makeWfv2ApplyCmd() *cobra.Command {
 	var noAutoDefaults bool
 	var noLayout bool
 	var forceLock bool
+	var allowUnvalidated bool
 
 	cmd := &cobra.Command{
 		Use:     "apply",
@@ -344,10 +345,19 @@ End-node output (endConfig on the 'end' node):
 				return err
 			}
 
-			// Determine target alias (predicted before any API call).
+			// Determine target alias (predicted before any API call). A spec
+			// without one is targeted by the label's slug, which makes the
+			// label the workflow's identity: relabel it and apply creates a
+			// second workflow instead of updating this one. Warn now; a future
+			// release requires `alias`.
 			targetAlias := spec.Alias
 			if targetAlias == "" {
 				targetAlias = slugifyWorkflowLabel(spec.Label)
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"# WARNING: spec has no `alias`; targeting %q, derived from the label. "+
+						"Add \"alias\": %q to the spec -- a future release will require it. "+
+						"Without one, changing the label creates a second workflow instead of updating this one.\n",
+					targetAlias, targetAlias)
 			}
 
 			// Lookup: is there an existing workflow with this alias on the
@@ -400,11 +410,12 @@ End-node output (endConfig on the 'end' node):
 				if err != nil {
 					return err
 				}
-				_ = serverPreflightValidate(c, cmd, workflow, capture, false)
+				_ = serverPreflightValidate(c, cmd, workflow, capture, false, allowUnvalidated)
 			default:
 				// Real apply (create OR update): validate before posting anything,
-				// abort on server errors.
-				workflow, err = applyAssembleValidateAndPost(c, cmd, &spec, publish, skipRescope, allowStealOwnership, noAutoDefaults, noLayout)
+				// abort on server errors -- and on an unusable oracle, unless
+				// --allow-unvalidated.
+				workflow, err = applyAssembleValidateAndPost(c, cmd, &spec, publish, skipRescope, allowStealOwnership, noAutoDefaults, noLayout, allowUnvalidated)
 				if err != nil {
 					return err
 				}
@@ -634,6 +645,7 @@ End-node output (endConfig on the 'end' node):
 	cmd.Flags().BoolVar(&verify, "verify", true, "after writing, read back the persisted tasks and warn (stderr, non-fatal) about any spec-set field the backend dropped or nulled. Pass --verify=false to skip the extra GETs")
 	cmd.Flags().BoolVar(&noAutoDefaults, "no-auto-defaults", false, "disable apply's opinionated convenience defaults: (1) end-node borrower_id/billable_id wired to the single customer node's borrower_id, (2) end-node PDF generation (pdfConfig.enabled+pdfGenerationRequired default to true), (3) deal-contact identity_value back-filled from each contact's identity_key field (default tax_id). Each only fills an absent field; caller-supplied values always win -- an explicit pdfConfig.enabled=false keeps the report off")
 	cmd.Flags().BoolVar(&forceLock, "force-lock", false, "take the workflow's edit lock even when a live session holds it. By default apply only reclaims a lock a previous apply run abandoned (its own clientId prefix, never renewed) and refuses anything that looks like an open Hub tab, naming the holder. Forcing discards whatever that session has unsaved")
+	cmd.Flags().BoolVar(&allowUnvalidated, "allow-unvalidated", false, "proceed when the server pre-flight (POST /v2/workflows/validate) cannot be used: a 5xx, a rejected request, a transport error or an unreadable response. Default: refuse, because a graph the server later rejects leaks /v2/tasks rows that cannot be deleted. A 404 from a backend that predates the endpoint always proceeds")
 	cmd.Flags().BoolVar(&noLayout, "no-layout", false, "skip auto-layout of the canvas. By default apply positions nodes in left-to-right columns (the same algorithm as the Hub builder's Align button) so the graph opens readable; with this flag nodes ship on a single row at a 200px pitch and overlap until someone clicks Align. Auto-layout is also skipped when the spec pins `position` on any node")
 	return cmd
 }
@@ -1556,32 +1568,142 @@ func isRefNameByte(c byte) bool {
 		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
-// dependencyTypesKey is the one custom-variable field whose refs live in map
-// KEYS rather than values, so the generic value walk must skip it.
-const dependencyTypesKey = "dependencyTypes"
+// rewriteTaskOutputsRefsDeep rewrites every `task_outputs.<ref>` reference
+// reachable from o, in place: string values at any depth AND map keys. It is
+// the one generic pass behind rewriteCustomVariableRefs and the task-body
+// rewrite in rewriteTaskRefs, so a new field carrying the long form is covered
+// without anyone remembering to name it. Six fixes (#18, #20, #21, #106, #111
+// and the pdf sourcesConfig one before them) were each "rewrite refs in one
+// more field"; the long form is unambiguous, so it can be rewritten wherever it
+// appears.
+//
+// skipFields names the map keys whose string values are prose and are left
+// alone (label, description, ...). The nearest enclosing key applies through
+// arrays, which is the rule validateNoResidualSpecRefs uses to skip the same
+// strings, so the pass and the guard always agree on the surface. Keys are
+// always rewritten: the only key-borne refs today are
+// customVariables[].dependencyTypes, keyed BY the dependency string, and a
+// key-shaped ref is never prose.
+//
+// A key already present under the destination name wins: it names a
+// dependency the author declared directly, and overwriting it with a
+// carried-over entry would replace a correct declaration with a stale one.
+// Moves run in sorted source order so the outcome does not depend on Go's map
+// iteration order.
+func rewriteTaskOutputsRefsDeep(o any, refMap map[string]string, skipFields map[string]bool) any {
+	return rewriteDeepUnderField(o, "", refMap, skipFields)
+}
 
-// rewriteRefStringsDeep returns o with every string VALUE reachable from it
-// rewritten, at any depth. Maps are walked in place; `dependencyTypes` is left
-// to its own key-aware pass.
-func rewriteRefStringsDeep(o any, refMap map[string]string) any {
+func rewriteDeepUnderField(o any, field string, refMap map[string]string, skipFields map[string]bool) any {
 	switch t := o.(type) {
 	case string:
+		if skipFields[field] {
+			return t
+		}
 		return rewriteTaskOutputsRefsInString(t, refMap)
 	case []any:
 		for i, e := range t {
-			t[i] = rewriteRefStringsDeep(e, refMap)
+			t[i] = rewriteDeepUnderField(e, field, refMap, skipFields)
+		}
+		return t
+	case []map[string]any:
+		for _, m := range t {
+			rewriteDeepUnderField(m, field, refMap, skipFields)
 		}
 		return t
 	case map[string]any:
 		for k, e := range t {
-			if k == dependencyTypesKey {
-				continue
+			t[k] = rewriteDeepUnderField(e, k, refMap, skipFields)
+		}
+		var moves []string
+		for k := range t {
+			if rewriteTaskOutputsRefsInString(k, refMap) != k {
+				moves = append(moves, k)
 			}
-			t[k] = rewriteRefStringsDeep(e, refMap)
+		}
+		sort.Strings(moves)
+		for _, k := range moves {
+			v := t[k]
+			delete(t, k)
+			nk := rewriteTaskOutputsRefsInString(k, refMap)
+			if _, taken := t[nk]; !taken {
+				t[nk] = v
+			}
 		}
 		return t
 	}
 	return o
+}
+
+// deepTaskOutputsRefs returns, in first-seen order, every distinct <head> of a
+// `task_outputs.<head>` reference reachable from body -- values and keys,
+// skipping the same prose fields rewriteTaskOutputsRefsDeep skips. Heads come
+// back as written; topologicalTaskOrder ignores one that names no task, so the
+// scan can afford to be generous. Maps are walked in sorted key order so the
+// result is deterministic.
+func deepTaskOutputsRefs(body any, skipFields map[string]bool) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		for _, h := range taskOutputsHeads(s) {
+			if !seen[h] {
+				seen[h] = true
+				out = append(out, h)
+			}
+		}
+	}
+	var walk func(o any, field string)
+	walk = func(o any, field string) {
+		switch t := o.(type) {
+		case string:
+			if !skipFields[field] {
+				add(t)
+			}
+		case []any:
+			for _, e := range t {
+				walk(e, field)
+			}
+		case []map[string]any:
+			for _, m := range t {
+				walk(m, field)
+			}
+		case map[string]any:
+			keys := make([]string, 0, len(t))
+			for k := range t {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				add(k)
+				walk(t[k], k)
+			}
+		}
+	}
+	walk(body, "")
+	return out
+}
+
+// taskOutputsHeads extracts the <head> of every `task_outputs.<head>` in s,
+// where a head is a maximal run of ref-name bytes (isRefNameByte). The dot in
+// the prefix keeps `task_outputs_by_type.` from matching.
+func taskOutputsHeads(s string) []string {
+	const prefix = "task_outputs."
+	var heads []string
+	for {
+		i := strings.Index(s, prefix)
+		if i < 0 {
+			return heads
+		}
+		s = s[i+len(prefix):]
+		j := 0
+		for j < len(s) && isRefNameByte(s[j]) {
+			j++
+		}
+		if j > 0 {
+			heads = append(heads, s[:j])
+		}
+		s = s[j:]
+	}
 }
 
 // rewriteCustomVariableRefs rewrites every spec-local ref inside ONE compute
@@ -1608,45 +1730,12 @@ func rewriteCustomVariableRefs(v map[string]any, refMap map[string]string) {
 	if v == nil {
 		return
 	}
-	// Every string VALUE, at any depth. Naming the fields one by one is what let
-	// `simpleConfig.formulaText` go stale while `expression` and `dependencies`
-	// rewrote correctly: the CLI never mentions simpleConfig anywhere, so the
-	// formula the client reads in the Hub kept pointing at spec-local refs. The
-	// compiled expression was right, so the workflow RAN correctly -- until
-	// someone opened that formula and saved, at which point the Hub recompiled
-	// the stale text and the variable silently resolved to nothing.
-	//
-	// Walking values means the next field added to a custom variable is covered
-	// without anyone remembering to come back here.
-	for k, e := range v {
-		if k == dependencyTypesKey {
-			continue // keyed BY the ref -- the pass below owns it
-		}
-		v[k] = rewriteRefStringsDeep(e, refMap)
-	}
-	if types, ok := v[dependencyTypesKey].(map[string]any); ok {
-		rewritten := make(map[string]any, len(types))
-		// Pass 1: keys the rewrite leaves alone. These name a dependency the
-		// author declared directly, so they own their slot.
-		for key, declared := range types {
-			if rewriteTaskOutputsRefsInString(key, refMap) == key {
-				rewritten[key] = declared
-			}
-		}
-		// Pass 2: move the rest onto their destination, never over an existing
-		// entry. Doing this second is what makes the outcome independent of Go's
-		// non-deterministic map iteration order.
-		for key, declared := range types {
-			newKey := rewriteTaskOutputsRefsInString(key, refMap)
-			if newKey == key {
-				continue
-			}
-			if _, taken := rewritten[newKey]; !taken {
-				rewritten[newKey] = declared
-			}
-		}
-		v["dependencyTypes"] = rewritten
-	}
+	// Every string VALUE at any depth and every map KEY. Naming the fields one
+	// by one is what let `simpleConfig.formulaText` go stale while `expression`
+	// and `dependencies` rewrote correctly, and then let `dependencyTypes` (the
+	// one field keyed BY the ref) stay on pre-rewrite names. No prose exclusion
+	// here: a variable definition has no free-text field the runtime ignores.
+	rewriteTaskOutputsRefsDeep(v, refMap, nil)
 }
 
 // rewriteRefsInTemplate rewrites every {{...}} placeholder in s whose inner
@@ -1771,12 +1860,14 @@ func rewriteRefsInTemplate(s string, refMap map[string]string, localMappings map
 // inputMappings-style dep and a forward reference inside a template will
 // fail at rewrite time instead of being ordered correctly.
 //
-// This switch is an ALLOWLIST and a generic walk was deliberately not put in
-// its place: only the typed cases can substitute a bare head, expand a bare
-// {{token}} through inputMappings, and reject an unknown head as a typo. A
-// blind body-wide rewrite would do the easy two thirds of the job while
-// silencing validateNoResidualSpecRefs, which is the thing that tells anyone
-// the next field is missing. The guard is the net; this switch is the fix.
+// This switch is an ALLOWLIST for the shapes only a typed case can handle:
+// substituting a bare `<ref>.<field>` head, expanding a bare {{token}} through
+// inputMappings, and rejecting an unknown head as a typo. The unambiguous long
+// form (`task_outputs.<ref>`) is NOT its job any more: rewriteTaskRefs runs
+// rewriteTaskOutputsRefsDeep over the whole body after this switch, and
+// topologicalTaskOrder scans the same surface, so a new field that carries the
+// long form is ordered and rewritten without an entry here. A field that uses
+// the BARE form still needs a case here and in templateDependencyRefs.
 func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) error {
 	taskType, _ := task["type"].(string)
 	// The task's inputMappings map short tokens (e.g. "borrower_id") to
@@ -2221,11 +2312,11 @@ func validateNoResidualSpecRefs(body map[string]any, refMap map[string]string, c
 				}
 				return fmt.Errorf(
 					"%s: residual spec-local ref %q embedded in a template at path %q: %q still contains "+
-						"%q (expected server-assigned alias %q). This means rewriteRefsInTaskTemplates "+
-						"doesn't yet walk this field for the task type -- at runtime the reference resolves "+
-						"to nothing and the literal is persisted/used as-is. Add the field to the rewriter "+
-						"AND to templateDependencyRefs (or add %q to residualSpecRefExcludedFields if the "+
-						"text is genuinely user-authored prose).",
+						"%q (expected server-assigned alias %q). rewriteTaskOutputsRefsDeep walks every "+
+						"non-prose string in the body, so this is a bug in that pass -- at runtime the "+
+						"reference resolves to nothing and the literal is persisted/used as-is. Report it "+
+						"(or add %q to residualSpecRefExcludedFields if the text is genuinely "+
+						"user-authored prose).",
 					ctx, ref, path, truncateForError(v), "task_outputs."+ref+".", refMap[ref], last)
 			}
 		}
@@ -2395,11 +2486,22 @@ func rewriteTaskRefs(task map[string]any, refMap map[string]string, ctx string) 
 	if err := rewriteRefsInTaskTemplates(task, refMap); err != nil {
 		return fmt.Errorf("%s: %w", ctx, err)
 	}
-	// Safety net: after all known rewriters run, fail loud on any string that
-	// still exactly equals a ref/placeholder the map would rename -- a field a
-	// rewriter doesn't yet walk. Run with the map that excludes THIS task's own
-	// identifier (the caller has not added it yet), so a task type/ref collision
-	// (e.g. an "end" node) is never mistaken for a residue.
+	// Generic pass: every remaining `task_outputs.<ref>` reference anywhere in
+	// the body, values and keys, minus the prose fields the guard below also
+	// skips. The typed rewriters above own the shapes only they can handle: a
+	// bare `<ref>.<field>` head, a bare {{token}} expanded through
+	// inputMappings, an unknown head rejected as a typo. The long form is
+	// unambiguous, so it is rewritten wherever it appears, and
+	// topologicalTaskOrder scans the same surface (deepTaskOutputsRefs) so the
+	// alias is already minted by the time this runs.
+	rewriteTaskOutputsRefsDeep(task, refMap, residualSpecRefExcludedFields)
+	// Safety net: after all rewriters run, fail loud on any string that still
+	// exactly equals a ref/placeholder the map would rename (a bare identifier
+	// in a field no typed rewriter walks) or still embeds one (which, after the
+	// generic pass, can only mean a bug in that pass). Run with the map that
+	// excludes THIS task's own identifier (the caller has not added it yet), so
+	// a task type/ref collision (e.g. an "end" node) is never mistaken for a
+	// residue.
 	if err := validateNoResidualSpecRefs(task, refMap, ctx); err != nil {
 		return err
 	}
@@ -2553,6 +2655,14 @@ func topologicalTaskOrder(tasks []map[string]any, edges []map[string]any) ([]int
 		// must be ordered AFTER that task so rewriteRefsInTaskTemplates
 		// resolves the ref to a server alias.
 		for _, ref := range templateDependencyRefs(t) {
+			addDep(i, ref)
+		}
+		// Long-form `task_outputs.<ref>` references anywhere else in the body,
+		// i.e. a field no typed scanner names yet. rewriteTaskRefs rewrites the
+		// same surface, so ordering and rewriting cannot disagree on what counts
+		// as a reference: a forward reference in a brand-new field is ordered
+		// here and resolved there.
+		for _, ref := range deepTaskOutputsRefs(t, residualSpecRefExcludedFields) {
 			addDep(i, ref)
 		}
 	}
@@ -3220,10 +3330,11 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				if err := rewriteRefsInTaskTemplates(taskBody, refMap); err != nil {
 					return nil, fmt.Errorf("node ref=%q: %w", ref, err)
 				}
-				// Same safety net as the spec.Tasks loop above -- see comment
-				// there. extraNode end tasks build their body inline, so any
-				// rewrite gap in pdfConfig (or future end-task fields) would
+				// Same generic long-form pass and safety net as rewriteTaskRefs
+				// runs for spec.Tasks. extraNode end tasks build their body
+				// inline, so a pdfConfig (or future end-task) field would
 				// otherwise ship verbatim.
+				rewriteTaskOutputsRefsDeep(taskBody, refMap, residualSpecRefExcludedFields)
 				if err := validateNoResidualSpecRefs(taskBody, refMap, fmt.Sprintf("node ref=%q", ref)); err != nil {
 					return nil, err
 				}
@@ -3239,6 +3350,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 					if err := rewriteRefsInTaskTemplates(taskBody, rm); err != nil {
 						return fmt.Errorf("node ref=%q: %w", ref, err)
 					}
+					rewriteTaskOutputsRefsDeep(taskBody, rm, residualSpecRefExcludedFields)
 					return validateNoResidualSpecRefs(taskBody, rm, fmt.Sprintf("node ref=%q", ref))
 				}
 			}
@@ -3561,8 +3673,8 @@ var fetchLiveTaskTypes func() map[string]bool
 // time. Returns nil on any transport/shape error -- callers fall back to the
 // compiled-in mirror, which is exactly the pre-existing behavior.
 func fetchServerTaskTypes(c *client.Client) map[string]bool {
-	data, _, err := c.Do("GET", "borrower_central", "/v1/meta/workflows-v2-schema?section=taskTypes", nil)
-	if err != nil {
+	data := fetchMetaSection(c, "taskTypes")
+	if data == nil {
 		return nil
 	}
 	var payload struct {
@@ -4734,8 +4846,8 @@ var (
 // section) so callers fall back to the compiled-in mirror -- exactly the
 // pre-existing behavior. Mirrors fetchServerTaskTypes.
 func fetchServerWorkflowCategories(c *client.Client) map[string]bool {
-	data, _, err := c.Do("GET", "borrower_central", "/v1/meta/workflows-v2-schema?section=workflowCategories", nil)
-	if err != nil {
+	data := fetchMetaSection(c, "workflowCategories")
+	if data == nil {
 		return nil
 	}
 	var payload struct {
@@ -4936,8 +5048,8 @@ var (
 // nil on any transport/shape error so callers fall back to the compiled-in
 // mirror. Mirrors fetchServerTaskTypes.
 func fetchServerRelationshipKinds(c *client.Client) map[string]bool {
-	data, _, err := c.Do("GET", "borrower_central", "/v1/meta/workflows-v2-schema?section=relationshipKinds", nil)
-	if err != nil {
+	data := fetchMetaSection(c, "relationshipKinds")
+	if data == nil {
 		return nil
 	}
 	var payload struct {
@@ -5215,8 +5327,8 @@ var (
 // Returns nil on any transport/shape error so callers fall back to the
 // compiled-in mirror. Mirrors fetchServerTaskTypes.
 func fetchServerInputSchemaTypes(c *client.Client) map[string]bool {
-	data, _, err := c.Do("GET", "borrower_central", "/v1/meta/workflows-v2-schema?section=inputSchemaTypes", nil)
-	if err != nil {
+	data := fetchMetaSection(c, "inputSchemaTypes")
+	if data == nil {
 		return nil
 	}
 	var payload struct {

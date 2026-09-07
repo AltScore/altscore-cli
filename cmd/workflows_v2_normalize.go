@@ -107,8 +107,8 @@ var (
 // compiled-in mirror, which is exactly the pre-existing behavior. Mirrors
 // fetchServerTaskTypes.
 func fetchServerConditionOperators(c *client.Client) map[string]bool {
-	data, _, err := c.Do("GET", "borrower_central", "/v1/meta/workflows-v2-schema?section=conditionOperators", nil)
-	if err != nil {
+	data := fetchMetaSection(c, "conditionOperators")
+	if data == nil {
 		return nil
 	}
 	var payload struct {
