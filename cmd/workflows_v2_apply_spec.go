@@ -41,6 +41,18 @@ type composeSpec struct {
 	// contract (Nodes) is what matters here.
 	Tasks      []map[string]any `json:"-"`
 	ExtraNodes []map[string]any `json:"-"`
+
+	// ExistingNodeTypes is INTERNAL: the set of node types the apply TARGET
+	// already carries, filled by apply from the workflow it looked up by alias
+	// (nil on the create path, and nil when that lookup failed). No JSON tag:
+	// never read from user input.
+	//
+	// Only the deprecation gate reads it, and only to mirror the backend's
+	// diff-based rule -- a retired type already in the stored graph is a
+	// carry-forward, not new authoring (see deprecatedTaskTypeRefused). The
+	// zero value therefore has to be the STRICT one: a code path that forgets
+	// to fill this refuses every deprecated type, exactly as before.
+	ExistingNodeTypes map[string]bool `json:"-"`
 }
 
 // detectLegacySpecShape rejects specs that use the removed

@@ -36,7 +36,10 @@ var dealHiddenTypes = map[string]bool{
 // Checks (in order, fail-fast):
 //  1. duplicate spec-local refs / explicit aliases
 //  2. label + type present
-//  3. type is in the backend TaskType enum (with closest-match suggestion)
+//  3. type is in the backend TaskType enum (with closest-match suggestion),
+//     and is not a RETIRED type the spec is newly authoring -- one the target
+//     workflow already carries (spec.ExistingNodeTypes) is warned about and
+//     carried forward, mirroring the backend's diff-based rule
 //  4. http: headers must be a JSON-encoded string
 //  5. data-store-write / data-store-query / webhook / comment / exception /
 //     child-workflow: per-type required fields
@@ -345,24 +348,42 @@ func preflightTasks(spec *composeSpec) error {
 		if label == "" || taskType == "" {
 			return fmt.Errorf("node ref=%q: label and type are required (validated before any POST)", ref)
 		}
-		// Deprecated types are refused BEFORE the validTaskTypes check and
+		// Deprecated types are settled BEFORE the validTaskTypes check and
 		// never through the warn-and-proceed path below. This half of the
 		// check is compiled in, so it needs no backend and holds offline.
+		//
+		// Refused only when the type is NEW to the target, which is the rule
+		// the backend applies: a retired type the stored graph already holds is
+		// carried forward with a warning, so a legacy workflow stays editable
+		// and can actually be migrated off it (see deprecatedTaskTypeRefused).
+		//
+		// Settled here means the vocabulary block below is SKIPPED for it: a
+		// retired type is deliberately absent from validTaskTypes, so that
+		// block would otherwise re-diagnose a carried-forward node as an
+		// unknown type and warn about it a second time.
 		if deprecatedTaskTypes[taskType] {
-			return deprecatedTaskTypeError(fmt.Sprintf("node ref=%q", ref), taskType)
-		}
-		if !validTaskTypes[taskType] {
+			if deprecatedTaskTypeRefused(taskType, spec.ExistingNodeTypes) {
+				return deprecatedTaskTypeError(fmt.Sprintf("node ref=%q", ref), taskType)
+			}
+			warnDeprecatedTaskTypeCarriedForward(fmt.Sprintf("node ref=%q", ref), taskType)
+		} else if !validTaskTypes[taskType] {
 			if !liveTypesFetched && fetchLiveTaskTypes != nil {
 				liveTaskTypes = fetchLiveTaskTypes()
 				liveTypesFetched = true
 			}
 			// The fetch unions the backend's own `deprecated` list into
 			// deprecatedTaskTypes, so a type retired after this binary shipped
-			// is refused too -- and refused here, not warned about below.
+			// is settled here too -- refused when new, carried forward with a
+			// warning when the target already holds it, and never routed
+			// through the vocabulary diagnosis below (which would call a
+			// carried-forward node unknown: fetchServerTaskTypes filters
+			// retired types out of the live authorable set).
 			if deprecatedTaskTypes[taskType] {
-				return deprecatedTaskTypeError(fmt.Sprintf("node ref=%q", ref), taskType)
-			}
-			if liveTaskTypes[taskType] {
+				if deprecatedTaskTypeRefused(taskType, spec.ExistingNodeTypes) {
+					return deprecatedTaskTypeError(fmt.Sprintf("node ref=%q", ref), taskType)
+				}
+				warnDeprecatedTaskTypeCarriedForward(fmt.Sprintf("node ref=%q", ref), taskType)
+			} else if liveTaskTypes[taskType] {
 				fmt.Fprintf(os.Stderr,
 					"# WARNING: node ref=%q: task type %q is newer than this CLI build "+
 						"(absent from its compiled-in list) but IS accepted by the live backend -- proceeding. "+
@@ -892,7 +913,11 @@ func preflightTasks(spec *composeSpec) error {
 		// not here. Compose's normalize step fills inputKeys from each
 		// source's inputFields automatically; rejecting the spec at preflight
 		// would block work that compose can fix on its own.
-		if err := validateTaskV2BodyStructural(json.RawMessage(body)); err != nil {
+		// spec.ExistingNodeTypes travels with it: the validator carries its own
+		// deprecation gate (it is the only one on the tasks-v2 paths), and
+		// without the target's types it would refuse the carry-forward this
+		// loop just warned about and let through.
+		if err := validateTaskV2BodyStructural(json.RawMessage(body), spec.ExistingNodeTypes); err != nil {
 			return fmt.Errorf("node ref=%q: %w", ref, err)
 		}
 

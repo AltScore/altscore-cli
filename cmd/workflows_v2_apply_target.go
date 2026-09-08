@@ -29,6 +29,32 @@ func findWorkflowByAlias(c *client.Client, alias string) (map[string]any, string
 	return nil, "", nil
 }
 
+// workflowNodeTypes collects the `type` of every node in a live workflow
+// payload -- the set the deprecation gate diffs the incoming spec against, so a
+// retired type the target already holds is recognised as a carry-forward rather
+// than as new authoring (see deprecatedTaskTypeRefused).
+//
+// No request of its own: findWorkflowByAlias already returns the full node
+// list. GET /v2/workflows?alias=... serves the same DTO as the single-workflow
+// GET and drops only config.taskSnapshots (borrower-central
+// app/model/workflows_v2/workflows.py::to_api_dto), so nodes[].type is present
+// on the listing payload apply has in hand before assembly.
+//
+// nil in, nil out: a create has no target, so it carries nothing forward and
+// every deprecated type stays refused.
+func workflowNodeTypes(workflow map[string]any) map[string]bool {
+	if workflow == nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, node := range toMapSlice(workflow["nodes"]) {
+		if t, _ := node["type"].(string); t != "" {
+			out[t] = true
+		}
+	}
+	return out
+}
+
 // queryLatestWorkflowByAliasStatus returns the highest-version workflow matching
 // alias+status, or nil when none match. BC handlers have historically ignored
 // the query filters, so we also filter client-side after parsing.

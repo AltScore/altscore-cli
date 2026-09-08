@@ -299,6 +299,14 @@ func TestBundleToApplySpec_WarnsOnDeprecatedNodeType(t *testing.T) {
 	if !strings.Contains(stderr, "DEPRECATED") || !strings.Contains(stderr, "webhook") {
 		t.Errorf("apply-spec export must warn about the deprecated node type, got: %q", stderr)
 	}
+	// And it must say what actually happens: re-applying over the workflow the
+	// spec came from carries the node forward (apply refuses a retired type
+	// only as new authoring), while a new alias makes it new and is refused.
+	// Telling the author the re-apply simply fails sends them off to rewrite a
+	// spec that would have applied.
+	if !strings.Contains(stderr, "carries them forward") || !strings.Contains(stderr, "NEW alias") {
+		t.Errorf("the warning must distinguish re-applying in place from applying under a new alias, got: %q", stderr)
+	}
 	// The node still travels: the warning is advice, not a filter.
 	if got := specNodesByRef(t, spec)["score"]["type"]; got != "webhook" {
 		t.Errorf("node type = %v, want the original webhook (the export must not rewrite the graph)", got)

@@ -193,8 +193,14 @@ func sortedBoolMapKeys(m map[string]bool) []string {
 // so for them the error remains useful.
 //
 // validateTaskV2Body = structural + sourcable. Compose calls structural only.
-func validateTaskV2Body(body json.RawMessage) error {
-	if err := validateTaskV2BodyStructural(body); err != nil {
+//
+// existingTypes is the set of task types the write TARGET already carries, and
+// only the deprecation gate reads it: `tasks-v2 create-version <alias>` passes
+// the stored task's own type, because a bump that keeps an already-retired type
+// is a carry-forward the backend accepts by design, not new authoring.
+// `tasks-v2 create` passes nil -- a brand-new task carries nothing forward.
+func validateTaskV2Body(body json.RawMessage, existingTypes map[string]bool) error {
+	if err := validateTaskV2BodyStructural(body, existingTypes); err != nil {
 		return err
 	}
 	if len(body) == 0 {
@@ -303,7 +309,11 @@ func deriveAltdataInputKeysForCreate(c *client.Client, body *json.RawMessage) er
 // Does NOT catch the altdata-enrichment empty-inputKeys case (see
 // validateTaskV2Body). Compose's preflight uses this so a compose spec
 // missing inputKeys is fixed by normalize, not rejected by preflight.
-func validateTaskV2BodyStructural(body json.RawMessage) error {
+//
+// existingTypes is the set of task types the write TARGET already carries; see
+// validateTaskV2Body. Nil means nothing is carried forward, which is the strict
+// reading: every deprecated type is then refused as new authoring.
+func validateTaskV2BodyStructural(body json.RawMessage, existingTypes map[string]bool) error {
 	if len(body) == 0 {
 		return nil
 	}
@@ -317,7 +327,11 @@ func validateTaskV2BodyStructural(body json.RawMessage) error {
 	// every deprecated type whether or not one ever grows a case. `tasks-v2
 	// create` / `create-version` reach this validator without going through
 	// compose, so it is the only gate on that path.
-	if deprecatedTaskTypes[taskType] {
+	//
+	// Silent when the type IS carried forward: the two callers that can supply
+	// existingTypes (preflightTasks and `tasks-v2 create-version`) each warn at
+	// their own call site, where they can name the node ref or the task alias.
+	if deprecatedTaskTypeRefused(taskType, existingTypes) {
 		return deprecatedTaskTypeError("task body", taskType)
 	}
 	switch taskType {

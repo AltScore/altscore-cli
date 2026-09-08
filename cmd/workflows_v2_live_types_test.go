@@ -155,18 +155,18 @@ func TestDeprecatedTaskTypeErrorNamesTheReplacement(t *testing.T) {
 func TestValidateTaskV2BodyStructural_RefusesDeprecatedTypes(t *testing.T) {
 	for _, typ := range retiredTaskTypes {
 		body := json.RawMessage(`{"type":"` + typ + `","label":"X","alias":"x"}`)
-		if err := validateTaskV2BodyStructural(body); err == nil {
+		if err := validateTaskV2BodyStructural(body, nil); err == nil {
 			t.Errorf("tasks-v2 create must refuse type %q", typ)
 		} else if !strings.Contains(err.Error(), "DEPRECATED") {
 			t.Errorf("%q: unexpected refusal message: %v", typ, err)
 		}
 		// validateTaskV2Body wraps the structural pass; both create paths use it.
-		if err := validateTaskV2Body(body); err == nil {
+		if err := validateTaskV2Body(body, nil); err == nil {
 			t.Errorf("validateTaskV2Body must refuse type %q", typ)
 		}
 	}
 	// A current type with no structural rules still passes.
-	if err := validateTaskV2BodyStructural(json.RawMessage(`{"type":"customer","label":"X"}`)); err != nil {
+	if err := validateTaskV2BodyStructural(json.RawMessage(`{"type":"customer","label":"X"}`), nil); err != nil {
 		t.Errorf("a current type must still pass the structural validator: %v", err)
 	}
 }

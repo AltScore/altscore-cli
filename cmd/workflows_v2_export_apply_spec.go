@@ -164,15 +164,20 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 		specNodes = append(specNodes, entry)
 	}
 
-	// A live workflow may still run a retired node type, but the spec it
-	// exports into cannot be re-applied while it carries one -- apply refuses
-	// deprecated types outright. Say so here rather than at the failed apply.
-	// diff (refFromAlias) stays quiet: nobody re-applies a comparison.
+	// A live workflow may still run a retired node type. Re-applying this spec
+	// over the SAME workflow keeps working -- apply refuses a deprecated type
+	// only as new authoring, and these are carried forward (see
+	// deprecatedTaskTypeRefused) -- but retargeting the spec at a fresh alias
+	// makes every one of them new, and that apply is refused. Say so here
+	// rather than at the failed apply. diff (refFromAlias) stays quiet: nobody
+	// re-applies a comparison.
 	if mode == refFromSpecRef && len(deprecatedNodes) > 0 {
 		fmt.Fprintf(os.Stderr,
 			"# WARNING: this apply-spec carries DEPRECATED node type(s): %s. "+
-				"'workflows-v2 apply' refuses them, so re-applying this spec fails until they are "+
-				"replaced. Run 'altscore workflows-v2 schema-guide taskTypes' for the live palette.\n",
+				"Re-applying it over the workflow it came from carries them forward unchanged, but "+
+				"applying it under a NEW alias is refused -- there they would be newly authored. "+
+				"Replace them as you migrate. "+
+				"Run 'altscore workflows-v2 schema-guide taskTypes' for the live palette.\n",
 			strings.Join(sortedKeys(deprecatedNodes), ", "),
 		)
 	}

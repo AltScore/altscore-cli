@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/AltScore/altscore-cli/internal/client"
 	"github.com/AltScore/altscore-cli/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -101,7 +102,9 @@ Returns the created task DTO including its id, alias, and version=1.`,
 			if err != nil {
 				return err
 			}
-			if err := validateTaskV2Body(body); err != nil {
+			// nil target types: a brand-new task carries nothing forward, so a
+			// deprecated type here is unambiguously new authoring and refused.
+			if err := validateTaskV2Body(body, nil); err != nil {
 				return err
 			}
 			if err := deriveAltdataInputKeysForCreate(c, &body); err != nil {
@@ -116,6 +119,47 @@ Returns the created task DTO including its id, alias, and version=1.`,
 	}
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON body (or pipe via stdin)")
 	return cmd
+}
+
+// taskV2BodyType reads the `type` off a tasks-v2 body or task DTO. Empty when
+// the payload is absent or unparseable -- the validators own those complaints.
+func taskV2BodyType(body json.RawMessage) string {
+	var task struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(body, &task); err != nil {
+		return ""
+	}
+	return task.Type
+}
+
+// deprecatedCarryForwardForTaskVersion answers, for a `tasks-v2 create-version`
+// body, which retired task types the bump merely CARRIES FORWARD -- the set the
+// deprecation gate diffs the body against (see deprecatedTaskTypeRefused).
+//
+// A version bump of an existing task whose type is ALREADY the retired one is
+// not new authoring: the backend takes it by design, so the task stays editable
+// while it is migrated off. Switching a task TO a retired type is new authoring
+// and stays refused, which is why the stored type is read rather than inferred
+// from the alias being known.
+//
+// Costs nothing in the common case -- the GET fires only when the body's own
+// type is retired. Any failure (offline, 404, unparseable, a type that does not
+// match) yields nil, so the refusal stands: the CLI must not end up looser than
+// the server because a lookup hiccuped.
+func deprecatedCarryForwardForTaskVersion(c *client.Client, alias string, body json.RawMessage) map[string]bool {
+	bodyType := taskV2BodyType(body)
+	if !deprecatedTaskTypes[bodyType] {
+		return nil
+	}
+	data, _, err := c.Do("GET", "borrower_central", fmt.Sprintf("/v2/tasks/%s", alias), nil)
+	if err != nil {
+		return nil
+	}
+	if taskV2BodyType(data) != bodyType {
+		return nil
+	}
+	return map[string]bool{bodyType: true}
 }
 
 func makeTv2CreateVersionCmd() *cobra.Command {
@@ -142,8 +186,12 @@ minus the alias.`,
 			if err != nil {
 				return err
 			}
-			if err := validateTaskV2Body(body); err != nil {
+			carriedForward := deprecatedCarryForwardForTaskVersion(c, args[0], body)
+			if err := validateTaskV2Body(body, carriedForward); err != nil {
 				return err
+			}
+			for _, typ := range sortedKeys(carriedForward) {
+				warnDeprecatedTaskTypeCarriedForward(fmt.Sprintf("task %q", args[0]), typ)
 			}
 			if err := deriveAltdataInputKeysForCreate(c, &body); err != nil {
 				return err

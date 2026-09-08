@@ -37,16 +37,24 @@ var validTaskTypes = map[string]bool{
 
 // deprecatedTaskTypes are the task types AltScore has retired. The backend
 // still parses them, so live workflows keep running, but it refuses them for
-// new authoring -- so every CLI authoring path refuses them too, and does so
-// UNCONDITIONALLY. This list is compiled in precisely so the refusal also
-// holds offline, where no live vocabulary can be consulted.
+// NEW authoring -- so every CLI authoring path refuses them too. This list is
+// compiled in precisely so the refusal also holds offline, where no live
+// vocabulary can be consulted.
+//
+// "New" is the whole rule, and it is the backend's: BC diffs the incoming graph
+// against the stored one and only refuses a deprecated type it does not already
+// hold, so a workflow that ALREADY carries such a node stays editable. It has
+// to: making a legacy workflow uneditable blocks the one thing someone opens it
+// to do, which is migrate it off the retired type. See
+// deprecatedTaskTypeRefused for the mirror, which keys on the TYPE being
+// present in the target -- exactly what BC diffs.
 //
 // That is the opposite of the policy for an UNKNOWN type (see
 // warnUnverifiedVocabularyValue): an unknown type may simply be newer than
 // this build, so preflight cannot tell "invalid" from "valid but newer" and
 // fails open. A deprecated type is different in kind -- this build KNOWS the
-// backend refuses it -- so there is nothing to verify and nothing to fail open
-// about.
+// backend refuses it for new work -- so there is nothing to verify and nothing
+// to fail open about.
 //
 // fetchServerTaskTypes unions the backend's own `deprecated` list into this
 // map, so a type retired after this binary shipped is honoured without a CLI
@@ -72,13 +80,53 @@ var deprecatedTaskTypeReplacements = map[string]string{
 	"update-borrower":         `the "customer" task with operation=write`,
 }
 
+// deprecatedTaskTypeRefused reports whether a task type must be refused as new
+// authoring. It is the CLI's mirror of the backend's diff-based rule: BC
+// refuses a deprecated type only when the target does not already hold it, so
+// `existingTypes` is the set of task types the apply target currently carries.
+//
+// Keyed on the TYPE, not on node identity, because that is precisely what the
+// backend diffs. Mirroring it exactly is the point: a CLI stricter than the
+// server makes a legacy workflow uneditable, and a CLI looser than the server
+// waves a spec through to a 4xx it could have explained locally.
+//
+// `existingTypes` is nil on every CREATE path -- nothing is carried forward
+// there, so every deprecated type is new and refused. Nil is also what a failed
+// target lookup yields, which keeps the refusal standing rather than opening a
+// hole whenever the network hiccups.
+func deprecatedTaskTypeRefused(taskType string, existingTypes map[string]bool) bool {
+	return deprecatedTaskTypes[taskType] && !existingTypes[taskType]
+}
+
+// warnDeprecatedTaskTypeCarriedForward is the non-fatal counterpart of
+// deprecatedTaskTypeError: the target already carries this retired type, so the
+// node travels through unchanged instead of blocking the apply. Visible on
+// stderr because the author should still migrate it -- just not at the cost of
+// being unable to touch the workflow at all.
+func warnDeprecatedTaskTypeCarriedForward(path, taskType string) {
+	fmt.Fprintf(os.Stderr,
+		"# WARNING: %s: task type %q is DEPRECATED and cannot be newly authored, but the "+
+			"apply target already carries it -- CARRIED FORWARD unchanged. %s "+
+			"Mirrors the backend, which refuses a retired type only for newly added work so a "+
+			"legacy workflow stays editable.\n",
+		path, taskType, deprecatedTaskTypeGuidance(taskType),
+	)
+}
+
+// deprecatedTaskTypeGuidance names what to author instead, or says there is
+// nothing. Shared by the refusal and the carry-forward warning so the advice
+// cannot drift between them.
+func deprecatedTaskTypeGuidance(taskType string) string {
+	if r := deprecatedTaskTypeReplacements[taskType]; r != "" {
+		return fmt.Sprintf("Use %s instead.", r)
+	}
+	return "It has no replacement -- drop the node."
+}
+
 // deprecatedTaskTypeError is the one refusal message every authoring path
 // shares. `path` is the caller-formatted prefix (e.g. `node ref="score"`).
 func deprecatedTaskTypeError(path, taskType string) error {
-	guidance := "It has no replacement -- drop the node."
-	if r := deprecatedTaskTypeReplacements[taskType]; r != "" {
-		guidance = fmt.Sprintf("Use %s instead.", r)
-	}
+	guidance := deprecatedTaskTypeGuidance(taskType)
 	return fmt.Errorf(
 		"%s: task type %q is DEPRECATED and can no longer be authored. %s "+
 			"The backend still parses workflows that already use it but refuses it for new "+
