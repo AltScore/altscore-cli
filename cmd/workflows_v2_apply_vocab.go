@@ -129,8 +129,9 @@ func deprecatedTaskTypeError(path, taskType string) error {
 	guidance := deprecatedTaskTypeGuidance(taskType)
 	return fmt.Errorf(
 		"%s: task type %q is DEPRECATED and can no longer be authored. %s "+
-			"The backend still parses workflows that already use it but refuses it for new "+
-			"authoring, so this is refused unconditionally -- offline included. "+
+			"A workflow that ALREADY contains this type keeps working and stays editable "+
+			"-- only adding one is refused, and that refusal does not depend on the "+
+			"backend being reachable. "+
 			"Run 'altscore workflows-v2 schema-guide taskTypes' for the live palette.",
 		path, taskType, guidance,
 	)
