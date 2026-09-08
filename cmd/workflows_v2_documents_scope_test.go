@@ -5,7 +5,7 @@ import "testing"
 // documents.<key>.<attr> is the http task's OWN late-resolved input. The
 // optional `documents` list on the task names borrower documents by key, and
 // BC substitutes {{documents.<key>.base64}} (also .fileName, .mimeType,
-// .sizeBytes, .files) in a second pass inside http_activity, exactly like
+// .extension, .sizeBytes, .files) in a second pass inside http_activity, exactly like
 // End's {{self.pdf_url}}. The bytes do not exist at graph time and never reach
 // task_outputs, so apply must treat the head as a reserved scope: never
 // rewritten to a server alias, never rejected as an unknown ref.

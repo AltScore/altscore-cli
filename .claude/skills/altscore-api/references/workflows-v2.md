@@ -511,7 +511,7 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 | System | `system.<key>` | `system.workflow_execution_id` |
 | Indexed by type | `task_outputs_by_type.<taskType>[<idx>].<field>` | `task_outputs_by_type.altdata-enrichment[0].result` |
 
-**`documents.<key>.base64` (also `.fileName`, `.mimeType`, `.sizeBytes`, `.files`) is not a resolver namespace but an `http`-task second pass:** it is only valid inside that task's `body` for a `<key>` declared in the task's `documents` list, the http activity fills it in late exactly like End's `{{self.pdf_url}}`, and `apply` passes it through untouched.
+**`documents.<key>.base64` (also `.fileName`, `.mimeType`, `.extension`, `.sizeBytes`, `.files`) is not a resolver namespace but an `http`-task second pass:** it is only valid inside that task's `body` for a `<key>` declared in the task's `documents` list, the http activity fills it in late exactly like End's `{{self.pdf_url}}`, and `apply` passes it through untouched.
 
 **System scope keys — the execution id is `workflow_execution_id`, NOT `execution_id`.** There is no `system.execution_id` key; referencing it resolves to `None` and the `{{...}}` token is left in place literally (so `"{{system.execution_id}}"` survives verbatim into `custom_output`). The keys that exist include `workflow_execution_id`, `tenant`, `executed_by`, `execution_batch_id`, `primary_borrower_id`, `primary_deal_id`, and `workflow_start_time`.
 
