@@ -51,30 +51,39 @@ altscore workflows-v2 schema-guide tasks         # task shape + per-type config 
 altscore workflows-v2 schema-guide examples      # full scoring_pipeline template
 ```
 
-#### Discovery before authoring (ask, then build)
+#### Discovery before authoring (infer first, ask only what nobody wrote down)
 
-"Create a workflow that does X" and "change workflow Y so that Z" almost always leave business decisions open that no `schema-guide` section can answer. Before you write a spec, ask the user with the **AskUserQuestion** tool: one round, at most 4 questions, 2 to 4 options each, the option you would pick first and labelled `(Recommended)`. Then build.
+"Create a workflow that does X" and "change workflow Y so that Z" leave decisions open. Most of them are already written down somewhere in the tenant; a few are business policy that only the user knows. Read the first group, ask the second with the **AskUserQuestion** tool, then build. One round, at most 4 questions, 2 to 4 options each, the option you would pick first and labelled `(Recommended)`. Skip the round when nothing survives the reads.
 
-Ask about the business, not the JSON. Anything the spec can default is yours to decide without asking: node labels, positions, aliases and refs, `dataAge`, branch ids, `inputKeys`, the end node, publish policy (DRAFT on create). Never ask which field a task type uses; read `schema-guide tasks`. Skip every question the request already answers, and skip the round entirely when nothing is open.
+**Infer first. Never ask these; read them.**
 
-**Business use case.** Pick the ones the request left open.
+| Decision | Where the answer is |
+|---|---|
+| Who is evaluated, which country, which stage of the customer's process | the request itself. "KYB for Ecuadorian SMEs" is a company, ECU, origination. |
+| Which sources, their required inputs, what they can detect | `altscore workflows-v2 sources-status --country <ISO3> --status active`, then `altscore altdata describe <id>` |
+| Decision vocabulary, whether a review lane exists | `altscore decisions list`: the registered keys are the only ones a run can write |
+| Write targets, output shape, input payload, PDF or not, freshness of paid sources | the tenant's closest existing workflow: `workflows-v2 list --filter is-latest=true`, then `export <id> --format apply-spec` and read its `inputSchema`, end node, `decisionConfig` and `sourcesConfig.dataAge`. Mirror it. |
+| Fields available on borrower and deal | `altscore data-models list` |
+| Structure: orchestrator plus per-party child, fan-out, two-layer decisioning | [kyc-kyb-habits](kyc-kyb-habits.md) |
+| Whether a change is visible to others (update path) | `workflows-v2 schedule get <id>`, and other workflows whose `child-workflow` nodes carry this alias as `executorId` |
 
-| Question | Options to offer | Ground the options with |
+Anything the spec can default is yours as well: labels, positions, aliases and refs, branch ids, `inputKeys`, publish policy (DRAFT on create). Never ask which field a task type uses; read `schema-guide tasks`.
+
+**Ask only what survives the reads.** These are business policy: nothing in the tenant states them, and guessing wrong costs money or a customer. Pick the ones the flow triggers, at most 4.
+
+| Question | Ask when | Options to offer |
 |---|---|---|
-| Who is being evaluated? | an individual; a company; a company plus its people (owners, legal representatives, guarantors) | `altscore workflows-v2 list --filter is-latest=true` shows what the tenant already runs |
-| What is the workflow deciding? | approve or reject; a risk score with no verdict; a score plus hard-stop gates `(Recommended)` for credit; enrichment only, no decision | `altscore decisions list` for the registered decision keys; a key the tenant lacks cannot be written |
-| Where does the flow sit in the customer's process? | origination of a new applicant; recurring monitoring of existing customers; a one-off batch over a portfolio | `workflows-v2 list --filter category=EVALUATION` (or `ACTION`) for a sibling flow in the same stage |
-| What happens with the result? | write the decision on a deal; on the borrower; produce a PDF report; return it to the caller only | `altscore data-models list` for the deal and borrower fields already defined |
-| Which country's data? | one option per country the tenant has active sources for | `altscore workflows-v2 sources-status --status active`, one option per distinct country |
+| A source the decision depends on fails or times out mid-run. What happens to the application? | any gating source in the flow | reject and stop; continue on what came back and flag the gap `(Recommended)` for monitoring; park it for manual review; retry later |
+| Which findings end the application outright, and which go to a human? (multi-select the outright rejects) | the tenant registers a review-type decision key. Without one everything rejects; do not invent a lane | sanctions or PEP hit; dissolved or suspended entity; identity mismatch; adverse judicial record |
+| Where do the cutoffs come from? | the flow scores or gates on a number and no sibling scorecard or rule-tree holds the numbers | reuse the cutoffs of the existing `<scorecard>` `(Recommended)` when one exists; the user supplies them now; a permissive placeholder marked TODO, tuned after test runs. Never invent thresholds silently |
+| How fresh must paid bureau or registry data be? | a paid external source is in the flow and no sibling workflow already uses it | pull fresh every run; reuse within 30 days `(Recommended)` for origination; reuse within 90 days or more for monitoring |
+| The same identity applies again within the window. Then what? | the flow writes a deal or a decision | re-run everything, writes are idempotent `(Recommended)`; reuse the last decision if younger than N days; reject as a duplicate |
+| Are the entity's people screened too? | KYB, and the country has an ownership or legal-representative source. Without the source the question is moot | entity only; entity plus owners and legal representatives `(Recommended)`; entity plus the guarantors named in the input |
+| Who reads the reasons? | no sibling workflow shows the output shape | internal only, decision key plus reason codes `(Recommended)`; the partner shows them to the applicant, so reasons go in the output; a human reads a PDF in the Hub |
+| Update path: the change renames or removes an output, or the workflow has schedules or child callers. Blast radius? | the read above found a schedule or a caller | go live on the alias now, consumers are updated; keep the old field names too for a transition; apply under a new alias for a trial |
+| Update path: a rule got stricter. Does the past get re-evaluated? | the change tightens a gate or a cutoff | new applications only `(Recommended)`; batch re-run the active portfolio in test mode first; re-run and re-decide |
 
-**High-level clarifications of the workflow.** Ask only when the answer changes the graph.
-
-- **One workflow, or an orchestrator plus a per-party child?** Ask when related parties are screened (KYB with owners or legal reps, deals with guarantors). See [kyc-kyb-habits](kyc-kyb-habits.md).
-- **What does the caller send in?** Only the identity key (tax id or person id), or a fuller application payload (amount, term, product). This becomes the `inputSchema`.
-- **What must never pass?** The hard stops that reject regardless of score: sanctions hit, dissolved entity, identity mismatch. Offer the ones the chosen sources can detect.
-- **Modifying an existing workflow:** which one, when the label is ambiguous (options from `workflows-v2 list --filter search=<words>`), and whether the change replaces the live version now or is tried first under a new alias. `apply` over an ACTIVE alias publishes; a new alias saves a DRAFT you can execute by id.
-
-Example round for "create a KYB workflow for Ecuadorian SMEs": ask who is screened (company only / company plus owners and legal reps), what is decided (approve-reject with gates / score plus gates / enrichment only) and where the decision lands (deal / borrower / caller). Do not ask about the country (given), the sources (derive them from `sources-status --country ECU --status active` and the answers) or publishing (DRAFT by default). Restate the answers in one line, then write the spec.
+Example round for "create a KYB workflow for Ecuadorian SMEs" in a tenant that already runs a KYC flow. Read: company, ECU and origination from the request; sources from `sources-status --country ECU`; a `review` key from `decisions list`; write targets, output shape and `dataAge` from the KYC export. Ask three things: what happens when the registry or judicial source fails mid-run; which findings reject outright versus go to review; whether owners and legal representatives are screened, since the country has an ownership source. Do not ask who is evaluated, which country, which sources, where the decision lands, or whether to publish. Restate the answers in one line, then write the spec.
 
 **When AskUserQuestion is unavailable** (print mode `-p`, background jobs, some SDK hosts) do not guess and mutate. Write down the assumptions you would have asked about, build the spec under them, run `apply --dry-run` (or `--diff` for an update) and stop. Report the plan and the open questions; apply only after the user answers.
 
