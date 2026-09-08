@@ -956,6 +956,19 @@ var residualSpecRefExcludedFields = map[string]bool{
 	// that is a false positive by construction.
 	"categoryKey": true,
 	"valueFields": true,
+	// A deal contact's role names one of the TENANT's deal roles -- on the
+	// write side (contacts[].role_key) the role the row is attached with, on
+	// the read side (readDealContactsConfig.picks[].role_key) the role the pick
+	// filters on. Both are user-authored literals resolved server-side, never
+	// node references. And the natural role vocabulary collides head-on with
+	// the natural ref vocabulary: a spec with a node ref="customer" and a
+	// contact role_key="customer" aborted apply MID-POST with
+	//   residual spec-local ref "customer" at path "contacts[0].role_key"
+	// after tasks had already been created, with no rollback. The documented
+	// workaround was to rename the node ref (customer -> borrower), which is
+	// backwards: the literal is legitimate.
+	"role_key": true,
+	"roleKey":  true,
 }
 
 // validateNoResidualSpecRefs walks a composed task body and returns an error
