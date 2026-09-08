@@ -1583,8 +1583,10 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 			// rewritten to server aliases -- and validated (unknown ref -> error).
 			// Without this walk a section ships with a stale spec ref and the
 			// runtime resolves it to an empty section (the safety net below only
-			// catches BARE refs, not {{...}}-wrapped ones).
-			if raw, present := endCfg["standardOutput"]; present {
+			// catches BARE refs, not {{...}}-wrapped ones). An explicit null is
+			// how the server stores "no standard output" and how an export
+			// emits it, so it reads as absent, not as the wrong type.
+			if raw, present := endCfg["standardOutput"]; present && raw != nil {
 				stdOut, ok := raw.(map[string]any)
 				if !ok {
 					return fmt.Errorf("endConfig.standardOutput must be an object, got %T", raw)

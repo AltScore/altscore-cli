@@ -318,6 +318,28 @@ func TestRewriteRefsInTaskTemplates_EndStandardOutputUnknownRef(t *testing.T) {
 	}
 }
 
+// TestRewriteRefsInTaskTemplates_EndStandardOutputNullIsUnset: the server
+// stores "no standard output" as an explicit null and an export emits it that
+// way, so a null must read as absent -- not as "must be an object" -- and must
+// survive untouched so the body still matches the stored one on re-apply.
+func TestRewriteRefsInTaskTemplates_EndStandardOutputNullIsUnset(t *testing.T) {
+	endCfg := map[string]any{
+		"outputJson":     `{"s":"{{task_outputs.score.rows}}"}`,
+		"standardOutput": nil,
+		"decisionConfig": nil,
+	}
+	task := map[string]any{"type": "end", "endConfig": endCfg}
+	if err := rewriteRefsInTaskTemplates(task, map[string]string{"score": "score"}); err != nil {
+		t.Fatalf("a null standardOutput must be accepted as unset, got: %v", err)
+	}
+	if v, present := endCfg["standardOutput"]; !present || v != nil {
+		t.Errorf("null standardOutput must survive as null, got present=%v value=%v", present, v)
+	}
+	if _, err := json.Marshal(task); err != nil {
+		t.Fatalf("body must still marshal: %v", err)
+	}
+}
+
 // TestValidateStandardOutputShape covers the structural validation surfaced
 // before apply ships the body.
 func TestValidateStandardOutputShape(t *testing.T) {
