@@ -49,12 +49,12 @@ type validationFinding struct {
 	Message  string         `json:"message"`
 }
 
-// validationResponse is the /v2/workflows/validate 200 body (returned 200 even
-// when the graph is invalid; `valid` and `findings` carry the verdict).
-// skippedNodeIds names the nodes whose task body the server could not resolve,
-// so a clean verdict can be told apart from one whose interesting parts were
-// never checked. apply's pre-flight has them inline and ignores it; `lint`
-// reports it, because there the bodies come from the persisted repository.
+// validationResponse is the verdict shape POST /v2/workflows/apply and
+// POST /v2/workflows/validate answer with (the latter returns 200 even when the
+// graph is invalid; `valid` and `findings` carry the verdict). skippedNodeIds
+// names the nodes whose task body the server could not resolve; apply sends
+// bodies inline so nothing is skipped, `lint` reports it because there the
+// bodies come from the persisted repository.
 type validationResponse struct {
 	Valid          bool                `json:"valid"`
 	Findings       []validationFinding `json:"findings"`
@@ -65,18 +65,8 @@ type validationResponse struct {
 	Refs map[string]string `json:"refs"`
 }
 
-// hasFindingCode reports whether any finding carries the given code.
-func hasFindingCode(findings []validationFinding, code string) bool {
-	for _, f := range findings {
-		if f.Code == code {
-			return true
-		}
-	}
-	return false
-}
-
 // preflightResponseDetail returns a short, trimmed description of a rejected
-// validation response for the loud contract-mismatch note. The client folds a
+// validation response for lint's contract-mismatch note. The client folds a
 // >=400 response body into derr (data is nil), so it falls back to derr; a bare
 // "HTTP <status>" (empty body) is dropped since the caller already prints the
 // status.

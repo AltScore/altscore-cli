@@ -39,13 +39,6 @@ func validateWorkflowV2Body(body *json.RawMessage) error {
 		return nil
 	}
 
-	// As of BC #1291, the create endpoint honors an explicit `alias` field
-	// when provided (and falls back to slugifying `label` when absent). No
-	// warning is needed -- caller intent is respected. We keep this block
-	// intentionally empty so the historical comment trail is searchable;
-	// the prior "silently drops alias" warning was removed once the BC
-	// contract changed.
-
 	var problems []string
 	mutated := false
 
@@ -168,18 +161,13 @@ func renameToCamel(m map[string]any, shortKey, camelKey, context string) (bool, 
 }
 
 // makeWfv2LintCmd inspects an existing workflow. Two sources, merged into one
-// report: borrower-central's validation oracle (POST /v2/workflows/validate --
-// the same one apply's pre-flight and the Hub builder call) plus the local
-// structural checks that cover what the oracle does not (orphan nodes,
-// duplicate nodeIds, malformed edge endpoints).
-//
-// Until #101 this command was local-only, and that was the defect: the oracle
-// owns every reference-integrity rule (dangling `task_outputs.<alias>` in
-// inputMappings, PDF sources, outputJson, task config; unconsumed input
-// variables; identity keys), so `lint` reported a clean workflow while the Hub
-// builder -- which does call it -- listed the real problems. A Bolivariano KYB
-// review hit exactly that: `lint` clean, five live defects, one of them a
-// dangling task ref that had survived 47 versions.
+// report: borrower-central's validation oracle (POST /v2/workflows/validate,
+// the same rules POST /v2/workflows/apply and the Hub builder run) plus the
+// local structural checks that cover what the oracle does not (orphan nodes,
+// duplicate nodeIds, malformed edge endpoints). The oracle owns every
+// reference-integrity rule (dangling `task_outputs.<alias>` in inputMappings,
+// PDF sources, outputJson, task config; unconsumed input variables; identity
+// keys), so a local-only lint reports clean workflows that the Hub flags.
 func makeWfv2LintCmd() *cobra.Command {
 	var localOnly bool
 	cmd := &cobra.Command{
@@ -253,8 +241,8 @@ Exits with non-zero status if any issue is found, from either source. Pass
 			default:
 				resp, reason := fetchWorkflowValidation(c, wf)
 				if resp == nil {
-					// Fail open, exactly like apply's pre-flight: the oracle's
-					// health never turns lint into an error of its own.
+					// Fail open: the oracle's health never turns lint into an
+					// error of its own.
 					report.ServerValidation = lintServerSkipped
 					dimNote(cmd.ErrOrStderr(), "server validation skipped: "+reason+"; reporting local checks only")
 					break
@@ -282,17 +270,6 @@ Exits with non-zero status if any issue is found, from either source. Pass
 				fetchEndTaskBodies(c, asSlice(wf["nodes"])),
 				fetchWorkflowRules(c, wfAlias),
 				cmd.ErrOrStderr())
-			// (Silent-PDF lint removed: borrower-central's end_activity
-			// now auto-resolves PDF sources from the ancestor graph at
-			// runtime when pdfConfig.enabled=true but sourcesConfig is
-			// empty. The "enabled+empty" state is now a valid shape, so
-			// the old warning would mislead.)
-			// (inputMappings namespace check removed: BC's variable resolver
-			// now accepts bare-alias refs `<alias>.<field>` as implicit
-			// `task_outputs.<alias>.<field>`. Create-time validation in BC
-			// catches structurally-broken mapping values synchronously, and
-			// ValidateInputMappingsUC catches unknown-alias refs at workflow
-			// validate time with full graph context.)
 			raw, _ := json.Marshal(report)
 			if err := output.RawJSON(json.RawMessage(raw)); err != nil {
 				return err
@@ -521,9 +498,8 @@ func lintWorkflowV2(wf map[string]any) lintReport {
 // status. No `tasks` map is sent for the same reason -- the server resolving
 // them is the whole point, and it is one request instead of N.
 //
-// Returns (nil, reason) on anything unusable, mirroring apply's pre-flight
-// fail-open policy: the oracle's health must never turn a lint into an error of
-// its own. The reason is already human-readable.
+// Returns (nil, reason) on anything unusable: the oracle's health must never
+// turn a lint into an error of its own. The reason is already human-readable.
 func fetchWorkflowValidation(c *client.Client, wf map[string]any) (*validationResponse, string) {
 	if c == nil || wf == nil {
 		return nil, "no client"
@@ -748,7 +724,7 @@ func computeVarSelectors(nodes []any) map[string]string {
 // identically there, and custom variables should be reserved for values a rule
 // or scorecard actually evaluates.
 //
-// Both `workflows-v2 lint` and the `apply` preflight call this. It is advisory
+// Both `workflows-v2 lint` and `apply` call this. It is advisory
 // only by construction: it writes to stderr and returns nothing.
 func adviseExtractionProbes(customVariables map[string]any, nodes []any) {
 	probes := findExtractionProbeVars(customVariables)

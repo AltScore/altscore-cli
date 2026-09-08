@@ -10,16 +10,11 @@ import (
 // for variables this apply is ADDING, and carries the live `enforceType` forward for
 // variables the workflow already has.
 //
-// A declared type used to be decoration: nothing applied it at runtime, so a good number
-// of the types already sitting on live variables are wrong precisely because being wrong
-// never had a consequence. Stamping only the variables that are new to this workflow
-// keeps that history inert while making the declaration mean something from here on.
-//
-// A variable already live keeps whatever enforcement it has. Autosave sends
-// customVariables wholesale, so a re-apply whose spec never mentioned the field used to
-// strip `enforceType: true` off a variable that had it -- the first apply stamped it, the
-// second silently removed it, and the type contract weakened with no warning. Carrying
-// the live value forward makes a round-trip a no-op.
+// Only variables new to this workflow are stamped: many live variables carry a
+// declared type that was never enforced and is wrong, and those stay inert. A live
+// variable's `enforceType` is carried forward because autosave sends customVariables
+// wholesale, so a spec that omits the field would otherwise strip it; carrying it
+// makes a round-trip a no-op.
 //
 // An explicit `enforceType` in the spec always wins, including `false` -- an author who
 // has said what they want is not second-guessed.

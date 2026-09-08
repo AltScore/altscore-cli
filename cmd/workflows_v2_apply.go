@@ -380,10 +380,8 @@ End-node output (endConfig on the 'end' node):
 				composeAllowSteal = true
 			}
 
-			// Assemble ONCE, posting nothing. Preview modes (--diff / --dry-run)
-			// assemble tolerantly (stubbed lookups + a "Would POST" echo); the
-			// real apply assembles strictly. compose mutates the spec in place,
-			// so every path below reuses this one assembly.
+			// Preview modes assemble tolerantly (stubbed lookups); the real
+			// apply assembles strictly.
 			previewAssembly := diffFlag || dryRun
 			capture := newComposeCapture()
 			workflow, err := composeWorkflowBody(c, &spec, previewAssembly, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, !noLayout, capture)
@@ -704,13 +702,12 @@ func localRef(entry map[string]any, fallback string) string {
 
 // slugifyWorkflowLabel mirrors borrower-central's
 // app/utils/workflow_alias.py:slugify_workflow_label so compose can predict
-// the alias the server will assign before any task POST happens. Knowing the
-// alias up-front matters because credit-decisioning entities
-// (evaluation-rules, rule-trees, mapping-tables, scorecards) only show up in
-// a workflow's builder pickers when their workflowAlias matches the
-// workflow's alias -- and the alias is server-derived from the label, not
-// settable from the body. When a label like "All 5 types" silently slugs to
-// "all-5-types", entities stamped with "all-types" become invisible.
+// the alias the server derives for a spec without an explicit `alias`. Knowing
+// it up-front matters because credit-decisioning entities (evaluation-rules,
+// rule-trees, mapping-tables, scorecards) only show up in a workflow's builder
+// pickers when their workflowAlias matches the workflow's alias: a label like
+// "All 5 types" silently slugs to "all-5-types", and entities stamped with
+// "all-types" become invisible.
 //
 // Rules (must match BC byte-for-byte):
 //   - lowercase + strip
@@ -756,20 +753,6 @@ func edgeEndpoints(e map[string]any) (from, to string) {
 	}
 	return from, to
 }
-
-// (buildEndAutoWiring + endNodeBilliableIDSchema + pdfTitleByType deleted.)
-// The compose-time PDF source pre-fill was migrated to runtime in
-// borrower-central's end_activity: when endConfig.pdfConfig.enabled=true
-// but sourcesConfig is empty, the runtime walks the workflow graph
-// upstream from the end node and auto-resolves sections from recognised
-// ancestor types (altdata-enrichment, scorecard, mapping-table,
-// rule-tree, evaluate-rules). Agents can flip pdfConfig.enabled=true
-// without needing to understand the ancestor graph.
-//
-// inputSchema / inputMappings auto-wiring for the Hub canvas continues
-// to be derived client-side by
-// altscore-ai-chat/lib/stores/workflow-builder-v2/actions/edge/pdf-data-source-auto-mapping.ts
-// when the workflow loads.
 
 // readSpecHTMLSections extracts the spec-only `htmlSections` field from an
 // extraNode. Returns nil when the field is absent or shaped wrong (compose
@@ -901,40 +884,8 @@ func inferSchemaForVar(specValue any, name string) map[string]any {
 	return out
 }
 
-// printComposeSummary writes a one-line-per-task summary to stderr after
-// compose finishes its real (non-dry-run) POSTs. Without this, the only thing
-// compose returns to stdout is `{"id": "..."}` of the workflow -- the user
-// then has to GET the workflow + each task to discover server-assigned
-// aliases. Format mirrors `workflows-v2 lint`'s short report style.
-func printComposeSummary(w io.Writer, workflow map[string]any) {
-	if w == nil {
-		return
-	}
-	rawNodes, ok := workflow["nodes"].([]map[string]any)
-	if !ok {
-		// Try the slice-of-any form some assemblies produce.
-		alt, _ := workflow["nodes"].([]any)
-		for _, item := range alt {
-			if m, ok := item.(map[string]any); ok {
-				rawNodes = append(rawNodes, m)
-			}
-		}
-	}
-	if len(rawNodes) == 0 {
-		return
-	}
-	fmt.Fprintf(w, "# created %d task(s) backing the workflow nodes:\n", len(rawNodes))
-	for _, n := range rawNodes {
-		typ, _ := n["type"].(string)
-		alias, _ := n["taskAlias"].(string)
-		label, _ := n["label"].(string)
-		if alias == "" {
-			continue
-		}
-		fmt.Fprintf(w, "#   %-20s  alias=%-40s  label=%q\n", typ, alias, label)
-	}
-}
-
+// reservedMappingScopes are the leading segments in a mapping value that are
+// NOT spec-local refs and must not be rewritten.
 var reservedMappingScopes = map[string]bool{
 	"inputs":               true,
 	"custom":               true,
@@ -1090,20 +1041,17 @@ func templateDependencyRefs(task map[string]any) []string {
 	return out
 }
 
-// rewriteRefsInMappings replaces leading spec-local refs in mapping values
-// with the server-assigned alias from refMap. Spec refs are the
-// human-friendly names the spec assigns to each task (`ref` / `alias` /
-// `nodeId` fallback); the server picks a slug-NNNNNN alias on create that we
-// must substitute in so downstream tasks reference the correct stored alias.
+// rewriteRefsInMappings resolves the spec-local ref at the head of each mapping
+// value through refMap. Spec refs are the human-friendly names the spec assigns
+// to each task (`ref` / `alias` / `nodeId` fallback); the server substitutes
+// the slug-NNNNNN alias it assigns to the task.
 //
 // Two shapes are recognised:
 //   - long  "task_outputs.<taskRef>.<field>" -> "task_outputs.<server-alias>.<field>"
 //   - bare  "<taskRef>.<field>"              -> "<server-alias>.<field>"
 //
-// Both forms are accepted by the BC runtime resolver -- bare form is the
-// implicit task_outputs.<alias> shortcut (PR #1269 / borrower-central feature
-// branch feat/workflows-v2-resolver-bare-alias-refs). We no longer rewrite
-// bare form to the long form; the server-side resolver expands it.
+// Both forms are accepted by the BC runtime resolver: the bare form is the
+// implicit task_outputs.<alias> shortcut, expanded server-side.
 //
 // Reserved scopes (inputs, custom, system, task_outputs, task_outputs_by_type,
 // entity) are never treated as refs.
@@ -1193,14 +1141,8 @@ func rewriteTaskOutputsRefsInString(s string, refMap map[string]string) string {
 }
 
 // replaceTaskOutputsRef swaps `task_outputs.<ref>` for `task_outputs.<alias>`
-// wherever the ref ends on a real boundary.
-//
-// The boundary used to be a required trailing dot, which quietly missed every
-// reference that does not continue with a field: a bare `task_outputs.tablas`,
-// and the bracket forms `task_outputs.tablas[0].x` / `task_outputs.a.arr[].f`.
-// Bracket indexing is legal in the Hub's formula syntax, so those references
-// stayed on the spec-local ref and the variable pointed at a node that does not
-// exist. A dot is still A boundary -- it is just no longer the only one.
+// wherever the ref ends on a real boundary: a dot, a bracket (`[0]`, `[].f`,
+// legal in the Hub's formula syntax) or the end of the string.
 //
 // The ref must not be followed by a word char or a hyphen, so a ref `tabla`
 // cannot match inside `task_outputs.tablas`. Go's RE2 has no lookahead, so the
@@ -1400,34 +1342,18 @@ func taskOutputsHeads(s string) []string {
 }
 
 // rewriteCustomVariableRefs rewrites every spec-local ref inside ONE compute
-// variable definition, in place. It is the single definition of that rewrite so
-// the two sites that need it -- the spec assembly in apply and the pre-flight
-// alias substitution -- cannot drift.
-//
-// `dependencyTypes` is keyed BY the dependency string, so it is the one field
-// here where the ref lives in a map KEY rather than a value. Every other
-// rewriter in this file walks values only, which is exactly why the field was
-// missed: a variable landed with correct `dependencies` and an `expression` and
-// a `dependencyTypes` map still keyed by the pre-rewrite refs. Two silent
-// consequences on the server -- the runtime's dependency coercion looks up by
-// the REAL name and misses, so a declared scalar type on an array-map
-// dependency loses its None-slot-drop-and-unwrap; and the builder's
-// reference-integrity scan stringifies the variable and matches
-// `task_outputs.<alias>`, so every stale key renders as a phantom "references a
-// node that no longer exists" warning on a workflow that is wired correctly.
-//
-// An entry already under the destination key wins: it names a dependency the
-// author declared directly, and overwriting it with a carried-over type would
-// replace a correct declaration with a stale one.
+// variable definition, in place: every string value at any depth and every map
+// key. `dependencyTypes` is keyed BY the dependency string, so the ref lives in
+// a map KEY there; a stale key makes the runtime's dependency coercion miss and
+// the builder's reference scan report a phantom dangling reference. An entry
+// already under the destination key wins: it names a dependency the author
+// declared directly.
 func rewriteCustomVariableRefs(v map[string]any, refMap map[string]string) {
 	if v == nil {
 		return
 	}
-	// Every string VALUE at any depth and every map KEY. Naming the fields one
-	// by one is what let `simpleConfig.formulaText` go stale while `expression`
-	// and `dependencies` rewrote correctly, and then let `dependencyTypes` (the
-	// one field keyed BY the ref) stay on pre-rewrite names. No prose exclusion
-	// here: a variable definition has no free-text field the runtime ignores.
+	// Every string VALUE at any depth and every map KEY; a variable definition
+	// has no free-text field the runtime ignores.
 	rewriteTaskOutputsRefsDeep(v, refMap, nil)
 }
 
@@ -1582,9 +1508,8 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 	// (resolved by the activity itself via resolve_context_field, which requires
 	// that literal prefix and does NOT accept the bare `<alias>.<field>`
 	// shortcut). rewriteRefsInTemplate early-returns on a string with no "{{",
-	// so the bare form needs the substring rewriter -- data-store batchSource
-	// and sqlParameters are commonly authored bare, which is exactly how the
-	// spec ref used to survive.
+	// so the bare form needs the substring rewriter (data-store batchSource
+	// and sqlParameters are commonly authored bare).
 	rewriteTemplateOrPath := func(fieldPath string, value string) (string, error) {
 		if strings.Contains(value, "{{") {
 			return rewriteField(fieldPath, value)
@@ -1893,9 +1818,7 @@ var residualSpecRefExcludedFields = map[string]bool{
 	// node references -- the category node deliberately takes no id of any kind.
 	// A spec is perfectly entitled to have a node ref that reads the same as a
 	// category key ("segmentation" is a natural name for both), and flagging
-	// that is a false positive by construction. It is also an expensive one:
-	// this validator runs inside the POST loop, so the abort lands after tasks
-	// have already been created and there is no rollback.
+	// that is a false positive by construction.
 	"categoryKey": true,
 	"valueFields": true,
 }
@@ -2566,13 +2489,8 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 	fmt.Fprintf(os.Stderr, "#   altscore mapping-tables   create --workflow-alias %s ...\n", predictedAlias)
 	fmt.Fprintf(os.Stderr, "#   altscore scorecards       create --workflow-alias %s ...\n", predictedAlias)
 
-	// Pre-flight: validate every task's REQUIRED-field shape locally before
-	// posting anything. The previous loop would create tasks 0..N-1 on the
-	// server, then fail on N because a label/type was missing or an enum was
-	// wrong. Without a tasks-v2 DELETE endpoint there's no cleanup, so we
-	// surface those errors before the first HTTP call. Server-side errors
-	// (e.g. "headers must be JSON-encoded string") still happen mid-loop, but
-	// the cheap-and-obvious mistakes are now blocked client-side.
+	// Pre-flight: validate every task's required-field shape locally, so the
+	// cheap mistakes never reach the server.
 	fetchLiveTaskTypes = func() map[string]bool { return fetchServerTaskTypes(c) }
 	defer func() { fetchLiveTaskTypes = nil }()
 
@@ -2622,14 +2540,8 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 	// error surfaced. See the la-fabril spike report for the original sighting.
 	lintOutputJsonObjectRefs(spec)
 
-	// Warn when a spec contains both a rule-tree task and an end task that
-	// isn't wired in the canonical "single end node" shape. The canonical
-	// pattern collapses conditional + N parallel end nodes into ONE end node
-	// fed directly by the rule-tree, with decision_key tracked through
-	// inputMappings -- BC's end_activity then auto-records the per-run
-	// decision and renders the PDF. Skipping any field is legal (some
-	// workflows want multiple ends per branch, no PDF, or no decision
-	// recording), so this lint is advisory only.
+	// Advisory: a rule-tree feeding an end node that is not in the canonical
+	// single-end shape (see lintCanonicalEndNode).
 	lintCanonicalEndNode(spec)
 
 	// Advisory: flag customVariables that are pure pass-through extraction
@@ -2693,9 +2605,8 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 
 	// Opinionated end-node defaults (gated by --no-auto-defaults): force PDF
 	// generation on and wire borrower_id/billable_id to the single customer
-	// node. Runs before the task-build loop so the borrower_id mapping uses a
-	// spec-local ref that the loop's rewriteRefsInMappings turns into the
-	// server alias.
+	// node. Runs before the task-build loop so the borrower_id mapping is a
+	// spec-local ref the loop validates like any other.
 	if autoDefaults {
 		applyAutoEndDefaults(spec)
 	}
@@ -2736,15 +2647,9 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		return placeholder
 	}
 
-	// Topologically sort task creation order so cross-task inputMappings
-	// always resolve at the time we POST each task. Without this, a task
-	// listed in spec.tasks BEFORE the task it references would have a bare
-	// "<ref>.<output>" value persist verbatim -- the runtime resolver then
-	// fails with "Unknown variable namespace". rewriteRefsInMappings now
-	// errors on unresolved refs as a safety net, so this ordering is the
-	// difference between "compose works regardless of spec ordering" and
-	// "compose silently produces broken workflows when authors list tasks
-	// in flow order rather than dependency order".
+	// Order tasks by dependency so every ref is in refMap before its consumer
+	// is rewritten; a task listed before the task it references would
+	// otherwise fail the unknown-ref check.
 	order, err := topologicalTaskOrder(spec.Tasks, spec.Edges)
 	if err != nil {
 		return nil, err
@@ -2772,13 +2677,11 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		task["specRef"] = ref
 		task["workflowAlias"] = predictedAlias
 
-		// Strip the spec-only `ref` field before posting; it's not part of the API.
+		// Strip the spec-only `ref` field; it is not part of the task body.
 		delete(task, "ref")
 
 		// A pinned canvas position is a graph concern, not part of the task
-		// body: lift it onto the node below and keep it out of what we POST to
-		// /v2/tasks (which drops undeclared keys silently, so this was a
-		// no-op field that read as if it worked).
+		// body: lift it onto the node below.
 		pinnedPos, hasPinnedPos := task["position"]
 		delete(task, "position")
 
@@ -2809,9 +2712,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			return nil, fmt.Errorf("node ref=%q: %w", ref, err)
 		}
 
-		// Assemble (do NOT post): record the body and take a placeholder
-		// identifier for the graph. The server rewrites the refs to the real
-		// aliases and stamps alias + version onto the node.
+		// Record the body and take a placeholder identifier for the graph.
 		placeholder := registerTask(task, ref, ctx)
 		refMap[ref] = placeholder
 
@@ -2858,16 +2759,10 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			// Auto-create a trivial backing task: just type + label.
 			// For `end` nodes we also auto-wire inputSchema / inputMappings
 			// from upstream tasks so the PDF report editor (and end_activity's
-			// context.get() calls) have the data they expect. Without this,
-			// the end task ships with empty schemas and the PDF picker shows
-			// nothing -- matching the bug the user hit before manually
-			// recreating the end node in the Hub UI.
+			// context.get() calls) have the data they expect.
 			//
-			// specRef + workflowAlias enable the server's stable-alias path
-			// (BC's CreateTaskV2UC.find_by_spec_ref) so successive applies
-			// of the same spec version-bump THIS task instead of minting a
-			// fresh fin-XXXXXX / start-XXXXXX alias. Same rationale as the
-			// spec.Tasks loop above.
+			// specRef + workflowAlias let the server version-bump THIS task on
+			// re-apply instead of minting a fresh alias.
 			taskBody := map[string]any{
 				"label":         label,
 				"type":          nodeType,
@@ -2875,20 +2770,9 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				"workflowAlias": predictedAlias,
 			}
 			if strings.ToLower(nodeType) == "end" {
-				// Data-source ancestors (altdata-enrichment, scorecard,
-				// mapping-table, rule-tree, evaluate-rules) used to be
-				// walked here and pre-filled into endConfig.pdfConfig
-				// .sourcesConfig (the ~180-LOC buildEndAutoWiring). That
-				// walker now lives at runtime in borrower-central's
-				// end_activity, which auto-resolves sources from the
-				// workflow graph whenever pdfConfig.enabled=true but
-				// sourcesConfig is empty. Agents can flip enabled=true
-				// without also pre-populating the array.
-				//
-				// inputSchema / inputMappings auto-wiring for the Hub
-				// canvas is similarly handled client-side by
-				// pdf-data-source-auto-mapping.ts when the workflow is
-				// loaded into the builder.
+				// PDF sources are resolved at runtime by end_activity when
+				// pdfConfig.enabled is true and sourcesConfig is empty, so
+				// nothing is pre-filled here.
 				inSchema := map[string]any{}
 				inMappings := map[string]any{}
 				var pdfSections []map[string]any
@@ -3017,15 +2901,14 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 				}
 			}
 
-			// Assemble (do NOT post): record the backing task body and take a
-			// placeholder identifier.
+			// Record the backing task body and take a placeholder identifier.
 			taskAlias = registerTask(taskBody, ref, fmt.Sprintf("node ref=%q (extra-node backing)", ref))
 			n["taskAlias"] = taskAlias
 			n["taskVersion"] = 1
 		}
 
-		// nodeId follows the server-assigned task alias (1:1) so edges and
-		// downstream references resolve cleanly.
+		// nodeId is the task placeholder (1:1) so edges and downstream
+		// references resolve cleanly.
 		if taskAlias != "" {
 			n["nodeId"] = taskAlias
 			refMap[ref] = taskAlias
@@ -3100,11 +2983,8 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		allEdges = append(allEdges, e)
 	}
 
-	// Lay the canvas out now that nodes and edges are both resolved. Before
-	// this, every node shipped on y=0 at a 200px pitch -- narrower than the
-	// Hub's 250px card -- so a composed workflow opened as one overlapping row
-	// with every branch collapsed on top of itself, and the only fix was
-	// clicking Align by hand. This is the same algorithm that button runs.
+	// Lay the canvas out now that nodes and edges are both resolved, with the
+	// same algorithm as the Hub's Align button.
 	if autoLayout {
 		if layoutPinned {
 			fmt.Fprintf(os.Stderr, "# Auto-layout skipped: spec pins node positions. Remove them to let the CLI lay the canvas out.\n")
@@ -3191,22 +3071,10 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 
 		// Rewrite spec-ref prefixes in customVariable strings so the runtime
 		// compute_variables_activity can resolve them against _task_outputs.
-		// The dependency list is the lookup key against _task_outputs (see
-		// borrower-central/app/temporal/activities/compute_variables_activity.py
-		// :_collect_dependencies), AND the same string is used as the dict
-		// key into `inputs` inside the expression -- so both must agree on
-		// the alias. Symptom when this rewrite is missing: every dependency
-		// resolves to None, the compute function falls back to whatever
-		// default it has (often 0 or a sentinel like -999999), and every
-		// downstream score / decision collapses. Tracked through the v10
-		// stress run (Argentine SMB workflow with refs like
-		// "task_outputs.enrich.ARG-PUB-0001..." that compose persisted
-		// without rewriting `enrich` to the server alias).
-		// NOTE: in this phase refMap is the identity map, so this call is a
-		// no-op by construction -- the real substitution happens in the
-		// pre-flight pass once server aliases exist. Kept so the two sites
-		// share one definition and a future change here is not silently
-		// half-applied.
+		// The dependency list is the lookup key against _task_outputs AND the
+		// dict key into `inputs` inside the expression, so both must name the
+		// same alias. refMap is the identity map here: the call validates the
+		// refs and the server performs the real substitution.
 		rewriteCustomVariableRefs(v, refMap)
 
 		customVars[name] = v
@@ -3220,10 +3088,8 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		"nodes":           allNodes,
 		"edges":           allEdges,
 	}
-	// Honor an explicit `alias` from the spec (BC #1291 made the create
-	// endpoint accept it). Without this, BC slugifies `label` -- which is
-	// fine, but specs that set alias explicitly were silently ignored by
-	// compose for several releases. Threaded as a plain pass-through.
+	// An explicit `alias` passes through; without one the server slugifies
+	// `label`.
 	if spec.Alias != "" {
 		wf["alias"] = spec.Alias
 	}
@@ -3358,12 +3224,10 @@ func fetchServerTaskTypes(c *client.Client) map[string]bool {
 }
 
 // preflightTasks runs cheap validation across every task in the spec during
-// assembly, before apply POSTs any /v2/tasks -- fully local, except at most one
+// assembly, before the apply request is sent -- fully local, except at most one
 // read-only backend lookup when a task type is unknown to this build (see
-// fetchLiveTaskTypes). Catches the mistakes that would otherwise create
-// orphan /v2/tasks rows mid-loop. Without a tasks-v2 DELETE endpoint,
-// partial-failure cleanup is impossible; everything we can catch here we
-// MUST.
+// fetchLiveTaskTypes). A structural mistake caught here never reaches the
+// server.
 //
 // Checks (in order, fail-fast):
 //  1. duplicate spec-local refs / explicit aliases
@@ -3383,13 +3247,6 @@ func fetchServerTaskTypes(c *client.Client) map[string]bool {
 func preflightTasks(spec *composeSpec) error {
 	// Spec-level checks: workflow alias + category + inputVariables shape.
 	// These fail with opaque backend errors otherwise; surface here.
-	//
-	// The alias check has to live here, not at POST /v2/workflows: BC only
-	// rejects a non-kebab-case alias when the workflow itself is created,
-	// which is AFTER every task has been POSTed. Tasks cannot be un-created
-	// (see the rollback note at the top of this file), so without this the
-	// whole spec clears both pre-flights, leaks one task row per node, and
-	// dies on the last call.
 	if err := checkWorkflowAlias(spec.Alias); err != nil {
 		return err
 	}
@@ -4570,13 +4427,11 @@ func warnUnverifiedVocabularyValue(path, value, vocabulary string) {
 // legitimately hold a bare VARIABLE name -- mappingTableConfig.entries[].
 // inputVariable, compute-variables selectedVariables[], scorecardConfig.
 // totalScoreVariable, and so on -- then read as un-rewritten node refs and abort
-// apply. That abort happens in the POST loop, i.e. after tasks have already been
-// created, which is the one place apply must never fail.
+// apply.
 //
 // Excluding those fields one at a time (residualSpecRefExcludedFields) is a
 // losing race against the task schema. Keeping the two namespaces disjoint is
-// the precondition that makes the exact-match check sound in the first place, so
-// it is enforced here, before anything is POSTed.
+// the precondition that makes the exact-match check sound in the first place.
 func checkRefVariableCollisions(spec *composeSpec, knownRefs map[string]bool) error {
 	type collision struct{ name, scope string }
 	var found []collision
@@ -4607,8 +4462,8 @@ func checkRefVariableCollisions(spec *composeSpec, knownRefs map[string]bool) er
 			"They are different scopes at runtime (the node's output is task_outputs.%s.*, the variable is a "+
 			"bare %q), but apply rewrites refs by exact string match, so any field holding the variable's bare "+
 			"name -- a mapping-table entry's inputVariable, a compute node's selectedVariables, a scorecard's "+
-			"totalScoreVariable -- looks like an un-rewritten node ref and aborts apply DURING the task POST "+
-			"loop, after some tasks already exist. Rename one of the two: e.g. ref %q, or a distinct variable name.",
+			"totalScoreVariable -- looks like an un-rewritten node ref and is rejected before the apply request "+
+			"is sent. Rename one of the two: e.g. ref %q, or a distinct variable name.",
 		strings.Join(names, ", "), first, first, first+"-node",
 	)
 }
@@ -4617,15 +4472,9 @@ func checkRefVariableCollisions(spec *composeSpec, knownRefs map[string]bool) er
 // same shape the backend enforces at POST /v2/workflows ("alias must be
 // kebab-case: lowercase letters, digits, and hyphens; start with a letter or
 // digit; length 1-100 characters"). An empty alias is fine -- the server
-// slugifies the label instead, which always yields a conforming alias.
-//
-// Node refs and node aliases have been checked against validAliasPattern for a
-// while; the WORKFLOW alias was the one identifier nothing checked, and it is
-// the most expensive one to get wrong. It is the last field the create path
-// validates (workflow creation is the final call, after every task POST) and
-// the alias is also what every credit-decisioning entity gets stamped with, so
-// a rejected alias leaves both orphan task rows and, on a rename, entities
-// stamped with an alias no workflow will ever have.
+// slugifies the label instead, which always yields a conforming alias. The
+// alias is also what every credit-decisioning entity gets stamped with, so a
+// bad one is caught here rather than after entities have been re-scoped.
 func checkWorkflowAlias(alias string) error {
 	if alias == "" {
 		return nil
@@ -4637,9 +4486,7 @@ func checkWorkflowAlias(alias string) error {
 		"workflow alias %q is not kebab-case. The server derives the workflow's URL paths from it, so it "+
 			"must be lowercase alphanumeric with internal dashes only (regex: ^[a-z0-9][a-z0-9-]*$) and at "+
 			"most 100 characters. Don't use spaces, underscores, slashes, uppercase, or other punctuation. "+
-			"Try %q. This is checked here because POST /v2/workflows is the LAST call apply makes: without "+
-			"it the spec clears both pre-flights, every task is created, and only then does the backend "+
-			"reject the alias -- leaving orphan task rows behind.",
+			"Try %q.",
 		alias, slugifyWorkflowLabel(alias),
 	)
 }

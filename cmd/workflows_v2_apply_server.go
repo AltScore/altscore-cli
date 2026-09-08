@@ -16,25 +16,19 @@ import (
 
 // Server-side apply: POST /v2/workflows/apply.
 //
-// Borrower Central accepts the flat authoring spec verbatim and does what this
-// CLI did client-side before v0.35.0 (post each task, substitute aliases, then
-// the lock / draft / autosave / publish dance): it resolves every spec-local ref to
-// a task alias BEFORE writing, validates the assembled graph with the oracle
+// Borrower Central accepts the flat authoring spec verbatim: it resolves every
+// spec-local ref to a task alias BEFORE writing, validates the assembled graph with the oracle
 // publish uses, creates or version-bumps the tasks by (workflowAlias, specRef),
 // then creates / drafts+autosaves / publishes the workflow under the edit
 // lock. A rejected spec writes nothing; a mid-write infrastructure failure is
 // unwound server-side. `dryRun` returns the plan (exact ref -> alias map,
 // assembled graph, findings) without taking the lock.
 //
-// The CLI still owns authoring sugar and rendering: it parses, normalizes and
-// assembles exactly as before (composeWorkflowBody, posting nothing), then
-// rebuilds the flat spec from the assembled graph plus the captured task bodies
-// and sends it once. References inside bodies are already in the canonical
-// long form (`task_outputs.<ref>`) after assembly with the identity map.
-//
-// Availability. An older backend answers 404 (or 405: POST on a path that only
-// exists as GET /{workflow_id}). There is no client-side fallback since
-// v0.35.0: apply reports the missing endpoint and stops.
+// The CLI owns authoring sugar and rendering: it parses, normalizes and
+// assembles locally (composeWorkflowBody, posting nothing), then rebuilds the
+// flat spec from the assembled graph plus the captured task bodies and sends
+// it once. References inside bodies are already in the canonical long form
+// (`task_outputs.<ref>`) after assembly with the identity map.
 
 const serverApplyPath = "/v2/workflows/apply"
 

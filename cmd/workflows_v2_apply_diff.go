@@ -5,73 +5,12 @@ import (
 	"fmt"
 	"io"
 	"reflect"
-	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/client"
 	"github.com/spf13/cobra"
 )
-
-// stripHashSuffix removes the trailing "-<6hex>" disambiguation suffix that
-// BC appends to task aliases when slugifying labels (e.g.
-// "start-553bc9" -> "start"). Two reasons we strip it for the diff:
-//
-//  1. The assembled body in --diff mode runs composeWorkflowBody with
-//     dryRun=true, which uses the spec-local `ref` as the alias (no server
-//     call). Existing tenant workflows have hash-suffixed aliases. Without
-//     this stripping, every node in an existing workflow would show as
-//     removed and every spec node as added on the UPDATE path -- which is
-//     technically what apply does (it recreates all tasks) but useless as
-//     a "what changed?" preview.
-//
-//  2. The slug encodes the human label, so stripped-slug comparison gives
-//     a stable identity that survives the hash regeneration on every apply.
-//     Trade-off: two nodes that slug to the same value collide and look
-//     identical in the diff. Mitigated by also tracking the original alias
-//     for tie-breaking.
-var hashSuffixRegex = regexp.MustCompile(`-[0-9a-f]{6}$`)
-
-func stripHashSuffix(s string) string {
-	return hashSuffixRegex.ReplaceAllString(s, "")
-}
-
-// taskOutputsRefRegex matches `task_outputs.<alias>` segments inside a
-// mapping value or template string. Used to canonicalize references so the
-// spec's `task_outputs.fetch.X` compares equal to the tenant's
-// `task_outputs.fetch-abc123.X`. The replacement strips the trailing
-// `-<6hex>` off the alias segment only -- non-task-outputs parts of the
-// string are left alone.
-var taskOutputsRefRegex = regexp.MustCompile(`task_outputs\.([a-zA-Z0-9_-]+)`)
-
-func normalizeRefValue(v any) any {
-	s, ok := v.(string)
-	if !ok {
-		return v
-	}
-	return taskOutputsRefRegex.ReplaceAllStringFunc(s, func(match string) string {
-		// match is "task_outputs.<alias>"; strip just the alias's hash suffix.
-		parts := strings.SplitN(match, ".", 2)
-		if len(parts) != 2 {
-			return match
-		}
-		return parts[0] + "." + stripHashSuffix(parts[1])
-	})
-}
-
-// normalizeMappings returns a fresh map with every value passed through
-// normalizeRefValue. Mutates nothing on the input. Used by the diff renderer
-// to compare inputMappings without the hash-suffix noise.
-func normalizeMappings(m map[string]any) map[string]any {
-	if m == nil {
-		return nil
-	}
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		out[k] = normalizeRefValue(v)
-	}
-	return out
-}
 
 // diffWorkflow renders a human-readable structural diff between the spec
 // (already assembled into the workflow body apply would POST/autosave) and
@@ -206,8 +145,7 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 		// Per-field detail for inputMappings.
 		if contains(ch.fields, "inputMappings") {
 			diffMappings(&buf, "      ", "inputMappings",
-				normalizeMappings(readNodeMappings(specNodes[key])),
-				normalizeMappings(readNodeMappings(currNodes[key])))
+				readNodeMappings(specNodes[key]), readNodeMappings(currNodes[key]))
 		}
 		changes++
 	}
@@ -313,12 +251,8 @@ func diffNodeIndex(spec, current map[string]map[string]any) (added, removed []st
 			}
 		}
 		// inputMappings is stored at node.inputMappings in the assembled
-		// body but at node.data.inputMappings in the GET response. Read
-		// from both and normalize task_outputs.<alias> refs before
-		// comparing.
-		specMappings := normalizeMappings(readNodeMappings(sn))
-		currMappings := normalizeMappings(readNodeMappings(cn))
-		if !reflect.DeepEqual(specMappings, currMappings) {
+		// body but at node.data.inputMappings in the GET response.
+		if !reflect.DeepEqual(readNodeMappings(sn), readNodeMappings(cn)) {
 			fields = append(fields, "inputMappings")
 		}
 		if len(fields) > 0 {
@@ -350,7 +284,7 @@ func indexEdges(edges []map[string]any, nodeKeyByID map[string]string) map[edgeK
 		if k, ok := nodeKeyByID[s]; ok {
 			return k
 		}
-		return stripHashSuffix(s)
+		return s
 	}
 	for _, e := range edges {
 		src, _ := e["sourceNodeId"].(string)

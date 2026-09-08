@@ -2,13 +2,12 @@ package cmd
 
 // Shared rendering for server validation findings.
 //
-// Two commands surface the same finding shape from two different endpoints:
-// `apply` pre-flights POST /v2/workflows/validate before creating any task, and
-// `import` reads the findings POST /v2/workflows/import reports about the
-// destination tenant. They differ in their headline sentence and their exit
-// policy, but the per-finding lines are identical and must stay that way -- a
-// second copy would drift, which is the whole class of bug the backend change
-// behind this exists to remove.
+// Three commands surface the same finding shape from three endpoints: `apply`
+// renders what POST /v2/workflows/apply returns, `lint` what
+// POST /v2/workflows/validate returns, and `import` what
+// POST /v2/workflows/import reports about the destination tenant. They differ
+// in their headline sentence and their exit policy, but the per-finding lines
+// are identical and must stay that way.
 
 import (
 	"fmt"

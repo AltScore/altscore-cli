@@ -123,8 +123,7 @@ var barePlaceholder = regexp.MustCompile(`^\s*\{[A-Za-z0-9_-]+\}\s*$`)
 //
 // It deliberately says NOTHING about a data-source section being absent:
 // includeAllSources auto-wires those at render time, so "missing" is the normal,
-// recommended shape and warning on it would mislead (this is the same trap the
-// removed silent-PDF lint fell into).
+// recommended shape and warning on it would mislead.
 //
 // endConfig lives in two places depending on the caller. An apply spec carries it
 // INLINE on the node; GET /v2/workflows/{id} does NOT embed task bodies at all
