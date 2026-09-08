@@ -51,6 +51,33 @@ altscore workflows-v2 schema-guide tasks         # task shape + per-type config 
 altscore workflows-v2 schema-guide examples      # full scoring_pipeline template
 ```
 
+#### Discovery before authoring (ask, then build)
+
+"Create a workflow that does X" and "change workflow Y so that Z" almost always leave business decisions open that no `schema-guide` section can answer. Before you write a spec, ask the user with the **AskUserQuestion** tool: one round, at most 4 questions, 2 to 4 options each, the option you would pick first and labelled `(Recommended)`. Then build.
+
+Ask about the business, not the JSON. Anything the spec can default is yours to decide without asking: node labels, positions, aliases and refs, `dataAge`, branch ids, `inputKeys`, the end node, publish policy (DRAFT on create). Never ask which field a task type uses; read `schema-guide tasks`. Skip every question the request already answers, and skip the round entirely when nothing is open.
+
+**Business use case.** Pick the ones the request left open.
+
+| Question | Options to offer | Ground the options with |
+|---|---|---|
+| Who is being evaluated? | an individual; a company; a company plus its people (owners, legal representatives, guarantors) | `altscore workflows-v2 list --filter is-latest=true` shows what the tenant already runs |
+| What is the workflow deciding? | approve or reject; a risk score with no verdict; a score plus hard-stop gates `(Recommended)` for credit; enrichment only, no decision | `altscore decisions list` for the registered decision keys; a key the tenant lacks cannot be written |
+| Where does the flow sit in the customer's process? | origination of a new applicant; recurring monitoring of existing customers; a one-off batch over a portfolio | `workflows-v2 list --filter category=EVALUATION` (or `ACTION`) for a sibling flow in the same stage |
+| What happens with the result? | write the decision on a deal; on the borrower; produce a PDF report; return it to the caller only | `altscore data-models list` for the deal and borrower fields already defined |
+| Which country's data? | one option per country the tenant has active sources for | `altscore workflows-v2 sources-status --status active`, one option per distinct country |
+
+**High-level clarifications of the workflow.** Ask only when the answer changes the graph.
+
+- **One workflow, or an orchestrator plus a per-party child?** Ask when related parties are screened (KYB with owners or legal reps, deals with guarantors). See [kyc-kyb-habits](kyc-kyb-habits.md).
+- **What does the caller send in?** Only the identity key (tax id or person id), or a fuller application payload (amount, term, product). This becomes the `inputSchema`.
+- **What must never pass?** The hard stops that reject regardless of score: sanctions hit, dissolved entity, identity mismatch. Offer the ones the chosen sources can detect.
+- **Modifying an existing workflow:** which one, when the label is ambiguous (options from `workflows-v2 list --filter search=<words>`), and whether the change replaces the live version now or is tried first under a new alias. `apply` over an ACTIVE alias publishes; a new alias saves a DRAFT you can execute by id.
+
+Example round for "create a KYB workflow for Ecuadorian SMEs": ask who is screened (company only / company plus owners and legal reps), what is decided (approve-reject with gates / score plus gates / enrichment only) and where the decision lands (deal / borrower / caller). Do not ask about the country (given), the sources (derive them from `sources-status --country ECU --status active` and the answers) or publishing (DRAFT by default). Restate the answers in one line, then write the spec.
+
+**When AskUserQuestion is unavailable** (print mode `-p`, background jobs, some SDK hosts) do not guess and mutate. Write down the assumptions you would have asked about, build the spec under them, run `apply --dry-run` (or `--diff` for an update) and stop. Report the plan and the open questions; apply only after the user answers.
+
 #### Recommended path: `apply` (declarative create-or-update)
 
 For "Create a workflow that does X" — or "Update workflow Y to do Z" — use `workflows-v2 apply`. It takes a single spec and reconciles it against the tenant. Use `--dry-run` first to inspect what will be sent (the dry-run output also tells you which branch will fire: CREATE or UPDATE).
