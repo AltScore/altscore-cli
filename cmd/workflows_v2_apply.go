@@ -264,6 +264,16 @@ End-node output (endConfig on the 'end' node):
 			// composeWorkflowBody, which never sees it.
 			stampEnforceTypeOnNewVariables(spec.CustomVariables, liveCustomVariables(existing), cmd.ErrOrStderr())
 
+			// Same reason: the deprecation gate refuses a retired task type only
+			// as NEW authoring, mirroring the backend, which diffs the incoming
+			// graph against the stored one. Without the target's node types a
+			// workflow that already carries a retired node could not be applied
+			// at all -- not even to change an unrelated node -- which is exactly
+			// the migration someone opens it to perform. `existing` is nil on
+			// the create path (and when the alias lookup failed), so nothing is
+			// carried forward there and every deprecated type stays refused.
+			spec.ExistingNodeTypes = workflowNodeTypes(existing)
+
 			// Assemble the workflow body. composeWorkflowBody POSTs nothing: it
 			// builds the graph with spec-local refs standing in for the server
 			// aliases and (via capture) records each node's task body; the server

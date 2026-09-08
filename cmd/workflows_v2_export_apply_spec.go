@@ -3,6 +3,8 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 )
 
 // exportRefMode picks the identity a flattened node's `ref` carries.
@@ -94,6 +96,7 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 	rawNodes, _ := b.Workflow["nodes"].([]any)
 	specNodes := make([]map[string]any, 0, len(rawNodes))
 	refByNodeID := make(map[string]string, len(rawNodes))
+	deprecatedNodes := map[string]bool{}
 	for _, rn := range rawNodes {
 		node, _ := rn.(map[string]any)
 		if node == nil {
@@ -103,6 +106,9 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 		label, _ := node["label"].(string)
 		nodeID, _ := node["nodeId"].(string)
 		taskAlias, _ := node["taskAlias"].(string)
+		if deprecatedTaskTypes[nodeType] {
+			deprecatedNodes[nodeType] = true
+		}
 
 		entry := map[string]any{}
 		body := taskByAlias[taskAlias]
@@ -156,6 +162,24 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 		}
 
 		specNodes = append(specNodes, entry)
+	}
+
+	// A live workflow may still run a retired node type. Re-applying this spec
+	// over the SAME workflow keeps working -- apply refuses a deprecated type
+	// only as new authoring, and these are carried forward (see
+	// deprecatedTaskTypeRefused) -- but retargeting the spec at a fresh alias
+	// makes every one of them new, and that apply is refused. Say so here
+	// rather than at the failed apply. diff (refFromAlias) stays quiet: nobody
+	// re-applies a comparison.
+	if mode == refFromSpecRef && len(deprecatedNodes) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"# WARNING: this apply-spec carries DEPRECATED node type(s): %s. "+
+				"Re-applying it over the workflow it came from carries them forward unchanged, but "+
+				"applying it under a NEW alias is refused -- there they would be newly authored. "+
+				"Replace them as you migrate. "+
+				"Run 'altscore workflows-v2 schema-guide taskTypes' for the live palette.\n",
+			strings.Join(sortedKeys(deprecatedNodes), ", "),
+		)
 	}
 
 	// Edges: the bundle names node ids, the spec names refs. Map every endpoint

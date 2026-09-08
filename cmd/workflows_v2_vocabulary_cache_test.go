@@ -110,3 +110,52 @@ func TestVocabularyCache_KeyedByBackendURL(t *testing.T) {
 		t.Errorf("each backend must be fetched once, got a=%d b=%d", callsA, callsB)
 	}
 }
+
+// The taskTypes section carries a `deprecated` array alongside `values`. It is
+// UNIONED into the compiled-in deprecatedTaskTypes map rather than replacing
+// it: the compiled-in entries are what makes the refusal work offline, and the
+// live half lets BC retire a type without a CLI release. A type BC reports as
+// deprecated never comes back as authorable, even while it is still listed
+// under `values` (which is BC's actual shape -- it keeps parsing them).
+func TestFetchServerTaskTypes_UnionsTheServerDeprecatedList(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var calls int32
+	srv := vocabularyServer(t, http.StatusOK,
+		`{"taskTypes":{"values":["http","legacy-thing"],"deprecated":["legacy-thing","soap"]}}`, &calls)
+	defer srv.Close()
+	defer delete(deprecatedTaskTypes, "legacy-thing")
+
+	got := fetchServerTaskTypes(newTestClient(t, srv.URL))
+	if !got["http"] {
+		t.Errorf("a current type must stay authorable, got %v", got)
+	}
+	if got["legacy-thing"] {
+		t.Errorf("a server-deprecated type must not come back as authorable, got %v", got)
+	}
+	if !deprecatedTaskTypes["legacy-thing"] {
+		t.Error("the server's deprecated list must union into deprecatedTaskTypes")
+	}
+	if !deprecatedTaskTypes["soap"] {
+		t.Error("compiled-in deprecated entries must survive the union")
+	}
+}
+
+// An older backend answers without the key. That must leave the compiled-in
+// list untouched and still return the live values -- the offline refusal is
+// the compiled-in map's job, not the payload's.
+func TestFetchServerTaskTypes_MissingDeprecatedKeyIsHarmless(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var calls int32
+	srv := vocabularyServer(t, http.StatusOK, `{"taskTypes":{"values":["http","end"]}}`, &calls)
+	defer srv.Close()
+
+	got := fetchServerTaskTypes(newTestClient(t, srv.URL))
+	if !got["http"] || !got["end"] {
+		t.Errorf("values must still parse without a deprecated key, got %v", got)
+	}
+	for _, typ := range retiredTaskTypes {
+		if !deprecatedTaskTypes[typ] {
+			t.Errorf("%q dropped out of deprecatedTaskTypes after a payload with no deprecated key", typ)
+		}
+	}
+}

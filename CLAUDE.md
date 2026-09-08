@@ -77,7 +77,7 @@ A ResourceDef group (`cmd/root.go`, `Name: "workflows-v2"`, `BasePath: /v2/workf
 
 Each of the 7 graph-edit helpers wraps lock + fetch + mutate + autosave + release, via `mutateAndAutosaveV2` in `cmd/workflows_v2_helpers.go`. The two mapping endpoints do not: `makeWfv2UpdateMappingCmd` and `makeWfv2ResolveMappingsCmd` live in `cmd/workflows_v2.go` and are single bare calls (PUT `/v2/workflows/{id}/update_mapping_workflow`, GET `/v2/workflows/{id}/resolve-mappings`) with no lock and no autosave.
 
-`tasks-v2` is a separate top-level group (`cmd/tasks_v2.go`, registered at `cmd/root.go:905`) for `/v2/tasks`: `list`, `get`, `create`, `create-version`, `delete`, `get-soap-methods`.
+`tasks-v2` is a separate top-level group (`cmd/tasks_v2.go`, registered at `cmd/root.go:905`) for `/v2/tasks`: `list`, `get`, `create`, `create-version`, `delete`. (`get-soap-methods` was removed with the `soap` task type.)
 
 ### Non-negotiables
 

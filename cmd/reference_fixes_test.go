@@ -173,3 +173,107 @@ func TestInputMappingErrorListsEveryReservedScope(t *testing.T) {
 		t.Error("`self` must be listed: compute-variable dependencies and End's own outputs use it")
 	}
 }
+
+// The 13 types AltScore retired. BC still parses them so live workflows keep
+// running, but it refuses them for new authoring -- so no CLI path may author
+// one either. Leaving one in validTaskTypes let a delivery engineer clear
+// preflight and hit the refusal at POST /v2/tasks mid-compose, orphaning every
+// task created before it (there is no rollback path). Listed literally rather
+// than derived from deprecatedTaskTypes so dropping an entry from that map is
+// a test failure, not a silently smaller check.
+var retiredTaskTypes = []string{
+	"create-alert", "create-borrower", "create-identity", "data-store",
+	"end-old", "fetch-borrower-entities", "fetch-entity", "html-template",
+	"pdf-report", "soap", "update-borrower", "update-borrower-name", "webhook",
+}
+
+func TestDeprecatedTaskTypesAreRefused(t *testing.T) {
+	for _, typ := range retiredTaskTypes {
+		if validTaskTypes[typ] {
+			t.Errorf("%q is retired and must not be in validTaskTypes", typ)
+		}
+		if !deprecatedTaskTypes[typ] {
+			t.Errorf("%q must be in deprecatedTaskTypes -- that map is what makes the refusal work offline", typ)
+		}
+	}
+}
+
+// A type can never be both authorable and retired: every authoring path checks
+// the deprecated map first, so an entry in both would make the refusal depend
+// on check order.
+func TestNoTaskTypeIsBothValidAndDeprecated(t *testing.T) {
+	for typ := range deprecatedTaskTypes {
+		if validTaskTypes[typ] {
+			t.Errorf("%q is in both validTaskTypes and deprecatedTaskTypes", typ)
+		}
+	}
+}
+
+func TestDeprecatedTaskTypeReplacementsNameRetiredTypes(t *testing.T) {
+	// Guidance for a type that is not retired is stale guidance.
+	for typ := range deprecatedTaskTypeReplacements {
+		if !deprecatedTaskTypes[typ] {
+			t.Errorf("deprecatedTaskTypeReplacements has %q, which is not deprecated", typ)
+		}
+	}
+	// The eight with a documented successor must keep naming it; the other
+	// five are refused with no replacement on purpose.
+	for _, typ := range []string{
+		"create-borrower", "create-identity", "data-store", "fetch-borrower-entities",
+		"fetch-entity", "pdf-report", "soap", "update-borrower",
+	} {
+		if deprecatedTaskTypeReplacements[typ] == "" {
+			t.Errorf("%q has a replacement task type; the refusal must name it", typ)
+		}
+	}
+}
+
+func TestClosestTaskTypeNeverSuggestsARetiredType(t *testing.T) {
+	// A "did you mean" that points at a type apply refuses is worse than no
+	// suggestion: it sends the author round the same loop.
+	for _, typ := range retiredTaskTypes {
+		for _, probe := range []string{typ, typ + "s", typ + "-x"} {
+			if s := closestTaskType(probe); deprecatedTaskTypes[s] {
+				t.Errorf("closestTaskType(%q) suggested retired type %q", probe, s)
+			}
+		}
+	}
+}
+
+func TestTasksV2HasNoGetSoapMethodsCommand(t *testing.T) {
+	// `soap` is deleted from BC entirely, so GET
+	// /v2/tasks/{alias}/services/methods has nothing left to introspect.
+	// Asserted on the built command tree so it fails if the command is
+	// reintroduced by any route.
+	var tasks *cobra.Command
+	for _, c := range rootCmd.Commands() {
+		if c.Name() == "tasks-v2" {
+			tasks = c
+			break
+		}
+	}
+	if tasks == nil {
+		t.Fatal("tasks-v2 command not registered")
+	}
+	found := map[string]bool{}
+	for _, sub := range tasks.Commands() {
+		found[sub.Name()] = true
+	}
+	if found["get-soap-methods"] {
+		t.Error("tasks-v2 still exposes get-soap-methods, but the soap task type is gone")
+	}
+	// Sanity: the group is intact, so this cannot pass by tasks-v2 losing
+	// every subcommand.
+	for _, want := range []string{"create", "create-version", "list", "get", "delete"} {
+		if !found[want] {
+			t.Errorf("tasks-v2 should still expose %q", want)
+		}
+	}
+	// The group's Long help doubles as the type palette an author reads first.
+	if strings.Contains(tasks.Long, "webhook") {
+		t.Error("tasks-v2 help still lists `webhook` as a common type; it is retired")
+	}
+	if strings.Contains(tasks.Long, "soap") {
+		t.Error("tasks-v2 help still mentions soap")
+	}
+}

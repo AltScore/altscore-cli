@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/AltScore/altscore-cli/internal/client"
 	"github.com/AltScore/altscore-cli/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -20,7 +21,6 @@ import (
 //   POST   /v2/tasks/{alias}                  create new version
 //   GET    /v2/tasks                          list (paginated, filterable)
 //   GET    /v2/tasks/{alias}                  get latest (with version history)
-//   GET    /v2/tasks/{alias}/services/methods SOAP method introspection
 //   DELETE /v2/tasks/{alias}                  delete every version of a task
 
 func registerTasksV2(parent *cobra.Command) {
@@ -31,7 +31,7 @@ func registerTasksV2(parent *cobra.Command) {
 workflow node references a task by alias (and optionally pinned version).
 
 Common types: altdata-enrichment, evaluate-rules, http, conditional, wait,
-webhook, compute-variables, data-store-write, data-store-query, end.
+compute-variables, data-store-write, data-store-query, end.
 (PDF generation is endConfig on the end node, not a task type.) Each type has
 its own config fields (sourcesConfig for altdata, evaluatorAlias for
 evaluators, url+method for http, branches for conditional, etc.).
@@ -42,7 +42,6 @@ Subcommands:
   create           create a new task (auto-generates alias if omitted)
   create-version   bump a task's version sequence
   delete           hard-delete every version of a task (refuses if referenced)
-  get-soap-methods SOAP method introspection for soap-typed tasks
 
 Run 'altscore workflows-v2 schema-guide taskTypes' for the field list per type.`,
 	}
@@ -51,7 +50,6 @@ Run 'altscore workflows-v2 schema-guide taskTypes' for the field list per type.`
 	group.AddCommand(makeTv2GetCmd())
 	group.AddCommand(makeTv2ListCmd())
 	group.AddCommand(makeTv2DeleteCmd())
-	group.AddCommand(makeTv2GetSoapMethodsCmd())
 	parent.AddCommand(group)
 }
 
@@ -104,7 +102,9 @@ Returns the created task DTO including its id, alias, and version=1.`,
 			if err != nil {
 				return err
 			}
-			if err := validateTaskV2Body(body); err != nil {
+			// nil target types: a brand-new task carries nothing forward, so a
+			// deprecated type here is unambiguously new authoring and refused.
+			if err := validateTaskV2Body(body, nil); err != nil {
 				return err
 			}
 			if err := deriveAltdataInputKeysForCreate(c, &body); err != nil {
@@ -119,6 +119,47 @@ Returns the created task DTO including its id, alias, and version=1.`,
 	}
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON body (or pipe via stdin)")
 	return cmd
+}
+
+// taskV2BodyType reads the `type` off a tasks-v2 body or task DTO. Empty when
+// the payload is absent or unparseable -- the validators own those complaints.
+func taskV2BodyType(body json.RawMessage) string {
+	var task struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(body, &task); err != nil {
+		return ""
+	}
+	return task.Type
+}
+
+// deprecatedCarryForwardForTaskVersion answers, for a `tasks-v2 create-version`
+// body, which retired task types the bump merely CARRIES FORWARD -- the set the
+// deprecation gate diffs the body against (see deprecatedTaskTypeRefused).
+//
+// A version bump of an existing task whose type is ALREADY the retired one is
+// not new authoring: the backend takes it by design, so the task stays editable
+// while it is migrated off. Switching a task TO a retired type is new authoring
+// and stays refused, which is why the stored type is read rather than inferred
+// from the alias being known.
+//
+// Costs nothing in the common case -- the GET fires only when the body's own
+// type is retired. Any failure (offline, 404, unparseable, a type that does not
+// match) yields nil, so the refusal stands: the CLI must not end up looser than
+// the server because a lookup hiccuped.
+func deprecatedCarryForwardForTaskVersion(c *client.Client, alias string, body json.RawMessage) map[string]bool {
+	bodyType := taskV2BodyType(body)
+	if !deprecatedTaskTypes[bodyType] {
+		return nil
+	}
+	data, _, err := c.Do("GET", "borrower_central", fmt.Sprintf("/v2/tasks/%s", alias), nil)
+	if err != nil {
+		return nil
+	}
+	if taskV2BodyType(data) != bodyType {
+		return nil
+	}
+	return map[string]bool{bodyType: true}
 }
 
 func makeTv2CreateVersionCmd() *cobra.Command {
@@ -145,8 +186,12 @@ minus the alias.`,
 			if err != nil {
 				return err
 			}
-			if err := validateTaskV2Body(body); err != nil {
+			carriedForward := deprecatedCarryForwardForTaskVersion(c, args[0], body)
+			if err := validateTaskV2Body(body, carriedForward); err != nil {
 				return err
+			}
+			for _, typ := range sortedKeys(carriedForward) {
+				warnDeprecatedTaskTypeCarriedForward(fmt.Sprintf("task %q", args[0]), typ)
 			}
 			if err := deriveAltdataInputKeysForCreate(c, &body); err != nil {
 				return err
@@ -376,26 +421,4 @@ func formatTv2DeleteConflict(alias string, original error) error {
 		"task %q is referenced by %d workflow(s): %s; detach those nodes before deleting",
 		alias, len(refs), strings.Join(parts, ", "),
 	)
-}
-
-func makeTv2GetSoapMethodsCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:     "get-soap-methods <alias>",
-		Short:   "Introspect SOAP methods from a task's WSDL URL",
-		Long:    `For tasks of type 'soap', returns the available methods + schemas defined by the WSDL.`,
-		Args:    cobra.ExactArgs(1),
-		Example: `  altscore tasks-v2 get-soap-methods my-soap-task`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := loadClient()
-			if err != nil {
-				return err
-			}
-			path := fmt.Sprintf("/v2/tasks/%s/services/methods", args[0])
-			data, _, err := c.Do("GET", "borrower_central", path, nil)
-			if err != nil {
-				return err
-			}
-			return output.RawJSON(data)
-		},
-	}
 }

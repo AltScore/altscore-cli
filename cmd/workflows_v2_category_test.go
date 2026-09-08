@@ -25,7 +25,7 @@ func TestCategory_MirrorCarriesEveryValueTransform(t *testing.T) {
 	backend := []string{"none", "trim", "upper", "lower"}
 	for _, tr := range backend {
 		cfg := map[string]any{"operation": "read", "categoryKey": "segmentation", "valueTransform": tr}
-		if err := validateTaskV2BodyStructural(categoryBody(cfg)); err != nil {
+		if err := validateTaskV2BodyStructural(categoryBody(cfg), nil); err != nil {
 			t.Errorf("valueTransform %q is accepted by the backend but rejected here: %v", tr, err)
 		}
 	}
@@ -33,7 +33,7 @@ func TestCategory_MirrorCarriesEveryValueTransform(t *testing.T) {
 	// Literal would refuse, which would turn an offline typo into a 400.
 	for _, tr := range []string{"uppercase", "UPPER", "strip", "titlecase"} {
 		cfg := map[string]any{"operation": "read", "categoryKey": "segmentation", "valueTransform": tr}
-		if err := validateTaskV2BodyStructural(categoryBody(cfg)); err == nil {
+		if err := validateTaskV2BodyStructural(categoryBody(cfg), nil); err == nil {
 			t.Errorf("valueTransform %q is not a backend value but passed validation", tr)
 		}
 	}
@@ -105,7 +105,7 @@ func TestCategory_StructuralValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateTaskV2BodyStructural(categoryBody(tc.cfg))
+			err := validateTaskV2BodyStructural(categoryBody(tc.cfg), nil)
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("expected no error, got: %v", err)
