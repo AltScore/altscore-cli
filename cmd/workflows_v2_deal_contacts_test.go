@@ -164,3 +164,132 @@ func TestPreflightTasks_DealContactsSourcesConfigRejected(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// READ operation: readDealContactsConfig.picks -> dealpick-<id> handles
+// ---------------------------------------------------------------------------
+
+// dealReadTask builds a deal READ task carrying contact picks. leftoverContacts
+// simulates a node authored in write mode and later switched to read: the
+// `contacts` list stays in the body and must not be judged by the write rules.
+func dealReadTask(ref string, picks []any, leftoverContacts []any) map[string]any {
+	t := map[string]any{
+		"ref":       ref,
+		"type":      "deal",
+		"label":     "Read deal contacts",
+		"operation": "read",
+		"lookupBy":  "deal_id",
+		"inputSchema": map[string]any{
+			"deal_id": map[string]any{"type": "string", "required": true},
+		},
+		"inputMappings": map[string]any{"deal_id": "inputs.deal_id"},
+	}
+	if picks != nil {
+		t["readDealContactsConfig"] = map[string]any{"picks": picks}
+	}
+	if leftoverContacts != nil {
+		t["contacts"] = leftoverContacts
+	}
+	return t
+}
+
+// TestPreflightTasks_DealReadPicksPass: role/primary filters and both take
+// values are accepted.
+func TestPreflightTasks_DealReadPicksPass(t *testing.T) {
+	spec := dealSpec("Deal read picks", dealReadTask("read-deal", []any{
+		map[string]any{"id": "g", "role_key": "guarantor", "take": "oldest"},
+		map[string]any{"id": "p", "is_primary": true, "take": "newest"},
+		map[string]any{"id": "any"},
+	}, nil))
+	if err := preflightTasks(spec); err != nil {
+		t.Fatalf("preflight should accept read contact picks, got: %v", err)
+	}
+}
+
+// TestPreflightTasks_DealReadIgnoresLeftoverContacts: the write-mode rules must
+// NOT run on a read node. These leftover rows carry no borrower_id and no
+// identity with upsert off -- fatal in write mode, irrelevant in read mode.
+func TestPreflightTasks_DealReadIgnoresLeftoverContacts(t *testing.T) {
+	spec := dealSpec("Deal read leftovers", dealReadTask("read-deal", []any{
+		map[string]any{"id": "g", "role_key": "guarantor"},
+	}, []any{
+		map[string]any{"id": "c1", "role_key": "customer"},
+	}))
+	if err := preflightTasks(spec); err != nil {
+		t.Fatalf("read mode must not apply the write-mode contact rules, got: %v", err)
+	}
+}
+
+// TestPreflightTasks_DealReadPickBadTakeFails: take is oldest|newest -- the
+// relationships node's highest|lowest is a different vocabulary because a deal
+// contact has no priority column.
+func TestPreflightTasks_DealReadPickBadTakeFails(t *testing.T) {
+	spec := dealSpec("Deal read bad take", dealReadTask("read-deal", []any{
+		map[string]any{"id": "g", "role_key": "guarantor", "take": "highest"},
+	}, nil))
+	err := preflightTasks(spec)
+	if err == nil {
+		t.Fatal("expected preflight to reject take=highest on a deal pick")
+	}
+	if !strings.Contains(err.Error(), "oldest") {
+		t.Errorf("error should name the accepted values; got: %v", err)
+	}
+}
+
+// TestPreflightTasks_DealReadPickNotObjectFails: a non-object pick is a shape
+// error worth catching before the POST.
+func TestPreflightTasks_DealReadPickNotObjectFails(t *testing.T) {
+	spec := dealSpec("Deal read bad pick", dealReadTask("read-deal", []any{"guarantor"}, nil))
+	err := preflightTasks(spec)
+	if err == nil {
+		t.Fatal("expected preflight to reject a non-object pick")
+	}
+	if !strings.Contains(err.Error(), "readDealContactsConfig.picks[0]") {
+		t.Errorf("error should name the offending path; got: %v", err)
+	}
+}
+
+// TestValidateNoResidualSpecRefs_DealRoleKeyIsALiteral: a deal role that reads
+// the same as a node ref is a legitimate literal, not a missed ref rewrite.
+// This exact collision (node ref="customer", role_key="customer") used to abort
+// apply MID-POST, after tasks were already created and with no rollback.
+func TestValidateNoResidualSpecRefs_DealRoleKeyIsALiteral(t *testing.T) {
+	refMap := map[string]string{"customer": "borrower-ca89d5", "guarantor": "aval-77f0e1"}
+
+	t.Run("write-side contacts[].role_key", func(t *testing.T) {
+		body := map[string]any{
+			"type": "deal",
+			"contacts": []any{
+				map[string]any{"id": "c1", "borrower_id": "brw_1", "role_key": "customer"},
+			},
+		}
+		if err := validateNoResidualSpecRefs(body, refMap, "test"); err != nil {
+			t.Errorf("role_key is a tenant role literal, not a ref: %v", err)
+		}
+	})
+
+	t.Run("read-side picks[].role_key", func(t *testing.T) {
+		body := map[string]any{
+			"type":      "deal",
+			"operation": "read",
+			"readDealContactsConfig": map[string]any{
+				"picks": []any{map[string]any{"id": "g", "role_key": "guarantor"}},
+			},
+		}
+		if err := validateNoResidualSpecRefs(body, refMap, "test"); err != nil {
+			t.Errorf("pick role_key is a tenant role literal, not a ref: %v", err)
+		}
+	})
+
+	t.Run("a real missed ref on the same task still fails", func(t *testing.T) {
+		// The exclusion must be scoped to role_key, not to the deal type: an
+		// unknown ref-bearing field on a deal body must still be caught.
+		body := map[string]any{
+			"type":            "deal",
+			"someNewRefField": "customer",
+		}
+		if err := validateNoResidualSpecRefs(body, refMap, "test"); err == nil {
+			t.Error("excluding role_key must not blind the validator to other fields")
+		}
+	})
+}

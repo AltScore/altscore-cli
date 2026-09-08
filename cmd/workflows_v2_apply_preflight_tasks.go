@@ -676,6 +676,34 @@ func preflightTasks(spec *composeSpec) error {
 			// identity (identity_value, or tax_id / identity_key shorthand) AND
 			// persona. Mirrors the relationships preflight below.
 			if taskType == "deal" {
+				dealOp, _ := task["operation"].(string)
+				// READ mode authors contact PICKS, not inline contacts: each pick
+				// narrows the deal's contacts to one on a dealpick-<id> handle.
+				// The write rules below must not run here -- a node switched from
+				// write to read KEEPS its authored `contacts`, and judging them by
+				// the write rules fails a perfectly valid read node (the Hub's
+				// deal plugin validator had the identical hole).
+				if dealOp == "read" {
+					readCfg := asMap(task["readDealContactsConfig"])
+					for pi, p := range asSlice(readCfg["picks"]) {
+						pm, ok := p.(map[string]any)
+						if !ok {
+							return fmt.Errorf("node ref=%q: readDealContactsConfig.picks[%d] must be an object", ref, pi)
+						}
+						// A deal contact has no priority column, so take orders by
+						// createdAt -- NOT the relationships node's highest/lowest.
+						if take, ok := pm["take"].(string); ok && take != "" && take != "oldest" && take != "newest" {
+							return fmt.Errorf(
+								"node ref=%q: readDealContactsConfig.picks[%d].take=%q must be \"oldest\" or \"newest\"",
+								ref, pi, take,
+							)
+						}
+					}
+					// Zero picks is warn-only in the Hub (the node exposes no
+					// contact branch), not a hard compose error. role_key is a
+					// tenant vocabulary, validated server-side.
+					break
+				}
 				inlineContacts := asSlice(task["contacts"])
 				upsertContacts, _ := task["upsertContacts"].(bool)
 				for ci, contact := range inlineContacts {
