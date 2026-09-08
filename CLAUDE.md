@@ -10,7 +10,7 @@
 
 ## Project Structure
 
-`cmd/` holds 85 `.go` files (46 non-test, 39 test; ~21.5k source lines, ~8.6k test lines). This is a subsystem map, not a full tree. The workflows-v2 files are two thirds of the source; `workflows_v2_apply.go` alone is a quarter.
+`cmd/` holds 94 `.go` files (54 non-test, 40 test; ~21.3k source lines, ~8.7k test lines). This is a subsystem map, not a full tree. The workflows-v2 files are two thirds of the source; the `workflows_v2_apply*.go` stage files are about 8k lines of it.
 
 ```
 altscore-cli/
@@ -20,7 +20,15 @@ altscore-cli/
 │   ├── resource.go                        # ResourceDef + registerResource() generic CRUD
 │   ├── workflows.go                       # v1 group: execute, execute-by-alias, input-schema-guide, update-schema; ResourceDef Name:"workflows" in root.go
 │   ├── workflows_v2.go                    # 25 of the 36 wfv2 subcommands: all but the 7 graph edits, apply, lint and import
-│   ├── workflows_v2_apply.go              # makeWfv2ApplyCmd: composeSpec + build pipeline
+│   ├── workflows_v2_apply.go              # makeWfv2ApplyCmd: flags + RunE (parse -> target -> assemble -> POST /v2/workflows/apply)
+│   ├── workflows_v2_apply_spec.go         # composeSpec, detectLegacySpecShape, per-node helpers (localRef, edgeEndpoints)
+│   ├── workflows_v2_apply_target.go       # findWorkflowByAlias, slugifyWorkflowLabel
+│   ├── workflows_v2_apply_assemble.go     # composeWorkflowBody, applyAutoEndDefaults, htmlSections
+│   ├── workflows_v2_apply_refs.go         # ref rewriters, the residual-ref safety net, topologicalTaskOrder
+│   ├── workflows_v2_apply_preflight_tasks.go # preflightTasks + the offline lints it runs
+│   ├── workflows_v2_apply_vocab.go        # compiled-in vocabularies + live fallback (task types, categories, rel kinds, inputSchema types)
+│   ├── workflows_v2_apply_rescope.go      # reconcileEntityScopes
+│   ├── workflows_v2_apply_util.go         # camelToSnake, humanizeKey, isServerAlias, sortedKeys, ...
 │   ├── workflows_v2_apply_server.go       # POST /v2/workflows/apply: flat-spec builder, request, result rendering
 │   ├── workflows_v2_apply_diff.go         # --diff renderer
 │   ├── workflows_v2_apply_enforce_type.go # enforceType stamping on new custom variables, carry-forward on live ones
@@ -82,7 +90,7 @@ Each of the 7 graph-edit helpers wraps lock + fetch + mutate + autosave + releas
 
 ### How `apply` works
 
-Read this before touching `cmd/workflows_v2_apply.go`. `makeWfv2ApplyCmd` runs ONE pipeline; `--dry-run` and `--diff` leave it before the first write. Function names below are the anchors to grep for.
+Read this before touching the `cmd/workflows_v2_apply*.go` files. `makeWfv2ApplyCmd` (`cmd/workflows_v2_apply.go`) runs ONE pipeline; `--dry-run` and `--diff` leave it before the first write. Function names below are the anchors to grep for.
 
 1. **Parse.** `composeSpec` (typed), `detectLegacySpecShape`, then the `nodes[]` split above.
 2. **Target.** `spec.alias`, else the label slug via `slugifyWorkflowLabel` with a WARNING on stderr. A relabel without an alias creates a second workflow; a future release requires the field. `findWorkflowByAlias` prefers ACTIVE, else the latest DRAFT.
@@ -127,7 +135,7 @@ Mechanism 2, invisible from root.go. 10 files self-register their command from t
 ### Key design rules
 
 - **JSON to stdout only.** Status messages, errors, and verbose output go to stderr.
-- **Raw JSON for generic CRUD, typed structs for workflows-v2.** `registerResource` bodies are `json.RawMessage` passed through as-is. This does NOT hold for workflows-v2: `composeSpec` (`cmd/workflows_v2_apply.go`) is the typed apply spec, alongside `composeCapture` / `validationFinding` / `validationResponse` (`cmd/workflows_v2_validation.go`). Adding an apply field means editing `composeSpec`, not passing extra raw JSON. `Description *string` is a pointer on purpose: explicit `""` blanks the description, an omitted field leaves it untouched.
+- **Raw JSON for generic CRUD, typed structs for workflows-v2.** `registerResource` bodies are `json.RawMessage` passed through as-is. This does NOT hold for workflows-v2: `composeSpec` (`cmd/workflows_v2_apply_spec.go`) is the typed apply spec, alongside `composeCapture` / `validationFinding` / `validationResponse` (`cmd/workflows_v2_validation.go`). Adding an apply field means editing `composeSpec`, not passing extra raw JSON. `Description *string` is a pointer on purpose: explicit `""` blanks the description, an omitted field leaves it untouched.
 - **Schemas are documentation only.** They appear in `--help` text, not used for validation.
 - **Auto token refresh.** On HTTP 401 the client re-authenticates and retries once.
 

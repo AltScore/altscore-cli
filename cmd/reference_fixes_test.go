@@ -159,7 +159,7 @@ func TestInputMappingErrorListsEveryReservedScope(t *testing.T) {
 	// The message hardcoded six namespaces while reservedMappingScopes held seven --
 	// `self` (added with the End node's own-output scope, cli#92) was missing, so the
 	// error told authors a valid namespace was invalid. Derive it from the map instead.
-	src := readCmdSource(t, "workflows_v2_apply.go")
+	src := readCmdSource(t, "workflows_v2_apply_refs.go")
 	if strings.Contains(src, "Valid namespaces: inputs, custom, system, task_outputs, task_outputs_by_type, entity") {
 		t.Error("inputMappings error still hardcodes the namespace list; derive it from reservedMappingScopes")
 	}
