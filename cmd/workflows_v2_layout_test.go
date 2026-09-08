@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"testing"
@@ -404,12 +405,11 @@ func TestComposeWorkflowBody_PinnedTaskPositionLiftedOffTaskBody(t *testing.T) {
 	if x, y := nodePos(t, nodes, "gate"); x != 500 || y != 250 {
 		t.Errorf("pinned task position not applied to node: got (%v,%v), want (500,250)", x, y)
 	}
-	for _, entry := range capture.postPlan {
-		if entry.placeholder != "gate" {
-			continue
-		}
-		if _, leaked := entry.body["position"]; leaked {
-			t.Error("position leaked into the /v2/tasks body")
-		}
+	var gateBody map[string]any
+	if err := json.Unmarshal(capture.tasks["gate"], &gateBody); err != nil {
+		t.Fatalf("captured gate body: %v", err)
+	}
+	if _, leaked := gateBody["position"]; leaked {
+		t.Error("position leaked into the captured task body")
 	}
 }

@@ -123,8 +123,7 @@ var barePlaceholder = regexp.MustCompile(`^\s*\{[A-Za-z0-9_-]+\}\s*$`)
 //
 // It deliberately says NOTHING about a data-source section being absent:
 // includeAllSources auto-wires those at render time, so "missing" is the normal,
-// recommended shape and warning on it would mislead (this is the same trap the
-// removed silent-PDF lint fell into).
+// recommended shape and warning on it would mislead.
 //
 // endConfig lives in two places depending on the caller. An apply spec carries it
 // INLINE on the node; GET /v2/workflows/{id} does NOT embed task bodies at all
@@ -286,6 +285,20 @@ func fetchEndTaskBodies(c *client.Client, nodes []any) []map[string]any {
 		out = append(out, task)
 	}
 	return out
+}
+
+// fetchPersistedTask GETs the latest version of a task by alias and returns its
+// body as a generic map.
+func fetchPersistedTask(c *client.Client, alias string) (map[string]any, error) {
+	data, _, err := c.Do("GET", "borrower_central", "/v2/tasks/"+alias, nil)
+	if err != nil {
+		return nil, err
+	}
+	var task map[string]any
+	if err := json.Unmarshal(data, &task); err != nil {
+		return nil, fmt.Errorf("parse task: %w", err)
+	}
+	return task, nil
 }
 
 func fetchWorkflowRules(c *client.Client, alias string) []any {

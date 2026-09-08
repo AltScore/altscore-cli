@@ -2,29 +2,23 @@ package cmd
 
 import (
 	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 )
 
-// Characterization tests for the apply assembly -> post pipeline.
+// Characterization tests for the apply assembly.
 //
 // These pin the OBSERVABLE assembly semantics (graph node ids, edge endpoints +
 // handles, inputMappings/template/customVar ref rewrites, and the per-node task
-// bodies) for a representative spec that exercises every element the split
+// bodies) for a representative spec that exercises every element assembly
 // touches: a conditional with authored branches + labeled edges, a task node
 // whose inputMappings reference other refs, an end node with endConfig, an extra
 // (start) node, and custom variables.
 //
-// They are written against the STABLE entry points (composeWorkflowBody in
-// preview/dry mode, and applyAssembleValidateAndPost end-to-end) so they hold
-// across the assemble/post split: dry assembly must keep producing ref
-// placeholders, and the real path must keep producing a body that differs from
-// the validated one ONLY by the ref -> server-alias substitution.
+// They are written against composeWorkflowBody in preview/dry mode: assembly
+// must keep producing ref placeholders and canonical `task_outputs.<ref>`
+// references, which is exactly what buildFlatSpecForServer sends to
+// POST /v2/workflows/apply.
 
 // richSplitSpec returns a fresh spec exercising every assembly element. Fresh
 // maps each call: compose mutates the spec in place.
@@ -227,209 +221,4 @@ func keysOf(m map[string]json.RawMessage) []string {
 		out = append(out, k)
 	}
 	return out
-}
-
-// recordingApplyServer serves the validate endpoint (valid:true) and records
-// every POST /v2/tasks body in order, minting srv-task-N aliases.
-func recordingApplyServer(t *testing.T, taskBodies *[]map[string]any, validateBodies *[]map[string]any) *httptest.Server {
-	t.Helper()
-	var n int32
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == "POST" && r.URL.Path == "/v2/workflows/validate":
-			raw, _ := io.ReadAll(r.Body)
-			var body map[string]any
-			_ = json.Unmarshal(raw, &body)
-			*validateBodies = append(*validateBodies, body)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"valid":true,"findings":[]}`))
-		case r.Method == "POST" && r.URL.Path == "/v2/tasks":
-			raw, _ := io.ReadAll(r.Body)
-			var body map[string]any
-			_ = json.Unmarshal(raw, &body)
-			*taskBodies = append(*taskBodies, body)
-			k := atomic.AddInt32(&n, 1)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"alias":"srv-task-` + strconv.Itoa(int(k)) + `","version":` + strconv.Itoa(int(k)) + `}`))
-		default:
-			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-	}))
-}
-
-// TestCharacterization_RealApply_AliasSubstitution pins the fully-substituted
-// artifacts the real apply path posts: graph node ids/versions are server
-// aliases, edges + handles carry through with substituted endpoints, and every
-// inputMapping / template / customVar ref is rewritten to the server alias.
-func TestCharacterization_RealApply_AliasSubstitution(t *testing.T) {
-	var taskBodies, validateBodies []map[string]any
-	srv := recordingApplyServer(t, &taskBodies, &validateBodies)
-	defer srv.Close()
-	c := newTestClient(t, srv.URL)
-	cmd, _ := preflightTestCmd()
-
-	// noAutoDefaults=true keeps the end node deterministic (no borrower_id wiring).
-	wf, err := applyAssembleValidateAndPost(c, cmd, richSplitSpec(), false, false, false, true, false, false)
-	if err != nil {
-		t.Fatalf("real apply failed: %v", err)
-	}
-
-	// Exactly one validate call carrying all 5 task bodies; 5 task POSTs.
-	if len(validateBodies) != 1 {
-		t.Fatalf("want exactly 1 validate call, got %d", len(validateBodies))
-	}
-	if vt, _ := validateBodies[0]["tasks"].(map[string]any); len(vt) != 5 {
-		t.Errorf("validate payload should carry 5 task bodies, got %d", len(vt))
-	}
-	if len(taskBodies) != 5 {
-		t.Fatalf("want 5 task POSTs, got %d", len(taskBodies))
-	}
-
-	// Graph ids are server aliases; taskVersion follows the server (POST order).
-	fetch := nodeByLabel(t, wf, "Fetch")
-	if fetch["nodeId"] != "srv-task-1" || fetch["taskAlias"] != "srv-task-1" {
-		t.Errorf("Fetch node not aliased: %v", fetch)
-	}
-	if v, _ := fetch["taskVersion"].(int); v != 1 {
-		t.Errorf("Fetch taskVersion: want server version 1, got %v", fetch["taskVersion"])
-	}
-	end := nodeByLabel(t, wf, "End")
-	if end["nodeId"] != "srv-task-4" {
-		t.Errorf("End nodeId: want srv-task-4, got %v", end["nodeId"])
-	}
-	if v, _ := end["taskVersion"].(int); v != 4 {
-		t.Errorf("End taskVersion: want server version 4, got %v", end["taskVersion"])
-	}
-
-	// Score inputMappings rewritten to the fetch server alias (long + bare form).
-	im := nodeInputMappings(t, nodeByLabel(t, wf, "Score"))
-	if im["amount"] != "task_outputs.srv-task-1.amount" {
-		t.Errorf("Score amount not substituted: %v", im["amount"])
-	}
-	if im["raw"] != "srv-task-1.raw" {
-		t.Errorf("Score raw not substituted: %v", im["raw"])
-	}
-
-	// Labeled edge keeps its handle; endpoints substituted.
-	approve := edgeWithHandle(t, wf, "approve")
-	if approve["sourceNodeId"] != "srv-task-2" || approve["targetNodeId"] != "srv-task-3" {
-		t.Errorf("approve edge endpoints not substituted: %v->%v", approve["sourceNodeId"], approve["targetNodeId"])
-	}
-	if id, _ := approve["id"].(string); id != "srv-task-2->srv-task-3" {
-		t.Errorf("approve edge auto-id not rebuilt from aliases: %v", approve["id"])
-	}
-
-	// Custom variable rewritten to the fetch server alias.
-	cv, _ := wf["customVariables"].(map[string]any)["risk"].(map[string]any)
-	if !strings.Contains(cv["expression"].(string), "task_outputs.srv-task-1.amount") {
-		t.Errorf("risk expression not substituted: %v", cv["expression"])
-	}
-	if cv["dependencies"].([]any)[0] != "task_outputs.srv-task-1.amount" {
-		t.Errorf("risk dependency not substituted: %v", cv["dependencies"])
-	}
-	// The formula the client reads has to agree with the expression that runs.
-	sc, _ := cv["simpleConfig"].(map[string]any)
-	if got, _ := sc["formulaText"].(string); got != "$task_outputs.srv-task-1.amount * 2" {
-		t.Errorf("risk formulaText not substituted: %v", got)
-	}
-	// dependencyTypes carries the ref in the KEY, not the value.
-	dt, _ := cv["dependencyTypes"].(map[string]any)
-	if _, ok := dt["task_outputs.srv-task-1.amount"]; !ok {
-		t.Errorf("risk dependencyTypes key not substituted: %v", dt)
-	}
-
-	// The POSTED task bodies are fully substituted -- no residual spec refs.
-	for _, b := range taskBodies {
-		blob, _ := json.Marshal(b)
-		s := string(blob)
-		for _, residual := range []string{"task_outputs.fetch.", "task_outputs.score.", `"fetch.raw"`} {
-			if strings.Contains(s, residual) {
-				t.Errorf("posted task body carries residual ref %q: %s", residual, s)
-			}
-		}
-	}
-	// The posted score body specifically carries the substituted mapping.
-	var scorePosted map[string]any
-	for _, b := range taskBodies {
-		if b["specRef"] == "score" {
-			scorePosted = b
-		}
-	}
-	if scorePosted == nil {
-		t.Fatal("no posted body with specRef=score")
-	}
-	sim, _ := scorePosted["inputMappings"].(map[string]any)
-	if sim["amount"] != "task_outputs.srv-task-1.amount" {
-		t.Errorf("posted score inputMappings.amount not substituted: %v", sim["amount"])
-	}
-}
-
-// TestCharacterization_ValidatedMatchesPostedModuloAlias asserts the split's
-// core guarantee: the graph handed to the validator and the graph ultimately
-// posted differ ONLY by the ref -> server-alias substitution. It compares the
-// dry (validated) body against the real (posted) body node-by-node and
-// edge-by-edge by stable label / handle, confirming topology + wiring shape are
-// identical and only identifiers changed.
-func TestCharacterization_ValidatedMatchesPostedModuloAlias(t *testing.T) {
-	// Validated artifacts (what the pre-flight sees).
-	dryCapture := newComposeCapture()
-	dryWf, err := composeWorkflowBody(nil, richSplitSpec(), true, false, true, false, false, true, dryCapture)
-	if err != nil {
-		t.Fatalf("dry assembly failed: %v", err)
-	}
-
-	// Posted artifacts (what apply persists).
-	var taskBodies, validateBodies []map[string]any
-	srv := recordingApplyServer(t, &taskBodies, &validateBodies)
-	defer srv.Close()
-	c := newTestClient(t, srv.URL)
-	cmd, _ := preflightTestCmd()
-	realWf, err := applyAssembleValidateAndPost(c, cmd, richSplitSpec(), false, false, false, true, false, false)
-	if err != nil {
-		t.Fatalf("real apply failed: %v", err)
-	}
-
-	// Same node + edge counts.
-	if len(nodesOf(t, dryWf)) != len(nodesOf(t, realWf)) {
-		t.Fatalf("node count drift: dry=%d real=%d", len(nodesOf(t, dryWf)), len(nodesOf(t, realWf)))
-	}
-	if len(edgesOf(t, dryWf)) != len(edgesOf(t, realWf)) {
-		t.Fatalf("edge count drift: dry=%d real=%d", len(edgesOf(t, dryWf)), len(edgesOf(t, realWf)))
-	}
-
-	// ref -> alias derived from the two bodies, keyed by stable node label.
-	refToAlias := map[string]string{}
-	for _, dn := range nodesOf(t, dryWf) {
-		label, _ := dn["label"].(string)
-		rn := nodeByLabel(t, realWf, label)
-		refToAlias[dn["nodeId"].(string)] = rn["nodeId"].(string)
-	}
-	// Every graph identifier must have changed to a server alias.
-	for ref, alias := range refToAlias {
-		if !strings.HasPrefix(alias, "srv-task-") {
-			t.Errorf("node %q did not become a server alias: %q", ref, alias)
-		}
-	}
-
-	// The labeled conditional edge keeps its handle; endpoints map through refToAlias.
-	dryApprove := edgeWithHandle(t, dryWf, "approve")
-	realApprove := edgeWithHandle(t, realWf, "approve")
-	if refToAlias[dryApprove["sourceNodeId"].(string)] != realApprove["sourceNodeId"] {
-		t.Errorf("approve edge source not consistent under substitution")
-	}
-	if refToAlias[dryApprove["targetNodeId"].(string)] != realApprove["targetNodeId"] {
-		t.Errorf("approve edge target not consistent under substitution")
-	}
-
-	// Score inputMappings: same keys, values differ only by the fetch alias.
-	dryIM := nodeInputMappings(t, nodeByLabel(t, dryWf, "Score"))
-	realIM := nodeInputMappings(t, nodeByLabel(t, realWf, "Score"))
-	if len(dryIM) != len(realIM) {
-		t.Fatalf("Score inputMappings key drift: dry=%v real=%v", dryIM, realIM)
-	}
-	fetchAlias := refToAlias["fetch"]
-	if strings.ReplaceAll(dryIM["amount"].(string), "fetch", fetchAlias) != realIM["amount"] {
-		t.Errorf("Score amount not a pure fetch->alias rename: dry=%v real=%v", dryIM["amount"], realIM["amount"])
-	}
 }

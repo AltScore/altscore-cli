@@ -446,8 +446,7 @@ type composeNormalizeOpts struct {
 	// migration / decommissioning the old owner). When false (default),
 	// apply refuses to re-stamp an entity whose workflowAlias points at
 	// another workflow and instructs the spec author to clone the entity
-	// with a new code instead. When true, the legacy "silently re-stamp"
-	// behavior is restored. Only apply's --allow-steal-ownership flag
+	// with a new code instead. Only apply's --allow-steal-ownership flag
 	// sets this; non-apply callers leave it false.
 	AllowStealOwnership bool
 	// AutoDefaults -- when true (the default; disabled by --no-auto-defaults),
@@ -622,11 +621,8 @@ func normalizeCategoryTask(task map[string]any) error {
 }
 
 // childInputVariablesCache memoizes /v2/workflows/<alias>/latest within a
-// single compose run for the single remaining purpose: surfacing a stderr
-// warning when a single-mode child-workflow has required inputs that the
-// parent task's inputMappings doesn't cover. Schema fill is now done
-// server-side at GET /v2/tasks time (DerivedSchemaService) so the CLI no
-// longer mirrors child inputSchema / outputSchema into the parent body.
+// single compose run, to warn when a single-mode child-workflow has required
+// inputs that the parent task's inputMappings doesn't cover.
 var childInputVariablesCache = map[string]map[string]any{}
 
 func lookupChildInputVariables(c *client.Client, alias string, dryRun bool) (map[string]any, error) {
@@ -656,11 +652,9 @@ func lookupChildInputVariables(c *client.Client, alias string, dryRun bool) (map
 }
 
 // normalizeChildWorkflowTask warns when a single-mode child-workflow's
-// required inputs aren't covered by the parent's inputMappings. The
-// inputSchema / outputSchema fill that this normalizer used to perform now
-// lives in BC's DerivedSchemaService and surfaces at GET /v2/tasks time as
-// “derivedSchema“. preflightTasks already renamed executorAlias ->
-// executorId; by the time this runs the alias lives on “executorId“.
+// required inputs aren't covered by the parent's inputMappings. preflightTasks
+// already renamed executorAlias -> executorId; by the time this runs the alias
+// lives on “executorId“.
 func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bool) error {
 	executor, _ := task["executorId"].(string)
 	if executor == "" {
@@ -783,13 +777,10 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 
 	task["sourcesConfig"] = applyAltdataSourceDefaults(sources)
 
-	// inputKeys auto-fill (different concern from inputSchema fill that
-	// moved to BC's DerivedSchemaService): the runtime activity reads the
-	// per-source required fields from inputKeys, and an agent that omits
-	// inputKeys ends up with an unwired source the first time someone
-	// runs the workflow. Look the source up once per id and wire one
-	// entry per required field. inputSchema is no longer touched here --
-	// it's computed server-side at GET /v2/tasks time.
+	// inputKeys auto-fill: the runtime activity reads the per-source required
+	// fields from inputKeys, and an agent that omits inputKeys ends up with an
+	// unwired source the first time someone runs the workflow. Look the source
+	// up once per id and wire one entry per required field.
 	seenInput := map[string]bool{}
 	derivedInputKeys := len(inputKeys) == 0
 	for _, s := range sources {
@@ -885,11 +876,8 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 		}
 	}
 
-	// outputSchema is no longer filled here: BC stamps it at task-create time
-	// AND serves a reconciled outputSchema + derivedSchema on every GET
-	// (DerivedSchemaService covers altdata-enrichment), so the CLI-side
-	// catalog mirror became redundant duplication. User-authored entries on
-	// the task body still pass through untouched and win on reconcile.
+	// outputSchema is server-derived (DerivedSchemaService); user-authored
+	// entries pass through untouched and win on reconcile.
 
 	if _, has := task["mode"]; !has {
 		task["mode"] = "single"
@@ -1229,11 +1217,9 @@ func validateConditionGroup(v any, path string) error {
 //
 // The four credit-decisioning task types (evaluate-rules, mapping-table,
 // scorecard, rule-tree) reference entities at /v1/{evaluation-rules,
-// mapping-tables, scorecards, rule-trees}. The Hub plugins fill canonical
-// outputSchema entries when these tasks are placed on a canvas. The
-// outputSchema derivation now lives server-side in BC's
-// DerivedSchemaService; compose only runs existence + workflow-scope
-// checks here.
+// mapping-tables, scorecards, rule-trees}. compose only runs existence +
+// workflow-scope checks here; outputSchema is derived server-side
+// (DerivedSchemaService).
 
 // entityCache memoizes /v1/{resource} lookups within a compose run, one
 // entry per (resource, codeOrId).
@@ -1375,8 +1361,6 @@ func lookupEntity(c *client.Client, resource, codeOrID string, dryRun bool) (map
 // normalizeEvaluateRulesTask validates that rulesConfig is a non-empty array
 // of {ruleCode, ruleId} references and verifies each referenced entity
 // exists on the tenant (warning by default, hard error with --publish).
-// The canonical alerts/alerts_count outputSchema is now derived server-side
-// at GET /v2/tasks time (see BC's DerivedSchemaService).
 func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
 	if opts != nil {
@@ -1424,11 +1408,8 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *com
 
 // normalizeMappingTableTask validates mappingTableConfig.entries[] and
 // stamps a stable UUID on entries that omit `id` (the runtime
-// MappingTableEntry pydantic model requires it). The per-entry outputSchema
-// fill (3 canonical outputs per entry) has moved to BC's
-// DerivedSchemaService and is exposed at GET /v2/tasks time via the
-// “derivedSchema“ field. Top-level inputMappings mirroring is preserved
-// because it controls runtime wiring, not schema display.
+// MappingTableEntry pydantic model requires it). Top-level inputMappings are
+// mirrored because they control runtime wiring.
 func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
 	var inputVars map[string]any
@@ -1565,8 +1546,7 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *comp
 // reflect every entry's inputVariable. The runtime activity resolves
 // entries[].inputVariable directly, but keeping inputMappings in sync at
 // the top level matches the Hub editor's persisted shape. Caller-supplied
-// entries in inputMappings are preserved. inputSchema is no longer touched
-// here -- derived server-side at GET /v2/tasks time.
+// entries in inputMappings are preserved.
 func mirrorEntryInputsToTopLevel(task map[string]any, entries []any) {
 	mappings := asMap(task["inputMappings"])
 	for _, e := range entries {
@@ -1596,9 +1576,7 @@ func mirrorEntryInputsToTopLevel(task map[string]any, entries []any) {
 // existing /v1/scorecards entity, defaults totalScoreVariable /
 // breakdownVariable when omitted, and mirrors top-level inputMappings into
 // the nested scorecardConfig.inputMappings (the runtime activity reads its
-// per-rule inputs from the nested map specifically). outputSchema fill has
-// moved to BC's DerivedSchemaService and is exposed at GET /v2/tasks time
-// via the “derivedSchema“ field.
+// per-rule inputs from the nested map specifically).
 func normalizeScorecardTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
 	if opts != nil {
@@ -1664,8 +1642,7 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, opts *compose
 	}
 	// Default totalScoreVariable / breakdownVariable when omitted so the
 	// task body is self-consistent (the runtime activity reads them from
-	// here). BC's DerivedSchemaService picks up these values to build the
-	// derivedSchema response shape.
+	// here).
 	if v, _ := cfg["totalScoreVariable"].(string); v == "" {
 		cfg["totalScoreVariable"] = "total_score"
 	}
@@ -1685,10 +1662,7 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, opts *compose
 }
 
 // normalizeRuleTreeTask validates ruleTreeConfig and mirrors top-level
-// inputMappings into the nested ruleTreeConfig.inputMappings. The
-// outputSchema fill (outputVariable + 4 canonical companions) has moved to
-// BC's DerivedSchemaService and is exposed at GET /v2/tasks time via the
-// “derivedSchema“ field.
+// inputMappings into the nested ruleTreeConfig.inputMappings.
 func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	predictedAlias := ""
 	if opts != nil {
@@ -1902,20 +1876,12 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 
 	operation, _ := task["operation"].(string)
 	if operation == "write" {
-		// persona is required by CreateBorrower's Literal validator. It is a
-		// property of the workflow's DESIGN (a cedula flow is always
-		// "individual", a RUC flow always "business"), not a per-execution
-		// choice -- so by default it lives on the task as a literal
-		// (CustomerTaskData.persona) and never surfaces as a user-facing
-		// input. The runtime resolves persona as `context.get("persona") or
-		// task.persona`, so a resolved context value still wins.
-		//
-		// This is RUNTIME wiring, NOT a display fill. BC's DerivedSchemaService
-		// (schema_derivation.py, deployed in #1526) now derives the persona
-		// INPUT entry into derivedSchema for customer / create-borrower, so the
-		// CLI no longer authors inputSchema.persona -- but the display
-		// derivation never sets task.persona nor wires inputMappings.persona,
-		// so those two runtime steps stay here.
+		// persona is a property of the workflow's design (see the
+		// inputVariables.persona note in composeWorkflowBody), so it lives on
+		// the task as a literal and is wired into inputMappings here; the
+		// runtime resolves `context.get("persona") or task.persona`. This is
+		// runtime wiring, not display: the server derives the persona INPUT
+		// entry but never sets task.persona nor wires inputMappings.persona.
 		//
 		// Two opt-ins keep persona as a real workflow input: the agent
 		// declares inputVariables.persona, or wires an entity-write task's
@@ -1939,16 +1905,6 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 			}
 		}
 		// (persona wired to a non-input source, e.g. custom.* -> leave as-is)
-
-		// outputSchema fill removed: BC's DerivedSchemaService now derives
-		// customer/deal/asset outputSchema server-side (_derive_customer_write /
-		// _derive_deal / _derive_asset) and serves it as derivedSchema on every
-		// GET. The derived shape matches the runtime output exactly -- the
-		// per-source-row keys plus the entity id (borrower_id for customer,
-		// asset_id for asset, deal_id for deal) -- and is strictly more accurate
-		// than the CLI's one-size fill, which stamped borrower_id even on
-		// asset/deal (whose activities return asset_id/deal_id) and a lookup key
-		// that the write activities never emit as an output.
 	}
 	return nil
 }

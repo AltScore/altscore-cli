@@ -16,32 +16,21 @@ import (
 
 // Server-side apply: POST /v2/workflows/apply.
 //
-// Borrower Central accepts the flat authoring spec verbatim and does what this
-// CLI used to do in `postCapturedTasks` + `substituteWorkflowAliases` + the
-// lock / draft / autosave / publish dance: it resolves every spec-local ref to
-// a task alias BEFORE writing, validates the assembled graph with the oracle
+// Borrower Central accepts the flat authoring spec verbatim: it resolves every
+// spec-local ref to a task alias BEFORE writing, validates the assembled graph with the oracle
 // publish uses, creates or version-bumps the tasks by (workflowAlias, specRef),
 // then creates / drafts+autosaves / publishes the workflow under the edit
 // lock. A rejected spec writes nothing; a mid-write infrastructure failure is
 // unwound server-side. `dryRun` returns the plan (exact ref -> alias map,
 // assembled graph, findings) without taking the lock.
 //
-// The CLI still owns authoring sugar and rendering: it parses, normalizes and
-// assembles exactly as before (composeWorkflowBody, posting nothing), then
-// rebuilds the flat spec from the assembled graph plus the captured task bodies
-// and sends it once. References inside bodies are already in the canonical
-// long form (`task_outputs.<ref>`) after assembly with the identity map.
-//
-// Availability. An older backend answers 404 (or 405: POST on a path that only
-// exists as GET /{workflow_id}) and apply falls back to the client-side
-// pipeline unchanged. That fallback is deleted one release after the endpoint
-// has been live.
+// The CLI owns authoring sugar and rendering: it parses, normalizes and
+// assembles locally (composeWorkflowBody, posting nothing), then rebuilds the
+// flat spec from the assembled graph plus the captured task bodies and sends
+// it once. References inside bodies are already in the canonical long form
+// (`task_outputs.<ref>`) after assembly with the identity map.
 
 const serverApplyPath = "/v2/workflows/apply"
-
-// errServerApplyUnavailable is returned by applyViaServer when the backend
-// predates the endpoint; the caller falls back to the client-side pipeline.
-var errServerApplyUnavailable = errors.New("server-side apply is not available on this backend")
 
 // serverOwnedTaskKeys are body keys the server assigns or derives from the node
 // entry itself. Sending them is either rejected (alias, nodeId, taskId,
@@ -92,23 +81,22 @@ type serverApplyResult struct {
 
 // buildFlatSpecForServer rebuilds the flat authoring spec the server accepts
 // from the assembled graph (nodes keyed by their spec-local placeholder) and the
-// task bodies the assembly pass captured. ok is false when the spec cannot go
-// through the server path: an explicit node `alias` (the placeholder differs
-// from the ref; the server rejects that key) or a node with neither a captured
-// body nor a taskAlias.
-func buildFlatSpecForServer(assembled map[string]any, capture *composeCapture, targetAlias string) (map[string]any, bool) {
+// task bodies the assembly pass captured. It refuses, naming the node, a spec
+// the server path cannot express: an explicit node `alias` (task aliases are
+// server-assigned; `taskAlias` references an existing task instead) or a node
+// with neither a captured body nor a taskAlias.
+func buildFlatSpecForServer(assembled map[string]any, capture *composeCapture, targetAlias string) (map[string]any, error) {
 	if capture == nil {
-		return nil, false
+		return nil, fmt.Errorf("apply: assembly recorded no task bodies")
 	}
 	nodes := []map[string]any{}
 	for _, n := range asMapSlice(assembled["nodes"]) {
 		placeholder, _ := n["nodeId"].(string)
 		if placeholder == "" {
-			return nil, false
+			return nil, fmt.Errorf("apply: assembled node %q has no id", n["label"])
 		}
 		if ref, ok := capture.refByNodeID[placeholder]; ok && ref != "" && ref != placeholder {
-			// Explicit node alias: server-assigned on the new path.
-			return nil, false
+			return nil, fmt.Errorf("node ref=%q sets an explicit alias %q: task aliases are server-assigned; drop `alias`, or use `taskAlias` to reference an existing task", ref, placeholder)
 		}
 		flat := map[string]any{"ref": placeholder, "type": n["type"], "label": n["label"]}
 		if pos, ok := n["position"]; ok && pos != nil {
@@ -117,7 +105,7 @@ func buildFlatSpecForServer(assembled map[string]any, capture *composeCapture, t
 		if raw, ok := capture.tasks[placeholder]; ok {
 			var body map[string]any
 			if err := json.Unmarshal(raw, &body); err != nil {
-				return nil, false
+				return nil, fmt.Errorf("apply: node %q: unreadable task body: %w", placeholder, err)
 			}
 			for k, v := range body {
 				if serverOwnedTaskKeys[k] || k == "type" || k == "label" {
@@ -130,7 +118,7 @@ func buildFlatSpecForServer(assembled map[string]any, capture *composeCapture, t
 			// without writing it.
 			flat["taskAlias"] = ta
 		} else {
-			return nil, false
+			return nil, fmt.Errorf("node %q has neither a task body nor a taskAlias", placeholder)
 		}
 		nodes = append(nodes, flat)
 	}
@@ -140,7 +128,7 @@ func buildFlatSpecForServer(assembled map[string]any, capture *composeCapture, t
 		src, _ := e["sourceNodeId"].(string)
 		tgt, _ := e["targetNodeId"].(string)
 		if src == "" || tgt == "" {
-			return nil, false
+			return nil, fmt.Errorf("apply: assembled edge %v is missing an endpoint", e["id"])
 		}
 		flat := map[string]any{"from": src, "to": tgt}
 		for _, k := range []string{"sourceHandle", "targetHandle", "label"} {
@@ -176,13 +164,13 @@ func buildFlatSpecForServer(assembled map[string]any, capture *composeCapture, t
 		}
 		flat[k] = v
 	}
-	return flat, true
+	return flat, nil
 }
 
-// applyViaServer sends the flat spec to POST /v2/workflows/apply. It returns
-// errServerApplyUnavailable on a 404/405 (older backend) so the caller can fall
-// back, prints the server's findings for a 400/422 and returns a one-line
-// error, and returns the parsed result on 2xx.
+// applyViaServer sends the flat spec to POST /v2/workflows/apply. A 404/405
+// without an APPLY_* subcode means the backend predates the endpoint and is
+// reported as such (no client-side fallback since v0.35.0); a 400/422 prints
+// the server's findings and returns a one-line error; a 2xx is parsed.
 func applyViaServer(c *client.Client, cmd *cobra.Command, flat map[string]any, opts serverApplyOptions) (*serverApplyResult, error) {
 	req := map[string]any{
 		"spec":      flat,
@@ -206,8 +194,8 @@ func applyViaServer(c *client.Client, cmd *cobra.Command, flat map[string]any, o
 	switch {
 	case (status == http.StatusNotFound || status == http.StatusMethodNotAllowed) && !isApplyErrorEnvelope(data):
 		// The route itself is missing (a 404/405 the endpoint produced would
-		// carry an APPLY_* subcode); an older backend.
-		return nil, errServerApplyUnavailable
+		// carry an APPLY_* subcode): an older backend.
+		return nil, fmt.Errorf("this backend has no POST /v2/workflows/apply (HTTP %d): upgrade Borrower Central, or use altscore v0.34.x, the last release with the client-side apply pipeline", status)
 	case status >= 200 && status < 300:
 		var res serverApplyResult
 		if err := json.Unmarshal(data, &res); err != nil {
@@ -477,8 +465,8 @@ func finishServerApply(c *client.Client, cmd *cobra.Command, spec *composeSpec, 
 	if diffFlag {
 		printServerApplySummary(errOut, res)
 		// The server resolved every ref to its real alias (existing tasks keep
-		// theirs), so nodes are matched by alias, not by the label heuristic.
-		return diffWorkflowWith(c, cmd, spec, planned, existing, targetAlias, diffIdentityByAlias)
+		// theirs), so nodes are matched by alias.
+		return diffWorkflow(c, cmd, spec, planned, existing, targetAlias)
 	}
 
 	if dryRun {
