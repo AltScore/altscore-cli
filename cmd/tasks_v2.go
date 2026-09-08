@@ -20,7 +20,6 @@ import (
 //   POST   /v2/tasks/{alias}                  create new version
 //   GET    /v2/tasks                          list (paginated, filterable)
 //   GET    /v2/tasks/{alias}                  get latest (with version history)
-//   GET    /v2/tasks/{alias}/services/methods SOAP method introspection
 //   DELETE /v2/tasks/{alias}                  delete every version of a task
 
 func registerTasksV2(parent *cobra.Command) {
@@ -31,7 +30,7 @@ func registerTasksV2(parent *cobra.Command) {
 workflow node references a task by alias (and optionally pinned version).
 
 Common types: altdata-enrichment, evaluate-rules, http, conditional, wait,
-webhook, compute-variables, data-store-write, data-store-query, end.
+compute-variables, data-store-write, data-store-query, end.
 (PDF generation is endConfig on the end node, not a task type.) Each type has
 its own config fields (sourcesConfig for altdata, evaluatorAlias for
 evaluators, url+method for http, branches for conditional, etc.).
@@ -42,7 +41,6 @@ Subcommands:
   create           create a new task (auto-generates alias if omitted)
   create-version   bump a task's version sequence
   delete           hard-delete every version of a task (refuses if referenced)
-  get-soap-methods SOAP method introspection for soap-typed tasks
 
 Run 'altscore workflows-v2 schema-guide taskTypes' for the field list per type.`,
 	}
@@ -51,7 +49,6 @@ Run 'altscore workflows-v2 schema-guide taskTypes' for the field list per type.`
 	group.AddCommand(makeTv2GetCmd())
 	group.AddCommand(makeTv2ListCmd())
 	group.AddCommand(makeTv2DeleteCmd())
-	group.AddCommand(makeTv2GetSoapMethodsCmd())
 	parent.AddCommand(group)
 }
 
@@ -376,26 +373,4 @@ func formatTv2DeleteConflict(alias string, original error) error {
 		"task %q is referenced by %d workflow(s): %s; detach those nodes before deleting",
 		alias, len(refs), strings.Join(parts, ", "),
 	)
-}
-
-func makeTv2GetSoapMethodsCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:     "get-soap-methods <alias>",
-		Short:   "Introspect SOAP methods from a task's WSDL URL",
-		Long:    `For tasks of type 'soap', returns the available methods + schemas defined by the WSDL.`,
-		Args:    cobra.ExactArgs(1),
-		Example: `  altscore tasks-v2 get-soap-methods my-soap-task`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := loadClient()
-			if err != nil {
-				return err
-			}
-			path := fmt.Sprintf("/v2/tasks/%s/services/methods", args[0])
-			data, _, err := c.Do("GET", "borrower_central", path, nil)
-			if err != nil {
-				return err
-			}
-			return output.RawJSON(data)
-		},
-	}
 }

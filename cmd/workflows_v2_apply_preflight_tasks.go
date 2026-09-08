@@ -345,10 +345,22 @@ func preflightTasks(spec *composeSpec) error {
 		if label == "" || taskType == "" {
 			return fmt.Errorf("node ref=%q: label and type are required (validated before any POST)", ref)
 		}
+		// Deprecated types are refused BEFORE the validTaskTypes check and
+		// never through the warn-and-proceed path below. This half of the
+		// check is compiled in, so it needs no backend and holds offline.
+		if deprecatedTaskTypes[taskType] {
+			return deprecatedTaskTypeError(fmt.Sprintf("node ref=%q", ref), taskType)
+		}
 		if !validTaskTypes[taskType] {
 			if !liveTypesFetched && fetchLiveTaskTypes != nil {
 				liveTaskTypes = fetchLiveTaskTypes()
 				liveTypesFetched = true
+			}
+			// The fetch unions the backend's own `deprecated` list into
+			// deprecatedTaskTypes, so a type retired after this binary shipped
+			// is refused too -- and refused here, not warned about below.
+			if deprecatedTaskTypes[taskType] {
+				return deprecatedTaskTypeError(fmt.Sprintf("node ref=%q", ref), taskType)
 			}
 			if liveTaskTypes[taskType] {
 				fmt.Fprintf(os.Stderr,
@@ -367,9 +379,7 @@ func preflightTasks(spec *composeSpec) error {
 					"node ref=%q: unknown task type %q. %s"+
 						"The live backend was also consulted and does not list this type either (%d types). "+
 						"Run 'altscore workflows-v2 schema-guide taskTypes' for the live list, or "+
-						"'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' for the active palette. "+
-						"Common deprecations: 'data-store' is split into 'data-store-write'/'data-store-query'; "+
-						"'pdf-report' is now part of the 'end' task's endConfig.",
+						"'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' for the active palette.",
 					ref, taskType, suggestionLine, len(liveTaskTypes),
 				)
 			} else {
@@ -399,13 +409,6 @@ func preflightTasks(spec *composeSpec) error {
 			}
 			if u, _ := task["url"].(string); u == "" {
 				return fmt.Errorf("node ref=%q: http task requires 'url'", ref)
-			}
-		case "webhook":
-			if u, _ := task["url"].(string); u == "" {
-				return fmt.Errorf("node ref=%q: webhook task requires 'url'", ref)
-			}
-			if s, _ := task["secret"].(string); s == "" {
-				return fmt.Errorf("node ref=%q: webhook task requires 'secret'", ref)
 			}
 		case "data-store-write":
 			cfg := asMap(task["dataStoreWriteConfig"])

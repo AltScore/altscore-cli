@@ -13,19 +13,19 @@ import (
 // Compiled-in vocabularies (task types, categories, relationship kinds, inputSchema
 // types) with a live fallback, plus the format checks that use them.
 
-// validTaskTypes mirrors the backend TaskType enum at
+// validTaskTypes mirrors the AUTHORABLE half of the backend TaskType enum at
 // borrower-central/app/model/workflows_v2/task.py. Sourced once and kept in
-// sync as the enum evolves. Used by preflight to reject typos like
-// "data-store" (correct: data-store-write/data-store-query) BEFORE creating
+// sync as the enum evolves. Used by preflight to reject typos BEFORE creating
 // any /v2/tasks rows. Without this check, a typo would orphan all earlier
 // tasks in the compose loop (no rollback path exists today).
+//
+// Types the backend still parses but refuses for new authoring are NOT here;
+// they live in deprecatedTaskTypes below and are refused outright.
 var validTaskTypes = map[string]bool{
 	"http": true, "conditional": true,
-	"start": true, "end": true, "wait": true, "webhook": true,
-	"create-borrower": true, "update-borrower": true, "update-borrower-name": true,
-	"evaluate-rules": true, "altdata-enrichment": true, "create-identity": true,
-	"fetch-entity": true, "html-template": true, "fetch-borrower-entities": true,
-	"child-workflow": true, "exception": true, "soap": true,
+	"start": true, "end": true, "wait": true,
+	"evaluate-rules": true, "altdata-enrichment": true,
+	"child-workflow": true, "exception": true,
 	"mapping-table": true, "scorecard": true, "rule-tree": true,
 	"compute-variables": true, "data-store-write": true, "data-store-query": true,
 	"customer": true, "deal": true, "credit-line": true,
@@ -33,6 +33,59 @@ var validTaskTypes = map[string]bool{
 	"package-io": true, "sftp": true, "notices": true,
 	"contact": true, "document-extraction": true,
 	"spreadsheet-extraction": true, "category": true,
+}
+
+// deprecatedTaskTypes are the task types AltScore has retired. The backend
+// still parses them, so live workflows keep running, but it refuses them for
+// new authoring -- so every CLI authoring path refuses them too, and does so
+// UNCONDITIONALLY. This list is compiled in precisely so the refusal also
+// holds offline, where no live vocabulary can be consulted.
+//
+// That is the opposite of the policy for an UNKNOWN type (see
+// warnUnverifiedVocabularyValue): an unknown type may simply be newer than
+// this build, so preflight cannot tell "invalid" from "valid but newer" and
+// fails open. A deprecated type is different in kind -- this build KNOWS the
+// backend refuses it -- so there is nothing to verify and nothing to fail open
+// about.
+//
+// fetchServerTaskTypes unions the backend's own `deprecated` list into this
+// map, so a type retired after this binary shipped is honoured without a CLI
+// rebuild. Entries are only ever added, never removed.
+var deprecatedTaskTypes = map[string]bool{
+	"create-alert": true, "create-borrower": true, "create-identity": true,
+	"data-store": true, "end-old": true, "fetch-borrower-entities": true,
+	"fetch-entity": true, "html-template": true, "pdf-report": true,
+	"soap": true, "update-borrower": true, "update-borrower-name": true,
+	"webhook": true,
+}
+
+// deprecatedTaskTypeReplacements names what to author instead, per retired
+// type. A type absent from this map has no replacement and is simply refused.
+var deprecatedTaskTypeReplacements = map[string]string{
+	"create-borrower":         `the "customer" task with operation=write`,
+	"create-identity":         `the entity-specific tasks ("customer" / "deal" / "asset" / "contact")`,
+	"data-store":              `"data-store-write" or "data-store-query"`,
+	"fetch-borrower-entities": `the "customer" or "deal" task with operation=read`,
+	"fetch-entity":            `the "customer" or "deal" task with operation=read`,
+	"pdf-report":              `endConfig on the "end" task`,
+	"soap":                    `the "http" task`,
+	"update-borrower":         `the "customer" task with operation=write`,
+}
+
+// deprecatedTaskTypeError is the one refusal message every authoring path
+// shares. `path` is the caller-formatted prefix (e.g. `node ref="score"`).
+func deprecatedTaskTypeError(path, taskType string) error {
+	guidance := "It has no replacement -- drop the node."
+	if r := deprecatedTaskTypeReplacements[taskType]; r != "" {
+		guidance = fmt.Sprintf("Use %s instead.", r)
+	}
+	return fmt.Errorf(
+		"%s: task type %q is DEPRECATED and can no longer be authored. %s "+
+			"The backend still parses workflows that already use it but refuses it for new "+
+			"authoring, so this is refused unconditionally -- offline included. "+
+			"Run 'altscore workflows-v2 schema-guide taskTypes' for the live palette.",
+		path, taskType, guidance,
+	)
 }
 
 // fetchLiveTaskTypes, when set, lazily returns the LIVE backend's task-type
@@ -46,6 +99,12 @@ var fetchLiveTaskTypes func() map[string]bool
 // the machine-readable type list BC derives from its TaskType enum at request
 // time. Returns nil on any transport/shape error -- callers fall back to the
 // compiled-in mirror, which is exactly the pre-existing behavior.
+//
+// The payload's `deprecated` array is UNIONED into deprecatedTaskTypes rather
+// than replacing it: the compiled-in entries are what keeps the refusal
+// working offline, and the live half retires a type without a CLI release.
+// A deprecated type never comes back as authorable, even when the backend
+// still lists it under `values`.
 func fetchServerTaskTypes(c *client.Client) map[string]bool {
 	data := fetchMetaSection(c, "taskTypes")
 	if data == nil {
@@ -53,14 +112,24 @@ func fetchServerTaskTypes(c *client.Client) map[string]bool {
 	}
 	var payload struct {
 		TaskTypes struct {
-			Values []string `json:"values"`
+			Values     []string `json:"values"`
+			Deprecated []string `json:"deprecated"`
 		} `json:"taskTypes"`
 	}
-	if err := json.Unmarshal(data, &payload); err != nil || len(payload.TaskTypes.Values) == 0 {
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil
+	}
+	for _, v := range payload.TaskTypes.Deprecated {
+		deprecatedTaskTypes[v] = true
+	}
+	if len(payload.TaskTypes.Values) == 0 {
 		return nil
 	}
 	out := make(map[string]bool, len(payload.TaskTypes.Values))
 	for _, v := range payload.TaskTypes.Values {
+		if deprecatedTaskTypes[v] {
+			continue
+		}
 		out[v] = true
 	}
 	return out
@@ -394,7 +463,8 @@ func checkInputSchemaType(t, path string) error {
 }
 
 // closestTaskType returns the canonical TaskType nearest to a given typo by
-// Levenshtein distance, or "" if nothing is meaningfully close.
+// Levenshtein distance, or "" if nothing is meaningfully close. Deprecated
+// types are skipped: a suggestion the author cannot act on is worse than none.
 func closestTaskType(input string) string {
 	best := ""
 	bestDist := -1
@@ -403,6 +473,9 @@ func closestTaskType(input string) string {
 		cutoff = 2
 	}
 	for t := range validTaskTypes {
+		if deprecatedTaskTypes[t] {
+			continue
+		}
 		d := levenshtein(input, t)
 		if d <= cutoff && (bestDist == -1 || d < bestDist) {
 			best, bestDist = t, d

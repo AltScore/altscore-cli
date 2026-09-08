@@ -276,3 +276,41 @@ func keysOfNodes(m map[string]map[string]any) []string {
 	}
 	return out
 }
+
+// A live workflow can still be running a retired node type. The exported spec
+// carries it verbatim -- dropping the node would silently change the graph --
+// so the warning is what tells the author the spec will not re-apply as-is.
+func TestBundleToApplySpec_WarnsOnDeprecatedNodeType(t *testing.T) {
+	bundle := strings.Replace(sampleExportBundle,
+		`"type": "scorecard", "label": "Score",
+       "taskAlias": "score-222222"`,
+		`"type": "webhook", "label": "Score",
+       "taskAlias": "score-222222"`, 1)
+	if bundle == sampleExportBundle {
+		t.Fatal("fixture edit did not apply -- the sample bundle's node shape changed")
+	}
+
+	var spec map[string]any
+	var err error
+	stderr := captureStderr(t, func() { spec, err = bundleToApplySpec(json.RawMessage(bundle), refFromSpecRef) })
+	if err != nil {
+		t.Fatalf("bundleToApplySpec: %v", err)
+	}
+	if !strings.Contains(stderr, "DEPRECATED") || !strings.Contains(stderr, "webhook") {
+		t.Errorf("apply-spec export must warn about the deprecated node type, got: %q", stderr)
+	}
+	// The node still travels: the warning is advice, not a filter.
+	if got := specNodesByRef(t, spec)["score"]["type"]; got != "webhook" {
+		t.Errorf("node type = %v, want the original webhook (the export must not rewrite the graph)", got)
+	}
+
+	// diff flattens through the same function and must stay quiet: nobody
+	// re-applies a comparison.
+	quiet := captureStderr(t, func() { _, err = bundleToApplySpec(json.RawMessage(bundle), refFromAlias) })
+	if err != nil {
+		t.Fatalf("bundleToApplySpec(refFromAlias): %v", err)
+	}
+	if strings.Contains(quiet, "DEPRECATED") {
+		t.Errorf("diff's flatten must not warn, got: %q", quiet)
+	}
+}

@@ -312,6 +312,14 @@ func validateTaskV2BodyStructural(body json.RawMessage) error {
 		return nil
 	}
 	taskType, _ := task["type"].(string)
+	// Checked before the switch, not in a default branch: the switch only has
+	// cases for types with structural rules, and this refusal has to hold for
+	// every deprecated type whether or not one ever grows a case. `tasks-v2
+	// create` / `create-version` reach this validator without going through
+	// compose, so it is the only gate on that path.
+	if deprecatedTaskTypes[taskType] {
+		return deprecatedTaskTypeError("task body", taskType)
+	}
 	switch taskType {
 	case "conditional":
 		// Run normalize on a deep copy so we don't mutate the caller's body.

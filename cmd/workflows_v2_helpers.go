@@ -199,6 +199,9 @@ custom UI hints, etc.). Do not put task config in --data.`,
 			if nodeType == "" || nodeID == "" || label == "" {
 				return fmt.Errorf("--type, --node-id, and --label are required")
 			}
+			if deprecatedTaskTypes[nodeType] {
+				return deprecatedTaskTypeError("--type", nodeType)
+			}
 			if taskAlias == "" && taskID == "" {
 				return fmt.Errorf(
 					"every node needs --task-alias (or --task-id) -- including start/end/conditional. " +

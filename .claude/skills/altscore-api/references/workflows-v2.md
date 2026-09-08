@@ -289,12 +289,14 @@ Per-type config (full reference: `schema-guide tasks`):
 | `http` | `url`, `method`, `headers` (JSON string), `body`, auth fields |
 | `conditional` | `branches`: `[{label, expression, is_else}]` |
 | `wait` | `seconds` or `untilCondition` |
-| `webhook` | `secret` |
 | `compute-variables` | `selectedVariables` |
-| `data-store` | `dataStoreWriteConfig` or `dataStoreQueryConfig` |
-| `pdf-report` / `end` | `endConfig: {title, subtitle, brand_logo}` |
+| `data-store-write` | `dataStoreWriteConfig` |
+| `data-store-query` | `dataStoreQueryConfig` |
+| `end` | `endConfig: {title, subtitle, brand_logo}` (PDF generation is `endConfig.pdfConfig`, not a task type) |
 | `customer` / `deal` / `asset` | `operation` (`write`/`read`), `lookupBy`, `key`/`identityKey`, `inputSchema`, `inputMappings`, `sourcesConfig` |
 | `category` | `categoryConfig: {operation (read/assign), categoryKey, entityRoot, valueFormat, valueFields, createMissing}` -- every field nests INSIDE `categoryConfig`; a top-level `operation` is silently swallowed by the customer/deal/asset field of the same name |
+
+> **Retired types — `apply` refuses these outright.** `create-alert`, `create-borrower`, `create-identity`, `data-store`, `end-old`, `fetch-borrower-entities`, `fetch-entity`, `html-template`, `pdf-report`, `soap`, `update-borrower`, `update-borrower-name`, `webhook`. BC still parses workflows that already use them, but it refuses them for new authoring, and so does every CLI path (`apply`, `add-node`, `tasks-v2 create`, `tasks-v2 create-version`) — offline included. Replacements: `create-borrower`/`update-borrower` → `customer` with `operation: "write"`; `fetch-entity`/`fetch-borrower-entities` → `customer` or `deal` with `operation: "read"`; `create-identity` → the entity-specific tasks; `data-store` → `data-store-write`/`data-store-query`; `pdf-report` → `endConfig.pdfConfig` on `end`; `soap` → `http`. The rest have no replacement.
 
 For `customer` / `deal` / `asset` write tasks the `sourcesConfig` entries map each persisted attribute to a context key. Common entry shapes:
 
@@ -558,7 +560,7 @@ In a `compute-variables` expression, reference it as a **bare** dependency name 
 
 Caveats worth knowing before you reach for this:
 
-- **`http` / `soap` nodes should not use it.** They have first-class secret fields (`user`, `password`, `token`, `secret`) — set the field to the *secretId* and the runtime dereferences it. That path is the one the Hub UI supports (its editors have a secret picker).
+- **`http` nodes should not use it.** They have first-class secret fields (`user`, `password`, `token`, `secret`) — set the field to the *secretId* and the runtime dereferences it. That path is the one the Hub UI supports (its editors have a secret picker).
 - **No Hub UI can author a `secret`-typed inputSchema field.** Every type dropdown in the builder offers `string|number|integer|boolean|object|array` only, so this shape is CLI/API-authored and the builder will not show a picker for it.
 - **The validation oracle flags the bare dependency.** `POST /v2/workflows/validate` reports `CUSTOM_VAR_DEPENDENCY_UNRESOLVED` because the name matches no workflow input, custom variable, or task alias. It still resolves correctly at runtime — treat that one finding as a known false positive.
 - **A workflow-level `inputVariables` entry with `type: "secret"` is a dead end.** The type is accepted, but nothing dereferences it against the secret store, so the run sees the literal secretId string. Only the task `inputSchema` path resolves.
