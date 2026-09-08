@@ -87,7 +87,7 @@ var conditionOperators = map[string]bool{
 // validation can accept operators the backend gained after this binary was
 // built. composeWorkflowBody wires it to fetchServerConditionOperators before
 // normalize runs; unit tests leave it nil, keeping validation fully offline.
-// Mirrors the fetchLiveTaskTypes hook in workflows_v2_apply.go.
+// Mirrors the fetchLiveTaskTypes hook in workflows_v2_apply_vocab.go.
 var fetchLiveConditionOperators func() map[string]bool
 
 // Live-operator list, fetched at most once per compose and only when an

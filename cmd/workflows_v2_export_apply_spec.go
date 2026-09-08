@@ -40,7 +40,7 @@ const (
 // Each workflow node references its backing task by `taskAlias`. apply, by
 // contrast, wants ONE flat node entry per graph node carrying the task body
 // fields INLINE plus `type`, `label`, `position` and a spec-local `ref` (see
-// the composeSpec docs in workflows_v2_apply.go). bundleToApplySpec performs
+// the composeSpec docs in workflows_v2_apply_spec.go). bundleToApplySpec performs
 // that inversion: it indexes tasks by alias, then for every workflow node
 // merges the matching task body into the node entry.
 //
