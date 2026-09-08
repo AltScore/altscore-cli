@@ -60,6 +60,12 @@ All commands output JSON to stdout. Use `--help` on any command to see fields, f
 
 This repo includes a Claude Code skill at `.claude/skills/altscore-api/SKILL.md` that gives agents full access to the API through the CLI.
 
+Claude Code loads it only when the session runs inside this repo. To use it from another directory, symlink the skill into your user skills:
+
+```bash
+ln -s "$(pwd)/.claude/skills/altscore-api" ~/.claude/skills/altscore-api
+```
+
 ## Release
 
 ```bash

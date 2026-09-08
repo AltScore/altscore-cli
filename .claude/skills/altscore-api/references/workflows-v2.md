@@ -51,6 +51,42 @@ altscore workflows-v2 schema-guide tasks         # task shape + per-type config 
 altscore workflows-v2 schema-guide examples      # full scoring_pipeline template
 ```
 
+#### Discovery before authoring (infer first, ask only what nobody wrote down)
+
+"Create a workflow that does X" and "change workflow Y so that Z" leave decisions open. Most of them are already written down somewhere in the tenant; a few are business policy that only the user knows. Read the first group, ask the second with the **AskUserQuestion** tool, then build. One round, at most 4 questions, 2 to 4 options each, the option you would pick first and labelled `(Recommended)`. Skip the round when nothing survives the reads.
+
+**Infer first. Never ask these; read them.**
+
+| Decision | Where the answer is |
+|---|---|
+| Who is evaluated, which country, which stage of the customer's process | the request itself. "KYB for Ecuadorian SMEs" is a company, ECU, origination. |
+| Which sources, their required inputs, what they can detect | `altscore workflows-v2 sources-status --country <ISO3> --status active`, then `altscore altdata describe <id>` |
+| Decision vocabulary, whether a review lane exists | `altscore decisions list`: the registered keys are the only ones a run can write |
+| Write targets, output shape, input payload, PDF or not, freshness of paid sources | the tenant's closest existing workflow: `workflows-v2 list --filter is-latest=true`, then `export <id> --format apply-spec` and read its `inputSchema`, end node, `decisionConfig` and `sourcesConfig.dataAge`. Mirror it. |
+| Fields available on borrower and deal | `altscore data-models list` |
+| Structure: orchestrator plus per-party child, fan-out, two-layer decisioning | [kyc-kyb-habits](kyc-kyb-habits.md) |
+| Whether a change is visible to others (update path) | `workflows-v2 schedule get <id>`, and other workflows whose `child-workflow` nodes carry this alias as `executorId` |
+
+Anything the spec can default is yours as well: labels, positions, aliases and refs, branch ids, `inputKeys`, publish policy (DRAFT on create). Never ask which field a task type uses; read `schema-guide tasks`.
+
+**Ask only what survives the reads.** These are business policy: nothing in the tenant states them, and guessing wrong costs money or a customer. Pick the ones the flow triggers, at most 4.
+
+| Question | Ask when | Options to offer |
+|---|---|---|
+| A source the decision depends on fails or times out mid-run. What happens to the application? | any gating source in the flow | reject and stop; continue on what came back and flag the gap `(Recommended)` for monitoring; park it for manual review; retry later |
+| Which findings end the application outright, and which go to a human? (multi-select the outright rejects) | the tenant registers a review-type decision key. Without one everything rejects; do not invent a lane | sanctions or PEP hit; dissolved or suspended entity; identity mismatch; adverse judicial record |
+| Where do the cutoffs come from? | the flow scores or gates on a number and no sibling scorecard or rule-tree holds the numbers | reuse the cutoffs of the existing `<scorecard>` `(Recommended)` when one exists; the user supplies them now; a permissive placeholder marked TODO, tuned after test runs. Never invent thresholds silently |
+| How fresh must paid bureau or registry data be? | a paid external source is in the flow and no sibling workflow already uses it | pull fresh every run; reuse within 30 days `(Recommended)` for origination; reuse within 90 days or more for monitoring |
+| The same identity applies again within the window. Then what? | the flow writes a deal or a decision | re-run everything, writes are idempotent `(Recommended)`; reuse the last decision if younger than N days; reject as a duplicate |
+| Are the entity's people screened too? | KYB, and the country has an ownership or legal-representative source. Without the source the question is moot | entity only; entity plus owners and legal representatives `(Recommended)`; entity plus the guarantors named in the input |
+| Who reads the reasons? | no sibling workflow shows the output shape | internal only, decision key plus reason codes `(Recommended)`; the partner shows them to the applicant, so reasons go in the output; a human reads a PDF in the Hub |
+| Update path: the change renames or removes an output, or the workflow has schedules or child callers. Blast radius? | the read above found a schedule or a caller | go live on the alias now, consumers are updated; keep the old field names too for a transition; apply under a new alias for a trial |
+| Update path: a rule got stricter. Does the past get re-evaluated? | the change tightens a gate or a cutoff | new applications only `(Recommended)`; batch re-run the active portfolio in test mode first; re-run and re-decide |
+
+Example round for "create a KYB workflow for Ecuadorian SMEs" in a tenant that already runs a KYC flow. Read: company, ECU and origination from the request; sources from `sources-status --country ECU`; a `review` key from `decisions list`; write targets, output shape and `dataAge` from the KYC export. Ask three things: what happens when the registry or judicial source fails mid-run; which findings reject outright versus go to review; whether owners and legal representatives are screened, since the country has an ownership source. Do not ask who is evaluated, which country, which sources, where the decision lands, or whether to publish. Restate the answers in one line, then write the spec.
+
+**When AskUserQuestion is unavailable** (print mode `-p`, background jobs, some SDK hosts) do not guess and mutate. Write down the assumptions you would have asked about, build the spec under them, run `apply --dry-run` (or `--diff` for an update) and stop. Report the plan and the open questions; apply only after the user answers.
+
 #### Recommended path: `apply` (declarative create-or-update)
 
 For "Create a workflow that does X" — or "Update workflow Y to do Z" — use `workflows-v2 apply`. It takes a single spec and reconciles it against the tenant. Use `--dry-run` first to inspect what will be sent (the dry-run output also tells you which branch will fire: CREATE or UPDATE).
