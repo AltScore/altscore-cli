@@ -87,7 +87,7 @@ func New(cfg *config.Config, profileName string, profile *config.Profile, verbos
 		Profile:     profile,
 		Config:      cfg,
 		ProfileName: profileName,
-		HTTPClient:  &http.Client{},
+		HTTPClient:  sharedHTTPClient,
 		Verbose:     verbose,
 	}
 }
@@ -186,8 +186,10 @@ func (c *Client) DoKeepBody(method, module, path string, body any) (json.RawMess
 	return json.RawMessage(respBody), status, nil
 }
 
-// doRequest is the transport: build, send, read. It returns the body for every
-// status and leaves the status policy to its callers.
+// doRequest builds the request and reads the response; send owns the exchange
+// and the connect-phase retry. It returns the body for every status and leaves
+// the status policy to its callers. The body is re-derived from the any
+// parameter on every attempt, so a replay sends the same bytes.
 func (c *Client) doRequest(method, module, path string, body any, headers map[string]string) ([]byte, int, error) {
 	baseURL, err := c.moduleURL(module)
 	if err != nil {
@@ -196,47 +198,55 @@ func (c *Client) doRequest(method, module, path string, body any, headers map[st
 
 	url := baseURL + path
 
-	var bodyReader io.Reader
+	var data []byte
 	if body != nil {
 		switch v := body.(type) {
 		case json.RawMessage:
-			bodyReader = bytes.NewReader(v)
+			data = v
 		case []byte:
-			bodyReader = bytes.NewReader(v)
+			data = v
 		default:
-			data, err := json.Marshal(body)
+			data, err = json.Marshal(body)
 			if err != nil {
 				return nil, 0, fmt.Errorf("cannot encode request body: %w", err)
 			}
-			bodyReader = bytes.NewReader(data)
 		}
 	}
 
-	req, err := http.NewRequest(method, url, bodyReader)
-	if err != nil {
-		return nil, 0, fmt.Errorf("cannot create request: %w", err)
-	}
+	newRequest := func() (*http.Request, error) {
+		var bodyReader io.Reader
+		if body != nil {
+			bodyReader = bytes.NewReader(data)
+		}
 
-	req.Header.Set("Authorization", "Bearer "+c.Profile.AccessToken)
-	if c.Profile.TenantID != "" {
-		req.Header.Set("X-Tenant-ID", c.Profile.TenantID)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	req.Header.Set("Accept", "application/json")
+		req, err := http.NewRequest(method, url, bodyReader)
+		if err != nil {
+			return nil, fmt.Errorf("cannot create request: %w", err)
+		}
 
-	for k, v := range headers {
-		req.Header.Set(k, v)
+		req.Header.Set("Authorization", "Bearer "+c.Profile.AccessToken)
+		if c.Profile.TenantID != "" {
+			req.Header.Set("X-Tenant-ID", c.Profile.TenantID)
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set("Accept", "application/json")
+
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+
+		return req, nil
 	}
 
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "%s %s\n", method, url)
 	}
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := send(c.HTTPClient, newRequest)
 	if err != nil {
-		return nil, 0, fmt.Errorf("request failed: %w", err)
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 
@@ -253,7 +263,7 @@ func (c *Client) doRequest(method, module, path string, body any, headers map[st
 }
 
 func (c *Client) refreshToken() error {
-	authURL, err := ModuleURL(c.Profile.Environment, "auth")
+	authURL, err := c.moduleURL("auth")
 	if err != nil {
 		return err
 	}
@@ -280,8 +290,17 @@ func (c *Client) refreshToken() error {
 // DoRaw executes an HTTP request and returns the raw response body without
 // checking content type or parsing JSON. Used for file uploads and other
 // non-JSON endpoints.
-func (c *Client) DoRaw(method, module, path string, bodyReader io.Reader, contentType string) ([]byte, int, error) {
-	respBody, status, err := c.doRawOnce(method, module, path, bodyReader, contentType)
+//
+// newBody is a factory, not a reader, because DoRaw replays the request: once
+// on a 401 token refresh, and up to retryAttempts times on a connect-phase
+// failure inside send. A single io.Reader cannot serve two attempts. The
+// transport consumes and closes it on the first, so a replay either fails on
+// the closed reader (io.Pipe, as the multipart upload uses) or sends an empty
+// body (anything that reports EOF instead), and the upload never happens.
+// Buffering the body instead is not an option: the upload is unbounded in size.
+// newBody may be nil for a request without a body.
+func (c *Client) DoRaw(method, module, path string, newBody func() (io.Reader, error), contentType string) ([]byte, int, error) {
+	respBody, status, err := c.doRawOnce(method, module, path, newBody, contentType)
 	if err != nil {
 		return nil, status, err
 	}
@@ -293,13 +312,13 @@ func (c *Client) DoRaw(method, module, path string, bodyReader io.Reader, conten
 		if err := c.refreshToken(); err != nil {
 			return nil, status, fmt.Errorf("token refresh failed: %w", err)
 		}
-		return c.doRawOnce(method, module, path, bodyReader, contentType)
+		return c.doRawOnce(method, module, path, newBody, contentType)
 	}
 
 	return respBody, status, nil
 }
 
-func (c *Client) doRawOnce(method, module, path string, bodyReader io.Reader, contentType string) ([]byte, int, error) {
+func (c *Client) doRawOnce(method, module, path string, newBody func() (io.Reader, error), contentType string) ([]byte, int, error) {
 	baseURL, err := c.moduleURL(module)
 	if err != nil {
 		return nil, 0, err
@@ -307,26 +326,43 @@ func (c *Client) doRawOnce(method, module, path string, bodyReader io.Reader, co
 
 	url := baseURL + path
 
-	req, err := http.NewRequest(method, url, bodyReader)
-	if err != nil {
-		return nil, 0, fmt.Errorf("cannot create request: %w", err)
-	}
+	newRequest := func() (*http.Request, error) {
+		var bodyReader io.Reader
+		if newBody != nil {
+			r, err := newBody()
+			if err != nil {
+				return nil, err
+			}
+			bodyReader = r
+		}
 
-	req.Header.Set("Authorization", "Bearer "+c.Profile.AccessToken)
-	if c.Profile.TenantID != "" {
-		req.Header.Set("X-Tenant-ID", c.Profile.TenantID)
-	}
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
+		req, err := http.NewRequest(method, url, bodyReader)
+		if err != nil {
+			// The body may be a pipe with a writer goroutine behind it.
+			if rc, ok := bodyReader.(io.Closer); ok {
+				_ = rc.Close()
+			}
+			return nil, fmt.Errorf("cannot create request: %w", err)
+		}
+
+		req.Header.Set("Authorization", "Bearer "+c.Profile.AccessToken)
+		if c.Profile.TenantID != "" {
+			req.Header.Set("X-Tenant-ID", c.Profile.TenantID)
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+
+		return req, nil
 	}
 
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "%s %s\n", method, url)
 	}
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := send(c.HTTPClient, newRequest)
 	if err != nil {
-		return nil, 0, fmt.Errorf("request failed: %w", err)
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 

@@ -33,9 +33,22 @@ func Authenticate(authURL, clientID, clientSecret string) (string, error) {
 		return "", fmt.Errorf("cannot encode auth request: %w", err)
 	}
 
-	resp, err := http.Post(authURL+"/oauth/token", "application/json", bytes.NewReader(data))
+	// Goes through send on the shared client so the token refresh gets the
+	// same transport timeouts and connect-phase retry as every other call. On
+	// http.DefaultClient a single dial failure here turned a recoverable 401
+	// into a hard "token refresh failed".
+	resp, err := send(sharedHTTPClient, func() (*http.Request, error) {
+		req, err := http.NewRequest(http.MethodPost, authURL+"/oauth/token", bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("cannot create auth request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 	if err != nil {
-		return "", fmt.Errorf("auth request failed: %w", err)
+		// send already says "request failed", so this keeps the original
+		// "auth request failed: ..." wording instead of doubling it.
+		return "", fmt.Errorf("auth %w", err)
 	}
 	defer resp.Body.Close()
 

@@ -418,38 +418,57 @@ The file is sent as a multipart form upload to the document's attachment endpoin
 				return err
 			}
 
-			f, err := os.Open(filePath)
-			if err != nil {
-				return fmt.Errorf("cannot open file: %w", err)
-			}
-			defer f.Close()
-
 			filename := filepath.Base(filePath)
 
-			pr, pw := io.Pipe()
-			w := multipart.NewWriter(pw)
+			// The boundary is fixed up front because Content-Type names it and
+			// DoRaw may replay the body (401 refresh, connect-phase retry): a
+			// fresh multipart.Writer per attempt would otherwise pick a new
+			// boundary that no longer matches the header already sent.
+			boundaryWriter := multipart.NewWriter(io.Discard)
+			boundary := boundaryWriter.Boundary()
+			contentType := boundaryWriter.FormDataContentType()
 
-			go func() {
-				part, err := w.CreateFormFile("file", filename)
+			// A factory, not a reader: the pipe below is drained by the first
+			// attempt, so each attempt needs its own pipe and its own open file.
+			newBody := func() (io.Reader, error) {
+				f, err := os.Open(filePath)
 				if err != nil {
-					pw.CloseWithError(err)
-					return
+					return nil, fmt.Errorf("cannot open file: %w", err)
 				}
-				if _, err := io.Copy(part, f); err != nil {
-					pw.CloseWithError(err)
-					return
+
+				pr, pw := io.Pipe()
+				w := multipart.NewWriter(pw)
+				if err := w.SetBoundary(boundary); err != nil {
+					f.Close()
+					pr.Close()
+					pw.Close()
+					return nil, fmt.Errorf("cannot set multipart boundary: %w", err)
 				}
-				pw.CloseWithError(w.Close())
-			}()
+
+				go func() {
+					defer f.Close()
+					part, err := w.CreateFormFile("file", filename)
+					if err != nil {
+						pw.CloseWithError(err)
+						return
+					}
+					if _, err := io.Copy(part, f); err != nil {
+						pw.CloseWithError(err)
+						return
+					}
+					pw.CloseWithError(w.Close())
+				}()
+
+				return pr, nil
+			}
 
 			// POST .../attachments/upload -- the singular PUT .../attachment this
 			// used to send has never existed in borrower-central, so the command
 			// always failed. See app/api/documents/handler.py:172, which takes the
 			// same multipart "file" field.
 			path := "/v1/documents/" + args[0] + "/attachments/upload"
-			contentType := w.FormDataContentType()
 
-			respBody, _, err := c.DoRaw("POST", "borrower_central", path, pr, contentType)
+			respBody, _, err := c.DoRaw("POST", "borrower_central", path, newBody, contentType)
 			if err != nil {
 				return err
 			}
