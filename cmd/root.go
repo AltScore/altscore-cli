@@ -17,6 +17,7 @@ var (
 	flagTenant      string
 	flagVerbose     bool
 	flagBaseURLs    []string
+	flagNoRetry     bool
 )
 
 var rootCmd = &cobra.Command{
@@ -39,6 +40,13 @@ Quick start:
   altscore api GET /v1/borrowers?per-page=1`,
 	Version:      version.Version,
 	SilenceUsage: true,
+	// Set here rather than in loadClient so it also covers login and
+	// refresh-token, which authenticate without building a client.
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		if flagNoRetry {
+			client.SetRetryDisabled(true)
+		}
+	},
 }
 
 func init() {
@@ -46,6 +54,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagEnvironment, "environment", "", "override profile's environment (production, staging, sandbox)")
 	rootCmd.PersistentFlags().StringVar(&flagTenant, "tenant", "", "override profile's tenant ID")
 	rootCmd.PersistentFlags().BoolVar(&flagVerbose, "verbose", false, "print request details to stderr")
+	rootCmd.PersistentFlags().BoolVar(&flagNoRetry, "no-retry", false, "do not retry connect-phase network failures (also ALTSCORE_NO_RETRY=1)")
 	rootCmd.PersistentFlags().StringArrayVar(&flagBaseURLs, "base-url", nil, `override module base URL (format: module=url, repeatable)
   e.g. --base-url borrower_central=http://localhost:8000`)
 
