@@ -32,7 +32,7 @@ var reservedMappingScopes = map[string]bool{
 	// documents.<key>.<attr> is the http task's OWN late-resolved input -- the
 	// task's optional `documents` list names borrower documents by key and the
 	// body template reads {{documents.<key>.base64}} (also .fileName,
-	// .mimeType, .sizeBytes, .files). The bytes do not exist at graph time and
+	// .mimeType, .extension, .sizeBytes, .files). The bytes do not exist at graph time and
 	// never reach task_outputs; BC resolves the literal in a second pass inside
 	// http_activity, exactly like self.*, so apply must leave it alone. Only
 	// meaningful in an http body; anywhere else the runtime renders it empty.
