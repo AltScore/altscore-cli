@@ -318,6 +318,14 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			specNodes[i] = n
 		}
 		adviseExtractionProbes(spec.CustomVariables, specNodes)
+
+		// Advisory: custom variables whose whole output vocabulary is a small
+		// integer code (2/1/0/-1). Apply is where a v1 port LANDS, so this has
+		// to fire here and not only on a later `lint` of the saved workflow.
+		// It needs no server fetch, unlike the rest of the readability block.
+		if f, ok := adviseOrdinalCodeVars(spec.CustomVariables); ok {
+			printReadabilityFindings(os.Stderr, []readabilityFinding{f})
+		}
 	}
 
 	// persona is required by CreateBorrower's Literal["individual","business"]

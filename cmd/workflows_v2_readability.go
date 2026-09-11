@@ -62,11 +62,21 @@ func adviseHandoffReadability(wf map[string]any, endTasks []map[string]any, rule
 	if f, ok := adviseVariableTitles(asMap(wf["customVariables"])); ok {
 		findings = append(findings, f)
 	}
+	if f, ok := adviseOrdinalCodeVars(asMap(wf["customVariables"])); ok {
+		findings = append(findings, f)
+	}
 	findings = append(findings, advisePDFSections(asSlice(wf["nodes"]), endTasks)...)
 	if f, ok := adviseRuleDescriptions(rules); ok {
 		findings = append(findings, f)
 	}
-	if len(findings) == 0 {
+	printReadabilityFindings(w, findings)
+}
+
+// printReadabilityFindings emits the aggregated block. Split out because `apply`
+// reports the subset of these practices that needs no server fetch (see
+// adviseOrdinalCodeVars) and must print it in the same shape as lint does.
+func printReadabilityFindings(w io.Writer, findings []readabilityFinding) {
+	if w == nil || len(findings) == 0 {
 		return
 	}
 	fmt.Fprintf(w, "# readability advisory (client handoff): %d finding(s). "+

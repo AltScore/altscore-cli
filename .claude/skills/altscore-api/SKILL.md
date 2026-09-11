@@ -1,6 +1,6 @@
 ---
 name: altscore-api
-description: "Interact with the AltScore Borrower Central API using the altscore CLI. Use when the user needs to create, read, update, or delete borrowers, identities, documents, deals, or query executions and packages. Also use for raw API calls and profile management."
+description: "Interact with the AltScore Borrower Central API using the altscore CLI. Use when the user needs to create, read, update, or delete borrowers, identities, documents, deals, or query executions and packages. Also use when they want to author, change or MIGRATE a workflow -- 'migrate this off the legacy engine', 'port this workflow to v2', 'move <tenant> to the new repo' all start here. Also use for raw API calls and profile management."
 user-invocable: false
 allowed-tools: Bash, Read, Grep, Glob
 ---
@@ -95,6 +95,17 @@ These are silent-failure modes — the API accepts the request and fails later, 
 6. **`workflowAlias` is load-bearing** on credit-decisioning entities (rules, scorecards, mapping-tables, rule-trees) — without it they're invisible to the workflow's pickers. `apply` auto-stamps it. See [credit-decisioning](references/credit-decisioning.md).
 7. **Required fields that live in the body, not as flags**: identities/documents need `borrowerId`/`key` IN THE BODY; v2 field names are camelCase (`nodeId`, `sourceNodeId`). `execute --execution-mode async` returns only `executionId` (poll for status). See [resources](references/resources.md) and [workflows-v2](references/workflows-v2.md).
 
+## "I want to migrate"
+
+A delivery engineer asking to move a workflow off the legacy v1 engine has not told you the three things you need, because to them they are obvious. Do NOT start reading code and do NOT guess them.
+
+1. Pre-flight silently: `altscore config` (logged in? which tenant?) and `altscore profiles list`. If there is no session, say that `altscore login` needs a **client_id** and a **client_secret** and that it must be run in a terminal — it reads stdin, so you cannot do it for them.
+2. Ask, with **AskUserQuestion**, building the options from those reads: which tenant, where the legacy repo lives, how much is in scope. Then, once you can read the repo, which workflows — as a multi-select of the real entry points you found, not free text.
+3. Follow `altscore workflows-v2 schema-guide v1Migration`. That section is the doctrine and it is served live; nothing in this repo restates it.
+4. Parity is necessary and not sufficient. Fewest custom variables; complicate the ENTITY, not the Python; `*_indicator` becomes evaluation-rules and mapping-tables and the 2/1/0/-1 codes do not survive the port.
+
+Full intake, including the fallback when AskUserQuestion is unavailable: [v1-migration](references/v1-migration.md).
+
 ## Reference index
 
 Load the file that matches the task:
@@ -103,6 +114,7 @@ Load the file that matches the task:
 |---|---|---|
 | Core entities | [references/resources.md](references/resources.md) | borrowers, identities, documents, deals, executions (two-surface outputs), packages |
 | Workflows v1 | [references/workflows-v1.md](references/workflows-v1.md) | workflow-tasks, task-tests, v1 workflows, input-schema reference, DAG data-flow rules |
+| v1 -> v2 migration | [references/v1-migration.md](references/v1-migration.md) | the intake round (login pre-flight, tenant, legacy repo, workflow list), where the doctrine is served from, and the three porting rules parity does not check |
 | Workflows v2 | [references/workflows-v2.md](references/workflows-v2.md) | `apply`, tasks-v2, CRUD, lock dance, lifecycle, schedules, import/export, execute, helpers, variable resolution, atomic deal patterns |
 | Credit decisioning | [references/credit-decisioning.md](references/credit-decisioning.md) | mapping-tables, scorecards, evaluation-rules, decisions, rule-trees, pitfalls |
 | KYC/KYB good habits | [references/kyc-kyb-habits.md](references/kyc-kyb-habits.md) | tenant/country-agnostic structural habits for onboarding & screening flows — read before authoring a KYC/KYB/onboarding workflow |
