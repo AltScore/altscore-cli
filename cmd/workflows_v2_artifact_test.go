@@ -51,6 +51,35 @@ func TestArtifact_AResidualRefInInputMappingsStillAborts(t *testing.T) {
 	}
 }
 
+// residualSpecRefExcludedFields is shared with the REWRITER and the dependency
+// scanner, not just the validator, so moving the alias out of it has to be
+// checked on that side too: the literal must survive rewriting unrenamed, and
+// the mapping beside it must still be rewritten to the server-assigned alias.
+func TestArtifact_RewriteLeavesTheLiteralAndStillRewritesTheMapping(t *testing.T) {
+	task := map[string]any{
+		"type": "artifact",
+		"artifactConfig": map[string]any{
+			"artifactAlias": "usuarios",
+			"columns":       []any{"email"},
+		},
+		"inputMappings": map[string]any{"artifactAlias": "task_outputs.usuarios.alias"},
+	}
+	refMap := map[string]string{"usuarios": "usuarios-server-1234"}
+
+	if err := rewriteTaskRefs(task, refMap, `node ref="probe"`); err != nil {
+		t.Fatalf("rewriteTaskRefs: %v", err)
+	}
+
+	cfg := asMap(task["artifactConfig"])
+	if got := cfg["artifactAlias"]; got != "usuarios" {
+		t.Fatalf("the artifact alias literal must not be renamed by the rewriter, got %v", got)
+	}
+	mappings := asMap(task["inputMappings"])
+	if got := mappings["artifactAlias"]; got != "task_outputs.usuarios-server-1234.alias" {
+		t.Fatalf("the alias MAPPING must still be rewritten to the server alias, got %v", got)
+	}
+}
+
 // artifact is a live type, not a retired one: apply must not refuse it with the
 // deprecation message.
 func TestArtifact_IsNotDeprecated(t *testing.T) {
