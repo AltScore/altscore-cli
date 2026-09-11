@@ -206,6 +206,10 @@ things that decide whether the analyst who inherits this workflow can read it.
 A workflow that trips all of them runs identically, which is why nothing else
 catches them:
   - custom variables with no "title" (the Hub falls back to the raw name)
+  - custom variables whose whole output vocabulary is a small integer code
+    (2/1/0/-1) -- the variable has already made the decision, in a vocabulary
+    only its author can read. The usual source is a v1 port carrying its
+    *_indicator fields across unchanged
   - PDF sections with no title, and htmlBlock bodies that are a single
     {placeholder} fed by a Python expression (the markup is not editable
     without Python)
