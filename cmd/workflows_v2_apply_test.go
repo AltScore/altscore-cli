@@ -663,6 +663,18 @@ var refBearingTaskBodies = map[string]map[string]any{
 			"inputMappings": map[string]any{"subcanal": "task_outputs.a.subcanal"},
 		},
 	},
+	// The artifact node resolves its alias server-side and carries no nested
+	// inputMappings of its own, so the top-level inputMappings is its only
+	// ref-bearing surface. artifactAlias and columns are authored LITERALS --
+	// they are in residualSpecRefExcludedFields precisely so a node ref that
+	// reads like an artifact alias cannot abort apply mid-POST.
+	"artifact": {
+		"artifactConfig": map[string]any{
+			"artifactAlias": "usuarios",
+			"columns":       []any{"email"},
+		},
+		"inputMappings": map[string]any{"artifactAlias": "task_outputs.a.alias"},
+	},
 	"data-store-write": {
 		"dataStoreWriteConfig": map[string]any{
 			"tableName": "rows",
