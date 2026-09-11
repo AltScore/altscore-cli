@@ -971,6 +971,48 @@ var residualSpecRefExcludedFields = map[string]bool{
 	"roleKey":  true,
 }
 
+// residualSpecRefExcludedPaths is the same exclusion, qualified by the field's
+// PARENT, for literals whose field name is also a legitimate reference-bearing
+// key somewhere else in the same body.
+//
+// artifactConfig.artifactAlias names one of the TENANT's artifacts and
+// artifactConfig.columns names that table's own column keys -- user-authored
+// literals resolved server-side at run time, never node references (the
+// artifact node deliberately takes no id of any kind). The collision is real
+// rather than theoretical: a spec is entitled to a node ref that reads the same
+// as an artifact alias, since "usuarios" and "sucursales" are natural names for
+// both, and the backend field is spelled artifactAlias precisely BECAUSE a bare
+// "alias" is what a spec calls a node.
+//
+// But the alias is ALSO runtime-resolvable, so `inputMappings.artifactAlias` is
+// a real reference that must still be rewritten. Excluding the bare field name
+// would blind the validator to exactly that -- caught by
+// TestArtifact_AResidualRefInInputMappingsStillAborts, which failed when this
+// started life in the by-name map above.
+var residualSpecRefExcludedPaths = map[string]bool{
+	"artifactConfig.artifactAlias":  true,
+	"artifactConfig.artifact_alias": true,
+	"artifactConfig.columns":        true,
+}
+
+// parentSegment returns the second-to-last dotted segment of a walk path, with
+// any trailing array index stripped, or "" when the path has no parent.
+// "artifactConfig.columns[0]" -> "artifactConfig".
+func parentSegment(path string) string {
+	idx := strings.LastIndexByte(path, '.')
+	if idx < 0 {
+		return ""
+	}
+	parent := path[:idx]
+	if pidx := strings.LastIndexByte(parent, '.'); pidx >= 0 {
+		parent = parent[pidx+1:]
+	}
+	if bracket := strings.IndexByte(parent, '['); bracket >= 0 {
+		parent = parent[:bracket]
+	}
+	return parent
+}
+
 // validateNoResidualSpecRefs walks a composed task body and returns an error
 // if any string value at a non-excluded path exactly equals a key in refMap
 // whose server-assigned alias is different. A surviving spec-local ref means
@@ -1057,6 +1099,12 @@ func validateNoResidualSpecRefs(body map[string]any, refMap map[string]string, c
 				last = last[:bracket]
 			}
 			if residualSpecRefExcludedFields[last] {
+				return nil
+			}
+			// Parent-qualified exclusions: the same literal check, for a field
+			// name that is reference-bearing under a DIFFERENT parent.
+			if parent := parentSegment(path); parent != "" &&
+				residualSpecRefExcludedPaths[parent+"."+last] {
 				return nil
 			}
 			if server, found := refMap[v]; found && server != v {

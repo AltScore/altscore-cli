@@ -33,6 +33,7 @@ var validTaskTypes = map[string]bool{
 	"package-io": true, "sftp": true, "notices": true,
 	"contact": true, "document-extraction": true,
 	"spreadsheet-extraction": true, "category": true,
+	"artifact": true,
 }
 
 // deprecatedTaskTypes are the task types AltScore has retired. The backend
