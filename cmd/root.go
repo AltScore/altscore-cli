@@ -836,6 +836,8 @@ reference.`,
   inputVariables, customVariables, config (any subset).
   'status' is NOT patchable -- lifecycle transitions belong to the
   publish/archive/restore endpoints, and BC ignores it silently.
+  Visibility flags (hidden, showInCustomer, showInDeal) are alias-level:
+  use 'set-visibility'.
   Note: prefer 'autosave' with --lock-token for conflict-safe edits.`,
 		ResponseSchema: `  id, tenant, alias, label, description, category, status, version,
   isLatest, nodes, edges, notes, inputVariables, customVariables, config,
@@ -878,6 +880,7 @@ already have a hand-assembled body and know exactly what you are sending.`
 	wfv2Group.AddCommand(makeWfv2ArchiveCmd())
 	wfv2Group.AddCommand(makeWfv2RestoreCmd())
 	wfv2Group.AddCommand(makeWfv2DuplicateCmd())
+	wfv2Group.AddCommand(makeWfv2SetVisibilityCmd())
 	wfv2Group.AddCommand(makeWfv2LockGroupCmd())
 	wfv2Group.AddCommand(makeWfv2AutosaveCmd())
 	wfv2Group.AddCommand(makeWfv2UpdateMappingCmd())

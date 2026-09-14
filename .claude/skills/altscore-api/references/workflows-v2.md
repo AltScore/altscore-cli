@@ -373,6 +373,8 @@ altscore workflows-v2 revert my-wf <version-id> --mode publish   # replace ACTIV
 altscore workflows-v2 archive <id>                               # archive all versions
 altscore workflows-v2 restore <id>                               # un-archive
 altscore workflows-v2 duplicate <id> --new-label "Copy of X"
+altscore workflows-v2 set-visibility my-wf --show-in-deal=true    # per-surface flags: --hidden, --show-in-customer (default true), --show-in-deal (default false)
+altscore workflows-v2 set-visibility my-wf --hidden=true          # every version of the alias; survives publish/revert
 ```
 
 #### Versions, executions, mappings
