@@ -293,6 +293,116 @@ from the new label; if it collides with an existing alias the API returns 409.`,
 	return cmd
 }
 
+// ===================== Visibility =====================
+
+// wfv2VisibilityFlags carries the raw --hidden / --show-in-customer /
+// --show-in-deal values. Each is tri-state: "" means the flag was not passed
+// and its key must stay out of the body so the server leaves it untouched.
+type wfv2VisibilityFlags struct {
+	Hidden         string
+	ShowInCustomer string
+	ShowInDeal     string
+}
+
+type wfv2VisibilityBody struct {
+	Hidden         *bool `json:"hidden,omitempty"`
+	ShowInCustomer *bool `json:"showInCustomer,omitempty"`
+	ShowInDeal     *bool `json:"showInDeal,omitempty"`
+}
+
+func parseTriStateBool(flag, raw string) (*bool, error) {
+	switch raw {
+	case "":
+		return nil, nil
+	case "true", "false":
+		v := raw == "true"
+		return &v, nil
+	}
+	return nil, fmt.Errorf("%s must be true or false, got %q", flag, raw)
+}
+
+// buildVisibilityBody turns the tri-state flags into the PATCH body. Passing no
+// flag at all is refused here, before any request.
+func buildVisibilityBody(f wfv2VisibilityFlags) (json.RawMessage, error) {
+	var body wfv2VisibilityBody
+	var err error
+	if body.Hidden, err = parseTriStateBool("--hidden", f.Hidden); err != nil {
+		return nil, err
+	}
+	if body.ShowInCustomer, err = parseTriStateBool("--show-in-customer", f.ShowInCustomer); err != nil {
+		return nil, err
+	}
+	if body.ShowInDeal, err = parseTriStateBool("--show-in-deal", f.ShowInDeal); err != nil {
+		return nil, err
+	}
+	if body.Hidden == nil && body.ShowInCustomer == nil && body.ShowInDeal == nil {
+		return nil, fmt.Errorf("pass at least one of --hidden, --show-in-customer, --show-in-deal")
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("encode visibility body: %w", err)
+	}
+	return raw, nil
+}
+
+func setWorkflowVisibility(c *client.Client, alias string, body json.RawMessage) (json.RawMessage, error) {
+	path := fmt.Sprintf("/v2/workflows/%s/visibility", alias)
+	data, _, err := c.Do("PATCH", "borrower_central", path, body)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func makeWfv2SetVisibilityCmd() *cobra.Command {
+	var flags wfv2VisibilityFlags
+
+	cmd := &cobra.Command{
+		Use:   "set-visibility <alias-or-id>",
+		Short: "Show or hide a v2 workflow per surface (runner, Customer, Deal)",
+		Long: `Set the alias-level visibility flags of a workflow. Each flag is optional and
+takes true or false; a flag you do not pass is left untouched. The change
+applies to EVERY version of the alias and survives publish and revert.
+
+  --hidden            hide the workflow from the runner page and from every
+                      entity launcher (default false)
+  --show-in-customer  list the workflow in the Customer profile actions menu
+                      (default true: opt-out)
+  --show-in-deal      list the workflow in the Deal actions menu
+                      (default false: opt-in)
+
+At least one flag is required. Returns alias, modifiedCount and the flags sent.`,
+		Example: `  altscore workflows-v2 set-visibility my-wf --show-in-deal=true
+  altscore workflows-v2 set-visibility my-wf --hidden=true
+  altscore workflows-v2 set-visibility my-wf --show-in-customer=false --show-in-deal=true`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			body, err := buildVisibilityBody(flags)
+			if err != nil {
+				return err
+			}
+			c, err := loadClient()
+			if err != nil {
+				return err
+			}
+			alias, err := resolveWorkflowAlias(c, args[0])
+			if err != nil {
+				return err
+			}
+			data, err := setWorkflowVisibility(c, alias, body)
+			if err != nil {
+				return err
+			}
+			return output.RawJSON(data)
+		},
+	}
+
+	cmd.Flags().StringVar(&flags.Hidden, "hidden", "", "true|false: hide from the runner page and entity launchers")
+	cmd.Flags().StringVar(&flags.ShowInCustomer, "show-in-customer", "", "true|false: list in the Customer profile actions menu (unset = true)")
+	cmd.Flags().StringVar(&flags.ShowInDeal, "show-in-deal", "", "true|false: list in the Deal actions menu (unset = false)")
+	return cmd
+}
+
 // ===================== Locks =====================
 
 func makeWfv2LockGroupCmd() *cobra.Command {
