@@ -1,5 +1,5 @@
 ---
-name: altscore-api
+name: altscore-cli
 description: "Interact with the AltScore Borrower Central API using the altscore CLI. Use when the user needs to create, read, update, or delete borrowers, identities, documents, deals, or query executions and packages. Also use when they want to author, change or MIGRATE a workflow -- 'migrate this off the legacy engine', 'port this workflow to v2', 'move <tenant> to the new repo' all start here. Also use for raw API calls and profile management."
 user-invocable: false
 allowed-tools: Bash, Read, Grep, Glob
@@ -27,6 +27,8 @@ chmod +x /usr/local/bin/altscore
 ```
 
 Update in place with `altscore update` (downloads the latest release, verifies SHA-256, swaps the binary; set `GITHUB_TOKEN` if the repo is private).
+
+This skill ships inside the binary. `altscore skill status` says whether the copy you are reading is the one embedded in the installed CLI; if it is not, `altscore skill install` refreshes it (a managed install is also refreshed by `altscore update`). A hand-copied skill directory is left alone unless you pass `--force`.
 
 ## Authentication
 
@@ -94,6 +96,8 @@ These are silent-failure modes — the API accepts the request and fails later, 
 5. **Conditional branches use structured `conditions`, not `expression` strings** — the API stores `expression` as a no-op. See [workflows-v2](references/workflows-v2.md).
 6. **`workflowAlias` is load-bearing** on credit-decisioning entities (rules, scorecards, mapping-tables, rule-trees) — without it they're invisible to the workflow's pickers. `apply` auto-stamps it. See [credit-decisioning](references/credit-decisioning.md).
 7. **Required fields that live in the body, not as flags**: identities/documents need `borrowerId`/`key` IN THE BODY; v2 field names are camelCase (`nodeId`, `sourceNodeId`). `execute --execution-mode async` returns only `executionId` (poll for status). See [resources](references/resources.md) and [workflows-v2](references/workflows-v2.md).
+8. **Infer first, ask only what nobody wrote down.** Who is evaluated, the country, the sources, the decision keys and the write targets are readable from the request and the tenant; do not ask them. Ask the business policy nothing states (what happens when a gating source fails, what rejects outright versus goes to review, where cutoffs come from), every open point the brief lists as pending, and every identifier or rule you cannot trace to the brief or the tenant, with AskUserQuestion before writing a spec. Mid-build unknowns get a second round, never an analogy. When that tool is unavailable, stop at `apply --dry-run` and report the open questions. See [workflows-v2](references/workflows-v2.md#discovery-before-authoring-infer-first-ask-only-what-nobody-wrote-down).
+9. **Author without breaking the engineer next to you.** `--test` on every execute while iterating (live runs write alerts and decisions the client sees and nothing can delete); `lock get` before any write and stop if someone holds it; define a variable before a task version selects it; after the first publish every tenant write needs an explicit go, and a message that reads as feedback or a question is a read-only turn. An alias the brief names that is not in `workflows-v2 list` is a question, not a new workflow (`apply` refuses the near miss with `APPLY_ALIAS_NEAR_MATCH`). See [workflows-v2](references/workflows-v2.md#authoring-loop-how-to-work-a-tenant-without-breaking-the-person-next-to-you).
 
 ## "I want to migrate"
 
@@ -115,7 +119,7 @@ Load the file that matches the task:
 | Core entities | [references/resources.md](references/resources.md) | borrowers, identities, documents, deals, executions (two-surface outputs), packages |
 | Workflows v1 | [references/workflows-v1.md](references/workflows-v1.md) | workflow-tasks, task-tests, v1 workflows, input-schema reference, DAG data-flow rules |
 | v1 -> v2 migration | [references/v1-migration.md](references/v1-migration.md) | the intake round (login pre-flight, tenant, legacy repo, workflow list), where the doctrine is served from, and the three porting rules parity does not check |
-| Workflows v2 | [references/workflows-v2.md](references/workflows-v2.md) | `apply`, tasks-v2, CRUD, lock dance, lifecycle, schedules, import/export, execute, helpers, variable resolution, atomic deal patterns |
+| Workflows v2 | [references/workflows-v2.md](references/workflows-v2.md) | discovery round, authoring loop (test mode, locks, feedback turns), `apply`, tasks-v2, CRUD, lock dance, lifecycle, schedules, import/export, execute, helpers, variable resolution, atomic deal patterns |
 | Credit decisioning | [references/credit-decisioning.md](references/credit-decisioning.md) | mapping-tables, scorecards, evaluation-rules, decisions, rule-trees, pitfalls |
 | KYC/KYB good habits | [references/kyc-kyb-habits.md](references/kyc-kyb-habits.md) | tenant/country-agnostic structural habits for onboarding & screening flows — read before authoring a KYC/KYB/onboarding workflow |
 | AltData | [references/altdata.md](references/altdata.md) | source discovery (`describe` pre-flight), data requests |

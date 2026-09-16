@@ -29,6 +29,19 @@ const (
 // bounds live on the transport instead.
 var sharedHTTPClient = &http.Client{Transport: newTransport()}
 
+// LongResponseClient returns an http.Client identical to the shared one except
+// that the server may take up to headerTimeout to start answering. It exists
+// for the few calls that legitimately block on work the server performs
+// inline, such as a synchronous workflow execution: the 60s shared bound is
+// right for every other request and wrong for those, which routinely run
+// longer than a minute and then surface as "timeout awaiting response headers"
+// while the execution keeps running server-side.
+func LongResponseClient(headerTimeout time.Duration) *http.Client {
+	t := newTransport()
+	t.ResponseHeaderTimeout = headerTimeout
+	return &http.Client{Transport: t}
+}
+
 // newTransport clones the stdlib default so connection pooling, proxy handling
 // and HTTP/2 stay as configured, then tightens the phase timeouts.
 func newTransport() *http.Transport {

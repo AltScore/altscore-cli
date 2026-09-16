@@ -73,6 +73,9 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "Updated to %s\n", rel.TagName)
+	// The new binary embeds the matching skill; let it refresh a managed
+	// install so skill and CLI move together.
+	refreshSkillAfterUpdate(os.Stderr)
 	return nil
 }
 

@@ -60,6 +60,7 @@ func init() {
 
 	rootCmd.AddCommand(makeSchemaCmd())
 	rootCmd.AddCommand(makeToolsCmd())
+	rootCmd.AddCommand(makeSkillCmd())
 	rootCmd.AddCommand(makeVersionCmd())
 	registerResources()
 }
@@ -452,7 +453,7 @@ Supports pause, resume, cancel, and retry operations.`,
   sort-direction        "asc" or "desc"`,
 	})
 
-	registerResource(ResourceDef{
+	pkGroup := registerResource(ResourceDef{
 		Name:     "packages",
 		Singular: "package",
 		BasePath: "/v1/stores/packages",
@@ -461,7 +462,8 @@ Supports pause, resume, cancel, and retry operations.`,
 		Description: `View store packages.
 
 Packages represent installable data source or workflow bundles
-available in the AltScore store.`,
+available in the AltScore store. 'get' returns the envelope; 'content'
+returns the stored payload a package-io node reads at run time.`,
 		ResponseSchema: `  id, borrowerId, dealId, assetId, sourceId, alias, workflowId,
   label, contentType, tags, createdAt, ttl, hasAttachments, forcedStale`,
 		FilterHelp: `  borrower-id           Parent borrower ID
@@ -473,6 +475,7 @@ available in the AltScore store.`,
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
 	})
+	pkGroup.AddCommand(makePkContentCmd())
 
 	// --- Config/rules entities ---
 

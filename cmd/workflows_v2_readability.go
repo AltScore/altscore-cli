@@ -69,6 +69,9 @@ func adviseHandoffReadability(wf map[string]any, endTasks []map[string]any, rule
 	if f, ok := adviseRuleDescriptions(rules); ok {
 		findings = append(findings, f)
 	}
+	if f, ok := adviseDiacritics(humanStringsFromWorkflow(wf, endTasks, rules)); ok {
+		findings = append(findings, f)
+	}
 	printReadabilityFindings(w, findings)
 }
 

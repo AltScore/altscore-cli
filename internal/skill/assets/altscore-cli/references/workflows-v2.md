@@ -51,6 +51,74 @@ altscore workflows-v2 schema-guide tasks         # task shape + per-type config 
 altscore workflows-v2 schema-guide examples      # full scoring_pipeline template
 ```
 
+#### Discovery before authoring (infer first, ask only what nobody wrote down)
+
+"Create a workflow that does X" and "change workflow Y so that Z" leave decisions open. Most of them are already written down somewhere in the tenant; a few are business policy that only the user knows. Read the first group, ask the second with the **AskUserQuestion** tool, then build. One round, at most 4 questions, 2 to 4 options each, the option you would pick first and labelled `(Recommended)`. Skip the round when nothing survives the reads.
+
+**Infer first. Never ask these; read them.**
+
+| Decision | Where the answer is |
+|---|---|
+| Who is evaluated, which country, which stage of the customer's process | the request itself. "KYB for Ecuadorian SMEs" is a company, ECU, origination. |
+| Which sources, their required inputs, what they can detect | `altscore workflows-v2 sources-status --country <ISO3> --status active`, then `altscore altdata describe <id>` |
+| Decision vocabulary, whether a review lane exists | `altscore decisions list`: the registered keys are the only ones a run can write. A brief that says `approve/review/reject` while the tenant registers `passes/pending/fails` is mapped BY LABEL, and the mapping is restated to the user in one line |
+| Write targets, output shape, input payload, PDF or not, freshness of paid sources | the tenant's closest existing workflow: `workflows-v2 list --filter is-latest=true`, then `export <id> --format apply-spec` and read its `inputSchema`, end node, `decisionConfig` and `sourcesConfig.dataAge`. Mirror it. |
+| Fields available on borrower and deal, and what a real value looks like | `altscore data-models list`, then `borrower-fields list --filter borrower-id=<test borrower>` and `packages content <id>` on the test case. A null sample is a question, not a guess |
+| Structure: orchestrator plus per-party child, fan-out, two-layer decisioning | [kyc-kyb-habits](kyc-kyb-habits.md) |
+| Whether a change is visible to others (update path) | `workflows-v2 schedule get <id>`, and other workflows whose `child-workflow` nodes carry this alias as `executorId` |
+
+Anything the spec can default is yours as well: labels, positions, aliases and refs, branch ids, `inputKeys`, publish policy (DRAFT on create). Never ask which field a task type uses; read `schema-guide tasks`.
+
+**Ask only what survives the reads.** These are business policy: nothing in the tenant states them, and guessing wrong costs money or a customer. Pick the ones the flow triggers, at most 4.
+
+| Question | Ask when | Options to offer |
+|---|---|---|
+| A source the decision depends on fails or times out mid-run. What happens to the application? | any gating source in the flow | reject and stop; continue on what came back and flag the gap `(Recommended)` for monitoring; park it for manual review; retry later |
+| Which findings end the application outright, and which go to a human? (multi-select the outright rejects) | the tenant registers a review-type decision key. Without one everything rejects; do not invent a lane | sanctions or PEP hit; dissolved or suspended entity; identity mismatch; adverse judicial record |
+| Where do the cutoffs come from? | the flow scores or gates on a number and no sibling scorecard or rule-tree holds the numbers | reuse the cutoffs of the existing `<scorecard>` `(Recommended)` when one exists; the user supplies them now; a permissive placeholder marked TODO, tuned after test runs. Never invent thresholds silently |
+| How fresh must paid bureau or registry data be? | a paid external source is in the flow and no sibling workflow already uses it | pull fresh every run; reuse within 30 days `(Recommended)` for origination; reuse within 90 days or more for monitoring |
+| The same identity applies again within the window. Then what? | the flow writes a deal or a decision | re-run everything, writes are idempotent `(Recommended)`; reuse the last decision if younger than N days; reject as a duplicate |
+| Are the entity's people screened too? | KYB, and the country has an ownership or legal-representative source. Without the source the question is moot | entity only; entity plus owners and legal representatives `(Recommended)`; entity plus the guarantors named in the input |
+| Who reads the reasons? | no sibling workflow shows the output shape | internal only, decision key plus reason codes `(Recommended)`; the partner shows them to the applicant, so reasons go in the output; a human reads a PDF in the Hub |
+| Update path: the change renames or removes an output, or the workflow has schedules or child callers. Blast radius? | the read above found a schedule or a caller | go live on the alias now, consumers are updated; keep the old field names too for a transition; apply under a new alias for a trial |
+| Update path: a rule got stricter. Does the past get re-evaluated? | the change tightens a gate or a cutoff | new applications only `(Recommended)`; batch re-run the active portfolio in test mode first; re-run and re-decide |
+| The brief and the tenant disagree | a field the brief names is missing on the test borrower, a sample value has the opposite shape, an alias the brief names is not in `workflows-v2 list` | the options ARE the disagreement: which side is right, or what the missing piece should be |
+| A rule you want to write has no line in the brief | you are about to copy a rule family from a sibling workflow, or add a "sanity" rule the brief never asked for | add it; add it as informative (no decision impact); leave it out `(Recommended)` |
+
+Example round for "create a KYB workflow for Ecuadorian SMEs" in a tenant that already runs a KYC flow. Read: company, ECU and origination from the request; sources from `sources-status --country ECU`; a `review` key from `decisions list`; write targets, output shape and `dataAge` from the KYC export. Ask three things: what happens when the registry or judicial source fails mid-run; which findings reject outright versus go to review; whether owners and legal representatives are screened, since the country has an ownership source. Do not ask who is evaluated, which country, which sources, where the decision lands, or whether to publish. Restate the answers in one line, then write the spec.
+
+**Every open point in the brief is a question.** A brief that carries a "pending / to confirm" list (a fiscal cutoff month, how a registry identifies a kind of asset, a catalogue that has not arrived) hands you the question list ready-made. Each unchecked item becomes either a question in the round or an explicit `TODO` placeholder the user has seen; never a silently assumed value. The same goes for a "conservative by default" principle in the brief: when you cannot confirm something the brief says must be confirmed (an asset class against a list that does not exist yet), the conservative outcome is the default and the deviation is a question, not a judgment call you make alone.
+
+**Mid-build unknowns get a second round, not an analogy.** The first round covers what the reads surfaced. New unknowns appear while building (an alias the brief spelled differently from the tenant, a package alias nobody stated, a subflow output the brief does not say whether to consume). Each is a question. Deriving an identifier from a sibling's pattern ("the other ten documents end in `_info`") is the single most expensive shortcut an agent takes: it looks right, publishes, and is wrong in a way only the client notices.
+
+**When AskUserQuestion is unavailable** (print mode `-p`, background jobs, some SDK hosts) do not guess and mutate. Write down the assumptions you would have asked about, build the spec under them, run `apply --dry-run` (or `--diff` for an update) and stop. Report the plan and the open questions; apply only after the user answers.
+
+#### Authoring loop (how to work a tenant without breaking the person next to you)
+
+These rules come from a real session in which an agent built a 36-node workflow correctly and still cost the delivery engineer an afternoon: a duplicate workflow under a typo'd alias, 233 alerts and 4 decisions written to a real borrower by live test runs, a task version bumped under a draft the engineer was editing in the Hub, and three rounds of "that was feedback, not a go".
+
+**Before the first write.**
+
+- `altscore workflows-v2 list --filter is-latest=true` and read every alias and label. If the brief names an alias that is not in that list, STOP and ask which one it meant; a near miss (`validacion-...` vs `validaci-n-...`) is the tenant's real workflow spelled by a human. `apply` refuses this case itself (`APPLY_ALIAS_NEAR_MATCH`, override with `--create-new`); do not reach for the override to make the error go away.
+- Every identifier you will write (workflow alias, package alias, borrower-field key, decision key, source id) is either READ from the tenant (`packages list`, `packages content`, `borrower-fields list`, `decisions list`, `altdata describe`) or ASKED. Never derived by analogy.
+- Every rule you author cites the line of the brief, or the sibling workflow, it comes from. List the rules that have no source and the decision-key mapping in the question round; they are the ones the user will later call "invented".
+
+**While iterating.**
+
+- Execute in test mode: `workflows-v2 execute <id> --test` (or `execute-by-alias ... --test`). Live runs write alerts and decisions on real borrowers, cannot be deleted (`DELETE /v1/executions` is 405), and are what the client sees in the Hub. A live run happens only when the user asks for one by name.
+- `workflows-v2 lock get <alias>` before ANY write to a workflow, or to a task its nodes pin at `taskVersion: null` (a draft always floats to the latest task version, so bumping the task changes the draft under the editor's feet). If `canEdit` is false, stop and report who holds it; never `force-release` a live Hub tab.
+- Define before you reference: autosave the custom variable first, then create the task version that selects it. The reverse order leaves the draft pointing at a variable that does not exist and the Hub shows an error to whoever has it open.
+- Re-export before you patch (`export <id> --format apply-spec`). After the first publish the tenant is the source of truth, not your generator scripts: the engineer renames nodes, moves them, adds nodes in the Hub. Regenerating from your scripts erases that work. `apply` re-adopts Hub-authored nodes by their alias, so a re-exported spec round-trips.
+- Human-facing strings (node labels, rule labels and descriptions, PDF section titles, alert messages, HTML headings) are in the client's language with its diacritics: `Cédula`, `Opinión`, `Garantías`, never `Cedula`, `Opinion`, `Garantias`. `lint` and `apply` print a `[diacritics]` advisory when they see the folded form; fixing 72 rule labels afterwards is a script plus 72 PATCHes.
+- Group evaluators by business subject (company, legal representative, guarantor, operation), not by which compute node happens to feed them. The PDF section titles are read by a credit committee.
+- Mapping tables translate in the direction the DATA dictates: read one real value of the input field first. A borrower field that already holds a code (`corn`) maps code to label, not free text to code. When the sample is null, ask.
+
+**After the first publish.**
+
+- Every further tenant write needs an explicit go in the current message. "Esto es feedback", "what did you do here", "why did you...", a critique or a question is a READ-ONLY turn: answer, propose, wait. Acting on feedback the moment it arrives is what makes an engineer shout STOP while they are editing the same workflow in the Hub.
+- Never publish while the user is inside the Hub editor. Ask "are you out of the flow?" before taking the lock, even when `lock get` says it is free (locks expire; tabs do not).
+- When the user asks for a table or a block that already exists as data (a package, a task output), read it from the source; do not extend decision logic to carry presentation.
+
 #### Recommended path: `apply` (declarative create-or-update)
 
 For "Create a workflow that does X" — or "Update workflow Y to do Z" — use `workflows-v2 apply`. It takes a single spec and reconciles it against the tenant. Use `--dry-run` first to inspect what will be sent (the dry-run output also tells you which branch will fire: CREATE or UPDATE).
@@ -63,6 +131,7 @@ Use `--diff` to preview changes against the current tenant state before mutating
 - If **no** workflow has that alias → **CREATE path**: the server creates the tasks and the workflow (DRAFT by default unless `--publish`).
 - If a workflow has that alias → **UPDATE path**: the server drafts (adopting an existing DRAFT, or `create-draft --force-recreate` over an ACTIVE version), autosaves the new nodes/edges/variables/config/notes/category/status, and publishes when the target was ACTIVE, all under its own edit lock. Same workflow id, same alias, version increments, schedules and downstream consumers survive. Tasks are matched by `(workflowAlias, specRef)`: an unchanged body is left alone, a changed one is version-bumped under its existing alias.
   - A lock held by an open builder tab makes apply answer 409 naming the holder; the lock apply itself takes lives only for the request. Pass `--force-lock` to take it anyway and discard whatever is unsaved there.
+- If NO workflow has the spec's alias but one exists whose alias or label is one typo away (accent folded to a hyphen, one dropped letter), apply refuses with `APPLY_ALIAS_NEAR_MATCH` and lists the candidates with alias, label, status and version. The usual cause is an alias copied from a brief instead of from `workflows-v2 list`; set `spec.alias` to the existing one and apply UPDATES it. `--create-new` is for the rare case where a second, similarly named workflow is really wanted.
 
 Both paths share the same validation + normalize pipeline (`preflightTasks`, per-type normalize, `validateEntityWorkflowAliasMatch`, etc.) so a spec that passes against a fresh tenant also passes when re-applied later.
 
@@ -328,7 +397,8 @@ After any create or autosave, run `altscore workflows-v2 lint <id>` to confirm n
 #### Lock dance (required before edits)
 
 ```bash
-TOKEN=$(altscore workflows-v2 lock acquire my-wf --client-id "agent-$(uuidgen)" | jq -r .lockToken)
+altscore workflows-v2 lock get my-wf                 # FIRST: canEdit false = someone is in the Hub, stop and say so
+TOKEN=$(altscore workflows-v2 lock acquire my-wf | jq -r .lockToken)   # --client-id defaults to cli-<profile>-<host>-<pid>
 
 altscore workflows-v2 lock heartbeat my-wf --lock-token "$TOKEN"   # every ~60s during long edits
 
@@ -421,8 +491,16 @@ altscore workflows-v2 execute <id> --body '{"borrower_id":"abc"}'               
 altscore workflows-v2 execute <id> --body '{...}' --execution-mode async --tags smoke      # async returns executionId
 altscore workflows-v2 execute-by-alias my-wf latest --body '{...}'
 
-# Test mode -- mark the WHOLE run non-billable + hidden from metrics/default lists.
-# --test injects the "test" tag (BC sets is_test=true -> is_billable=false).
+# A sync run blocks until the graph finishes; the CLI waits up to 10 minutes for
+# the server to answer. If it still reports "timeout awaiting response headers",
+# the execution was ACCEPTED and is running: the error names the command that
+# finds it. Prefer --wait for anything that takes more than a few seconds.
+
+# Test mode -- the DEFAULT while authoring. Marks the WHOLE run non-billable +
+# hidden from metrics/default lists; --test injects the "test" tag (BC sets
+# is_test=true -> is_billable=false). A live run writes alerts and a decision
+# on the borrower that the client sees and that cannot be deleted afterwards
+# (DELETE /v1/executions is 405). Run live only when the user asks by name.
 # NOTE: side effects (borrower/deal/package writes) STILL run -- it is not a dry run.
 altscore workflows-v2 execute <id> --body '{...}' --test
 altscore workflows-v2 execute-batch <id> --body '{"inputs":[...]}' --test   # sets testMode=true

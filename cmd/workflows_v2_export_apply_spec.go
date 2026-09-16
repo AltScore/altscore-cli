@@ -14,8 +14,10 @@ const (
 	// refFromSpecRef emits the task's stored specRef, else its alias, else the
 	// node id. `export --format apply-spec` uses it so a re-apply matches every
 	// task by (workflowAlias, specRef) and reports it unchanged. A task without
-	// a specRef (authored in the Hub) falls back to its alias and re-applies as
-	// a new task until the server learns to adopt a task by its alias.
+	// a specRef (authored in the Hub) falls back to its alias; a backend that
+	// adopts by alias (a ref equal to the alias of a node of the target
+	// workflow) keeps it as the same task and stamps the specRef on the bump,
+	// an older backend re-applies it as a new task.
 	refFromSpecRef exportRefMode = iota
 	// refFromAlias emits the task alias, else the node id. `diff <a> <b>` uses
 	// it: aliases survive version bumps, while a specRef first appears when the
