@@ -789,8 +789,8 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 		// task_outputs scope at execute time. A spec-local ref like
 		// `task_outputs.fetch.cuit_list` survives compose unchanged
 		// otherwise, the runtime can't find `fetch` in the scope, and the
-		// expression collapses to a single execution with the full parent
-		// context. Walk the same rewriter we use on other deep-ref fields.
+		// node fails at dispatch naming the missing alias. Walk the same
+		// rewriter we use on other deep-ref fields.
 		if s, ok := task["inputExpression"].(string); ok && s != "" {
 			task["inputExpression"] = rewriteTaskOutputsRefsInString(s, refMap)
 		}

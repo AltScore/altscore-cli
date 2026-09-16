@@ -598,7 +598,7 @@ func preflightTasks(spec *composeSpec) error {
 					fmt.Fprintf(os.Stderr,
 						"# warning: tasks[%d] (ref=%q): child-workflow has runInBatch=true but no inputExpression. "+
 							"The runtime ignores runInBatch and dispatches by the type of inputExpression "+
-							"(list -> batch, dict -> single). Without inputExpression this task runs once with the full parent context. "+
+							"(list -> batch, dict -> single). Without inputExpression this task runs once and the child receives only this node's inputMappings. "+
 							"To batch, set inputExpression to an expression that resolves to a list "+
 							"(e.g. \"task_outputs.fetch.rows\").\n",
 						i, ref)
