@@ -163,19 +163,27 @@ func deprecatedCarryForwardForTaskVersion(c *client.Client, alias string, body j
 }
 
 func makeTv2CreateVersionCmd() *cobra.Command {
-	var bodyFlag string
+	var bodyFlag, lockToken, clientID string
 
 	cmd := &cobra.Command{
 		Use:   "create-version <alias>",
 		Short: "Create a new version of an existing v2 task (POST /v2/tasks/{alias})",
 		Long: `Bumps the task's version sequence; existing workflow nodes pinning a
 specific version are unaffected. Body shape is the same as 'create'
-minus the alias.`,
+minus the alias.
+
+A DRAFT floats on the latest task version, so this write edits every draft
+whose graph points at the task. The server attributes it to those workflows
+and applies their edit lock: a draft someone has open in the Hub answers
+423 LOCKED, even when that someone is you in another tab, because this CLI
+identifies itself as a separate editor (X-Lock-Client-Id). Pass --lock-token
+from 'workflows-v2 lock acquire' to write as the lock holder.`,
 		Example: `  altscore tasks-v2 create-version fetch-ecu --body '{
     "label":"Fetch ECU bureau v2",
     "type":"altdata-enrichment",
     "sourcesConfig":[{"sourceId":"ECU-PUB-0002","version":"v1"},{"sourceId":"ECU-PUB-0014","version":"v1"}]
-  }'`,
+  }'
+  altscore tasks-v2 create-version fetch-ecu --body @task.json --lock-token "$TOKEN"`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
@@ -196,8 +204,10 @@ minus the alias.`,
 			if err := deriveAltdataInputKeysForCreate(c, &body); err != nil {
 				return err
 			}
-			path := fmt.Sprintf("/v2/tasks/%s", args[0])
-			data, _, err := c.Do("POST", "borrower_central", path, body)
+			if clientID == "" {
+				clientID = defaultLockClientID(c.ProfileName)
+			}
+			data, err := postTaskVersion(c, args[0], body, lockToken, clientID)
 			if err != nil {
 				return err
 			}
@@ -205,7 +215,39 @@ minus the alias.`,
 		},
 	}
 	cmd.Flags().StringVar(&bodyFlag, "body", "", "JSON body (or pipe via stdin)")
+	cmd.Flags().StringVar(&lockToken, "lock-token", "", "lockToken from 'workflows-v2 lock acquire' on the workflow this task belongs to; sent as X-Lock-Token")
+	cmd.Flags().StringVar(&clientID, "client-id", "", "editor identity sent as X-Lock-Client-Id (default: cli-<profile>-<host>-<pid>)")
 	return cmd
+}
+
+// taskVersionLockHeaders is what a version write sends so the server can
+// judge it against the draft's edit lock: the caller's editor identity, and
+// the lock token when the caller holds the lock.
+func taskVersionLockHeaders(lockToken, clientID string) map[string]string {
+	headers := map[string]string{}
+	if clientID != "" {
+		headers["X-Lock-Client-Id"] = clientID
+	}
+	if lockToken != "" {
+		headers["X-Lock-Token"] = lockToken
+	}
+	return headers
+}
+
+// postTaskVersion performs the version write and turns the server's 423 into
+// an error that says what to do about it.
+func postTaskVersion(c *client.Client, alias string, body json.RawMessage, lockToken, clientID string) (json.RawMessage, error) {
+	path := fmt.Sprintf("/v2/tasks/%s", alias)
+	data, status, err := c.DoWithHeaders("POST", "borrower_central", path, body, taskVersionLockHeaders(lockToken, clientID))
+	if err != nil {
+		if status == 423 || strings.Contains(err.Error(), "HTTP 423") {
+			return nil, fmt.Errorf("%w\n"+
+				"# task %q is a node of a workflow whose draft is being edited (a Hub tab, possibly your own).\n"+
+				"# Wait for the editor to close the tab, or hold the lock yourself: `altscore workflows-v2 lock acquire <alias>` and re-run with --lock-token.", err, alias)
+		}
+		return nil, err
+	}
+	return data, nil
 }
 
 func makeTv2GetCmd() *cobra.Command {

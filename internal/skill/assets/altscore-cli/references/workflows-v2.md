@@ -310,7 +310,13 @@ altscore tasks-v2 create --body '{
   "mode":"single","savePackages":true,"timeout":60
 }'
 
-# Bump version (existing nodes pinning v1 are unaffected)
+# Bump version (existing nodes pinning v1 are unaffected). A DRAFT floats on the
+# latest version, so this EDITS every draft whose graph points at the task: the
+# server applies their edit lock and answers 423 when a Hub tab has one open,
+# including your own tab (the CLI identifies itself as a separate editor via
+# X-Lock-Client-Id). `workflows-v2 lock get <wf>` first; pass --lock-token to
+# write as the holder. Define a custom variable (autosave) BEFORE the version
+# that selects it, never after.
 altscore tasks-v2 create-version fetch-ecu --body '{
   "label":"Fetch ECU bureau v2",
   "type":"altdata-enrichment",
