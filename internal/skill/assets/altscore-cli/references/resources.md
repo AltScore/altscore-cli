@@ -112,6 +112,9 @@ altscore executions get-output-attachments <execution-id> | jq '.[].url'
 ### Packages (read-only)
 
 ```bash
-altscore packages list --filter alias=credit-report --per-page 5
-altscore packages get <id>
+altscore packages list --filter borrower-id=<id> | jq -r '.[] | "\(.id)\t\(.alias)"'   # what the test borrower has
+altscore packages get <id>            # envelope: alias, borrowerId, sourceId, tags, contentType
+altscore packages content <id>        # the stored payload a package-io node reads: real field names and values
 ```
+
+Before authoring a rule or a custom variable over a package, run `packages content` on the test borrower's package: the field names in a brief are a description, the content is the contract. A field the brief names and the content lacks is a question for the user, not a fallback in Python.

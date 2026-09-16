@@ -55,11 +55,15 @@ altscore-cli/
 │   ├── client/{client,auth,urls}.go       # HTTP client, OAuth2, env base URLs
 │   ├── config/config.go                   # TOML (~/.config/altscore/config.toml)
 │   ├── output/output.go                   # JSON to stdout
-│   └── version/version.go                 # feeds rootCmd's Version field in cmd/root.go
-└── .claude/skills/altscore-api/
-    ├── SKILL.md
-    └── references/                        # 12 files incl. workflows-v2.md, workflows-v1.md
+│   ├── version/version.go                 # feeds rootCmd's Version field in cmd/root.go
+│   └── skill/                             # go:embed of the Claude Code skill + install/refresh (cmd/skill.go)
+│       └── assets/altscore-cli/
+│           ├── SKILL.md
+│           └── references/                # 13 files incl. workflows-v2.md, workflows-v1.md
+└── .claude/skills/altscore-cli -> ../../internal/skill/assets/altscore-cli   # symlink: repo-local loading
 ```
+
+The skill is edited under `internal/skill/assets/altscore-cli/` and ships inside the binary; `altscore skill install` writes it to `~/.claude/skills/altscore-cli` with a marker, and `altscore update` (or the first command after an update) refreshes a managed install. Never edit `~/.claude/skills/altscore-cli` directly.
 
 ## workflows-v2 (the CLI's largest surface)
 

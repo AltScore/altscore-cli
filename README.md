@@ -9,6 +9,7 @@ Requires `gh` (GitHub CLI) with access to the AltScore org.
 ```bash
 gh release download --repo AltScore/altscore-cli --pattern "altscore-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')" --output /usr/local/bin/altscore --clobber
 chmod +x /usr/local/bin/altscore
+altscore skill install   # the Claude Code skill that teaches agents this CLI
 ```
 
 Or build from source (requires Go 1.25+):
@@ -58,7 +59,17 @@ All commands output JSON to stdout. Use `--help` on any command to see fields, f
 
 ## Claude Code Skill
 
-This repo includes a Claude Code skill at `.claude/skills/altscore-api/SKILL.md` that gives agents full access to the API through the CLI.
+The binary embeds the Claude Code skill `altscore-cli` (`internal/skill/assets/altscore-cli/`), which gives agents full access to the API through the CLI. Install it once:
+
+```bash
+altscore skill install          # writes ~/.claude/skills/altscore-cli and stamps a marker
+altscore skill status           # installed? managed? same version as the binary?
+altscore skill install --force  # replace a hand-copied skill directory
+```
+
+A managed install is refreshed by `altscore update` and by the first command run after a new version lands, so skill and CLI always carry the same tag. A directory without the marker is a hand copy and is never overwritten without `--force`. Set `CLAUDE_CONFIG_DIR` to target a non-default Claude Code config directory, or `--dir` for a project-local install.
+
+Inside this repo the skill also loads from the checkout: `.claude/skills/altscore-cli` is a symlink to the embedded assets, so editing the skill and running it from here is the same file. Edit the skill under `internal/skill/assets/`, never in `~/.claude/skills/`.
 
 ## Release
 

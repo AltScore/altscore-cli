@@ -126,6 +126,8 @@ func queryLatestWorkflowByAliasStatus(c *client.Client, alias, status string) (m
 // "all-types" become invisible.
 //
 // Rules (must match BC byte-for-byte):
+//   - fold diacritics to their base letter (BC: NFKD + drop combining marks),
+//     so "Validación" slugs to "validacion", never "validaci-n"
 //   - lowercase + strip
 //   - replace any run of non-[a-z0-9] with "-"
 //   - collapse repeated "-"
@@ -133,7 +135,7 @@ func queryLatestWorkflowByAliasStatus(c *client.Client, alias, status string) (m
 //   - cap at 100 chars
 //   - default to "workflow" when empty
 func slugifyWorkflowLabel(label string) string {
-	s := strings.ToLower(strings.TrimSpace(label))
+	s := strings.ToLower(strings.TrimSpace(foldDiacritics(label)))
 	var b strings.Builder
 	b.Grow(len(s))
 	prevDash := false
@@ -154,4 +156,56 @@ func slugifyWorkflowLabel(label string) string {
 		out = "workflow"
 	}
 	return out
+}
+
+// diacriticBase maps every Latin letter that NFKD decomposes into a base
+// letter plus combining marks (Latin-1 Supplement and Latin Extended-A) to
+// that base letter. Letters NFKD leaves alone (ß, æ, ø, đ, ł, þ) are absent
+// on purpose: the server does not fold them either, so they still become a
+// hyphen in the slug. Kept as a table so the binary stays free of x/text.
+var diacriticBase = map[rune]rune{
+	'À': 'A', 'Á': 'A', 'Â': 'A', 'Ã': 'A', 'Ä': 'A', 'Å': 'A', 'Ā': 'A', 'Ă': 'A', 'Ą': 'A',
+	'à': 'a', 'á': 'a', 'â': 'a', 'ã': 'a', 'ä': 'a', 'å': 'a', 'ā': 'a', 'ă': 'a', 'ą': 'a',
+	'Ç': 'C', 'Ć': 'C', 'Ĉ': 'C', 'Ċ': 'C', 'Č': 'C',
+	'ç': 'c', 'ć': 'c', 'ĉ': 'c', 'ċ': 'c', 'č': 'c',
+	'Ď': 'D', 'ď': 'd',
+	'È': 'E', 'É': 'E', 'Ê': 'E', 'Ë': 'E', 'Ē': 'E', 'Ĕ': 'E', 'Ė': 'E', 'Ę': 'E', 'Ě': 'E',
+	'è': 'e', 'é': 'e', 'ê': 'e', 'ë': 'e', 'ē': 'e', 'ĕ': 'e', 'ė': 'e', 'ę': 'e', 'ě': 'e',
+	'Ĝ': 'G', 'Ğ': 'G', 'Ġ': 'G', 'Ģ': 'G', 'ĝ': 'g', 'ğ': 'g', 'ġ': 'g', 'ģ': 'g',
+	'Ĥ': 'H', 'ĥ': 'h',
+	'Ì': 'I', 'Í': 'I', 'Î': 'I', 'Ï': 'I', 'Ĩ': 'I', 'Ī': 'I', 'Ĭ': 'I', 'Į': 'I', 'İ': 'I',
+	'ì': 'i', 'í': 'i', 'î': 'i', 'ï': 'i', 'ĩ': 'i', 'ī': 'i', 'ĭ': 'i', 'į': 'i',
+	'Ĵ': 'J', 'ĵ': 'j',
+	'Ķ': 'K', 'ķ': 'k',
+	'Ĺ': 'L', 'Ļ': 'L', 'Ľ': 'L', 'ĺ': 'l', 'ļ': 'l', 'ľ': 'l',
+	'Ñ': 'N', 'Ń': 'N', 'Ņ': 'N', 'Ň': 'N', 'ñ': 'n', 'ń': 'n', 'ņ': 'n', 'ň': 'n',
+	'Ò': 'O', 'Ó': 'O', 'Ô': 'O', 'Õ': 'O', 'Ö': 'O', 'Ō': 'O', 'Ŏ': 'O', 'Ő': 'O',
+	'ò': 'o', 'ó': 'o', 'ô': 'o', 'õ': 'o', 'ö': 'o', 'ō': 'o', 'ŏ': 'o', 'ő': 'o',
+	'Ŕ': 'R', 'Ŗ': 'R', 'Ř': 'R', 'ŕ': 'r', 'ŗ': 'r', 'ř': 'r',
+	'Ś': 'S', 'Ŝ': 'S', 'Ş': 'S', 'Š': 'S', 'ś': 's', 'ŝ': 's', 'ş': 's', 'š': 's',
+	'Ţ': 'T', 'Ť': 'T', 'ţ': 't', 'ť': 't',
+	'Ù': 'U', 'Ú': 'U', 'Û': 'U', 'Ü': 'U', 'Ũ': 'U', 'Ū': 'U', 'Ŭ': 'U', 'Ů': 'U', 'Ű': 'U', 'Ų': 'U',
+	'ù': 'u', 'ú': 'u', 'û': 'u', 'ü': 'u', 'ũ': 'u', 'ū': 'u', 'ŭ': 'u', 'ů': 'u', 'ű': 'u', 'ų': 'u',
+	'Ŵ': 'W', 'ŵ': 'w',
+	'Ý': 'Y', 'Ÿ': 'Y', 'Ŷ': 'Y', 'ý': 'y', 'ÿ': 'y', 'ŷ': 'y',
+	'Ź': 'Z', 'Ż': 'Z', 'Ž': 'Z', 'ź': 'z', 'ż': 'z', 'ž': 'z',
+}
+
+// foldDiacritics strips accents the way BC's fold_to_ascii does for the
+// letters that matter to alias derivation, and also drops stray combining
+// marks (U+0300..U+036F) so a decomposed input folds the same as a composed one.
+func foldDiacritics(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if base, ok := diacriticBase[r]; ok {
+			b.WriteRune(base)
+			continue
+		}
+		if r >= 0x0300 && r <= 0x036F {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

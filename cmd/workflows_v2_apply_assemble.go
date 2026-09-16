@@ -328,6 +328,13 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		}
 	}
 
+	// Advisory: client-facing text written in Spanish with the accents dropped
+	// (labels, titles, PDF headings). Cheap to fix in the spec, expensive after
+	// publish, so it fires here as well as on `lint`.
+	if f, ok := adviseDiacritics(humanStringsFromSpec(spec)); ok {
+		printReadabilityFindings(os.Stderr, []readabilityFinding{f})
+	}
+
 	// persona is required by CreateBorrower's Literal["individual","business"]
 	// validator on the new-borrower path. It is a property of the workflow's
 	// DESIGN (a cedula flow is always "individual", a RUC flow always

@@ -160,6 +160,7 @@ exists, the existing draft is returned unless --force-recreate is set.`,
 			if err != nil {
 				return err
 			}
+			noteCreateDraftResult(cmd.ErrOrStderr(), data)
 			return output.RawJSON(data)
 		},
 	}
@@ -457,15 +458,16 @@ Locks are keyed by workflow ALIAS. A UUID argument is resolved to its alias
 first -- locking a raw id would create a lock nobody else looks at (the Hub and
 the autosave/publish guard both key by alias), leaving you unprotected while
 believing otherwise.`,
-		Args:    cobra.ExactArgs(1),
-		Example: `  altscore workflows-v2 lock acquire my-wf --client-id cli-$(uuidgen)`,
+		Args: cobra.ExactArgs(1),
+		Example: `  altscore workflows-v2 lock acquire my-wf
+  altscore workflows-v2 lock acquire my-wf --client-id agent-session-7`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if clientID == "" {
-				return fmt.Errorf("--client-id is required")
-			}
 			c, err := loadClient()
 			if err != nil {
 				return err
+			}
+			if clientID == "" {
+				clientID = defaultLockClientID(c.ProfileName)
 			}
 			alias, err := resolveWorkflowAlias(c, args[0])
 			if err != nil {
@@ -484,7 +486,7 @@ believing otherwise.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&clientID, "client-id", "", "stable identifier for the lock holder (required)")
+	cmd.Flags().StringVar(&clientID, "client-id", "", "stable identifier for the lock holder (default: cli-<profile>-<host>-<pid>, unique to this process)")
 	return cmd
 }
 
@@ -1631,9 +1633,10 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 				headers.executionMode = "async"
 			}
 			path := fmt.Sprintf("/v2/workflows/%s/execute", args[0])
+			useSyncExecuteTimeout(c, headers.executionMode)
 			data, _, err := c.DoWithHeaders("POST", "borrower_central", path, body, headers.asMap())
 			if err != nil {
-				return err
+				return explainExecuteTimeout(err, args[0])
 			}
 			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, args[0], wait, flagVerbose)
 		},
@@ -1730,9 +1733,10 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 				}
 			}
 			path := fmt.Sprintf("/v2/workflows/%s/%s/execute", alias, version)
+			useSyncExecuteTimeout(c, headers.executionMode)
 			data, _, err := c.DoWithHeaders("POST", "borrower_central", path, body, headers.asMap())
 			if err != nil {
-				return err
+				return explainExecuteTimeout(err, alias)
 			}
 			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, workflowID, wait, flagVerbose)
 		},

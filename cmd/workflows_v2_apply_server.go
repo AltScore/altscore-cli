@@ -48,6 +48,9 @@ type serverApplyOptions struct {
 	Publish   *bool
 	ForceLock bool
 	ClientID  string
+	// CreateNew tells the server to create even when a workflow with a
+	// near-identical alias or label already exists in the tenant.
+	CreateNew bool
 }
 
 // serverApplyTask is one entry of the response's tasks[]: what happened to the
@@ -182,6 +185,11 @@ func applyViaServer(c *client.Client, cmd *cobra.Command, flat map[string]any, o
 	}
 	if opts.ClientID != "" {
 		req["clientId"] = opts.ClientID
+	}
+	if opts.CreateNew {
+		// Sent only when set so a backend that predates the near-match guard
+		// never sees an unknown field.
+		req["createNew"] = true
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -333,6 +341,17 @@ func describeServerApplyError(w io.Writer, status int, data json.RawMessage) err
 		fmt.Fprintf(w, "# publish rejected the workflow; tasks and DRAFT %s were written and left in place:\n%s\n", wfID, strings.Join(lines, "\n"))
 		return fmt.Errorf("workflow saved as DRAFT %s but publish rejected it (%d error(s), see above); fix the spec and re-apply, or fix the draft in the builder", wfID, len(lines))
 
+	case subCode == "APPLY_ALIAS_NEAR_MATCH":
+		candidates, _ := env.Details["candidates"].([]any)
+		fmt.Fprintf(w, "# no workflow has alias %q, but %d existing workflow(s) are one typo away:\n", stringOr(env.Details["alias"], "?"), len(candidates))
+		for _, raw := range candidates {
+			cand, _ := raw.(map[string]any)
+			fmt.Fprintf(w, "#   %s  (%s v%v, %q, matched by %s)\n",
+				stringOr(cand["alias"], "?"), stringOr(cand["status"], "?"), cand["version"],
+				stringOr(cand["label"], ""), stringOr(cand["reason"], "alias"))
+		}
+		return fmt.Errorf("%s. If the spec meant one of them, set spec.alias to that alias (apply then UPDATES it); if this is really a new workflow, re-run with --create-new", env.Message)
+
 	case env.Code == "LOCK_CONFLICT" || env.Code == "SELF_LOCK_CONFLICT":
 		holder := "another session"
 		since := ""
@@ -363,6 +382,14 @@ func describeServerApplyError(w io.Writer, status int, data json.RawMessage) err
 		msg += " [errorSubCode=" + subCode + "]"
 	}
 	return errors.New(msg)
+}
+
+// stringOr reads a string out of a decoded JSON value, or returns def.
+func stringOr(v any, def string) string {
+	if s, ok := v.(string); ok && s != "" {
+		return s
+	}
+	return def
 }
 
 // refsFromAny decodes the validation payload's alias -> ref map.

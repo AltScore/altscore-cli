@@ -70,7 +70,7 @@ func mutateAndAutosaveV2(
 
 	if lockToken == "" {
 		if clientID == "" {
-			return nil, fmt.Errorf("either --lock-token or --client-id is required")
+			clientID = defaultLockClientID(c.ProfileName)
 		}
 		if alias == "" {
 			return nil, fmt.Errorf("workflow has no alias; cannot acquire lock")
@@ -151,7 +151,7 @@ func asMap(v any) map[string]any {
 // addLockFlags binds the standard --lock-token / --client-id flags to a command.
 func addLockFlags(cmd *cobra.Command, lockToken, clientID *string) {
 	cmd.Flags().StringVar(lockToken, "lock-token", "", "lockToken from a prior 'lock acquire' (caller-managed)")
-	cmd.Flags().StringVar(clientID, "client-id", "", "client id; if --lock-token is omitted, a lock is acquired and released automatically")
+	cmd.Flags().StringVar(clientID, "client-id", "", "lock holder id used when --lock-token is omitted: a lock is acquired and released automatically (default: cli-<profile>-<host>-<pid>)")
 }
 
 // ===================== Helper subcommands =====================

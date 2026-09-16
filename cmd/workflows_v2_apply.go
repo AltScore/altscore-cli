@@ -76,6 +76,7 @@ func makeWfv2ApplyCmd() *cobra.Command {
 	var noAutoDefaults bool
 	var noLayout bool
 	var forceLock bool
+	var createNew bool
 
 	cmd := &cobra.Command{
 		Use:     "apply",
@@ -315,6 +316,7 @@ End-node output (endConfig on the 'end' node):
 				Publish:   publishOpt,
 				ForceLock: forceLock,
 				ClientID:  fmt.Sprintf("apply-%d", time.Now().UnixNano()),
+				CreateNew: createNew,
 			})
 			if err != nil {
 				return err
@@ -330,6 +332,7 @@ End-node output (endConfig on the 'end' node):
 	cmd.Flags().BoolVar(&allowStealOwnership, "allow-steal-ownership", false, "permit apply to transfer a credit-decisioning entity's workflowAlias when it is currently owned by ANOTHER workflow. Default: refuse and instruct the spec author to clone the entity with a new code. Use only for rare workflow rename / identity migration / decommissioning scenarios")
 	cmd.Flags().BoolVar(&noAutoDefaults, "no-auto-defaults", false, "disable apply's opinionated convenience defaults: (1) end-node borrower_id/billable_id wired to the single customer node's borrower_id, (2) end-node PDF generation (pdfConfig.enabled+pdfGenerationRequired default to true), (3) deal-contact identity_value back-filled from each contact's identity_key field (default tax_id). Each only fills an absent field; caller-supplied values always win -- an explicit pdfConfig.enabled=false keeps the report off")
 	cmd.Flags().BoolVar(&forceLock, "force-lock", false, "take the workflow's edit lock even when a live session holds it. The server holds the lock only for the duration of the request; by default a lock held by an open Hub tab makes apply refuse, naming the holder. Forcing discards whatever that session has unsaved")
+	cmd.Flags().BoolVar(&createNew, "create-new", false, "create the workflow even when the tenant already has one whose alias or label is one typo away from the spec's. By default apply refuses that case (APPLY_ALIAS_NEAR_MATCH) and lists the candidates, because the usual cause is an alias copied from a brief instead of from `workflows-v2 list` and the right move is to set spec.alias to the existing one")
 	cmd.Flags().BoolVar(&noLayout, "no-layout", false, "skip auto-layout of the canvas. By default apply positions nodes in left-to-right columns (the same algorithm as the Hub builder's Align button) so the graph opens readable; with this flag nodes ship on a single row at a 200px pitch and overlap until someone clicks Align. Auto-layout is also skipped when the spec pins `position` on any node")
 	return cmd
 }

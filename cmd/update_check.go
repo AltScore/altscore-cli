@@ -38,6 +38,7 @@ func init() {
 	// happens in a detached child) and never returns an error.
 	rootCmd.PersistentPostRunE = func(cmd *cobra.Command, args []string) error {
 		updateCheckHook(cmd)
+		skillRefreshHook(cmd)
 		return nil
 	}
 }
@@ -191,7 +192,9 @@ func runBackgroundCheck() {
 	_ = saveUpdateState(updateState{LastChecked: time.Now(), LatestVersion: rel.TagName})
 
 	if os.Getenv("ALTSCORE_DO_AUTO_UPDATE") == "1" && version.Compare(rel.TagName, version.Version) > 0 {
-		_ = performUpdate(rel, nil)
+		if err := performUpdate(rel, nil); err == nil {
+			refreshSkillAfterUpdate(io.Discard)
+		}
 	}
 }
 
