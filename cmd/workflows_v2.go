@@ -2063,48 +2063,58 @@ Returns a list of suggested mappings. May return 503 if the LLM is not configure
 
 // ===================== Schema guide =====================
 
+// wfv2SchemaGuidePath builds the query for GET /v1/meta/workflows-v2-schema.
+// No args is the INDEX (one line + token cost per section); --full is the
+// whole guide; one arg is a section; "tasks <type>" narrows to one task type.
+// A section argument wins over --full, as it does on the server.
+func wfv2SchemaGuidePath(args []string, full bool) string {
+	path := "/v1/meta/workflows-v2-schema"
+	if len(args) == 0 {
+		if full {
+			return path + "?full=true"
+		}
+		return path
+	}
+	path += "?section=" + url.QueryEscape(args[0])
+	if len(args) > 1 {
+		path += "&type=" + url.QueryEscape(args[1])
+	}
+	return path
+}
+
 func makeWfv2SchemaGuideCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "schema-guide [section]",
+	var full bool
+	cmd := &cobra.Command{
+		Use:   "schema-guide [section] [type]",
 		Short: "Canonical reference for v2 workflow shape (nodes, edges, tasks, examples, ...)",
 		Long: `Fetch the canonical reference for v2 workflow construction from the
 backend (/v1/meta/workflows-v2-schema).
 
-Available sections (run with no arg to see the full structure):
-  architecture                          tasks-first overview
-  endpoints                             /v2 routes the CLI wraps
-  nodes                                 graph node shape (camelCase fields)
-  edges                                 graph edge shape
-  variables                             input/custom/system/task_outputs scopes
-  mappings                              inputMappings rules + multi-dot syntax
-  tasks                                 per-type config (perType + deprecatedTypes)
-  taskTypes                             lean machine-readable type list (live, enum-derived)
-  composeSpec                           the spec format used by 'workflows-v2 apply'
-  conditions                            ConditionGroup operator vocabulary
-  creditDecisioningEntities             /v1/{evaluation-rules,mapping-tables,scorecards,rule-trees}
-  examples                              full minimal_shell + scoring_pipeline templates
-  gotchas                               common apply mistakes + fixes
-  gotchas_about_branches_and_inputkeys  conditional pitfalls
-  preflightChecks                       validation order before apply persists`,
+With no argument it prints the INDEX: every section with a one-line summary
+and its approximate token cost. Pick a section from there. The whole guide
+is ~50k tokens and is only printed with --full.
+
+  schema-guide                 the index (section names, summaries, sizes)
+  schema-guide <section>       one section: nodes, edges, variables, mappings, composeSpec, ...
+  schema-guide tasks <type>    one task type: hand-written notes + introspected fields
+  schema-guide --full          everything at once`,
 		Example: `  altscore workflows-v2 schema-guide
-  altscore workflows-v2 schema-guide tasks
   altscore workflows-v2 schema-guide composeSpec
+  altscore workflows-v2 schema-guide tasks deal
   altscore workflows-v2 schema-guide tasks | jq '.tasks.perType | keys'`,
-		Args: cobra.MaximumNArgs(1),
+		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
 			if err != nil {
 				return err
 			}
-			path := "/v1/meta/workflows-v2-schema"
-			if len(args) > 0 {
-				path += "?section=" + url.QueryEscape(args[0])
-			}
-			data, _, err := c.Do("GET", "borrower_central", path, nil)
+			data, _, err := c.Do("GET", "borrower_central", wfv2SchemaGuidePath(args, full), nil)
 			if err != nil {
 				return err
 			}
 			return output.RawJSON(data)
 		},
 	}
+	cmd.Flags().BoolVar(&full, "full", false, "Print the whole guide (~50k tokens) instead of the index")
+	return cmd
 }
