@@ -643,7 +643,7 @@ func normalizeCategoryTask(task map[string]any) error {
 }
 
 // childInputVariablesCache memoizes /v2/workflows/<alias>/latest within a
-// single compose run, to warn when a single-mode child-workflow has required
+// single compose run, to warn when a mapping-fed child-workflow has required
 // inputs that the parent task's inputMappings doesn't cover.
 var childInputVariablesCache = map[string]map[string]any{}
 
@@ -673,17 +673,20 @@ func lookupChildInputVariables(c *client.Client, alias string, dryRun bool) (map
 	return iv, nil
 }
 
-// normalizeChildWorkflowTask warns when a single-mode child-workflow's
-// required inputs aren't covered by the parent's inputMappings. preflightTasks
-// already renamed executorAlias -> executorId; by the time this runs the alias
-// lives on “executorId“.
+// normalizeChildWorkflowTask warns when a mapping-fed child-workflow's
+// required inputs aren't covered by the parent's inputMappings. The child
+// receives exactly what feeds it: the resolved inputExpression when there is
+// one, otherwise this node's inputMappings and nothing else from the parent
+// (HQ #1694), so an unmapped required input is truly absent at runtime.
+// preflightTasks already renamed executorAlias -> executorId; by the time this
+// runs the alias lives on “executorId“.
 func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bool) error {
 	executor, _ := task["executorId"].(string)
 	if executor == "" {
 		return nil
 	}
 	runInBatch, _ := task["runInBatch"].(bool)
-	// Coverage warning only applies to single-mode dispatch; batch mode
+	// Coverage warning only applies to mapping-fed dispatch; batch mode
 	// reads inputs from the resolved inputExpression, not inputMappings.
 	if runInBatch {
 		// In batch mode, every item in the upstream array auto-binds
@@ -730,6 +733,13 @@ func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bo
 				label, bareNames)
 			task["inputMappings"] = validMappings
 		}
+		return nil
+	}
+	// A single child fed by an inputExpression (one resolving to a dict) never
+	// reads its inputMappings either, so checking them would flag a correctly
+	// authored node. Same predicate as the Hub's
+	// childWorkflowSuppliesInputsByExpression.
+	if expr, _ := task["inputExpression"].(string); strings.TrimSpace(expr) != "" {
 		return nil
 	}
 	inputVariables, err := lookupChildInputVariables(c, executor, dryRun)
