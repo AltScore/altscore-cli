@@ -596,6 +596,9 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 | Custom variable | `custom.<name>` | `custom.normalized_score` |
 | System | `system.<key>` | `system.workflow_execution_id` |
 | Indexed by type | `task_outputs_by_type.<taskType>[<idx>].<field>` | `task_outputs_by_type.altdata-enrichment[0].result` |
+| Entity (DB read at run time) | `entity.<root>.<group>.<key>[.<subkey>]` | `entity.borrower.identities.tax_id`, `entity.<ref>:relpick-<id>.points_of_contact.email` |
+
+**`entity.*` reads the database, not a task output.** The workflow passes the value through verbatim and the CONSUMING node resolves it when it runs (`StandardActivity.run` -> `EntityResolver`); a null with no mapping default drops the input. Roots: `borrower` / `deal` (the workflow's primary ones) or `<ref>:<handle>` — the contact behind ONE per-item handle of a `relationships` / `deal` node (`rel-<id>` and `relpick-<id>` resolve to that item's `contact_id`, `deal-<id>` and `dealpick-<id>` to its `borrower_id`). Groups: `identities.<key>`, `borrower_fields.<key>[.amount|.currency]`, `points_of_contact.<email|phone>` (the primary one per method), `addresses[.<field>]` (the first address; `street1`, `city`, `zip_code`, `lat`... or the whole dict when keyless), `metrics.<key>`, `step[.<field>]`, `deal_fields.<key>` (deal roots only) and `id` (the entity's own id, no read). A SENSITIVE identity is decrypted here with audit and stored redacted in the execution record; every task output, the customer read node's included, carries `__sensitive__` instead. Write the spec REF in the root: `apply` remaps `entity.<ref>:` to the server alias like `task_outputs.<ref>`. The whole mapping value must be the reference; it is not interpolated inside templates or `compute-variables` Python. Full contract: `altscore workflows-v2 schema-guide mappings` -> `entityReferences`.
 
 **`documents.<key>.base64` (also `.fileName`, `.mimeType`, `.extension`, `.sizeBytes`, `.files`) is not a resolver namespace but an `http`-task second pass:** it is only valid inside that task's `body` for a `<key>` declared in the task's `documents` list, the http activity fills it in late exactly like End's `{{self.pdf_url}}`, and `apply` passes it through untouched.
 
@@ -750,21 +753,27 @@ A `deal` or `relationships` node that carries **inline items** exposes one outpu
 
 **Handle naming** (used in the edge's `sourceHandle`):
 
-| Source node | Inline item field | Handle per item |
-|---|---|---|
-| `relationships` | (relationship items) | `rel-<id>` |
-| `deal` | `contacts` | `deal-<id>` |
+| Source node | Mode | Item field | Handle per item |
+|---|---|---|---|
+| `relationships` | write (default) | `relationshipsConfig.items` | `rel-<id>` |
+| `deal` | write (default) | `contacts` | `deal-<id>` |
+| `relationships` | `operation: read` | `readRelationshipsConfig.picks` | `relpick-<id>` |
+| `deal` | `operation: read` | `readDealContactsConfig.picks` | `dealpick-<id>` |
 
-The `<id>` is the item's `id` within the inline array (e.g. the first item → `deal-0` / `rel-0`).
+The `<id>` is the item's `id` within the array (e.g. the first item → `deal-0` / `rel-0`). A READ-mode **pick** is an author-defined selector (`relationship` + `isLegalRepresentative` + `take: highest|lowest` on relationships; `role_key` + `is_primary` + `take: oldest|newest` on deal) that resolves to ONE existing relationship / deal contact, or to none: an unmatched pick still emits its handle, with `found: false` and null scalars.
 
 **Scoped output keys differ per node type** — a common trap. When `task_outputs.<sourceRef>` is scoped to one item, the keys you can read are:
 
 | Scoped source | Keys available on the scoped item dict |
 |---|---|
-| `relationships` item | `contact_id`, `relationship_id`, `relationship`, `ownership_pct` |
-| `deal` contact item | `borrower_id`, `deal_contact_id`, `role_key`, `is_primary` |
+| `relationships` item (`rel-`) | `contact_id`, `relationship_id`, `relationship`, `ownership_pct`, `is_legal_representative`, `is_active`, `priority` |
+| `deal` contact item (`deal-`) | `deal_id`, `borrower_id`, `deal_contact_id`, `role_key`, `is_primary` |
+| `relationships` pick (`relpick-`) | `found`, plus the relationship item keys above (null when `found` is false) |
+| `deal` contact pick (`dealpick-`) | `found`, plus the deal contact item keys above (null when `found` is false) |
 
 > **No `contact_id` on a scoped deal item.** A deal contact item exposes `borrower_id` (the party being attached) and `deal_contact_id` (the DealContact join-row id) — NOT `contact_id`. Reading `task_outputs.<dealRef>.contact_id` off a scoped deal item returns None. Use `borrower_id` for the party and `deal_contact_id` for the join row. (Relationships items are the inverse: they DO carry `contact_id`, plus `relationship_id`.)
+
+> **The item dict identifies the contact; it does not describe them.** Names, tax ids, email, phone, birth date and address of the matched contact are NOT keys of the item or pick dict, and you do not need a `customer(read)` subflow behind a `compute-variables` glue node to get them. Read them on the consuming node through the entity scope, root `<ref>:<handle>`: `{"lr_curp": "entity.relaciones:relpick-_TcuAUWL.identities.curp", "lr_email": "entity.relaciones:relpick-_TcuAUWL.points_of_contact.email", "lr_birth_date": "entity.relaciones:relpick-_TcuAUWL.borrower_fields.birth_date", "lr_city": "entity.relaciones:relpick-_TcuAUWL.addresses.city"}`. This works on a node scoped through the handle AND on a node that converges from several picks (the End node, typically), because the resolver reads `items_by_handle.<handle>` explicitly — so one End can lay out the legal representative's and the main contact's data side by side. It is also the only path that decrypts a sensitive identity (with audit); the customer read node returns `__sensitive__`. See "Variable resolution syntax" above.
 
 **Inline `contacts` field on a deal task** — the field that drives `deal-<id>` handles. Shape:
 
@@ -862,7 +871,7 @@ The **inline `contacts` field is the ONLY supported way to attach deal contacts*
 }
 ```
 
-For a `relationships` source the only changes are: use `sourceHandle: "rel-0"`, and read the relationships scoped keys (`contact_id`, `relationship_id`, `relationship`, `ownership_pct`) instead of the deal ones.
+For a `relationships` source the only changes are: use `sourceHandle: "rel-0"`, and read the relationships scoped keys (`contact_id`, `relationship_id`, `relationship`, `ownership_pct`) instead of the deal ones. For a READ-mode pick use `relpick-<id>` / `dealpick-<id>` and check `found` first.
 
 > **Anti-pattern: extraction probes.** The worked example above shows the *mechanics* of scoping, but the cleaner design is that scoped values flow **directly via `inputMappings`** into the nodes that consume them. Do NOT create a `compute-variables` node plus a custom variable whose expression merely extracts a scoped scalar (a pure pass-through like `result = inputs.get("task_outputs.<alias>.<field>")`). A node reachable only through a `rel-<id>`/`deal-<id>` handle already runs scoped, so the consuming node can reference `task_outputs.<alias>.<field>` in its own `inputMappings` and get THAT item's value — the probe node and the custom variable add nothing but indirection. Reserve custom variables for values a **rule or scorecard actually evaluates** (derived/computed figures), not for plain extraction. The cleaner shape for the example above drops the `probe` compute-variables node and its `scoped_deal_contact_id` custom variable, and wires the downstream node directly:
 >
