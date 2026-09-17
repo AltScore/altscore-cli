@@ -609,6 +609,47 @@ func preflightTasks(spec *composeSpec) error {
 					"node ref=%q: child-workflow failurePolicy=%q is invalid. Must be \"fail-fast\" or \"best-effort\" (default: \"best-effort\")",
 					ref, fp)
 			}
+			dm, _ := task["dispatchMode"].(string)
+			if dm != "" && dm != "inline" && dm != "async-batch" {
+				return fmt.Errorf(
+					"node ref=%q: child-workflow dispatchMode=%q is invalid. Must be \"inline\" or \"async-batch\" (default: \"inline\")",
+					ref, dm)
+			}
+			if irp, _ := task["invalidRowPolicy"].(string); irp != "" && irp != "fail" && irp != "skip" {
+				return fmt.Errorf(
+					"node ref=%q: child-workflow invalidRowPolicy=%q is invalid. Must be \"fail\" or \"skip\" (default: \"fail\")",
+					ref, irp)
+			}
+			if dm == "async-batch" {
+				// Hard error, not a warning: async dispatch hands a LIST of rows to
+				// the batch engine, so without inputExpression the node resolves a
+				// dict and fails at runtime. Better to say so at apply time.
+				if _, hasExpr := task["inputExpression"].(string); !hasExpr {
+					return fmt.Errorf(
+						"node ref=%q: child-workflow dispatchMode=\"async-batch\" requires 'inputExpression'. "+
+							"Async dispatch batches over a list; set it to an expression that resolves to one "+
+							"(e.g. \"task_outputs.build-rows.items\").",
+						ref)
+				}
+				// Neither survives into a platform batch: it owns its own dispatch
+				// rate and its own per-row failure handling.
+				for _, inert := range []string{"maxConcurrency", "failurePolicy"} {
+					if _, has := task[inert]; has {
+						fmt.Fprintf(os.Stderr,
+							"# warning: tasks[%d] (ref=%q): child-workflow %s is ignored when dispatchMode is "+
+								"\"async-batch\" -- the platform batch owns concurrency and per-row failure. "+
+								"Drop it, or switch to dispatchMode \"inline\" if you need it.\n",
+							i, ref, inert)
+					}
+				}
+			}
+			if irp, _ := task["invalidRowPolicy"].(string); irp != "" && dm != "async-batch" {
+				fmt.Fprintf(os.Stderr,
+					"# warning: tasks[%d] (ref=%q): child-workflow invalidRowPolicy is only read when "+
+						"dispatchMode is \"async-batch\"; this node dispatches inline, which does not "+
+						"validate rows at all.\n",
+					i, ref)
+			}
 		case "compute-variables":
 			// A compute-variables node's inputMappings keys ARE names in that
 			// node's own activity context, so a custom variable may declare one

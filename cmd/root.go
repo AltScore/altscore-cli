@@ -418,6 +418,13 @@ such as a scoring model run or data retrieval.`,
   workflow-id           Workflow ID
   workflow-alias        Workflow alias
   billable-id           Billable ID
+  execution-batch-id    Rows of one batch. NOTE the query name differs from the
+                        response field, which is 'batchId' -- '--filter batch-id'
+                        is not a real filter and is silently ignored, so it
+                        returns the whole unfiltered list.
+  parent-execution-id   Children of one run (inline subflow fan-out only; an
+                        async-batch subflow creates its rows through the batch
+                        engine, so use execution-batch-id for those)
   status                Execution status
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
@@ -448,6 +455,8 @@ Supports pause, resume, cancel, and retry operations.`,
 		ResponseSchema: `  id, workflowId, status, totalItems, processedItems, tags, isTest,
   createdAt, updatedAt`,
 		FilterHelp: `  workflow-id           Workflow ID
+  parent-execution-id   Batches an async-batch subflow node dispatched from one
+                        workflow execution
   status                Batch status
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,

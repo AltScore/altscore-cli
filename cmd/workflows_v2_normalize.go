@@ -415,6 +415,21 @@ func validateTaskV2BodyStructural(body json.RawMessage, existingTypes map[string
 					"(an expression resolving to a list, e.g. \"inputs.cuit_list\"); without it BC's batch dispatcher has nothing to fan out over")
 			}
 		}
+		// Reached by `tasks-v2 create` / `create-version`, which never go through
+		// compose preflight, so the same two enums have to be checked here too.
+		dispatchMode, _ := task["dispatchMode"].(string)
+		if dispatchMode != "" && dispatchMode != "inline" && dispatchMode != "async-batch" {
+			return fmt.Errorf("child-workflow task has dispatchMode %q; must be \"inline\" or \"async-batch\" (default: \"inline\")", dispatchMode)
+		}
+		if irp, _ := task["invalidRowPolicy"].(string); irp != "" && irp != "fail" && irp != "skip" {
+			return fmt.Errorf("child-workflow task has invalidRowPolicy %q; must be \"fail\" or \"skip\" (default: \"fail\")", irp)
+		}
+		if dispatchMode == "async-batch" {
+			if expr, _ := task["inputExpression"].(string); strings.TrimSpace(expr) == "" {
+				return fmt.Errorf("child-workflow task with dispatchMode=\"async-batch\" requires inputExpression " +
+					"(an expression resolving to a list); async dispatch batches over a list, and without one the node resolves a dict and fails at runtime")
+			}
+		}
 	}
 	return nil
 }
