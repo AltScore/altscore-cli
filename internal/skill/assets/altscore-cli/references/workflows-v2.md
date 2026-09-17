@@ -25,7 +25,7 @@
 >
 > 2. **`altdata-enrichment` tasks need `inputKeys` to wire source-required fields.** Each source (e.g. `ECU-PUB-0002`) declares `inputFields` like `personId`, `taxId`. The task must include `inputKeys: {"personId": "{{personId}}", "taxId": "{{taxId}}"}` matched against an `inputSchema` that declares those keys, plus `dataAge` (cache TTL minutes, default 30) and `packageAlias` (where to store results) on each `sourcesConfig` entry. `apply` auto-derives `inputKeys` by querying `sources-status` for each source's `inputFields` — use it.
 >
-> Run `altscore workflows-v2 schema-guide conditions` and `... schema-guide tasks` for the canonical reference.
+> Run `altscore workflows-v2 schema-guide conditions` and `... schema-guide tasks <type>` for the canonical reference.
 
 Workflows V2 is the API surface for the visual graph builder in the Hub. It uses **two collaborating resources**:
 
@@ -43,13 +43,16 @@ After creating a workflow, run `altscore workflows-v2 lint <id>` to verify there
 For canonical field-by-field reference run:
 
 ```bash
-altscore workflows-v2 schema-guide               # full guide
-altscore workflows-v2 schema-guide architecture  # the tasks-first explanation
-altscore workflows-v2 schema-guide nodes         # node shape (camelCase: nodeId, label, taskAlias, ...)
-altscore workflows-v2 schema-guide edges         # edge shape (sourceNodeId, targetNodeId)
-altscore workflows-v2 schema-guide tasks         # task shape + per-type config fields
-altscore workflows-v2 schema-guide examples      # full scoring_pipeline template
+altscore workflows-v2 schema-guide                # INDEX: every section, one line + token cost. Start here.
+altscore workflows-v2 schema-guide architecture   # the tasks-first explanation
+altscore workflows-v2 schema-guide nodes          # node shape (camelCase: nodeId, label, taskAlias, ...)
+altscore workflows-v2 schema-guide edges          # edge shape (sourceNodeId, targetNodeId)
+altscore workflows-v2 schema-guide tasks deal     # ONE task type: hand-written notes + introspected fields (1-4k tokens)
+altscore workflows-v2 schema-guide tasks          # every type at once (~24k tokens); only when comparing types
+altscore workflows-v2 schema-guide examples       # full scoring_pipeline template
 ```
+
+The whole guide is ~50k tokens; `--full` prints it, and nothing in this file needs it. Fetch the section that answers the question in front of you.
 
 #### Discovery before authoring (infer first, ask only what nobody wrote down)
 
@@ -67,7 +70,7 @@ altscore workflows-v2 schema-guide examples      # full scoring_pipeline templat
 | Structure: orchestrator plus per-party child, fan-out, two-layer decisioning | [kyc-kyb-habits](kyc-kyb-habits.md) |
 | Whether a change is visible to others (update path) | `workflows-v2 schedule get <id>`, and other workflows whose `child-workflow` nodes carry this alias as `executorId` |
 
-Anything the spec can default is yours as well: labels, positions, aliases and refs, branch ids, `inputKeys`, publish policy (DRAFT on create). Never ask which field a task type uses; read `schema-guide tasks`.
+Anything the spec can default is yours as well: labels, positions, aliases and refs, branch ids, `inputKeys`, publish policy (DRAFT on create). Never ask which field a task type uses; read `schema-guide tasks <type>`.
 
 **Ask only what survives the reads.** These are business policy: nothing in the tenant states them, and guessing wrong costs money or a customer. Pick the ones the flow triggers, at most 4.
 
@@ -355,28 +358,19 @@ altscore tasks-v2 list --alias-prefix co2- --per-page 100 | jq -r '.[].alias' > 
 xargs -n1 altscore tasks-v2 delete < /tmp/orphans.txt
 ```
 
-Per-type config (full reference: `schema-guide tasks`):
+Per-type config lives in `altscore workflows-v2 schema-guide tasks <type>`: the hand-written notes and traps for that type plus its fields introspected from the backend model, served live. This file does not restate it. The table that used to sit here had drifted from the runtime (`conditional` branches carry `conditions`, a ConditionGroup, and `isElse`; an `expression` string is silently dropped and the branch becomes a no-op), which is exactly why a copy is worse than a pointer. Two nesting traps are worth keeping in view because the API accepts the wrong shape with a 201:
 
-| type | key fields |
-|---|---|
-| `altdata-enrichment` | `sourcesConfig`, `borrowerIdField`, `mode`, `savePackages` |
-| `evaluate-rules` | `evaluatorTask`, optional `rulesConfig`/`scorecardConfig`/`ruleTreeConfig` |
-| `http` | `url`, `method`, `headers` (JSON string), `body`, auth fields |
-| `conditional` | `branches`: `[{label, expression, is_else}]` |
-| `wait` | `seconds` or `untilCondition` |
-| `compute-variables` | `selectedVariables` |
-| `data-store-write` | `dataStoreWriteConfig` |
-| `data-store-query` | `dataStoreQueryConfig` |
-| `end` | `endConfig: {title, subtitle, brand_logo}` (PDF generation is `endConfig.pdfConfig`, not a task type) |
-| `customer` / `deal` / `asset` | `operation` (`write`/`read`), `lookupBy`, `key`/`identityKey`, `inputSchema`, `inputMappings`, `sourcesConfig` |
-| `category` | `categoryConfig: {operation (read/assign), categoryKey, entityRoot, valueFormat, valueFields, createMissing}` -- every field nests INSIDE `categoryConfig`; a top-level `operation` is silently swallowed by the customer/deal/asset field of the same name |
+- `category`: every field nests INSIDE `categoryConfig`; a top-level `operation` is silently swallowed by the customer/deal/asset field of the same name.
+- `end`: PDF generation is `endConfig.pdfConfig` on the end task, not a task type.
 
 > **Retired types — refused for NEW authoring only.** `create-alert`, `create-borrower`, `create-identity`, `data-store`, `end-old`, `fetch-borrower-entities`, `fetch-entity`, `html-template`, `pdf-report`, `soap`, `update-borrower`, `update-borrower-name`, `webhook`. BC still parses workflows that already use them, and it refuses one only when the incoming graph ADDS it — diffed against the stored graph, so a workflow that already carries such a node stays editable and can be migrated off it. Every CLI path mirrors that rule: `apply` refuses a retired type absent from the target and carries forward one the target already holds (warning on stderr, non-fatal); `tasks-v2 create-version` treats a bump that keeps an already-retired type as a carry-forward; `add-node --type` and `tasks-v2 create` are unambiguously new authoring and always refuse. The refusal is compiled in, so it holds offline. Replacements: `create-borrower`/`update-borrower` → `customer` with `operation: "write"`; `fetch-entity`/`fetch-borrower-entities` → `customer` or `deal` with `operation: "read"`; `create-identity` → the entity-specific tasks; `data-store` → `data-store-write`/`data-store-query`; `pdf-report` → `endConfig.pdfConfig` on `end`; `soap` → `http`. The rest have no replacement.
 
-For `customer` / `deal` / `asset` write tasks the `sourcesConfig` entries map each persisted attribute to a context key. Common entry shapes:
+For `customer` / `deal` / `asset` write tasks the `sourcesConfig` entries map each persisted attribute to a context key. The value always comes from `context[entry.key]` (declare it in `inputSchema`, feed it through `inputMappings`); there is no `value` or `template` field. Common entry shapes:
 
 - `{type: "deal_field", key: "<context_key>", label: "..."}` — write one deal_field record per entry.
-- `{type: "identity", key: "<identity_key>"}` / `{type: "borrower_field", key: "..."}` for customer/asset writes.
+- `{type: "identity", key: "<identity_key>"}` / `{type: "borrower_field", key: "..."}` for customer writes; `{type: "asset_field", key: "..."}` for asset writes.
+
+Each node's full `type` vocabulary and its silent-drop rules are under `schema-guide tasks <customer|deal|asset>` → `sourcesConfig`.
 
 > **Attaching contacts to a deal: inline `contacts` ONLY.** The `deal_contact` (singular) and `deal_contacts` (plural) `sourcesConfig` types are **no longer supported**. Attaching deal contacts via `sourcesConfig` is rejected by `apply`. Declare contacts in the **inline `contacts` field** on the deal node instead — it both persists the DealContact rows and emits the per-contact `deal-<id>` output handles needed for scoping. Set `upsertContacts: true` (top-level on the deal task) to let rows resolve/create borrowers by identity. See [Inline `contacts` field](#per-item-output-scoping) below.
 
