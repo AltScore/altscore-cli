@@ -655,6 +655,45 @@ Caveats worth knowing before you reach for this:
 - **A workflow-level `inputVariables` entry with `type: "secret"` is a dead end.** The type is accepted, but nothing dereferences it against the secret store, so the run sees the literal secretId string. Only the task `inputSchema` path resolves.
 - **Secrets are not written to the task-execution record**, but a compute-variables failure logs a preview of each resolved input at error level — so a failing expression can put the first 32 characters of a key in the logs. Don't hold secrets in variables you also log.
 
+#### Dispatch a batch without waiting for it (`dispatchMode: "async-batch"`)
+
+A `child-workflow` node normally dispatches **and awaits** every child inside one activity, so the
+parent blocks and is bounded by a 600s activity budget, a 300s heartbeat and a single attempt --
+roughly 400 children in practice. When the parent does not need the results in the same run (a
+portfolio re-score fed by an ERP, say), `dispatchMode: "async-batch"` hands the whole list to the
+platform batch engine and returns the batch id immediately.
+
+```jsonc
+{"ref": "rescore-cartera", "type": "child-workflow",
+ "executorId": "preaprobacion-v2",
+ "runInBatch": true,
+ "dispatchMode": "async-batch",
+ "invalidRowPolicy": "fail",              // or "skip"
+ "inputExpression": "task_outputs.build-rows.items"}
+```
+
+Returns a **dispatch receipt**, not results:
+
+```jsonc
+{"executionBatchId": "batch_...", "status": "dispatched",
+ "total": 4200, "dispatched": 4200,
+ "rejectedCount": 0, "rejectedTruncated": false, "rejected": []}
+```
+
+`invalidRowPolicy` decides what happens when a row fails validation against the CHILD's
+`inputVariables`: `fail` (default) refuses the node and creates **no batch**, so a bad feed cannot
+half-run; `skip` dispatches the valid rows and reports the rest in `rejected`. Note the validator
+rejects a **missing** required key, not an empty string. An empty list, or every row rejected under
+`skip`, creates no batch at all and returns `status: "empty"` / `"rejected"` with a null id.
+
+Follow the batch:
+
+```bash
+altscore execution-batches get <executionBatchId>
+altscore executions list --filter execution-batch-id=<executionBatchId>
+altscore execution-batches list --filter parent-execution-id=<parentExecutionId>
+```
+
 #### Gotchas (v2 specific)
 
 - **Tasks first — for every node.** Even `start`/`end` need a backing `/v2/tasks` record. Hub workflows use trivial type-only tasks for those (`{"type":"start","label":"Start"}`). The API saves orphan-node bodies, but the Hub then hits `GET /v2/tasks/null` 404 on render.
@@ -667,6 +706,9 @@ Caveats worth knowing before you reach for this:
 - **`ai suggest-mappings`** returns 503 when the tenant has no LLM configured. Treat as a soft failure.
 - **No tasks LIST endpoint.** Discover task aliases via the workflows that use them, or via the Hub UI.
 - **`secrets.<name>` is not a scope.** To read a stored secret in a node, declare a `secret`-typed `inputSchema` field whose `default` is the secretId — see "Secrets" above.
+- **`dispatchMode: "async-batch"` needs `inputExpression`.** Async dispatch batches over a list; without one the node resolves a dict and fails at runtime, so preflight refuses it. `maxConcurrency` and `failurePolicy` are INERT in that mode (the platform batch owns concurrency and per-row failure) and preflight warns if you set them. `invalidRowPolicy` is read only in that mode.
+- **An async-batch node's children are invisible to the run that launched them.** `executions list --filter parent-execution-id=<parent>` returns NOTHING for one, because the batch engine creates its own rows. Go parent -> batch (`execution-batches list --filter parent-execution-id=`) -> rows (`executions list --filter execution-batch-id=`). Note the executions query name is `execution-batch-id` while the response field is `batchId`; `--filter batch-id=` is not a real filter and is silently ignored, so it returns the whole unfiltered list.
+- **The results email of an async-batch dispatch comes from the CHILD workflow's `batchPolicy`**, read live when the batch finishes -- not from the node and not from the parent workflow. A batch can therefore mail recipients the parent's author never configured; the node emits an info notice when that is the case.
 - **Preflight warns instead of blocking on an unverifiable enum value.** When a task type / workflow category / relationship kind / inputSchema type is absent from this build's compiled-in list *and* the backend's meta endpoint can't be reached, `apply` prints a warning and proceeds rather than rejecting: the CLI cannot tell "invalid" from "newer than me" without the backend, and the backend validates all four on write. A value a *reachable* backend disowns is still a hard error.
 
 
