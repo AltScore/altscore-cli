@@ -11,18 +11,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// /v2/tasks holds the executable config for v2 workflow nodes (HTTP urls,
-// evaluator aliases, sources_config, branches, etc.). Each task has an
-// alias and a version sequence; a workflow node references a task by
-// alias (and optionally pinned version).
-//
-// API endpoints:
-//   POST   /v2/tasks                          create new task
-//   POST   /v2/tasks/{alias}                  create new version
-//   GET    /v2/tasks                          list (paginated, filterable)
-//   GET    /v2/tasks/{alias}                  get latest (with version history)
-//   DELETE /v2/tasks/{alias}                  delete every version of a task
-
 func registerTasksV2(parent *cobra.Command) {
 	group := &cobra.Command{
 		Use:   "tasks-v2",
@@ -121,8 +109,6 @@ Returns the created task DTO including its id, alias, and version=1.`,
 	return cmd
 }
 
-// taskV2BodyType reads the `type` off a tasks-v2 body or task DTO. Empty when
-// the payload is absent or unparseable -- the validators own those complaints.
 func taskV2BodyType(body json.RawMessage) string {
 	var task struct {
 		Type string `json:"type"`
@@ -133,20 +119,8 @@ func taskV2BodyType(body json.RawMessage) string {
 	return task.Type
 }
 
-// deprecatedCarryForwardForTaskVersion answers, for a `tasks-v2 create-version`
-// body, which retired task types the bump merely CARRIES FORWARD -- the set the
-// deprecation gate diffs the body against (see deprecatedTaskTypeRefused).
-//
-// A version bump of an existing task whose type is ALREADY the retired one is
-// not new authoring: the backend takes it by design, so the task stays editable
-// while it is migrated off. Switching a task TO a retired type is new authoring
-// and stays refused, which is why the stored type is read rather than inferred
-// from the alias being known.
-//
-// Costs nothing in the common case -- the GET fires only when the body's own
-// type is retired. Any failure (offline, 404, unparseable, a type that does not
-// match) yields nil, so the refusal stands: the CLI must not end up looser than
-// the server because a lookup hiccuped.
+// A bump of a task whose type is ALREADY retired is not new authoring. Any lookup failure
+// yields nil, so the refusal stands rather than the CLI going looser than the server.
 func deprecatedCarryForwardForTaskVersion(c *client.Client, alias string, body json.RawMessage) map[string]bool {
 	bodyType := taskV2BodyType(body)
 	if !deprecatedTaskTypes[bodyType] {
@@ -220,9 +194,6 @@ from 'workflows-v2 lock acquire' to write as the lock holder.`,
 	return cmd
 }
 
-// taskVersionLockHeaders is what a version write sends so the server can
-// judge it against the draft's edit lock: the caller's editor identity, and
-// the lock token when the caller holds the lock.
 func taskVersionLockHeaders(lockToken, clientID string) map[string]string {
 	headers := map[string]string{}
 	if clientID != "" {
@@ -234,8 +205,6 @@ func taskVersionLockHeaders(lockToken, clientID string) map[string]string {
 	return headers
 }
 
-// postTaskVersion performs the version write and turns the server's 423 into
-// an error that says what to do about it.
 func postTaskVersion(c *client.Client, alias string, body json.RawMessage, lockToken, clientID string) (json.RawMessage, error) {
 	path := fmt.Sprintf("/v2/tasks/%s", alias)
 	data, status, err := c.DoWithHeaders("POST", "borrower_central", path, body, taskVersionLockHeaders(lockToken, clientID))
@@ -387,9 +356,6 @@ from a failed 'workflows-v2 apply' (the typical cleanup path).`,
 			path := fmt.Sprintf("/v2/tasks/%s", alias)
 			data, status, err := c.Do("DELETE", "borrower_central", path, nil)
 			if err != nil {
-				// Surface 409 referencedBy payload as an actionable message so
-				// users see which workflows still pin the task without having
-				// to re-parse the raw envelope.
 				if status == 409 {
 					return formatTv2DeleteConflict(alias, err)
 				}
@@ -411,19 +377,13 @@ from a failed 'workflows-v2 apply' (the typical cleanup path).`,
 	return cmd
 }
 
-// formatTv2DeleteConflict re-parses the server's 409 envelope to surface the
-// referencedBy details inline. Falls back to the raw error if the envelope
-// doesn't match the expected shape.
+// The client's formatHTTPError already stringified the response, so the details payload
+// has to be pulled back out of its (key=value) tail.
 func formatTv2DeleteConflict(alias string, original error) error {
-	// The client formatHTTPError already stringified the response; try to
-	// pull the details payload back out of its (key=value) tail. If that
-	// fails, just return the original error -- the user still sees the
-	// envelope text.
 	msg := original.Error()
 	if !strings.Contains(msg, "referencedBy") {
 		return original
 	}
-	// Look for the JSON-ish referencedBy=[{...}] fragment and try to parse it.
 	start := strings.Index(msg, "referencedBy=")
 	if start < 0 {
 		return original

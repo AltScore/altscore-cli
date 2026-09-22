@@ -2,10 +2,6 @@ package cmd
 
 import "testing"
 
-// spreadsheet-extraction is a backend task type as of borrower-central #1913.
-// Absent from validTaskTypes, preflight falls back to the live-backend lookup
-// and warns that the type is newer than this build -- true but noisy, and it
-// skips per-type local validation entirely.
 func TestSpreadsheetExtractionIsAValidTaskType(t *testing.T) {
 	if !validTaskTypes["spreadsheet-extraction"] {
 		t.Fatalf("spreadsheet-extraction must be in validTaskTypes")
@@ -54,8 +50,6 @@ func TestSpreadsheetExtractionPreflightAcceptsAConfiguredFile(t *testing.T) {
 	}
 }
 
-// The recommended wiring: an upstream http download feeds fileBase64. Counting
-// only config values would report this as a missing source.
 func TestSpreadsheetExtractionPreflightAcceptsAMappedFile(t *testing.T) {
 	err := preflightTasks(spreadsheetSpec(
 		map[string]any{},

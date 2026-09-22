@@ -8,10 +8,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// TestValidateWorkflowV2Body_RenamesCamelCase covers change #1: short/snake
-// node-edge keys (id/source/target) are renamed in place to the camelCase
-// aliases the API expects rather than rejected. Every node here carries a
-// taskAlias so the only thing under test is the rename.
 func TestValidateWorkflowV2Body_RenamesCamelCase(t *testing.T) {
 	body := json.RawMessage(`{
 		"nodes": [
@@ -51,9 +47,6 @@ func TestValidateWorkflowV2Body_RenamesCamelCase(t *testing.T) {
 	}
 }
 
-// TestValidateWorkflowV2Body_ConflictingKeysError covers the one case change #1
-// still rejects: both the short and camelCase keys present with conflicting
-// values. Equal values are tolerated and the short key is just dropped.
 func TestValidateWorkflowV2Body_ConflictingKeysError(t *testing.T) {
 	body := json.RawMessage(`{
 		"nodes": [
@@ -68,7 +61,6 @@ func TestValidateWorkflowV2Body_ConflictingKeysError(t *testing.T) {
 		t.Errorf("expected conflict error, got: %v", err)
 	}
 
-	// Equal values on both keys -> no error, short key dropped.
 	body = json.RawMessage(`{
 		"nodes": [
 			{"id": "a", "nodeId": "a", "type": "start", "taskAlias": "a"}
@@ -85,9 +77,6 @@ func TestValidateWorkflowV2Body_ConflictingKeysError(t *testing.T) {
 	}
 }
 
-// TestRewriteRefsInTemplate_BareSingleToken covers change #3: a bare
-// single-token placeholder is rewritten to its inputMappings long form when
-// resolvable, and left untouched otherwise.
 func TestRewriteRefsInTemplate_BareSingleToken(t *testing.T) {
 	refMap := map[string]string{}
 	localMappings := map[string]any{
@@ -100,7 +89,6 @@ func TestRewriteRefsInTemplate_BareSingleToken(t *testing.T) {
 	}{
 		{"{{borrower_id}}", "{{inputs.borrower_id}}"},
 		{`{"id":"{{tax_id}}"}`, `{"id":"{{task_outputs.fetch.tax_id}}"}`},
-		// Unknown token -> untouched (preserve current behavior).
 		{"{{unknown_token}}", "{{unknown_token}}"},
 	}
 	for _, c := range cases {
@@ -114,8 +102,6 @@ func TestRewriteRefsInTemplate_BareSingleToken(t *testing.T) {
 	}
 }
 
-// TestRewriteRefsInTemplate_NoMappings ensures a bare token with no mappings
-// at all is left untouched (no panic on nil localMappings).
 func TestRewriteRefsInTemplate_NoMappings(t *testing.T) {
 	got, err := rewriteRefsInTemplate("{{borrower_id}}", map[string]string{}, nil)
 	if err != nil {
@@ -126,11 +112,7 @@ func TestRewriteRefsInTemplate_NoMappings(t *testing.T) {
 	}
 }
 
-// TestNormalizeBatchBody covers change #4: a flat single-input body (no
-// top-level 'inputs') is wrapped as {"inputs":[<body>]}; an existing inputs[]
-// array is left as-is; an empty or non-array inputs is an error.
 func TestNormalizeBatchBody(t *testing.T) {
-	// Flat body -> wrapped.
 	out, wrapped, err := normalizeBatchBody(json.RawMessage(`{"borrower_id":"abc"}`))
 	if err != nil {
 		t.Fatalf("flat body errored: %v", err)
@@ -150,7 +132,6 @@ func TestNormalizeBatchBody(t *testing.T) {
 		t.Errorf("wrapped element lost data: %v", arr[0])
 	}
 
-	// Already has inputs[] -> untouched.
 	in := json.RawMessage(`{"inputs":[{"a":1},{"a":2}],"label":"x"}`)
 	out, wrapped, err = normalizeBatchBody(in)
 	if err != nil {
@@ -163,19 +144,14 @@ func TestNormalizeBatchBody(t *testing.T) {
 		t.Errorf("body with inputs[] should pass through unchanged")
 	}
 
-	// Empty inputs -> error.
 	if _, _, err := normalizeBatchBody(json.RawMessage(`{"inputs":[]}`)); err == nil {
 		t.Errorf("empty inputs should error")
 	}
-	// Non-array inputs -> error.
 	if _, _, err := normalizeBatchBody(json.RawMessage(`{"inputs":{"a":1}}`)); err == nil {
 		t.Errorf("non-array inputs should error")
 	}
 }
 
-// TestDeriveAltdataInputKeysForCreate_NoOps covers the cases change #2 must
-// leave untouched: non-altdata bodies, altdata without sources, and altdata
-// that already carries inputKeys.
 func TestDeriveAltdataInputKeysForCreate_NoOps(t *testing.T) {
 	cases := []string{
 		`{"type":"http","url":"https://x"}`,
@@ -194,7 +170,6 @@ func TestDeriveAltdataInputKeysForCreate_NoOps(t *testing.T) {
 	}
 }
 
-// findSubcommand walks the root command tree to find <group> <name>.
 func findSubcommand(t *testing.T, group, name string) *cobra.Command {
 	t.Helper()
 	for _, g := range rootCmd.Commands() {
@@ -210,8 +185,6 @@ func findSubcommand(t *testing.T, group, name string) *cobra.Command {
 	return nil
 }
 
-// TestWorkflowsV2CreateHidden covers change #6: the raw create subcommand is
-// hidden (deprecated in favor of apply) but still present.
 func TestWorkflowsV2CreateHidden(t *testing.T) {
 	create := findSubcommand(t, "workflows-v2", "create")
 	if create == nil {
@@ -225,9 +198,6 @@ func TestWorkflowsV2CreateHidden(t *testing.T) {
 	}
 }
 
-// TestExecuteByAliasVersionOptional covers change #5: the version arg is
-// optional (defaults to latest), so the command accepts 1 or 2 positional
-// args.
 func TestExecuteByAliasVersionOptional(t *testing.T) {
 	cmd := findSubcommand(t, "workflows-v2", "execute-by-alias")
 	if cmd == nil {
@@ -244,9 +214,6 @@ func TestExecuteByAliasVersionOptional(t *testing.T) {
 	}
 }
 
-// TestDeriveAltdataInputKeysForCreate_FallbackError covers change #2's
-// fallback: when the source lookup fails (here: no client), the CLI surfaces
-// the clear "could not derive" guidance rather than shipping an unwired task.
 func TestDeriveAltdataInputKeysForCreate_FallbackError(t *testing.T) {
 	body := json.RawMessage(`{"type":"altdata-enrichment","sourcesConfig":[{"sourceId":"ECU-PUB-0002","version":"v1"}]}`)
 	err := deriveAltdataInputKeysForCreate(nil, &body)
@@ -258,10 +225,7 @@ func TestDeriveAltdataInputKeysForCreate_FallbackError(t *testing.T) {
 	}
 }
 
-// TestValidateWorkflowV2Body_MultipleEndNodes covers the rule: a workflow must
-// have exactly one end node -- no exception, not even behind a conditional.
 func TestValidateWorkflowV2Body_MultipleEndNodes(t *testing.T) {
-	// Two end nodes, no conditional -> error.
 	body := json.RawMessage(`{
 		"nodes": [
 			{"nodeId": "s", "type": "start", "taskAlias": "s"},
@@ -274,7 +238,6 @@ func TestValidateWorkflowV2Body_MultipleEndNodes(t *testing.T) {
 		t.Fatalf("expected single-end-node error, got: %v", err)
 	}
 
-	// Two end nodes WITH a conditional -> still rejected (hard limit, no carve-out).
 	body = json.RawMessage(`{
 		"nodes": [
 			{"nodeId": "s", "type": "start", "taskAlias": "s"},
@@ -287,7 +250,6 @@ func TestValidateWorkflowV2Body_MultipleEndNodes(t *testing.T) {
 		t.Fatalf("a conditional must NOT permit multiple end nodes, got: %v", err)
 	}
 
-	// Single end node -> fine.
 	body = json.RawMessage(`{
 		"nodes": [
 			{"nodeId": "s", "type": "start", "taskAlias": "s"},
@@ -299,9 +261,6 @@ func TestValidateWorkflowV2Body_MultipleEndNodes(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_MultipleEndNodes pins the apply CREATE-path guard: the
-// preflight rejects >1 end node before any /v2 POST (the CREATE path never runs
-// validateWorkflowV2Body).
 func TestPreflightTasks_MultipleEndNodes(t *testing.T) {
 	twoEnds := &composeSpec{
 		Label:      "Two ends",

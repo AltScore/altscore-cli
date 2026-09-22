@@ -5,7 +5,6 @@ import (
 	"testing"
 )
 
-// relTask builds a relationships task body for these tests.
 func relTask(ref string, cfg map[string]any, inputMappings map[string]any) map[string]any {
 	t := map[string]any{
 		"ref":   ref,
@@ -21,11 +20,8 @@ func relTask(ref string, cfg map[string]any, inputMappings map[string]any) map[s
 	return t
 }
 
-// startNode is the minimal start ExtraNode every preflight-passing spec needs.
 var startNode = []map[string]any{{"ref": "start", "type": "start", "label": "Start"}}
 
-// TestPreflightTasks_RelationshipsHappyPath: an inline-config spec with one
-// borrower and three items passes preflight unchanged.
 func TestPreflightTasks_RelationshipsHappyPath(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel happy",
@@ -48,8 +44,6 @@ func TestPreflightTasks_RelationshipsHappyPath(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsVariableBound: items + borrower_id both wired
-// via inputMappings; no inline config. Must pass.
 func TestPreflightTasks_RelationshipsVariableBound(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel mapped",
@@ -68,11 +62,6 @@ func TestPreflightTasks_RelationshipsVariableBound(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsNoBorrowerOK: borrower_id is now OPTIONAL.
-// The backend resolves the anchor borrower from the workflow primary borrower
-// (_primary_borrower_id, set by an upstream customer/create-borrower node or a
-// borrower_id workflow input), so a relationships task with items but no
-// borrower_id must PASS preflight.
 func TestPreflightTasks_RelationshipsNoBorrowerOK(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel no borrower",
@@ -90,9 +79,6 @@ func TestPreflightTasks_RelationshipsNoBorrowerOK(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_PackageIO: package-io is a valid backend task type and must
-// pass preflight (regression for the missing-from-validTaskTypes bug that made
-// the CLI reject it as an "unknown task type").
 func TestPreflightTasks_PackageIO(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Package IO",
@@ -113,8 +99,6 @@ func TestPreflightTasks_PackageIO(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsEmptyItems: borrower wired, but no items
-// inline and no items mapping -- reject.
 func TestPreflightTasks_RelationshipsEmptyItems(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel no items",
@@ -133,8 +117,6 @@ func TestPreflightTasks_RelationshipsEmptyItems(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsMissingContactId: an item without contact_id
-// in the inline list is rejected.
 func TestPreflightTasks_RelationshipsMissingContactId(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel missing contact",
@@ -158,8 +140,6 @@ func TestPreflightTasks_RelationshipsMissingContactId(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsTwoLegalReps: two items with
-// is_legal_representative=true would clobber each other -- reject upfront.
 func TestPreflightTasks_RelationshipsTwoLegalReps(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel two legal reps",
@@ -184,11 +164,6 @@ func TestPreflightTasks_RelationshipsTwoLegalReps(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsInvalidKind: a relationship value the BACKEND
-// disowns is rejected. The live hook is wired so preflight has real authority --
-// that is the only branch that rejects. With no hook the CLI cannot tell
-// "invalid" from "newer than this build", so it warns and proceeds (covered by
-// TestCheckRelationshipKind_LiveBackendFallback).
 func TestPreflightTasks_RelationshipsInvalidKind(t *testing.T) {
 	fetchLiveRelationshipKinds = func() map[string]bool {
 		return map[string]bool{
@@ -226,9 +201,6 @@ func TestPreflightTasks_RelationshipsInvalidKind(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsUpsertHappyPath: upsertContacts=true allows
-// items without contact_id as long as they carry tax_id (or identity_value).
-// The KYC husband+wife shape.
 func TestPreflightTasks_RelationshipsUpsertHappyPath(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel upsert",
@@ -255,8 +227,6 @@ func TestPreflightTasks_RelationshipsUpsertHappyPath(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsUpsertCustomIdentityKey: defaultIdentityKey
-// lets the item carry the value under a non-tax_id field name.
 func TestPreflightTasks_RelationshipsUpsertCustomIdentityKey(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel upsert email",
@@ -283,8 +253,6 @@ func TestPreflightTasks_RelationshipsUpsertCustomIdentityKey(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsUpsertExplicitIdentityKey: per-item
-// identity_key + identity_value overrides defaultIdentityKey.
 func TestPreflightTasks_RelationshipsUpsertExplicitIdentityKey(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel upsert explicit",
@@ -311,8 +279,6 @@ func TestPreflightTasks_RelationshipsUpsertExplicitIdentityKey(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsUpsertMissingIdentity: upsertContacts=true
-// but item has neither contact_id nor any identity -- reject.
 func TestPreflightTasks_RelationshipsUpsertMissingIdentity(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel upsert no identity",
@@ -341,8 +307,6 @@ func TestPreflightTasks_RelationshipsUpsertMissingIdentity(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsUpsertOffHintsAtFlag: missing contact_id
-// without upsertContacts should mention the flag so the user can opt in.
 func TestPreflightTasks_RelationshipsUpsertOffHintsAtFlag(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel no contact no upsert",
@@ -370,8 +334,6 @@ func TestPreflightTasks_RelationshipsUpsertOffHintsAtFlag(t *testing.T) {
 	}
 }
 
-// relReadTask builds a relationships READ task (operation:read + picks). No
-// inline write items -- the read op resolves existing relationships.
 func relReadTask(ref string, picks []any, inputMappings map[string]any) map[string]any {
 	t := map[string]any{
 		"ref":       ref,
@@ -388,9 +350,6 @@ func relReadTask(ref string, picks []any, inputMappings map[string]any) map[stri
 	return t
 }
 
-// TestPreflightTasks_RelationshipsReadHappyPath: operation:read with valid picks
-// passes preflight WITHOUT any relationshipsConfig.items (the write-only items
-// requirement must not apply in read mode).
 func TestPreflightTasks_RelationshipsReadHappyPath(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel read",
@@ -410,8 +369,6 @@ func TestPreflightTasks_RelationshipsReadHappyPath(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsReadNoPicksOK: read mode with zero picks is
-// warn-only (node produces no output), not a hard compose error.
 func TestPreflightTasks_RelationshipsReadNoPicksOK(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel read empty",
@@ -427,7 +384,6 @@ func TestPreflightTasks_RelationshipsReadNoPicksOK(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsReadBadTake: an invalid tie-break is rejected.
 func TestPreflightTasks_RelationshipsReadBadTake(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel read bad take",
@@ -448,8 +404,6 @@ func TestPreflightTasks_RelationshipsReadBadTake(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_RelationshipsReadBadKind: an invalid pick relationship kind
-// is rejected (same enum as write items).
 func TestPreflightTasks_RelationshipsReadBadKind(t *testing.T) {
 	spec := &composeSpec{
 		Label:      "Rel read bad kind",

@@ -6,59 +6,31 @@ import (
 	"strings"
 )
 
-// The apply spec: its typed shape, legacy-shape detection and per-node helpers.
-
 type composeSpec struct {
 	Label    string `json:"label"`
 	Alias    string `json:"alias,omitempty"`
 	Category string `json:"category"`
 	// Pointer so an explicit "" (blank the description) is distinguishable from
 	// an omitted field (leave the existing description untouched on update).
-	Description     *string        `json:"description,omitempty"`
-	Status          string         `json:"status,omitempty"`
-	InputVariables  map[string]any `json:"inputVariables,omitempty"`
-	CustomVariables map[string]any `json:"customVariables,omitempty"`
-	Config          map[string]any `json:"config,omitempty"`
-	// Nodes is the workflow's graph -- one flat list, one entry per node
-	// (start, end, every task type). Apply dispatches each entry by `type`
-	// at parse time. This is the only accepted input shape.
-	//
-	// The legacy two-bucket shape (`tasks[]` + `extraNodes[]`) was removed:
-	// it half-worked, with fields like inputMappings / endConfig /
-	// htmlSections on extraNodes entries getting silently stripped or only
-	// partially honored depending on the field. detectLegacySpecShape()
-	// catches that input early and emits a one-shot rewrite suggestion.
-	Nodes []map[string]any `json:"nodes,omitempty"`
-	Edges []map[string]any `json:"edges"`
-	Notes []map[string]any `json:"notes,omitempty"`
+	Description     *string          `json:"description,omitempty"`
+	Status          string           `json:"status,omitempty"`
+	InputVariables  map[string]any   `json:"inputVariables,omitempty"`
+	CustomVariables map[string]any   `json:"customVariables,omitempty"`
+	Config          map[string]any   `json:"config,omitempty"`
+	Nodes           []map[string]any `json:"nodes,omitempty"`
+	Edges           []map[string]any `json:"edges"`
+	Notes           []map[string]any `json:"notes,omitempty"`
 
-	// Tasks and ExtraNodes are INTERNAL buckets used by the downstream
-	// build pipeline -- populated by splitting Nodes at parse time.
-	// No JSON tags: never read from user input. The internal split is
-	// type=="start" -> ExtraNodes (graph-only); everything else
-	// (including end) -> Tasks (backing task created). Renaming these
-	// to taskNodes/graphOnlyNodes is a future cleanup; the user-facing
-	// contract (Nodes) is what matters here.
+	// Internal buckets filled by splitting Nodes (type=="start" -> ExtraNodes, the rest
+	// -> Tasks). No JSON tags: never read from user input.
 	Tasks      []map[string]any `json:"-"`
 	ExtraNodes []map[string]any `json:"-"`
 
-	// ExistingNodeTypes is INTERNAL: the set of node types the apply TARGET
-	// already carries, filled by apply from the workflow it looked up by alias
-	// (nil on the create path, and nil when that lookup failed). No JSON tag:
-	// never read from user input.
-	//
-	// Only the deprecation gate reads it, and only to mirror the backend's
-	// diff-based rule -- a retired type already in the stored graph is a
-	// carry-forward, not new authoring (see deprecatedTaskTypeRefused). The
-	// zero value therefore has to be the STRICT one: a code path that forgets
-	// to fill this refuses every deprecated type, exactly as before.
+	// Node types the apply TARGET already carries, nil on create. Only the deprecation
+	// gate reads it, so the zero value has to be the strict one.
 	ExistingNodeTypes map[string]bool `json:"-"`
 }
 
-// detectLegacySpecShape rejects specs that use the removed
-// `tasks[]` + `extraNodes[]` two-bucket shape. Returns an error with a
-// concrete `nodes[]` rewrite when either key is present and non-empty.
-// Called pre-unmarshal so the message can cite the user's input verbatim.
 func detectLegacySpecShape(body []byte) error {
 	var peek map[string]json.RawMessage
 	if err := json.Unmarshal(body, &peek); err != nil {
@@ -117,9 +89,6 @@ htmlSections, sourcesConfig, every field carries over unchanged`,
 		strings.Join(got, " and "))
 }
 
-// localRef returns the spec-local reference for a task or extraNode entry,
-// in priority order: explicit `ref`, then `alias` (for tasks) or `nodeId`
-// (for nodes), falling back to the supplied default.
 func localRef(entry map[string]any, fallback string) string {
 	if v, _ := entry["ref"].(string); v != "" {
 		return v
@@ -133,8 +102,6 @@ func localRef(entry map[string]any, fallback string) string {
 	return fallback
 }
 
-// edgeEndpoints reads the source/target ref or nodeId of an edge entry,
-// preferring the spec-side `from`/`to` shortcuts.
 func edgeEndpoints(e map[string]any) (from, to string) {
 	from, _ = e["from"].(string)
 	if from == "" {
@@ -147,10 +114,6 @@ func edgeEndpoints(e map[string]any) (from, to string) {
 	return from, to
 }
 
-// readSpecHTMLSections extracts the spec-only `htmlSections` field from an
-// extraNode. Returns nil when the field is absent or shaped wrong (compose
-// silently ignores malformed entries; the spec validator would have caught
-// truly broken JSON before we got here).
 func readSpecHTMLSections(node map[string]any) []map[string]any {
 	raw, ok := node["htmlSections"].([]any)
 	if !ok {

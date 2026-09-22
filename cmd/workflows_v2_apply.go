@@ -9,63 +9,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// apply takes a single agent-friendly spec and reconciles it against the
-// tenant through POST /v2/workflows/apply: if no workflow shares the spec's
-// alias, Borrower Central creates one; if one exists, it drafts, autosaves
-// and (over an ACTIVE version) publishes in place, same workflow id and
-// alias retained. Tasks are identified by (workflowAlias, specRef): an
-// unchanged body is left alone, a changed one is version-bumped under the
-// same alias, a new ref gets a fresh alias. After the apply, every
-// referenced credit-decisioning entity (scorecards, rule-trees,
-// evaluation-rules, mapping-tables, and their nested rules) is re-stamped
-// to the workflow's alias so the Hub elements panel stays in sync. One
-// verb, one validation pipeline, no fork-vs-update branch for the caller.
-//
-// Spec shape (any field omitted falls through to API defaults):
-//
-//	{
-//	  "label":           "Scoring pipeline",
-//	  "category":        "EVALUATION",
-//	  "description":     "...",
-//	  "inputVariables":  {"borrower_id": {"type": "string", "required": true}},
-//	  "customVariables": {},
-//	  "nodes": [
-//	    {"ref": "start", "type": "start", "label": "Start"},
-//	    {
-//	      "ref":             "fetch",
-//	      "label":           "Fetch ECU bureau",
-//	      "type":            "altdata-enrichment",
-//	      "sourcesConfig":   [{"sourceId":"ECU-PUB-0002","version":"v1"}],
-//	      "borrowerIdField": "borrower_id",
-//	      "inputMappings":   {"borrower_id": "inputs.borrower_id"}
-//	      // ... any other CreateTaskV2 field
-//	    },
-//	    {"ref": "end", "type": "end", "label": "End"}
-//	  ],
-//	  "edges": [
-//	    {"from": "start", "to": "fetch"},
-//	    {"from": "fetch", "to": "end"}
-//	  ]
-//	}
-//
-// Behavior:
-//  1. Parse, normalize and assemble the spec locally, posting nothing:
-//     offline structural checks (preflightTasks), per-type normalization,
-//     every reference kept in the canonical `task_outputs.<ref>` form.
-//  2. Auto-layout the canvas: longest-path columns + barycenter row ordering,
-//     the same algorithm as the Hub builder's Align button (see
-//     autoLayoutNodes). Skipped by --no-layout, or when the spec pins
-//     `position` on any node.
-//  3. Send the flat spec ONCE (buildFlatSpecForServer + applyViaServer, see
-//     workflows_v2_apply_server.go). The server resolves every ref to a task
-//     alias before writing, validates the graph with the oracle publish uses,
-//     writes tasks and workflow under its own edit lock, all-or-nothing, and
-//     reports what happened per ref.
-//
-// A rejected spec writes nothing (400 / 422 carrying the server's findings); a
-// mid-write failure is unwound server-side. Anything catchable locally belongs
-// in preflightTasks or the normalizers, which run before the request.
-
 func makeWfv2ApplyCmd() *cobra.Command {
 	var bodyFlag string
 	var dryRun bool
@@ -169,9 +112,6 @@ End-node output (endConfig on the 'end' node):
   altscore workflows-v2 apply --body @spec.json --diff              # preview changes vs current tenant state
   altscore workflows-v2 apply --body @spec.json --skip-rescope     # leave entity scopes alone`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Mutually exclusive: --diff, --dry-run, --publish. --diff is a
-			// read-only preview; --dry-run prints the assembled body without
-			// hitting the API; --publish mutates. Pick one.
 			modes := 0
 			if diffFlag {
 				modes++
@@ -190,9 +130,7 @@ End-node output (endConfig on the 'end' node):
 			if err != nil {
 				return err
 			}
-			// Reject the legacy `tasks[]` + `extraNodes[]` two-bucket shape with
-			// an inline rewrite suggestion before parsing into the spec struct.
-			// Doing it pre-unmarshal lets us cite the original keys verbatim.
+			// Pre-unmarshal, so the message can cite the author's own keys verbatim.
 			if err := detectLegacySpecShape(body); err != nil {
 				return err
 			}
@@ -206,10 +144,6 @@ End-node output (endConfig on the 'end' node):
 			if len(spec.Nodes) == 0 {
 				return fmt.Errorf("spec.nodes is required and must contain at least one node (start + at least one task-bearing node)")
 			}
-			// Split spec.Nodes into the internal Tasks / ExtraNodes buckets
-			// the rest of the build pipeline expects. type=="start" is graph-
-			// only (ExtraNodes); everything else (including end) gets a
-			// backing task created (Tasks).
 			for _, n := range spec.Nodes {
 				t, _ := n["type"].(string)
 				if t == "start" {
@@ -219,10 +153,7 @@ End-node output (endConfig on the 'end' node):
 				}
 			}
 			spec.Nodes = nil
-			// BC's category enum is uppercase (ACTION / EVALUATION / CONTACT /
-			// OTHER). Help text / dry-run accept any case, then BC rejects
-			// lowercase with a 400. Normalize here so users don't have to
-			// shout. Status mirrors the same convention (DRAFT/ACTIVE).
+			// BC's category and status enums are uppercase and it 400s on anything else.
 			if spec.Category != "" {
 				spec.Category = strings.ToUpper(spec.Category)
 			}
@@ -235,11 +166,6 @@ End-node output (endConfig on the 'end' node):
 				return err
 			}
 
-			// Determine target alias (predicted before any API call). A spec
-			// without one is targeted by the label's slug, which makes the
-			// label the workflow's identity: relabel it and apply creates a
-			// second workflow instead of updating this one. Warn now; a future
-			// release requires `alias`.
 			targetAlias := spec.Alias
 			if targetAlias == "" {
 				targetAlias = slugifyWorkflowLabel(spec.Label)
@@ -250,46 +176,25 @@ End-node output (endConfig on the 'end' node):
 					targetAlias, targetAlias)
 			}
 
-			// Lookup: is there an existing workflow with this alias on the
-			// tenant? Prefer ACTIVE, else fall back to the latest DRAFT so a
-			// prior un-published apply is updated in place rather than forked.
-			// dry-run still does the lookup so the agent sees which branch will
-			// fire when they un-dry the run.
 			existing, _, lookupErr := findWorkflowByAlias(c, targetAlias)
 			if lookupErr != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "# warning: alias lookup for %q failed (%v); falling back to create path\n", targetAlias, lookupErr)
 			}
 
-			// A declared type binds the value only for variables this apply is ADDING.
-			// Needs the existing workflow, so it happens here rather than inside
-			// composeWorkflowBody, which never sees it.
+			// Needs the existing workflow, so it happens here and not inside composeWorkflowBody.
 			stampEnforceTypeOnNewVariables(spec.CustomVariables, liveCustomVariables(existing), cmd.ErrOrStderr())
 
-			// Same reason: the deprecation gate refuses a retired task type only
-			// as NEW authoring, mirroring the backend, which diffs the incoming
-			// graph against the stored one. Without the target's node types a
-			// workflow that already carries a retired node could not be applied
-			// at all -- not even to change an unrelated node -- which is exactly
-			// the migration someone opens it to perform. `existing` is nil on
-			// the create path (and when the alias lookup failed), so nothing is
-			// carried forward there and every deprecated type stays refused.
+			// Without the target's node types a workflow that already carries a retired node
+			// could not be applied at all -- exactly the migration someone opens it to perform.
 			spec.ExistingNodeTypes = workflowNodeTypes(existing)
 
-			// Assemble the workflow body. composeWorkflowBody POSTs nothing: it
-			// builds the graph with spec-local refs standing in for the server
-			// aliases and (via capture) records each node's task body; the server
-			// resolves refs to aliases and decides per task whether to create,
-			// bump or leave it. In diff mode we force allowStealOwnership=true so
-			// cross-owned entities don't abort assembly -- they surface in the
-			// diff output as "would RE-STAMP" instead, which is the whole point
-			// of a preview tool.
+			// A diff must not abort on a cross-owned entity; it reports "would RE-STAMP" instead.
 			composeAllowSteal := allowStealOwnership
 			if diffFlag {
 				composeAllowSteal = true
 			}
 
-			// Preview modes assemble tolerantly (stubbed lookups); the real
-			// apply assembles strictly.
+			// Preview modes assemble tolerantly (stubbed lookups); a real apply assembles strictly.
 			previewAssembly := diffFlag || dryRun
 			capture := newComposeCapture()
 			workflow, err := composeWorkflowBody(c, &spec, previewAssembly, publish, !skipRescope, composeAllowSteal, !noAutoDefaults, !noLayout, capture)
@@ -297,11 +202,6 @@ End-node output (endConfig on the 'end' node):
 				return err
 			}
 
-			// POST /v2/workflows/apply takes the flat spec and owns ref
-			// resolution, validation, task identity, the lock and publish,
-			// all-or-nothing. The CLI's job ends at assembly: a spec the server
-			// path cannot express (an explicit node alias) is refused here,
-			// before any request.
 			flat, err := buildFlatSpecForServer(workflow, capture, targetAlias)
 			if err != nil {
 				return err

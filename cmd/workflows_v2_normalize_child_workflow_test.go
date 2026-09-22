@@ -2,11 +2,6 @@ package cmd
 
 import "testing"
 
-// HQ #1694: a single child fed by an inputExpression never reads its
-// inputMappings, so the required-input coverage check must not run for it.
-// The gate is observed through the child lookup: with no client and no dry
-// run, reaching the lookup is an error, so a nil result proves the check was
-// skipped before it.
 func TestNormalizeChildWorkflowTaskSkipsCoverageWhenAnExpressionFeedsTheChild(t *testing.T) {
 	task := map[string]any{
 		"executorId":      "kyc-individual",

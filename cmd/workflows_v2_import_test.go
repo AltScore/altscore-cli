@@ -1,12 +1,5 @@
 package cmd
 
-// `workflows-v2 import` findings rendering and exit policy.
-//
-// Honest limit, stated here rather than implied by a test name: the CLI cannot
-// prove "no write happened" -- the server decides that. What these assert is
-// the property this repo actually controls, that the CLI issues exactly one
-// import request and never retries a refused one.
-
 import (
 	"bytes"
 	"encoding/json"
@@ -27,8 +20,6 @@ func importTestCmd() (*cobra.Command, *bytes.Buffer) {
 	return cmd, &errBuf
 }
 
-// importServer serves POST /v2/workflows/import with the given status+body and
-// counts the calls, erroring on any other path.
 func importServer(t *testing.T, status int, body string, calls *int32) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -82,10 +73,6 @@ func TestImport_CleanResponseIsQuietAndExitsZero(t *testing.T) {
 }
 
 func TestImport_NoValidationKeyIsNotTreatedAsInvalid(t *testing.T) {
-	// An older backend omits `validation` entirely. Decoding into
-	// `validationResponse` would give Valid=false and its caller's rule
-	// (!Valid || errs>0) would declare this completed import invalid. The
-	// dedicated envelope with a *pointer* Validation is what prevents that.
 	var calls int32
 	srv := importServer(t, http.StatusCreated,
 		`{"workflowId":"w1","workflowAlias":"a","tasksCreated":1}`, &calls)
@@ -108,8 +95,6 @@ func TestImport_WarningsPrintedAndExitZero(t *testing.T) {
 	defer srv.Close()
 
 	errBuf, err := runImport(t, srv, _bundle)
-	// The write already happened; a non-zero exit would teach CI to retry a
-	// completed import.
 	if err != nil {
 		t.Fatalf("warnings must not fail the command, got %v", err)
 	}
@@ -157,9 +142,6 @@ func TestImport_NoticesArePrinted(t *testing.T) {
 }
 
 func TestImport_RefusalIsNonZeroAndNamesTheEntities(t *testing.T) {
-	// The client folds >=400 bodies into the error and discards the JSON, so the
-	// server's MESSAGE has to carry the entity names. This pins that contract
-	// from the CLI side.
 	var calls int32
 	srv := importServer(t, http.StatusUnprocessableEntity, `{"code":"UnprocessableEntity",
 		"message":"This workflow references entities that do not exist on this tenant and are not carried by the bundle: scorecard 'sc-1'. Nothing was created.",
@@ -209,7 +191,6 @@ func TestPartitionFindings_UnknownSeverityBecomesWarning(t *testing.T) {
 		{Code: "A", Severity: "ERROR"},
 		{Code: "B", Severity: "critical"},
 	})
-	// EqualFold matches uppercase; anything unrecognised must not escalate.
 	if len(errs) != 1 || errs[0].Code != "A" {
 		t.Errorf("expected A as the only error, got %v", errs)
 	}

@@ -7,12 +7,6 @@ import (
 	"testing"
 )
 
-// diffBundle builds an export bundle with one conditional node whose body and
-// specRef the caller controls, so a test can vary exactly one thing.
-//
-// Mirrors the REAL /v2/workflows/{id}/export shape, verified against a live
-// bundle: the version is at the ROOT as sourceVersion, and bundle.workflow holds
-// only the authoring body -- no version and no status anywhere in the export.
 func diffBundle(version int, opts diffBundleOpts) json.RawMessage {
 	specRef := `"specRef": "fetch", "workflowAlias": "kyb",`
 	if opts.noSpecRef {
@@ -118,9 +112,6 @@ func TestDiffIdenticalVersionsReportNothing(t *testing.T) {
 }
 
 func TestDiffReportsATaskBodyChangeApplyDiffWouldMiss(t *testing.T) {
-	// The real case: a condition operator degraded from an array-valued not_in
-	// to a scalar not_equals. It lives inside the task body, which apply --diff
-	// never inspects (it compares type / label / config / inputMappings).
 	r := loadTwo(t,
 		diffBundle(47, diffBundleOpts{}),
 		diffBundle(48, diffBundleOpts{scalarOperator: true}))
@@ -172,8 +163,6 @@ func TestDiffCleanSpecRefSaysSo(t *testing.T) {
 }
 
 func TestDiffReportsAliasRotationAsRenameNotAddRemove(t *testing.T) {
-	// This is the downstream symptom of the specRef loss: export + re-apply
-	// mints a fresh alias, so the node looks deleted and a different one added.
 	r := loadTwo(t,
 		diffBundle(47, diffBundleOpts{}),
 		diffBundle(48, diffBundleOpts{rotatedAlias: "fetch-999999", noSpecRef: true}))
@@ -214,8 +203,6 @@ func TestDiffReportsVariableAndEdgeChanges(t *testing.T) {
 }
 
 func TestDiffIgnoresBookkeepingFields(t *testing.T) {
-	// taskVersion bumps on every write; reporting it would mark every node
-	// changed and bury the real hunks.
 	for field := range nodeFieldDropList {
 		if field == "ref" {
 			continue
@@ -233,8 +220,6 @@ func TestDiffIgnoresBookkeepingFields(t *testing.T) {
 }
 
 func TestDiffReadsVersionFromBundleRootAndDegradesOnStatus(t *testing.T) {
-	// sourceVersion lives at the bundle ROOT; bundle.workflow carries only the
-	// authoring body, with no version and no status at all.
 	doer := fakeDoer{byPath: map[string]json.RawMessage{
 		"/v2/workflows/id-a/export": diffBundle(47, diffBundleOpts{}),
 	}}
@@ -248,8 +233,6 @@ func TestDiffReadsVersionFromBundleRootAndDegradesOnStatus(t *testing.T) {
 	if side.Alias != "kyb" {
 		t.Fatalf("expected alias kyb, got %q", side.Alias)
 	}
-	// No stub for the plain workflow GET, so the status lookup fails. That must
-	// not fail the diff.
 	if side.Status != "" {
 		t.Fatalf("expected an empty status when the lookup fails, got %q", side.Status)
 	}

@@ -95,7 +95,6 @@ func TestAltdataRequiredFieldSatisfied(t *testing.T) {
 }
 
 func TestLookupAltdataSourceRequiredFields_FromCache(t *testing.T) {
-	// Pre-seed the per-run source-status cache so no API client is needed.
 	key := "TEST-SRC|v1"
 	altdataSourceStatusCache[key] = map[string]any{
 		"sourceId":      "TEST-SRC",

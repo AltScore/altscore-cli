@@ -9,15 +9,6 @@ import (
 	"testing"
 )
 
-// The deprecation refusal mirrors the backend's diff-based rule: BC refuses a
-// retired task type only for NEWLY added work, so a workflow that already
-// carries such a node stays editable and can be migrated off it. These tests
-// pin both halves -- the refusal that must stay, and the exemption that must
-// not become a blanket hole.
-
-// carryForwardSpec is a two-task spec (start -> n1 -> end) parameterized by the
-// node type under test, so the deprecation gate is the only thing that can
-// fail it.
 func carryForwardSpec(taskType string, existing map[string]bool) *composeSpec {
 	return &composeSpec{
 		Label:             "Legacy flow",
@@ -33,10 +24,6 @@ func carryForwardSpec(taskType string, existing map[string]bool) *composeSpec {
 	}
 }
 
-// CREATE mode carries nothing forward, so every retired type is new authoring
-// and must still hard-error -- including with no live hook wired, which is the
-// offline case a delivery engineer actually hits. Nothing here may soften into
-// a warning: an empty target set is exactly what a create looks like.
 func TestPreflightTasks_DeprecatedTypeStillFatalOnCreate(t *testing.T) {
 	fetchLiveTaskTypes = nil
 	for _, typ := range retiredTaskTypes {
@@ -55,11 +42,6 @@ func TestPreflightTasks_DeprecatedTypeStillFatalOnCreate(t *testing.T) {
 	}
 }
 
-// UPDATE mode over a workflow whose stored graph ALREADY holds the retired type
-// is a carry-forward: accepted, with a non-fatal warning that names the node so
-// it is visible without blocking. This is the case the strict refusal broke --
-// the legacy workflow could not be applied at all, not even to change an
-// unrelated node.
 func TestPreflightTasks_DeprecatedTypeCarriedForwardOnUpdate(t *testing.T) {
 	fetchLiveTaskTypes = nil
 	for _, typ := range retiredTaskTypes {
@@ -77,8 +59,6 @@ func TestPreflightTasks_DeprecatedTypeCarriedForwardOnUpdate(t *testing.T) {
 		if !strings.Contains(stderr, `node ref="n1"`) {
 			t.Errorf("%q: the warning must name the node, got: %q", typ, stderr)
 		}
-		// A retired type is deliberately absent from validTaskTypes, so the
-		// vocabulary block must be skipped rather than re-diagnosing the node.
 		if strings.Contains(stderr, "live backend could not be consulted") {
 			t.Errorf("%q was routed through the unverified-vocabulary warning: %q", typ, stderr)
 		}
@@ -88,9 +68,6 @@ func TestPreflightTasks_DeprecatedTypeCarriedForwardOnUpdate(t *testing.T) {
 	}
 }
 
-// The assertion that the exemption is not a blanket hole: a target that carries
-// ONE retired type does not license a DIFFERENT one. Adding `soap` to a
-// workflow that only holds `create-borrower` is new authoring and stays fatal.
 func TestPreflightTasks_DifferentDeprecatedTypeStillFatalOnUpdate(t *testing.T) {
 	fetchLiveTaskTypes = nil
 	existing := map[string]bool{"create-borrower": true, "end": true}
@@ -102,12 +79,9 @@ func TestPreflightTasks_DifferentDeprecatedTypeStillFatalOnUpdate(t *testing.T) 
 	if !strings.Contains(err.Error(), "DEPRECATED") || !strings.Contains(err.Error(), "soap") {
 		t.Errorf("refusal must name the newly added type, got: %v", err)
 	}
-	// And it must be refused, not warned about.
 	if strings.Contains(stderr, "CARRIED FORWARD") {
 		t.Errorf("a newly added retired type must not be reported as carried forward: %q", stderr)
 	}
-	// Sanity: the same target DOES exempt the type it actually holds, so the
-	// case above cannot pass merely because the exemption never fires.
 	var held error
 	captureStderr(t, func() { held = preflightTasks(carryForwardSpec("create-borrower", existing)) })
 	if held != nil {
@@ -115,12 +89,6 @@ func TestPreflightTasks_DifferentDeprecatedTypeStillFatalOnUpdate(t *testing.T) 
 	}
 }
 
-// End-to-end over the single assembly entry point, not just preflight: the
-// whole point of the finding is that a legacy workflow could not be applied AT
-// ALL, so clearing preflight is not enough -- the node has to survive
-// normalization and reach the flat spec with its type intact. Assembles with a
-// nil client (no network: the deprecated branch skips the live-type fetch) and
-// asserts the retired node is still in the graph the server would receive.
 func TestComposeWorkflowBody_CarriesForwardADeprecatedNode(t *testing.T) {
 	spec := &composeSpec{
 		Alias:             "legacy-flow",
@@ -166,11 +134,6 @@ func TestComposeWorkflowBody_CarriesForwardADeprecatedNode(t *testing.T) {
 	}
 }
 
-// A live backend that retires a type after this binary shipped is honoured the
-// same way: refused when new, carried forward when the target holds it. The
-// live authorable set never lists a retired type (fetchServerTaskTypes filters
-// them out), so the carry-forward must not fall through to the unknown-type
-// error.
 func TestPreflightTasks_LiveRetiredTypeFollowsTheSameRule(t *testing.T) {
 	const typ = "brand-new-retired"
 	fetchLiveTaskTypes = func() map[string]bool {
@@ -201,9 +164,6 @@ func TestPreflightTasks_LiveRetiredTypeFollowsTheSameRule(t *testing.T) {
 	}
 }
 
-// workflowNodeTypes is the mechanism the exemption rests on: the node types of
-// the workflow apply already looked up by alias. No request of its own -- the
-// /v2/workflows listing DTO carries the full nodes[].
 func TestWorkflowNodeTypes_ReadsTheTargetGraph(t *testing.T) {
 	if got := workflowNodeTypes(nil); got != nil {
 		t.Errorf("no target must carry nothing forward, got %v", got)
@@ -214,7 +174,7 @@ func TestWorkflowNodeTypes_ReadsTheTargetGraph(t *testing.T) {
 			map[string]any{"nodeId": "n0", "type": "start"},
 			map[string]any{"nodeId": "n1", "type": "create-borrower", "taskAlias": "cb-a1b2c3"},
 			map[string]any{"nodeId": "n2", "type": "http"},
-			map[string]any{"nodeId": "n3"}, // no type: skipped, not recorded as ""
+			map[string]any{"nodeId": "n3"},
 		},
 	}
 	got := workflowNodeTypes(listing)
@@ -229,15 +189,11 @@ func TestWorkflowNodeTypes_ReadsTheTargetGraph(t *testing.T) {
 	if len(got) != 3 {
 		t.Errorf("expected exactly 3 types, got %v", got)
 	}
-	// An empty graph is not the same as no target, but both carry nothing.
 	if got := workflowNodeTypes(map[string]any{"nodes": []any{}}); len(got) != 0 {
 		t.Errorf("an empty graph carries nothing forward, got %v", got)
 	}
 }
 
-// The structural validator is the only deprecation gate on the tasks-v2 paths,
-// so it has to honour the same rule -- and stay silent when it does, because
-// its callers warn where they can name the node ref or the task alias.
 func TestValidateTaskV2BodyStructural_HonoursTheCarryForward(t *testing.T) {
 	body := json.RawMessage(`{"type":"create-borrower","label":"X","alias":"x"}`)
 	if err := validateTaskV2BodyStructural(body, nil); err == nil {
@@ -253,16 +209,11 @@ func TestValidateTaskV2BodyStructural_HonoursTheCarryForward(t *testing.T) {
 	if stderr != "" {
 		t.Errorf("the validator must stay silent; its callers own the warning, got: %q", stderr)
 	}
-	// A carry-forward for a DIFFERENT type exempts nothing.
 	if err := validateTaskV2BodyStructural(body, map[string]bool{"soap": true}); err == nil {
 		t.Error("a carry-forward for another type must not exempt create-borrower")
 	}
 }
 
-// `tasks-v2 create-version <alias>` bumps an EXISTING task. Keeping a type that
-// is already retired is a carry-forward the backend accepts by design;
-// switching a task TO a retired type is new authoring and stays refused. The
-// stored type is therefore read, not inferred from the alias resolving.
 func TestDeprecatedCarryForwardForTaskVersion(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -299,9 +250,6 @@ func TestDeprecatedCarryForwardForTaskVersion(t *testing.T) {
 	}
 }
 
-// A lookup that fails leaves the refusal standing. Being stricter than the
-// server is the bug this whole change fixes, but being LOOSER than the server
-// is worse: it would wave a spec through to a 4xx the CLI could have explained.
 func TestDeprecatedCarryForwardForTaskVersion_FailedLookupRefuses(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -314,7 +262,6 @@ func TestDeprecatedCarryForwardForTaskVersion_FailedLookupRefuses(t *testing.T) 
 	if got := deprecatedCarryForwardForTaskVersion(c, "missing-task", body); len(got) != 0 {
 		t.Errorf("a 404 must carry nothing forward, got %v", got)
 	}
-	// And the gate it feeds still refuses.
 	if err := validateTaskV2Body(body, deprecatedCarryForwardForTaskVersion(c, "missing-task", body)); err == nil {
 		t.Error("with no verified carry-forward the retired type must be refused")
 	}

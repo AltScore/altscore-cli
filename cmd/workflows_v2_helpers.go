@@ -10,9 +10,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// ===================== Shared helpers =====================
-
-// fetchWorkflowV2 fetches the current state of a v2 workflow as a generic map.
 func fetchWorkflowV2(c *client.Client, id string) (map[string]any, error) {
 	raw, _, err := c.Do("GET", "borrower_central", "/v2/workflows/"+id, nil)
 	if err != nil {
@@ -25,7 +22,6 @@ func fetchWorkflowV2(c *client.Client, id string) (map[string]any, error) {
 	return wf, nil
 }
 
-// acquireWfv2Lock acquires an edit lock on a v2 workflow alias and returns the lockToken.
 func acquireWfv2Lock(c *client.Client, alias, clientID string) (string, error) {
 	body, _ := json.Marshal(map[string]string{"clientId": clientID})
 	raw, _, err := c.Do("POST", "borrower_central", "/v2/workflows/"+alias+"/lock", json.RawMessage(body))
@@ -43,19 +39,12 @@ func acquireWfv2Lock(c *client.Client, alias, clientID string) (string, error) {
 	return tok, nil
 }
 
-// releaseWfv2Lock releases a lock; failures are ignored since this is best-effort cleanup.
 func releaseWfv2Lock(c *client.Client, alias, token string) {
 	body, _ := json.Marshal(map[string]string{"lockToken": token})
 	_, _, _ = c.Do("DELETE", "borrower_central", "/v2/workflows/"+alias+"/lock", json.RawMessage(body))
 }
 
-// mutateAndAutosaveV2 runs the lock-fetch-mutate-autosave-release dance.
-//
-// If lockToken is provided, the caller manages the lock (no acquire/release).
-// Otherwise clientID must be provided; a lock is acquired and released here.
-//
-// The mutate function is called with the parsed workflow map and may modify it
-// in place. Only the editable top-level fields are sent on autosave.
+// With lockToken the caller manages the lock; otherwise one is acquired and released here.
 func mutateAndAutosaveV2(
 	c *client.Client,
 	workflowID, lockToken, clientID string,
@@ -111,7 +100,6 @@ func mutateAndAutosaveV2(
 	return result, nil
 }
 
-// asSlice coerces any (possibly nil) value into []any.
 func asSlice(v any) []any {
 	if v == nil {
 		return []any{}
@@ -122,14 +110,11 @@ func asSlice(v any) []any {
 	return []any{}
 }
 
-// isScopedRef reports whether s is a scoped reference (a dotted path like
-// inputs.x / task_outputs.a.b, or the __static__:: literal escape). Bare names
-// like "total_score" are unscoped and won't resolve at runtime.
+// A bare name like "total_score" is unscoped and will not resolve at runtime.
 func isScopedRef(s string) bool {
 	return strings.Contains(s, ".") || strings.HasPrefix(s, "__static__::")
 }
 
-// lastDotSegment returns the substring after the final "." (or all of s if none).
 func lastDotSegment(s string) string {
 	if i := strings.LastIndex(s, "."); i >= 0 {
 		return s[i+1:]
@@ -137,7 +122,6 @@ func lastDotSegment(s string) string {
 	return s
 }
 
-// asMap coerces any (possibly nil) value into map[string]any.
 func asMap(v any) map[string]any {
 	if v == nil {
 		return map[string]any{}
@@ -148,13 +132,10 @@ func asMap(v any) map[string]any {
 	return map[string]any{}
 }
 
-// addLockFlags binds the standard --lock-token / --client-id flags to a command.
 func addLockFlags(cmd *cobra.Command, lockToken, clientID *string) {
 	cmd.Flags().StringVar(lockToken, "lock-token", "", "lockToken from a prior 'lock acquire' (caller-managed)")
 	cmd.Flags().StringVar(clientID, "client-id", "", "lock holder id used when --lock-token is omitted: a lock is acquired and released automatically (default: cli-<profile>-<host>-<pid>)")
 }
-
-// ===================== Helper subcommands =====================
 
 func makeWfv2AddNodeCmd() *cobra.Command {
 	var lockToken, clientID string

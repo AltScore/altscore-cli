@@ -9,8 +9,7 @@ import (
 	"testing"
 )
 
-// createNew rides in the request body only when set, so an older backend
-// never sees an unknown field.
+// createNew rides in the request body only when set, so an older backend never sees an unknown field.
 func TestApplyViaServer_CreateNewIsSentOnlyWhenSet(t *testing.T) {
 	var got map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +36,6 @@ func TestApplyViaServer_CreateNewIsSentOnlyWhenSet(t *testing.T) {
 	}
 }
 
-// A near-match refusal lists the candidates and points at both ways out.
 func TestDescribeServerApplyError_AliasNearMatch(t *testing.T) {
 	var errb bytes.Buffer
 	body := `{"code":"ConflictError","message":"no workflow has alias 'validacion-documentos-persona-moral' but 1 existing workflow is one typo away","details":{"errorSubCode":"APPLY_ALIAS_NEAR_MATCH","alias":"validacion-documentos-persona-moral","candidates":[{"alias":"validaci-n-documentos-persona-moral","label":"Validación Documentos Persona Moral","status":"DRAFT","version":1,"workflowId":"c988be3b","reason":"alias"}]}}`

@@ -6,18 +6,8 @@ import (
 	"sort"
 )
 
-// stampEnforceTypeOnNewVariables marks a custom variable's declared `type` as binding
-// for variables this apply is ADDING, and carries the live `enforceType` forward for
-// variables the workflow already has.
-//
-// Only variables new to this workflow are stamped: many live variables carry a
-// declared type that was never enforced and is wrong, and those stay inert. A live
-// variable's `enforceType` is carried forward because autosave sends customVariables
-// wholesale, so a spec that omits the field would otherwise strip it; carrying it
-// makes a round-trip a no-op.
-//
-// An explicit `enforceType` in the spec always wins, including `false` -- an author who
-// has said what they want is not second-guessed.
+// Only variables new to the workflow are stamped; a live variable's enforceType is
+// carried forward because autosave sends customVariables wholesale.
 func stampEnforceTypeOnNewVariables(specVars map[string]any, existing map[string]any, warn io.Writer) {
 	if len(specVars) == 0 {
 		return
@@ -53,7 +43,6 @@ func stampEnforceTypeOnNewVariables(specVars map[string]any, existing map[string
 	}
 }
 
-// liveCustomVariables pulls the customVariables map off a workflow fetched from the API.
 func liveCustomVariables(existing map[string]any) map[string]any {
 	if existing == nil {
 		return nil

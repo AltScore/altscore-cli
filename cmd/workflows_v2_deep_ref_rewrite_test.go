@@ -6,11 +6,6 @@ import (
 	"testing"
 )
 
-// The class this pass closes: a task type or field the typed rewriters have
-// never heard of carries a long-form ref, and apply must both order it after
-// the task it names and rewrite it to the server alias. Before the generic pass
-// each such field was a fix of its own (#18, #20, #21, #106, #111).
-
 func deepRefMap() map[string]string {
 	return map[string]string{"q1": "consulta-turso-8f21c3", "fetch": "fetch-a1b2c3"}
 }
@@ -48,8 +43,6 @@ func TestRewriteTaskRefs_UnlistedFieldLongFormIsRewritten(t *testing.T) {
 	}
 }
 
-// Prose fields are the guard's exclusion list and must stay the author's text:
-// a label that mentions a ref is documentation, not wiring.
 func TestRewriteTaskRefs_ProseFieldsUntouched(t *testing.T) {
 	task := map[string]any{
 		"type":        "brand-new-type",
@@ -75,8 +68,6 @@ func TestRewriteTaskRefs_ProseFieldsUntouched(t *testing.T) {
 	}
 }
 
-// Assembly runs the rewrite with an identity map, the post phase with the real
-// one; the pass must be a no-op for the first and idempotent for the second.
 func TestRewriteTaskOutputsRefsDeep_IdentityAndIdempotent(t *testing.T) {
 	build := func() map[string]any {
 		return map[string]any{
@@ -100,8 +91,6 @@ func TestRewriteTaskOutputsRefsDeep_IdentityAndIdempotent(t *testing.T) {
 	}
 }
 
-// A key already declared under the destination name owns its slot, whatever
-// order Go iterates the map in.
 func TestRewriteTaskOutputsRefsDeep_KeyCollisionKeepsDeclared(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		m := map[string]any{
@@ -150,9 +139,6 @@ func TestDeepTaskOutputsRefs_SkipsProseAndDedupes(t *testing.T) {
 	}
 }
 
-// A forward reference in a field no typed scanner names must still order the
-// consumer after its producer; otherwise refMap lacks the alias at post time
-// and the rewrite silently leaves the spec ref in place.
 func TestTopologicalTaskOrder_DeepLongFormRefOrdersConsumerLast(t *testing.T) {
 	tasks := []map[string]any{
 		{"ref": "consumer", "type": "brand-new-type", "label": "C",
@@ -167,15 +153,12 @@ func TestTopologicalTaskOrder_DeepLongFormRefOrdersConsumerLast(t *testing.T) {
 		t.Errorf("producer must come first; got order %v", order)
 	}
 
-	// A mention in prose is not a dependency and must not manufacture a cycle.
 	tasks[1]["description"] = "feeds task_outputs.consumer.x"
 	if _, err := topologicalTaskOrder(tasks, nil); err != nil {
 		t.Errorf("prose must not create a dependency: %v", err)
 	}
 }
 
-// End-to-end through the split: the assembled body keeps the spec ref, the
-// posted body carries the alias, for a field the allowlist has never seen.
 func TestRewriteTaskRefs_UnlistedFieldSurvivesResidualGuard(t *testing.T) {
 	task := map[string]any{
 		"type":           "brand-new-type",

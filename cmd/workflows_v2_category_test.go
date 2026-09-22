@@ -6,21 +6,13 @@ import (
 	"testing"
 )
 
-// The compiled-in validTaskTypes map mirrors the backend TaskType enum by hand.
-// A missing entry makes `apply` reject a category node as an unknown type AFTER
-// the earlier tasks in the compose loop have already been created, and no
-// rollback path exists -- so the mirror is the thing worth pinning.
 func TestCategory_MirrorCarriesTheTaskType(t *testing.T) {
 	if !validTaskTypes["category"] {
 		t.Fatal("category must validate offline from the compiled-in validTaskTypes mirror")
 	}
 }
 
-// The transform vocabulary is mirrored by hand from
-// borrower-central/app/usecase/workflows_v2/category_node.py VALUE_TRANSFORMS.
-// Pinned as a set rather than only through the accept/reject cases above so
-// that adding a transform to the backend without teaching the CLI about it
-// fails here, instead of at `apply` time after earlier tasks were created.
+// Mirrored by hand from borrower-central/app/usecase/workflows_v2/category_node.py VALUE_TRANSFORMS.
 func TestCategory_MirrorCarriesEveryValueTransform(t *testing.T) {
 	backend := []string{"none", "trim", "upper", "lower"}
 	for _, tr := range backend {
@@ -29,8 +21,6 @@ func TestCategory_MirrorCarriesEveryValueTransform(t *testing.T) {
 			t.Errorf("valueTransform %q is accepted by the backend but rejected here: %v", tr, err)
 		}
 	}
-	// And the reverse: the CLI must not wave through a spelling the backend's
-	// Literal would refuse, which would turn an offline typo into a 400.
 	for _, tr := range []string{"uppercase", "UPPER", "strip", "titlecase"} {
 		cfg := map[string]any{"operation": "read", "categoryKey": "segmentation", "valueTransform": tr}
 		if err := validateTaskV2BodyStructural(categoryBody(cfg), nil); err == nil {
@@ -122,9 +112,6 @@ func TestCategory_StructuralValidation(t *testing.T) {
 	}
 }
 
-// The runtime reads the TOP-LEVEL inputMappings; schema-guide examples document
-// the nested form. Either spelling has to reach the runtime or the assigned
-// value is silently empty.
 func TestCategory_NormalizeMirrorsInputMappingsBothWays(t *testing.T) {
 	t.Run("nested to top level", func(t *testing.T) {
 		task := map[string]any{
@@ -162,10 +149,6 @@ func TestCategory_NormalizeMirrorsInputMappingsBothWays(t *testing.T) {
 	})
 }
 
-// A node ref and a category key are separate namespaces, and "segmentation" is
-// a natural name in both. The residual-ref validator runs INSIDE the POST loop,
-// so a false positive there aborts after tasks have already been created and
-// nothing rolls them back -- which is the one failure apply must never have.
 func TestCategory_KeyAndValueFieldsAreNotTreatedAsResidualRefs(t *testing.T) {
 	body := map[string]any{
 		"type": "category",
@@ -185,8 +168,6 @@ func TestCategory_KeyAndValueFieldsAreNotTreatedAsResidualRefs(t *testing.T) {
 	}
 }
 
-// The exclusion must not blind the validator to a real residual ref elsewhere
-// in the same body: inputMappings still has to be rewritten.
 func TestCategory_AResidualRefInInputMappingsStillAborts(t *testing.T) {
 	body := map[string]any{
 		"type": "category",

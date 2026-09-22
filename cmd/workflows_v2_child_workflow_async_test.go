@@ -6,7 +6,6 @@ import (
 	"testing"
 )
 
-// childTask builds a child-workflow task body. Callers add the async fields.
 func childTask(ref string, extra map[string]any) map[string]any {
 	t := map[string]any{
 		"ref":        ref,
@@ -30,8 +29,6 @@ func childSpec(task map[string]any) *composeSpec {
 	}
 }
 
-// A spec with no dispatchMode at all is the overwhelming majority of what is
-// already published; it must keep passing untouched.
 func TestPreflight_ChildWorkflowWithoutDispatchModeIsUnchanged(t *testing.T) {
 	spec := childSpec(childTask("sub", map[string]any{
 		"runInBatch":      true,
@@ -62,8 +59,6 @@ func TestPreflight_ChildWorkflowRejectsUnknownDispatchMode(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error for dispatchMode=async")
 	}
-	// The message has to name the valid values: "async" is the obvious wrong
-	// guess and the author needs to be told the real spelling.
 	if !strings.Contains(err.Error(), "async-batch") || !strings.Contains(err.Error(), "inline") {
 		t.Fatalf("error should name both valid modes, got %v", err)
 	}
@@ -84,9 +79,6 @@ func TestPreflight_ChildWorkflowRejectsUnknownInvalidRowPolicy(t *testing.T) {
 	}
 }
 
-// Async dispatch batches over a LIST. Without inputExpression the node resolves
-// a dict and fails at runtime, so this is a hard error rather than a warning:
-// the author believes they shipped async and would not find out until a run.
 func TestPreflight_ChildWorkflowAsyncBatchRequiresInputExpression(t *testing.T) {
 	spec := childSpec(childTask("sub", map[string]any{
 		"dispatchMode": "async-batch",
@@ -100,9 +92,6 @@ func TestPreflight_ChildWorkflowAsyncBatchRequiresInputExpression(t *testing.T) 
 	}
 }
 
-// maxConcurrency and failurePolicy do not survive into a platform batch. Warn,
-// do not reject: the author may be flipping between modes and we must not
-// delete their settings (that breaks the apply -> export -> apply round trip).
 func TestPreflight_ChildWorkflowAsyncBatchWarnsOnInertFields(t *testing.T) {
 	spec := childSpec(childTask("sub", map[string]any{
 		"dispatchMode":    "async-batch",
@@ -118,15 +107,12 @@ func TestPreflight_ChildWorkflowAsyncBatchWarnsOnInertFields(t *testing.T) {
 	if !strings.Contains(stderr, "maxConcurrency") || !strings.Contains(stderr, "failurePolicy") {
 		t.Fatalf("expected a warning naming both inert fields, got %q", stderr)
 	}
-	// The fields must still be on the body afterwards.
 	task := spec.Tasks[0]
 	if _, ok := task["maxConcurrency"]; !ok {
 		t.Fatal("preflight must not delete maxConcurrency")
 	}
 }
 
-// invalidRowPolicy on an inline node does nothing. Warn so it is not mistaken
-// for row validation that inline mode simply does not do.
 func TestPreflight_ChildWorkflowWarnsInvalidRowPolicyOutsideAsync(t *testing.T) {
 	spec := childSpec(childTask("sub", map[string]any{
 		"invalidRowPolicy": "skip",
@@ -143,8 +129,6 @@ func TestPreflight_ChildWorkflowWarnsInvalidRowPolicyOutsideAsync(t *testing.T) 
 	}
 }
 
-// The structural validator is reached by `tasks-v2 create` / `create-version`,
-// which never go through compose preflight, so the same rules live there too.
 func TestStructural_ChildWorkflowAsyncRules(t *testing.T) {
 	cases := []struct {
 		name    string

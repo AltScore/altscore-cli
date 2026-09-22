@@ -5,11 +5,6 @@ import (
 	"testing"
 )
 
-// `self.<field>` is a node's OWN late-resolved output -- today the End node's
-// pdf_url / pdf_error. BC leaves the literal in place at graph time and fills it
-// in a second pass inside end_activity, so apply must treat it as a reserved
-// scope: never rewritten to a server alias, never rejected as an unknown ref.
-
 func TestSelfIsAReservedMappingScope(t *testing.T) {
 	if !reservedMappingScopes["self"] {
 		t.Fatal("self must be a reserved mapping scope; otherwise apply rewrites or rejects {{self.pdf_url}}")
@@ -76,7 +71,6 @@ func TestSelfRefSurvivesTemplateRewrite(t *testing.T) {
 }
 
 func TestUnknownHeadStillRejected(t *testing.T) {
-	// Reserving `self` must not weaken the typo guard for everything else.
 	if _, err := rewriteRefsInTemplate(`{{nope.field}}`, map[string]string{}, nil); err == nil {
 		t.Fatal("expected an error for an unknown head")
 	}

@@ -16,9 +16,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// ExitCodeError lets a RunE bubble an explicit process exit code up to main().
-// Cobra still prints the wrapped error via its default Error handling; we just
-// surface a non-default code for callers (e.g. 2 for poll timeout).
+// Bubbles an explicit process exit code up to main(); Cobra still prints the wrapped error.
 type ExitCodeError struct {
 	Code int
 	Err  error
@@ -33,15 +31,10 @@ func (e *ExitCodeError) Error() string {
 
 func (e *ExitCodeError) Unwrap() error { return e.Err }
 
-// uuidPattern matches RFC 4122 UUIDs (8-4-4-4-12 hex). Used by helpers that
-// need to distinguish a workflow UUID from a workflow alias before calling
-// alias-only endpoints (e.g. /v2/workflows/{alias}/versions).
+// Distinguishes a workflow UUID from an alias before calling an alias-only endpoint.
 var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
-// resolveWorkflowAlias accepts either a workflow alias (returned as-is) or a
-// workflow UUID (resolved via GET /v2/workflows/{id}). Used to bridge the gap
-// between alias-only endpoints (versions, lock) and the UUIDs that compose
-// returns from create.
+// Bridges the alias-only endpoints (versions, lock) and the UUIDs compose returns.
 func resolveWorkflowAlias(c *client.Client, aliasOrID string) (string, error) {
 	if !uuidPattern.MatchString(aliasOrID) {
 		return aliasOrID, nil
@@ -54,8 +47,7 @@ func resolveWorkflowAlias(c *client.Client, aliasOrID string) (string, error) {
 	if err := json.Unmarshal(data, &wf); err != nil {
 		return "", fmt.Errorf("could not parse workflow %s: %w", aliasOrID, err)
 	}
-	// `alias` is the field the workflow DTO actually carries; `workflowAlias`
-	// is accepted as a fallback for the shapes that nest it.
+	// `alias` is what the workflow DTO carries; `workflowAlias` covers the nested shapes.
 	alias, _ := wf["alias"].(string)
 	if alias == "" {
 		alias, _ = wf["workflowAlias"].(string)
@@ -65,8 +57,6 @@ func resolveWorkflowAlias(c *client.Client, aliasOrID string) (string, error) {
 	}
 	return alias, nil
 }
-
-// ===================== Lifecycle =====================
 
 func makeWfv2PublishCmd() *cobra.Command {
 	var lockToken string
@@ -105,10 +95,8 @@ needed afterwards.`,
 	return cmd
 }
 
-// publishWorkflowV2 POSTs the publish endpoint, carrying the edit-lock token
-// when the caller holds one. BC's publish guard is token-strict (it does not
-// fall back to the caller's user id the way PATCH does), so a held lock without
-// its token is a 423 even for the lock's own holder.
+// BC's publish guard is token-strict: a held lock without its token 423s even for
+// the lock's own holder.
 func publishWorkflowV2(c *client.Client, workflowID, lockToken string) (json.RawMessage, error) {
 	path := fmt.Sprintf("/v2/workflows/%s/publish", workflowID)
 	var body any
@@ -294,11 +282,7 @@ from the new label; if it collides with an existing alias the API returns 409.`,
 	return cmd
 }
 
-// ===================== Visibility =====================
-
-// wfv2VisibilityFlags carries the raw --hidden / --show-in-customer /
-// --show-in-deal values. Each is tri-state: "" means the flag was not passed
-// and its key must stay out of the body so the server leaves it untouched.
+// Each flag is tri-state: "" means unset, so its key stays out of the body.
 type wfv2VisibilityFlags struct {
 	Hidden         string
 	ShowInCustomer string
@@ -322,8 +306,7 @@ func parseTriStateBool(flag, raw string) (*bool, error) {
 	return nil, fmt.Errorf("%s must be true or false, got %q", flag, raw)
 }
 
-// buildVisibilityBody turns the tri-state flags into the PATCH body. Passing no
-// flag at all is refused here, before any request.
+// Passing no flag at all is refused here, before any request.
 func buildVisibilityBody(f wfv2VisibilityFlags) (json.RawMessage, error) {
 	var body wfv2VisibilityBody
 	var err error
@@ -403,8 +386,6 @@ At least one flag is required. Returns alias, modifiedCount and the flags sent.`
 	cmd.Flags().StringVar(&flags.ShowInDeal, "show-in-deal", "", "true|false: list in the Deal actions menu (unset = false)")
 	return cmd
 }
-
-// ===================== Locks =====================
 
 func makeWfv2LockGroupCmd() *cobra.Command {
 	group := &cobra.Command{
@@ -618,10 +599,8 @@ whatever is blocking you is not a lock under that name.`,
 	}
 }
 
-// forceReleaseReportedNoLock reports whether a force-release response explicitly
-// says no lock was removed. Older backends answer a bare {"success": true} for
-// every outcome -- deleted, nothing there, wrong key -- so an absent `released`
-// field means "cannot tell" and is NOT reported as an empty release.
+// Older backends answer a bare {"success": true} for every outcome, so an absent
+// `released` field means "cannot tell" and is NOT reported as an empty release.
 func forceReleaseReportedNoLock(data json.RawMessage) bool {
 	var ack struct {
 		Released *bool `json:"released"`
@@ -631,8 +610,6 @@ func forceReleaseReportedNoLock(data json.RawMessage) bool {
 	}
 	return ack.Released != nil && !*ack.Released
 }
-
-// ===================== Editing =====================
 
 func makeWfv2AutosaveCmd() *cobra.Command {
 	var bodyFlag string
@@ -713,11 +690,8 @@ func makeWfv2UpdateMappingCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Backend UpdateMappingWorkflow expects snake_case body keys
-			// (node_id / previous_variable_name / new_variable_name) -- the
-			// model in app/api/workflows_v2/handler.py:101 doesn't declare
-			// camelCase aliases, unlike the rest of v2 which does. Sending
-			// camelCase 400s with "field required". Match the model.
+			// This handler's model declares snake_case keys only, unlike the rest of v2, so
+			// camelCase 400s with "field required".
 			body := map[string]any{
 				"node_id":                nodeID,
 				"previous_variable_name": previous,
@@ -765,8 +739,6 @@ func makeWfv2ResolveMappingsCmd() *cobra.Command {
 		},
 	}
 }
-
-// ===================== Versions / executions =====================
 
 func makeWfv2VersionsCmd() *cobra.Command {
 	var page int
@@ -822,10 +794,10 @@ a UUID to its alias via ` + "`GET /v2/workflows/{id}`" + ` first.`,
 
 func makeWfv2GetVersionCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "get-version <alias-or-id> <version>",
-		Short:   "Fetch a specific v2 workflow version",
-		Long:    `Pass "latest" as <version> to get the most recent published version.`,
-		Args:    cobra.ExactArgs(2),
+		Use:   "get-version <alias-or-id> <version>",
+		Short: "Fetch a specific v2 workflow version",
+		Long:  `Pass "latest" as <version> to get the most recent published version.`,
+		Args:  cobra.ExactArgs(2),
 		Example: `  altscore workflows-v2 get-version my-wf latest
   altscore workflows-v2 get-version my-wf 3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -909,7 +881,6 @@ func makeWfv2ExecutionsCmd() *cobra.Command {
 	return cmd
 }
 
-// splitFilter parses "key=value" into (key, value, true). Returns false if malformed.
 func splitFilter(f string) (string, string, bool) {
 	for i := 0; i < len(f); i++ {
 		if f[i] == '=' {
@@ -918,8 +889,6 @@ func splitFilter(f string) (string, string, bool) {
 	}
 	return "", "", false
 }
-
-// ===================== Schedules =====================
 
 func makeWfv2ScheduleGroupCmd() *cobra.Command {
 	group := &cobra.Command{
@@ -1081,8 +1050,8 @@ func makeWfv2SchedulePreviewCmd() *cobra.Command {
 				return err
 			}
 			body := map[string]any{
-				"cron":           cron,
-				"utcDeltaHours":  utcDelta,
+				"cron":          cron,
+				"utcDeltaHours": utcDelta,
 			}
 			if count > 0 {
 				body["count"] = count
@@ -1147,8 +1116,6 @@ func makeWfv2ScheduleValidateCmd() *cobra.Command {
 	return cmd
 }
 
-// ===================== Import / export =====================
-
 func makeWfv2ExportCmd() *cobra.Command {
 	var format string
 	cmd := &cobra.Command{
@@ -1182,7 +1149,7 @@ back reports every task unchanged. A task authored in the Hub has no specRef
 and falls back to its server alias (slug-NNNNNN) as the ref; applying that
 creates a fresh task under a new alias. Edge endpoints are mapped from node ids
 to refs; node positions are kept, so apply leaves the canvas as it was.`,
-		Args:    cobra.ExactArgs(1),
+		Args: cobra.ExactArgs(1),
 		Example: `  altscore workflows-v2 export <id> > my-wf.json
   altscore workflows-v2 export <id> --format apply-spec > spec.json
   altscore workflows-v2 export <id> --format apply-spec | altscore workflows-v2 apply`,
@@ -1219,8 +1186,6 @@ to refs; node positions are kept, so apply leaves the canvas as it was.`,
 	return cmd
 }
 
-// ===================== Execute =====================
-
 type wfv2ExecHeaders struct {
 	tags               string
 	test               bool
@@ -1232,11 +1197,8 @@ type wfv2ExecHeaders struct {
 
 func (h wfv2ExecHeaders) asMap() map[string]string {
 	out := map[string]string{}
-	// --test marks the whole execution as test: borrower-central sets
-	// is_test=true when the "test" tag is present, which forces
-	// is_billable=false and hides the run from metrics/default lists.
-	// (Side effects -- borrower/deal/package writes -- still run; test mode
-	// is about billing/metrics/visibility, not a dry run.)
+	// borrower-central sets is_test=true when the "test" tag is present, which forces
+	// is_billable=false. Side effects still run: this is not a dry run.
 	tags := h.tags
 	if h.test {
 		tags = ensureTestTag(tags)
@@ -1268,11 +1230,7 @@ func bindExecHeaderFlags(cmd *cobra.Command, h *wfv2ExecHeaders) {
 	cmd.Flags().StringVar(&h.executionMode, "execution-mode", "", `X-Execution-Mode ("sync"/"async")`)
 }
 
-// ensureTestTag returns a comma-separated tag string guaranteed to contain the
-// literal "test" tag. borrower-central auto-marks an execution is_test=true
-// (and therefore is_billable=false, hidden from metrics) when the "test" tag is
-// present on the run. Matching is on the exact "test" element, so "parity-test"
-// or "testing" do NOT trigger it -- only a standalone "test" tag does.
+// Matching is on the exact "test" element, so "parity-test" or "testing" do NOT trigger it.
 func ensureTestTag(csv string) string {
 	if csv == "" {
 		return "test"
@@ -1285,9 +1243,6 @@ func ensureTestTag(csv string) string {
 	return csv + ",test"
 }
 
-// wfv2WaitFlags holds the polling configuration shared by execute and
-// execute-by-alias. Defaults are 5m total deadline and 2s between polls,
-// matching the partner spec.
 type wfv2WaitFlags struct {
 	wait         bool
 	timeout      time.Duration
@@ -1300,9 +1255,7 @@ func bindWaitFlags(cmd *cobra.Command, w *wfv2WaitFlags) {
 	cmd.Flags().DurationVar(&w.pollInterval, "poll-interval", 2*time.Second, "interval between poll calls when --wait is set")
 }
 
-// terminalExecutionStatuses are the workflow-execution statuses that end the
-// poll loop. Source of truth: ExecutionStatus in
-// borrower-central/app/model/workflows_v2/workflow_execution.py.
+// Source of truth: ExecutionStatus in app/model/workflows_v2/workflow_execution.py.
 var terminalExecutionStatuses = map[string]bool{
 	"completed": true,
 	"failed":    true,
@@ -1310,22 +1263,13 @@ var terminalExecutionStatuses = map[string]bool{
 	"timed_out": true,
 }
 
-// failureExecutionStatuses are the subset of terminal statuses that should
-// cause the CLI to exit non-zero.
 var failureExecutionStatuses = map[string]bool{
 	"failed":    true,
 	"cancelled": true,
 	"timed_out": true,
 }
 
-// pollExecutionWait runs the --wait poll loop against
-// GET /v2/workflows/{workflowId}/executions/{executionId} until the execution
-// reaches a terminal state or the timeout fires.
-//
-// On --verbose, prints per-node status transitions to stderr as
-// "[<ts>] <node_id> <prev_status> -> <new_status>". Returns the final raw
-// execution JSON so the caller can pretty-print it to stdout, together with
-// the terminal status string. A timeout returns (nil, "", *ExitCodeError{2}).
+// A timeout returns (nil, "", *ExitCodeError{2}).
 func pollExecutionWait(c *client.Client, workflowID, executionID string, w wfv2WaitFlags, verbose bool, stderr io.Writer) (json.RawMessage, string, error) {
 	if w.pollInterval <= 0 {
 		w.pollInterval = 2 * time.Second
@@ -1345,7 +1289,6 @@ func pollExecutionWait(c *client.Client, workflowID, executionID string, w wfv2W
 	for {
 		data, _, err := c.Do("GET", "borrower_central", path, nil)
 		if err != nil {
-			// Be defensive about transient HTTP errors -- one retry, then fail.
 			transientFailures++
 			if transientFailures > 1 {
 				return nil, "", fmt.Errorf("poll %s failed: %w", path, err)
@@ -1375,9 +1318,7 @@ func pollExecutionWait(c *client.Client, workflowID, executionID string, w wfv2W
 	}
 }
 
-// extractExecutionStatus pulls the lowercase status string out of a workflow
-// execution JSON. Returns "" when the field is missing or not a string so the
-// loop keeps polling instead of crashing.
+// Returns "" when the field is missing, so the loop keeps polling instead of crashing.
 func extractExecutionStatus(data json.RawMessage) string {
 	var env map[string]any
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -1395,12 +1336,6 @@ func extractExecutionStatus(data json.RawMessage) string {
 	return ""
 }
 
-// extractNodeStatuses walks the execution JSON and returns a map of
-// node_id -> status. Looks at common shapes:
-//   - top-level "nodes": [{id|nodeId, status}, ...]
-//   - top-level "taskExecutions": [{taskId|nodeId, status}, ...]
-//   - "data.nodes" / "data.taskExecutions" for wrapped payloads
-//
 // Missing or differently-shaped data is silently ignored.
 func extractNodeStatuses(data json.RawMessage) map[string]string {
 	out := map[string]string{}
@@ -1471,9 +1406,6 @@ func printNodeStatusTransitions(stderr io.Writer, data json.RawMessage, prev map
 	}
 }
 
-// extractFailureDetail pulls failedNodeId + a best-effort failure reason out
-// of the execution payload. PR1 may be adding "failureReason" as a top-level
-// field; until then we also fall back to error.message / error.details.
 func extractFailureDetail(data json.RawMessage) (failedNodeID, reason string) {
 	var env map[string]any
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -1505,9 +1437,6 @@ func extractFailureDetail(data json.RawMessage) (failedNodeID, reason string) {
 	return failedNodeID, reason
 }
 
-// runExecuteWithOptionalWait centralises the post-submit flow shared by
-// execute and execute-by-alias. When wait is set it polls; otherwise it just
-// prints the submit response (existing behavior).
 func runExecuteWithOptionalWait(
 	c *client.Client,
 	stdout, stderr io.Writer,
@@ -1556,10 +1485,6 @@ func runExecuteWithOptionalWait(
 	return nil
 }
 
-// extractExecutionID digs the executionId out of an async-submit response.
-// Tolerates both the flat shape ({executionId}) and a nested-under-"data"
-// wrapper. The workflow id is not parsed here -- the CLI command already has
-// it from its arg list and passes it through.
 func extractExecutionID(data json.RawMessage) string {
 	var env map[string]any
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -1626,9 +1551,7 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 			if !skipStatusCheck {
 				warnIfNotActive(cmd.OutOrStderr(), c, args[0])
 			}
-			// --wait implies async submit -- otherwise the sync header would
-			// fight the poll loop and we'd race the HTTP timeout. Only flip
-			// the mode when the user hasn't explicitly passed one.
+			// --wait implies async: a sync submit would race the HTTP timeout against the poll loop.
 			if wait.wait && !cmd.Flags().Changed("execution-mode") {
 				headers.executionMode = "async"
 			}
@@ -1649,12 +1572,8 @@ state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 	return cmd
 }
 
-// warnIfNotActive does a best-effort GET /v2/workflows/{id}; if the targeted
-// version isn't ACTIVE, it prints an INFORMATIONAL note to stderr. The version
-// still executes its full graph faithfully -- node execution is never gated by
-// status -- so the note just flags that this isn't the version the alias
-// serves. Best-effort: if the GET fails for any reason we skip the note rather
-// than block the execute.
+// Informational only: node execution is never gated by status, so the note just
+// flags that this isn't the version the alias serves. A failed GET skips it.
 func warnIfNotActive(stderr io.Writer, c *client.Client, idOrAlias string) {
 	data, _, err := c.Do("GET", "borrower_central", "/v2/workflows/"+idOrAlias, nil)
 	if err != nil {
@@ -1777,10 +1696,7 @@ are non-billable and hidden from metrics; side effects still run.`,
 			if err != nil {
 				return err
 			}
-			// Preflight: batch needs inputs:[...]. Without it the API
-			// happily creates a no-op batch ID; agents copy-pasting from
-			// 'execute' get a silent zombie. A flat single-input body is
-			// auto-wrapped as {"inputs":[<body>]}.
+			// Without inputs[] the API happily creates a no-op batch id -- a silent zombie.
 			normalized, wrapped, err := normalizeBatchBody(body)
 			if err != nil {
 				return err
@@ -1809,9 +1725,7 @@ are non-billable and hidden from metrics; side effects still run.`,
 	return cmd
 }
 
-// setBodyTestMode sets testMode=true on an execute-batch JSON body. The batch
-// endpoint's first-class test signal is the body field testMode (vs the X-Tags
-// header used by single execute), so --test injects it here.
+// The batch endpoint's test signal is the body field testMode, not the X-Tags header.
 func setBodyTestMode(body json.RawMessage) (json.RawMessage, error) {
 	var parsed map[string]any
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -1825,11 +1739,7 @@ func setBodyTestMode(body json.RawMessage) (json.RawMessage, error) {
 	return json.RawMessage(out), nil
 }
 
-// normalizeBatchBody prepares an execute-batch body. When the body is a flat
-// JSON object with no top-level 'inputs' key (the shape 'execute' takes), it
-// is wrapped as {"inputs":[<body>]} and the second return value is true. When
-// 'inputs' is present it must be a non-empty array, else an error is returned.
-// Non-object bodies are passed through untouched (the API will reject them).
+// Non-object bodies pass through untouched; the API rejects them.
 func normalizeBatchBody(body json.RawMessage) (json.RawMessage, bool, error) {
 	var parsed map[string]any
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -1912,8 +1822,6 @@ func makeWfv2DownloadCmd() *cobra.Command {
 	return cmd
 }
 
-// ===================== Batch control =====================
-
 func makeWfv2BatchGroupCmd() *cobra.Command {
 	group := &cobra.Command{
 		Use:   "batch",
@@ -1945,8 +1853,6 @@ func makeWfv2BatchSignalCmd(verb, short string) *cobra.Command {
 		},
 	}
 }
-
-// ===================== Sources =====================
 
 func makeWfv2SourcesStatusCmd() *cobra.Command {
 	var status string
@@ -2019,8 +1925,6 @@ func makeWfv2ExternalSourcesStatusCmd() *cobra.Command {
 	}
 }
 
-// ===================== AI =====================
-
 func makeWfv2AIGroupCmd() *cobra.Command {
 	group := &cobra.Command{
 		Use:   "ai",
@@ -2061,11 +1965,6 @@ Returns a list of suggested mappings. May return 503 if the LLM is not configure
 	return cmd
 }
 
-// ===================== Schema guide =====================
-
-// wfv2SchemaGuidePath builds the query for GET /v1/meta/workflows-v2-schema.
-// No args is the INDEX (one line + token cost per section); --full is the
-// whole guide; one arg is a section; "tasks <type>" narrows to one task type.
 // A section argument wins over --full, as it does on the server.
 func wfv2SchemaGuidePath(args []string, full bool) string {
 	path := "/v1/meta/workflows-v2-schema"

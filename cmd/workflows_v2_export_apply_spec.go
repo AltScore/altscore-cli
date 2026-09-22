@@ -7,62 +7,19 @@ import (
 	"strings"
 )
 
-// exportRefMode picks the identity a flattened node's `ref` carries.
 type exportRefMode int
 
 const (
-	// refFromSpecRef emits the task's stored specRef, else its alias, else the
-	// node id. `export --format apply-spec` uses it so a re-apply matches every
-	// task by (workflowAlias, specRef) and reports it unchanged. A task without
-	// a specRef (authored in the Hub) falls back to its alias; a backend that
-	// adopts by alias (a ref equal to the alias of a node of the target
-	// workflow) keeps it as the same task and stamps the specRef on the bump,
-	// an older backend re-applies it as a new task.
+	// Stored specRef, else alias, else node id: a re-apply then matches every task by
+	// (workflowAlias, specRef) and reports it unchanged.
 	refFromSpecRef exportRefMode = iota
-	// refFromAlias emits the task alias, else the node id. `diff <a> <b>` uses
-	// it: aliases survive version bumps, while a specRef first appears when the
-	// CLI applies over a Hub-authored task, so alias identity keeps a node
-	// matched across that boundary.
+	// Alias, else node id: aliases survive version bumps, while a specRef only appears
+	// once the CLI applies over a Hub-authored task.
 	refFromAlias
 )
 
-// bundleToApplySpec converts a /v2/workflows/{id}/export bundle into the FLAT
-// spec shape that `workflows-v2 apply` consumes, so a live workflow can be
-// edited and re-applied without hand-reconstructing the spec.
-//
-// The export bundle (see borrower-central
-// app/usecase/workflows_v2/export_workflow.py) is shaped as:
-//
-//	{
-//	  "sourceAlias": "...",
-//	  "workflow": {label, description, category, nodes[], edges[],
-//	               inputVariables, customVariables, ...},
-//	  "tasks":    [ {alias, specRef?, type, label, ...full task body...}, ... ],
-//	  "evaluationRules": [...], "scorecards": [...], ... (entity arrays)
-//	}
-//
-// Each workflow node references its backing task by `taskAlias`. apply, by
-// contrast, wants ONE flat node entry per graph node carrying the task body
-// fields INLINE plus `type`, `label`, `position` and a spec-local `ref` (see
-// the composeSpec docs in workflows_v2_apply_spec.go). bundleToApplySpec performs
-// that inversion: it indexes tasks by alias, then for every workflow node
-// merges the matching task body into the node entry.
-//
-// Ref recovery: a task the CLI applied carries its original spec-local ref as
-// `specRef`, and the server identifies tasks by (workflowAlias, specRef). In
-// refFromSpecRef mode that value becomes the node's `ref`, so exporting a
-// workflow and applying the result reports every task unchanged. Edges in the
-// bundle name node ids, which are not always the alias (the Hub assigns its
-// own), so every endpoint is mapped through the node it points at; an endpoint
-// that matches no node is an error rather than a dangling edge.
-//
-// References inside bodies (`task_outputs.<alias>...`) are left as they are:
-// the alias is stable across version bumps and the server resolves it, so the
-// round trip stays faithful even though refs and bodies name the same task
-// differently. The credit-decisioning entity arrays (scorecards / ruleTrees /
-// ...) are NOT inlined -- apply references them by code from each task's
-// *Config and re-scopes the live entities, so they are intentionally dropped
-// from the spec.
+// The credit-decisioning entity arrays are dropped on purpose: apply references them by
+// code from each task's *Config and re-scopes the live entities.
 func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]any, error) {
 	var b struct {
 		SourceAlias string           `json:"sourceAlias"`
@@ -76,7 +33,6 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 		return nil, fmt.Errorf("export bundle has no .workflow object (is this a v2 export?)")
 	}
 
-	// Index tasks by their server alias so each node can pull its body.
 	taskByAlias := make(map[string]map[string]any, len(b.Tasks))
 	for _, t := range b.Tasks {
 		if alias, _ := t["alias"].(string); alias != "" {
@@ -84,9 +40,6 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 		}
 	}
 
-	// Fields on a task body that are bundle/identity bookkeeping, not part of
-	// the spec node contract. `specRef`/`alias` become `ref`; type/label are set
-	// from the node so they stay authoritative even if a task body lacks them.
 	taskDropFields := map[string]bool{
 		"alias":         true,
 		"type":          true,
@@ -121,7 +74,6 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 			entry[k] = v
 		}
 
-		// type/label/ref are authoritative from the node.
 		entry["type"] = nodeType
 		if label != "" {
 			entry["label"] = label
@@ -146,15 +98,12 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 			refByNodeID[taskAlias] = ref
 		}
 
-		// A pinned position keeps apply's auto-layout off, so the canvas
-		// survives the round trip.
+		// A pinned position keeps apply's auto-layout off, so the canvas survives the trip.
 		if pos, ok := node["position"]; ok && pos != nil {
 			entry["position"] = pos
 		}
 
-		// node.data.inputMappings is the canvas mirror of the task body's
-		// inputMappings. Prefer the task body's copy (already inlined above);
-		// fall back to the node's mirror when the task body didn't carry one.
+		// node.data.inputMappings is the canvas mirror; the task body's copy wins.
 		if _, has := entry["inputMappings"]; !has {
 			if data, _ := node["data"].(map[string]any); data != nil {
 				if im, ok := data["inputMappings"]; ok {
@@ -166,13 +115,7 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 		specNodes = append(specNodes, entry)
 	}
 
-	// A live workflow may still run a retired node type. Re-applying this spec
-	// over the SAME workflow keeps working -- apply refuses a deprecated type
-	// only as new authoring, and these are carried forward (see
-	// deprecatedTaskTypeRefused) -- but retargeting the spec at a fresh alias
-	// makes every one of them new, and that apply is refused. Say so here
-	// rather than at the failed apply. diff (refFromAlias) stays quiet: nobody
-	// re-applies a comparison.
+	// Only for an apply-spec: nobody re-applies a diff comparison.
 	if mode == refFromSpecRef && len(deprecatedNodes) > 0 {
 		fmt.Fprintf(os.Stderr,
 			"# WARNING: this apply-spec carries DEPRECATED node type(s): %s. "+
@@ -184,8 +127,6 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 		)
 	}
 
-	// Edges: the bundle names node ids, the spec names refs. Map every endpoint
-	// through the node it points at; handles, label and id travel unchanged.
 	rawEdges, _ := b.Workflow["edges"].([]any)
 	specEdges := make([]map[string]any, 0, len(rawEdges))
 	for _, re := range rawEdges {
@@ -217,9 +158,7 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 		"nodes": specNodes,
 		"edges": specEdges,
 	}
-	// alias: prefer the bundle's sourceAlias (the live workflow's alias) so a
-	// re-apply targets the SAME workflow (update path) rather than minting a
-	// new one. The export workflow object itself strips workflowAlias.
+	// sourceAlias makes a re-apply target the SAME workflow instead of minting a new one.
 	if b.SourceAlias != "" {
 		spec["alias"] = b.SourceAlias
 	}

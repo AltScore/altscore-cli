@@ -7,7 +7,6 @@ import (
 	"testing"
 )
 
-// layoutNode builds a minimal graph node for the layout passes.
 func layoutNode(id string) map[string]any {
 	return map[string]any{"nodeId": id, "type": "http", "label": id}
 }
@@ -16,7 +15,6 @@ func layoutEdge(from, to string) map[string]any {
 	return map[string]any{"sourceNodeId": from, "targetNodeId": to}
 }
 
-// nodePos reads back a position written by autoLayoutNodes.
 func nodePos(t *testing.T, nodes []map[string]any, id string) (float64, float64) {
 	t.Helper()
 	for _, n := range nodes {
@@ -33,8 +31,6 @@ func nodePos(t *testing.T, nodes []map[string]any, id string) (float64, float64)
 	return 0, 0
 }
 
-// assertNoOverlap fails when any two cards are close enough to visually
-// collide, using the same box the layout reserves for each node.
 func assertNoOverlap(t *testing.T, nodes []map[string]any) {
 	t.Helper()
 	type box struct {
@@ -61,8 +57,6 @@ func assertNoOverlap(t *testing.T, nodes []map[string]any) {
 	}
 }
 
-// assertEdgesPointForward fails on any edge whose target is not strictly right
-// of its source -- the backward-edge class Hub #2503 fixed in the builder.
 func assertEdgesPointForward(t *testing.T, nodes []map[string]any, edges []map[string]any) {
 	t.Helper()
 	for _, e := range edges {
@@ -75,8 +69,6 @@ func assertEdgesPointForward(t *testing.T, nodes []map[string]any, edges []map[s
 	}
 }
 
-// A diamond is the shape the old positioner mangled worst: both arms and the
-// join all landed on one row, and the short arm drew backwards into the join.
 func TestAutoLayoutNodes_DiamondColumnsAndForwardEdges(t *testing.T) {
 	nodes := []map[string]any{
 		layoutNode("start"), layoutNode("split"),
@@ -97,8 +89,6 @@ func TestAutoLayoutNodes_DiamondColumnsAndForwardEdges(t *testing.T) {
 	assertEdgesPointForward(t, nodes, edges)
 	assertNoOverlap(t, nodes)
 
-	// Both arms share a column; the join sits one column right of BOTH of them
-	// (longest-path leveling), not right of the first arm to be visited.
 	ax, ay := nodePos(t, nodes, "armA")
 	bx, by := nodePos(t, nodes, "armB")
 	if ax != bx {
@@ -113,8 +103,6 @@ func TestAutoLayoutNodes_DiamondColumnsAndForwardEdges(t *testing.T) {
 	}
 }
 
-// A short-circuit edge (start straight to end) must not drag `end` left into an
-// early column: end belongs one column right of its DEEPEST parent.
 func TestAutoLayoutNodes_ShortCircuitEdgeStaysForward(t *testing.T) {
 	nodes := []map[string]any{
 		layoutNode("start"), layoutNode("a"), layoutNode("b"), layoutNode("end"),
@@ -138,15 +126,10 @@ func TestAutoLayoutNodes_ShortCircuitEdgeStaysForward(t *testing.T) {
 	}
 }
 
-// colTopY is the y of the top-left corner of a column holding n cards. Cards
-// are centered on the y=0 axis, matching the Hub, so a lone card in a column
-// sits at -height/2 rather than 0.
 func colTopY(n int) float64 {
 	return -((layoutNodeH+layoutRowGap)*float64(n) - layoutRowGap) / 2
 }
 
-// A long linear chain is the common case and must come out as one row of evenly
-// spaced, non-overlapping columns -- the old 200px pitch overlapped every pair.
 func TestAutoLayoutNodes_LinearChainIsOneRow(t *testing.T) {
 	nodes := []map[string]any{}
 	edges := []map[string]any{}
@@ -172,16 +155,14 @@ func TestAutoLayoutNodes_LinearChainIsOneRow(t *testing.T) {
 	}
 }
 
-// Duplicate and self edges are spec redundancies, not topology: they must not
-// inflate in-degree and exile a node to the unconnected column.
 func TestAutoLayoutNodes_DuplicateAndSelfEdgesIgnored(t *testing.T) {
 	nodes := []map[string]any{layoutNode("start"), layoutNode("mid"), layoutNode("end")}
 	edges := []map[string]any{
 		layoutEdge("start", "mid"),
-		layoutEdge("start", "mid"), // duplicate
-		layoutEdge("mid", "mid"),   // self
+		layoutEdge("start", "mid"),
+		layoutEdge("mid", "mid"),
 		layoutEdge("mid", "end"),
-		layoutEdge("start", "ghost"), // unknown target
+		layoutEdge("start", "ghost"),
 	}
 
 	autoLayoutNodes(nodes, edges)
@@ -198,10 +179,6 @@ func TestAutoLayoutNodes_DuplicateAndSelfEdgesIgnored(t *testing.T) {
 	}
 }
 
-// A node the leveling pass can't reach (cycle member) lands in the trailing
-// column -- the Hub's "unconnected" bucket -- instead of piling up at the
-// origin. An edge-less node is still a level-0 root, so it shares the first
-// column with the other roots.
 func TestAutoLayoutNodes_CycleFallsToTrailingColumn(t *testing.T) {
 	nodes := []map[string]any{
 		layoutNode("start"), layoutNode("a"), layoutNode("b"), layoutNode("loner"),
@@ -209,13 +186,12 @@ func TestAutoLayoutNodes_CycleFallsToTrailingColumn(t *testing.T) {
 	edges := []map[string]any{
 		layoutEdge("start", "a"),
 		layoutEdge("a", "b"),
-		layoutEdge("b", "a"), // cycle: a keeps an unresolved parent forever
+		layoutEdge("b", "a"),
 	}
 
 	autoLayoutNodes(nodes, edges)
 	assertNoOverlap(t, nodes)
 
-	// Levels resolve to {0: start, loner}, {1: a}; b is stranded -> column 2.
 	pitch := layoutNodeW + layoutColGap
 	sx, _ := nodePos(t, nodes, "start")
 	lx, _ := nodePos(t, nodes, "loner")
@@ -227,8 +203,6 @@ func TestAutoLayoutNodes_CycleFallsToTrailingColumn(t *testing.T) {
 	}
 }
 
-// Determinism: the same input must lay out identically every run, so re-applying
-// an unchanged spec produces no spurious position diff.
 func TestAutoLayoutNodes_Deterministic(t *testing.T) {
 	build := func() ([]map[string]any, []map[string]any) {
 		nodes := []map[string]any{
@@ -295,9 +269,6 @@ func TestSpecHasPinnedPositions(t *testing.T) {
 	}
 }
 
-// Compose end-to-end: a branching spec must come out of composeWorkflowBody
-// laid out, with the pinned-position escape hatch honored. This is the
-// regression that made CLI-composed workflows open as an overlapping row.
 func TestComposeWorkflowBody_LaysOutBranchingGraph(t *testing.T) {
 	newSpec := func() *composeSpec {
 		return &composeSpec{
@@ -347,7 +318,6 @@ func TestComposeWorkflowBody_LaysOutBranchingGraph(t *testing.T) {
 		t.Errorf("branch arms should occupy different rows: both y=%v", ly)
 	}
 
-	// --no-layout keeps the legacy single-row positions.
 	legacy, err := composeWorkflowBody(nil, newSpec(), true, false, true, false, false, false, newComposeCapture())
 	if err != nil {
 		t.Fatalf("compose (no layout): %v", err)
@@ -359,7 +329,6 @@ func TestComposeWorkflowBody_LaysOutBranchingGraph(t *testing.T) {
 		}
 	}
 
-	// A pinned position anywhere in the spec disables layout entirely.
 	pinned := newSpec()
 	pinned.ExtraNodes[0]["position"] = map[string]float64{"x": 42, "y": 7}
 	pinnedWf, err := composeWorkflowBody(nil, pinned, true, false, true, false, false, true, newComposeCapture())
@@ -372,8 +341,6 @@ func TestComposeWorkflowBody_LaysOutBranchingGraph(t *testing.T) {
 	}
 }
 
-// A position pinned on a task entry must reach the graph node and NOT ride
-// along in the body posted to /v2/tasks.
 func TestComposeWorkflowBody_PinnedTaskPositionLiftedOffTaskBody(t *testing.T) {
 	spec := &composeSpec{
 		Label:    "Pinned task probe",

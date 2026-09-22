@@ -2,11 +2,6 @@ package cmd
 
 import "testing"
 
-// An absent dataAge is not an oversight, it is the instruction "use the freshness
-// this source publishes". apply used to stamp 30 onto every entry that lacked one,
-// which made that instruction unsayable: an authored dataAge overrides the
-// published policy, so every applied workflow asked for a half-hourly refresh of
-// data its source says is good for anywhere from a day to a fortnight.
 func TestAltdataSourceDefaults_DoesNotStampDataAge(t *testing.T) {
 	sources := []any{
 		map[string]any{"sourceId": "ECU-PUB-0063", "version": "v2"},

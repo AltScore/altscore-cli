@@ -12,37 +12,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// diffWorkflow renders a human-readable structural diff between the spec
-// (already assembled into the workflow body apply would POST/autosave) and
-// the current state of the target workflow on the tenant. Read-only: no
-// /v2/workflows mutations, no /v2/tasks POSTs, no entity-scope PATCHes.
-//
-//   - existing == nil  -> CREATE preview: print a summary of what apply would
-//     create (counts of tasks, edges, variables).
-//   - existing != nil  -> UPDATE preview: GET /v2/workflows/{id}, compare each
-//     section (label/description/category/status, nodes-by-taskAlias, edges,
-//     inputVariables, customVariables), and print a per-section diff using
-//     ASCII markers (+ added, - removed, ~ changed).
-//
-// Entity-scope conflicts that apply's preflight would catch are also surfaced
-// here -- when the spec references credit-decisioning entities whose current
-// workflowAlias points at a different workflow, we list the entities (best-
-// effort; the preflight inside composeWorkflowBody catches them as hard
-// errors before this diff renderer runs, so this branch only fires when
-// AllowStealOwnership is true and the entities would be re-stamped).
-//
-// Exit code 0 on success regardless of whether diffs exist. The caller (apply
-// RunE) returns nil and Cobra prints nothing extra; the diff itself goes to
-// stdout so it composes with `| less` / `> /tmp/foo`.
-//
-// Nodes on the two sides are matched by alias (nodeAliasKey): the server's
-// dryRun plan resolved every ref to its REAL alias (existing tasks keep
-// theirs), so a relabel is `~`, never `-`/`+`.
 func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assembled map[string]any, existing map[string]any, targetAlias string) error {
 	out := cmd.OutOrStdout()
 	keyFn := nodeAliasKey
 
-	// === CREATE preview ===
 	if existing == nil {
 		nodes := toMapSlice(assembled["nodes"])
 		edges := toMapSlice(assembled["edges"])
@@ -69,7 +42,6 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 		return nil
 	}
 
-	// === UPDATE preview ===
 	existingID, _ := existing["id"].(string)
 	if existingID == "" {
 		return fmt.Errorf("diff: existing workflow %q has no id", targetAlias)
@@ -83,30 +55,20 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 		return fmt.Errorf("diff: parse current workflow %s: %w", existingID, err)
 	}
 
-	// Header. Slice the id to 8 chars to keep the header compact -- the full
-	// UUID is already in the GET URL above so the agent can copy it.
 	shortID := existingID
 	if len(shortID) > 8 {
 		shortID = shortID[:8]
 	}
 
-	// Buffer the body of the diff. We only emit the "no changes" footer if
-	// nothing landed in the buffer.
 	var buf strings.Builder
 	changes := 0
 
-	// Metadata diff: only the fields apply actually rewrites on autosave.
-	// The spec's status defaults to "DRAFT" if not set, but autosave then
-	// publishes the workflow to ACTIVE on the update path -- so a spec
-	// without an explicit status is NOT a request to drop ACTIVE back to
-	// DRAFT. Skip the status compare when the spec didn't set it (we read
-	// the original spec, not the assembled body that injected DRAFT).
+	// A spec without an explicit status is not a request to drop ACTIVE back to DRAFT:
+	// the assembled body injects DRAFT, so the original spec is what decides.
 	specHasStatus := spec.Status != ""
 	for _, field := range []string{"label", "description", "category", "status", "alias"} {
 		a, _ := assembled[field].(string)
 		b, _ := current[field].(string)
-		// Spec's alias may be absent (server-derived); compare only when the
-		// assembled body actually carries the field.
 		if field == "alias" {
 			if _, has := assembled[field]; !has {
 				continue
@@ -121,8 +83,6 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 		}
 	}
 
-	// Nodes diff: keyed by taskAlias (start nodes have no taskAlias, so we
-	// fall back to nodeId for graph-only entries).
 	specNodes := indexNodesBy(toMapSlice(assembled["nodes"]), keyFn)
 	currNodes := indexNodesBy(toMapSlice(current["nodes"]), keyFn)
 	added, removed, changed := diffNodeIndex(specNodes, currNodes)
@@ -142,7 +102,6 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 		key := ch.key
 		typ, _ := specNodes[key]["type"].(string)
 		fmt.Fprintf(&buf, "  ~ nodes[]: %s (%s) -- %s\n", quoteName(key), typ, strings.Join(ch.fields, ", "))
-		// Per-field detail for inputMappings.
 		if contains(ch.fields, "inputMappings") {
 			diffMappings(&buf, "      ", "inputMappings",
 				readNodeMappings(specNodes[key]), readNodeMappings(currNodes[key]))
@@ -150,8 +109,6 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 		changes++
 	}
 
-	// Edges diff: keyed by (diff-source, sourceHandle, diff-target) where
-	// diff-source/target use the same identity rule as the node section.
 	specNodeKeys := buildNodeKeyByID(toMapSlice(assembled["nodes"]), keyFn)
 	currNodeKeys := buildNodeKeyByID(toMapSlice(current["nodes"]), keyFn)
 	specEdges := indexEdges(toMapSlice(assembled["edges"]), specNodeKeys)
@@ -169,12 +126,10 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 		}
 	}
 
-	// inputVariables diff.
 	changes += diffVarSection(&buf, "inputVariables",
 		toMap(assembled["inputVariables"]),
 		toMap(current["inputVariables"]))
 
-	// customVariables diff.
 	changes += diffVarSection(&buf, "customVariables",
 		toMap(assembled["customVariables"]),
 		toMap(current["customVariables"]))
@@ -187,21 +142,15 @@ func diffWorkflow(c *client.Client, cmd *cobra.Command, spec *composeSpec, assem
 		out.Write([]byte(buf.String()))
 	}
 
-	// Entity scope conflicts (advisory; preflight has already aborted with
-	// a hard error if any cross-ownership exists without --allow-steal-
-	// ownership, but we still surface the touched entities so the human
-	// reviewer can sanity-check).
 	printScopeConflicts(out, c, spec, targetAlias)
 	return nil
 }
 
-// nodeChange records a per-node field-level diff result.
 type nodeChange struct {
 	key    string
 	fields []string
 }
 
-// nodeAliasKey is the exact node identity: the task alias, else the node id.
 func nodeAliasKey(n map[string]any) string {
 	if alias, _ := n["taskAlias"].(string); alias != "" {
 		return alias
@@ -210,7 +159,6 @@ func nodeAliasKey(n map[string]any) string {
 	return id
 }
 
-// indexNodesBy indexes nodes by the given identity rule.
 func indexNodesBy(nodes []map[string]any, keyFn func(map[string]any) string) map[string]map[string]any {
 	out := map[string]map[string]any{}
 	for _, n := range nodes {
@@ -223,8 +171,6 @@ func indexNodesBy(nodes []map[string]any, keyFn func(map[string]any) string) map
 	return out
 }
 
-// diffNodeIndex returns added / removed / changed-with-field-list lists.
-// Sort everything so output is deterministic across re-runs.
 func diffNodeIndex(spec, current map[string]map[string]any) (added, removed []string, changed []nodeChange) {
 	for k := range spec {
 		if _, has := current[k]; !has {
@@ -242,16 +188,12 @@ func diffNodeIndex(spec, current map[string]map[string]any) (added, removed []st
 			continue
 		}
 		fields := []string{}
-		// Per-field shallow compare on the fields apply actually mutates.
-		// taskVersion bumps every apply (fresh tasks), so we skip it to
-		// avoid spamming "all 12 tasks changed taskVersion".
+		// taskVersion bumps on every apply, so comparing it would report every task changed.
 		for _, f := range []string{"type", "label", "config"} {
 			if !reflect.DeepEqual(sn[f], cn[f]) {
 				fields = append(fields, f)
 			}
 		}
-		// inputMappings is stored at node.inputMappings in the assembled
-		// body but at node.data.inputMappings in the GET response.
 		if !reflect.DeepEqual(readNodeMappings(sn), readNodeMappings(cn)) {
 			fields = append(fields, "inputMappings")
 		}
@@ -266,18 +208,14 @@ func diffNodeIndex(spec, current map[string]map[string]any) (added, removed []st
 	return
 }
 
-// edgeKey identifies an edge by its triple (source, handle, target). Empty
-// sourceHandle is normalized to "" so legacy edges and explicit "" match.
 type edgeKey struct {
 	source string
 	handle string
 	target string
 }
 
-// indexEdges keys edges by their (source, handle, target) triple. Endpoints
-// are mapped through nodeKeyByID -- the same keys the node section uses -- so
-// an edge compares by node identity rather than by raw graph id. nodeKeyByID
-// is the {nodeId -> diff-key} reverse map built by buildNodeKeyByID.
+// Endpoints are mapped through nodeKeyByID, so an edge compares by node identity rather
+// than by raw graph id.
 func indexEdges(edges []map[string]any, nodeKeyByID map[string]string) map[edgeKey]map[string]any {
 	out := map[edgeKey]map[string]any{}
 	resolve := func(s string) string {
@@ -295,9 +233,6 @@ func indexEdges(edges []map[string]any, nodeKeyByID map[string]string) map[edgeK
 	return out
 }
 
-// buildNodeKeyByID maps each node's graph id to its diff identity under the
-// given identity rule (the same one indexNodesBy used for the node section, so
-// edge endpoints and node keys agree).
 func buildNodeKeyByID(nodes []map[string]any, keyFn func(map[string]any) string) map[string]string {
 	out := map[string]string{}
 	for _, n := range nodes {
@@ -322,9 +257,6 @@ func formatEdgeKey(k edgeKey) string {
 	return fmt.Sprintf("%s -> %s", k.source, k.target)
 }
 
-// diffVarSection emits a +/-/~ block for inputVariables or customVariables.
-// Returns the number of lines emitted so the caller knows whether to print
-// the "no changes" footer.
 func diffVarSection(buf *strings.Builder, sectionName string, spec, current map[string]any) int {
 	added := []string{}
 	removed := []string{}
@@ -364,9 +296,6 @@ func diffVarSection(buf *strings.Builder, sectionName string, spec, current map[
 	return len(added) + len(removed) + len(changed)
 }
 
-// varBrief renders a one-line summary "(type, default=X)" for an inputVariable
-// or customVariable definition. Used in + / - lines where the value is
-// dropped wholesale and a compact summary is more useful than a JSON dump.
 func varBrief(raw any) string {
 	m, ok := raw.(map[string]any)
 	if !ok {
@@ -389,8 +318,6 @@ func varBrief(raw any) string {
 	return "(" + strings.Join(parts, ", ") + ")"
 }
 
-// printVarChange walks the keys of both maps and prints per-field changes.
-// Stays at one level deep -- nested map changes get dumped via JSON.
 func printVarChange(buf *strings.Builder, indent string, spec, current map[string]any) {
 	keys := map[string]bool{}
 	for k := range spec {
@@ -419,8 +346,6 @@ func printVarChange(buf *strings.Builder, indent string, spec, current map[strin
 	}
 }
 
-// diffMappings emits per-key changes for an inputMappings (or any flat
-// string-keyed) map. Both values are stringified for the diff line.
 func diffMappings(buf *strings.Builder, indent, label string, spec, current map[string]any) {
 	keys := map[string]bool{}
 	for k := range spec {
@@ -449,8 +374,6 @@ func diffMappings(buf *strings.Builder, indent, label string, spec, current map[
 	}
 }
 
-// briefVal returns a one-line representation of any JSON-shaped value.
-// Strings are quoted, scalars dumped as-is, nested maps/slices JSON-encoded.
 func briefVal(v any) string {
 	if v == nil {
 		return "null"
@@ -468,19 +391,8 @@ func briefVal(v any) string {
 	return string(b)
 }
 
-// printScopeConflicts walks the spec's credit-decisioning entities and lists
-// the ones the apply would touch via reconcileEntityScopes. Each entity is
-// classified:
-//   - "would CLAIM":     entity has no workflowAlias yet (apply will stamp)
-//   - "ok (already)":    entity already scoped to the target alias (no-op)
-//   - "would RE-STAMP":  entity is currently owned by another workflow
-//     (apply errors unless --allow-steal-ownership is passed; we still list
-//     it so the human reviewer sees the intent)
-//
-// Best-effort: lookup failures are silent (the missing entity was already
-// warned by composeWorkflowBody's normalize step). Only prints if at least
-// one entity is "would CLAIM" or "would RE-STAMP" -- the no-op case is the
-// common one and noise.
+// Advisory: a lookup failure is silent (normalize already warned) and an entity already
+// scoped to the target is the common case, so it is not printed.
 func printScopeConflicts(out io.Writer, c *client.Client, spec *composeSpec, targetAlias string) {
 	if c == nil || targetAlias == "" {
 		return
@@ -508,7 +420,7 @@ func printScopeConflicts(out io.Writer, c *client.Client, spec *composeSpec, tar
 		}
 		actual, _ := entity["workflowAlias"].(string)
 		if actual == targetAlias {
-			return // no-op
+			return
 		}
 		touches = append(touches, touch{resource, ref, actual})
 	}
@@ -574,7 +486,6 @@ func printScopeConflicts(out io.Writer, c *client.Client, spec *composeSpec, tar
 	if len(touches) == 0 {
 		return
 	}
-	// Stable order.
 	sort.Slice(touches, func(i, j int) bool {
 		if touches[i].resource != touches[j].resource {
 			return touches[i].resource < touches[j].resource
@@ -607,14 +518,10 @@ func printScopeConflicts(out io.Writer, c *client.Client, spec *composeSpec, tar
 	}
 }
 
-// quoteName wraps a name in backticks for the diff output. Backticks read
-// well in stderr against terminals that interpret single/double quotes as
-// shell delimiters when copy-pasting.
 func quoteName(s string) string {
 	return "`" + s + "`"
 }
 
-// plural is a 1-arg ternary -- "1 entity" vs "N entities".
 func plural(n int, singular, multiple string) string {
 	if n == 1 {
 		return singular
@@ -622,7 +529,6 @@ func plural(n int, singular, multiple string) string {
 	return multiple
 }
 
-// contains returns true if needle is in haystack.
 func contains(haystack []string, needle string) bool {
 	for _, s := range haystack {
 		if s == needle {
@@ -632,9 +538,6 @@ func contains(haystack []string, needle string) bool {
 	return false
 }
 
-// toMapSlice coerces an "any" value into []map[string]any. The assembled
-// body uses []map[string]any directly but the GET response (parsed from
-// JSON) uses []any with map[string]any items. Both shapes show up here.
 func toMapSlice(v any) []map[string]any {
 	switch t := v.(type) {
 	case []map[string]any:
@@ -651,8 +554,6 @@ func toMapSlice(v any) []map[string]any {
 	return nil
 }
 
-// toMap coerces an "any" value into map[string]any. Returns an empty (non-
-// nil) map so iteration is safe.
 func toMap(v any) map[string]any {
 	if m, ok := v.(map[string]any); ok {
 		return m
@@ -660,10 +561,8 @@ func toMap(v any) map[string]any {
 	return map[string]any{}
 }
 
-// readNodeMappings extracts inputMappings from a node, supporting both
-// shapes: the assembled body puts it at node.inputMappings, while the GET
-// response wraps it under node.data.inputMappings. Returns nil when neither
-// is present.
+// The assembled body puts inputMappings at node.inputMappings; the GET response wraps it
+// under node.data.inputMappings.
 func readNodeMappings(n map[string]any) map[string]any {
 	if m, ok := n["inputMappings"].(map[string]any); ok && len(m) > 0 {
 		return m

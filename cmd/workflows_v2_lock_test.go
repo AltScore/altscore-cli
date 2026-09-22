@@ -9,10 +9,6 @@ import (
 	"testing"
 )
 
-// TestPublishWorkflowV2_SendsLockToken pins the fix for HQ #1228: publish is
-// gated on the edit lock, so the CLI must present the token it holds. Before
-// this, publish POSTed a nil body and every update-path apply 423'd on the lock
-// it had just acquired itself.
 func TestPublishWorkflowV2_SendsLockToken(t *testing.T) {
 	var gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -40,9 +36,6 @@ func TestPublishWorkflowV2_SendsLockToken(t *testing.T) {
 	}
 }
 
-// TestPublishWorkflowV2_NoTokenSendsNoBody keeps the create path byte-identical
-// to before: a brand-new workflow holds no lock, so there is nothing to send and
-// the optional body must stay absent.
 func TestPublishWorkflowV2_NoTokenSendsNoBody(t *testing.T) {
 	var contentLength int64 = -1
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -61,9 +54,6 @@ func TestPublishWorkflowV2_NoTokenSendsNoBody(t *testing.T) {
 	}
 }
 
-// TestResolveWorkflowAlias_UUIDResolves covers the other half of HQ #1228: the
-// lock endpoints are alias-keyed, so a UUID has to be translated first. A raw id
-// addressed a key nothing had written, and force-release still answered success.
 func TestResolveWorkflowAlias_UUIDResolves(t *testing.T) {
 	const id = "aab5d352-18d6-40b0-8770-783be91d021f"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -84,8 +74,6 @@ func TestResolveWorkflowAlias_UUIDResolves(t *testing.T) {
 	}
 }
 
-// TestResolveWorkflowAlias_AliasMakesNoRequest keeps the common case free: an
-// alias argument must not cost a round-trip.
 func TestResolveWorkflowAlias_AliasMakesNoRequest(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -105,9 +93,6 @@ func TestResolveWorkflowAlias_AliasMakesNoRequest(t *testing.T) {
 	}
 }
 
-// TestForceReleaseReportedNoLock pins how `lock force-release` reads the
-// server's answer: only an explicit released:false means nothing was held. An
-// older backend that omits the field must not be reported as a no-op.
 func TestForceReleaseReportedNoLock(t *testing.T) {
 	cases := []struct {
 		name string

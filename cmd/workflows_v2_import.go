@@ -1,18 +1,5 @@
 package cmd
 
-// `workflows-v2 import` and the findings it surfaces.
-//
-// There is deliberately NO client-side pre-flight here. Like `apply`, import
-// is a SINGLE request that validates against the destination tenant inside its
-// own boundary and either writes or refuses, so a client pre-flight would buy
-// nothing, add a round trip and open a TOCTOU window.
-//
-// It would also be wrong. The server's availability set is
-// (already on tenant) UNION (carried by this bundle); reproducing that in Go
-// would mean re-implementing the import backend, and the house rule is stated
-// plainly in workflows_v2_validation.go: the server is the single oracle, the
-// rules are not re-implemented here.
-
 import (
 	"encoding/json"
 	"fmt"
@@ -21,14 +8,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// importResponseEnvelope is the part of the import response this command reads.
-//
-// Deliberately NOT `validationResponse`. That type carries `Valid bool`, which
-// decodes to false when the key is absent, and its caller's rule
-// (`!resp.Valid || len(errs) > 0`) would then declare every successful import
-// invalid -- aborting on a write that already completed. `Validation` is a
-// pointer and `Imported` a *bool for the same reason: an older backend omits
-// them, and absent must read as "unknown", never as "false".
+// Not validationResponse: an older backend omits these keys, and absent must read as
+// "unknown", never as "false" -- which would abort on an import that already wrote.
 type importResponseEnvelope struct {
 	Validation *struct {
 		Valid    bool                `json:"valid"`
@@ -77,7 +58,6 @@ The API returns 409 if the alias already exists.`,
 			if err != nil {
 				return err
 			}
-			// Wrap body in {"workflowData": <bundle>, ...overrides} per the API contract.
 			var bundle any
 			if err := json.Unmarshal(body, &bundle); err != nil {
 				return fmt.Errorf("invalid JSON body: %w", err)
@@ -104,14 +84,10 @@ The API returns 409 if the alias already exists.`,
 			}
 			data, _, err := c.Do("POST", "borrower_central", "/v2/workflows/import", json.RawMessage(raw))
 			if err != nil {
-				// A refusal arrives here as a 4xx. The client folds >=400 bodies
-				// into the error and discards the JSON, so the findings array is
-				// already gone -- which is why the server's message names the
-				// missing entities itself.
+				// The client folds a >=400 body into the error and drops the findings
+				// JSON, so the server's message has to name the missing entities.
 				return err
 			}
-			// stdout stays the raw server response so the findings remain
-			// machine-readable (and an older CLI still prints them, unformatted).
 			reportImportFindings(cmd, data)
 			return output.RawJSON(data)
 		},
@@ -126,15 +102,8 @@ The API returns 409 if the alias already exists.`,
 	return cmd
 }
 
-// reportImportFindings prints, to stderr, whatever the server reported about a
-// COMPLETED import. Never returns an error and never changes the exit code.
-//
-// Exit policy diverges from `lint` on purpose. Lint is a pure reporting command
-// where any issue of any severity is non-zero; import MUTATES, and by the time
-// these findings are read the workflow already exists. A non-zero exit here
-// would teach CI to retry a completed import, which either 409s on the alias it
-// just created or mints a duplicate under a new label. A refusal is the only
-// non-zero case, and it arrives as a transport error above, before any of this.
+// Never non-zero: import MUTATES, and a failing exit on a completed import would teach
+// CI to retry it, which either 409s on the alias it just created or mints a duplicate.
 func reportImportFindings(cmd *cobra.Command, data json.RawMessage) {
 	if len(data) == 0 {
 		return
@@ -160,9 +129,6 @@ func reportImportFindings(cmd *cobra.Command, data json.RawMessage) {
 		printFindingLines(errOut, "WARN", warns, nil)
 	}
 	if len(errs) > 0 {
-		// Reported, not fatal: these are properties of the SOURCE graph that the
-		// import copied, not something the import created. The workflow was
-		// still written -- saying otherwise would be a lie.
 		fmt.Fprintf(errOut, "# import: %d error(s) carried over from the source workflow:\n", len(errs))
 		printFindingLines(errOut, "ERROR", errs, nil)
 		fmt.Fprintln(errOut, "# the workflow WAS imported; fix these before publishing it.")
