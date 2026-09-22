@@ -7,8 +7,6 @@ import (
 	"testing"
 )
 
-// captureStderr runs fn with os.Stderr redirected to a pipe and returns what
-// was written. Used to assert the advisory surfaces on stderr.
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
 	orig := os.Stderr
@@ -24,10 +22,6 @@ func captureStderr(t *testing.T, fn func()) string {
 	return string(out)
 }
 
-// TestAdviseExtractionProbes_SurfacesOnStderr proves the advisory is emitted to
-// stderr, names the variable and the selecting compute-variables node, and
-// recommends the direct task_outputs.* wire. It also confirms a computed var in
-// the same workflow does NOT trigger any advisory line.
 func TestAdviseExtractionProbes_SurfacesOnStderr(t *testing.T) {
 	cv := map[string]any{
 		"scoped_id": map[string]any{
@@ -61,8 +55,6 @@ func TestAdviseExtractionProbes_SurfacesOnStderr(t *testing.T) {
 	}
 }
 
-// TestAdviseExtractionProbes_NoProbesIsSilent confirms a workflow with no probe
-// vars produces no stderr output (so it never clutters clean runs).
 func TestAdviseExtractionProbes_NoProbesIsSilent(t *testing.T) {
 	cv := map[string]any{
 		"dti": map[string]any{
@@ -76,9 +68,6 @@ func TestAdviseExtractionProbes_NoProbesIsSilent(t *testing.T) {
 	}
 }
 
-// TestIsPureExtractionProbe_Positive covers the genuine pass-through extraction
-// probes the advisory targets: a single `result = inputs.get("...")` over a
-// scoped per-item path, with returnValue "result" and no other computation.
 func TestIsPureExtractionProbe_Positive(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -139,9 +128,6 @@ func TestIsPureExtractionProbe_Positive(t *testing.T) {
 	}
 }
 
-// TestIsPureExtractionProbe_Negative covers everything that must NOT be flagged:
-// any computation, conditional, multiple statements, a non-"result" returnValue,
-// a flat (unscoped) input key, or a normal non-extraction custom var.
 func TestIsPureExtractionProbe_Negative(t *testing.T) {
 	cases := []struct {
 		name string
@@ -231,12 +217,12 @@ func TestIsPureExtractionProbe_Negative(t *testing.T) {
 			},
 		},
 		{
-			name:  "empty def",
-			def:   map[string]any{},
+			name: "empty def",
+			def:  map[string]any{},
 		},
 		{
-			name:  "nil def",
-			def:   nil,
+			name: "nil def",
+			def:  nil,
 		},
 	}
 	for _, tc := range cases {
@@ -248,8 +234,6 @@ func TestIsPureExtractionProbe_Negative(t *testing.T) {
 	}
 }
 
-// TestFindExtractionProbeVars verifies the map-level scan returns only the
-// probe variables, leaving computed ones alone, and tolerates malformed entries.
 func TestFindExtractionProbeVars(t *testing.T) {
 	cv := map[string]any{
 		"scoped_id": map[string]any{
@@ -274,8 +258,6 @@ func TestFindExtractionProbeVars(t *testing.T) {
 	}
 }
 
-// TestComputeVarSelectors cross-references which compute-variables node selects
-// a variable, across both fetched (nodeId) and spec (ref) node shapes.
 func TestComputeVarSelectors(t *testing.T) {
 	nodes := []any{
 		map[string]any{
@@ -293,7 +275,6 @@ func TestComputeVarSelectors(t *testing.T) {
 		t.Errorf("selector for scoped_id = %q, want probe", got["scoped_id"])
 	}
 
-	// spec shape uses ref instead of nodeId.
 	specNodes := []any{
 		map[string]any{
 			"ref":               "probe2",

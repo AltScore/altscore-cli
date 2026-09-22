@@ -9,14 +9,8 @@ import (
 	"strings"
 )
 
-// Offline structural checks apply runs before the request is sent.
-
-// customerHiddenTypes / dealHiddenTypes mirror the Hub's palette filter at
-// altscore-ai-chat/components/workflow-builder-v2/canvas/ComponentsMenu.tsx
-// (CUSTOMER_HIDDEN_TYPES / DEAL_HIDDEN_TYPES). A workflow whose
-// config.entityType is "customer" cannot include these task types in the
-// Hub editor, so a CLI-composed workflow that uses them would render as a
-// non-editable graph -- catch it at compose time instead.
+// Mirrors the Hub palette filter (ComponentsMenu.tsx CUSTOMER_HIDDEN_TYPES /
+// DEAL_HIDDEN_TYPES): a workflow using these renders as a non-editable graph.
 var customerHiddenTypes = map[string]bool{
 	"deal":  true,
 	"asset": true,
@@ -27,33 +21,10 @@ var dealHiddenTypes = map[string]bool{
 	"list-of-similars": true,
 }
 
-// preflightTasks runs cheap validation across every task in the spec during
-// assembly, before the apply request is sent -- fully local, except at most one
-// read-only backend lookup when a task type is unknown to this build (see
-// fetchLiveTaskTypes). A structural mistake caught here never reaches the
-// server.
-//
-// Checks (in order, fail-fast):
-//  1. duplicate spec-local refs / explicit aliases
-//  2. label + type present
-//  3. type is in the backend TaskType enum (with closest-match suggestion),
-//     and is not a RETIRED type the spec is newly authoring -- one the target
-//     workflow already carries (spec.ExistingNodeTypes) is warned about and
-//     carried forward, mirroring the backend's diff-based rule
-//  4. http: headers must be a JSON-encoded string
-//  5. data-store-write / data-store-query / webhook / comment / exception /
-//     child-workflow: per-type required fields
-//  6. validateTaskV2Body: type-specific structural checks (conditional
-//     branches, scorecard reference, mapping-table entries, rule-tree
-//     enums)
-//  7. inputMappings values: leading segment must be a runtime namespace OR
-//     a known spec-local ref; task_outputs.<X>.<rest> validates <X> too.
-//     {{...}} template syntax is skipped (handled by template engine).
-//  8. edge endpoints (from/to) must reference a known ref.
-//  9. duplicate edges and self-loops are rejected.
+// Fully local except at most one read-only lookup when a task type is unknown to
+// this build (fetchLiveTaskTypes). Fail-fast, so nothing caught here reaches the server.
 func preflightTasks(spec *composeSpec) error {
-	// Spec-level checks: workflow alias + category + inputVariables shape.
-	// These fail with opaque backend errors otherwise; surface here.
+	// These fail with opaque backend errors otherwise.
 	if err := checkWorkflowAlias(spec.Alias); err != nil {
 		return err
 	}
@@ -74,19 +45,11 @@ func preflightTasks(spec *composeSpec) error {
 		}
 	}
 
-	// Collect every spec-local ref upfront so we can validate forward
-	// references in inputMappings AND detect duplicates that would
-	// otherwise silently orphan tasks (the rewriter only records the
-	// last ref-to-alias mapping).
+	// Collected upfront so forward references in inputMappings can be validated.
 	knownRefs := map[string]bool{}
 	knownAliases := map[string]bool{}
 	for i, task := range spec.Tasks {
 		ref := localRef(task, fmt.Sprintf("t%d", i))
-		// 'ref' becomes the server-assigned alias prefix (and thus the
-		// nodeId) when no explicit 'alias' is set, so the same URL-safety
-		// constraint applies. Reject upper-case / spaces / punctuation
-		// upfront -- otherwise it propagates to nodeIds that misbehave in
-		// downstream cmds (set-mapping --node-id, lock acquire by alias).
 		if !validAliasPattern.MatchString(ref) {
 			return fmt.Errorf(
 				"node ref %q has invalid characters. Refs become server-assigned aliases (and nodeIds), "+
@@ -128,10 +91,6 @@ func preflightTasks(spec *composeSpec) error {
 	startCount := 0
 	for i, node := range spec.ExtraNodes {
 		ref := localRef(node, fmt.Sprintf("n%d", i))
-		// Same URL-safety constraint as tasks: refs become server-assigned
-		// aliases (and thus nodeIds). Reject upper-case / underscores /
-		// spaces / punctuation upfront so the spec fails fast instead of
-		// 400'ing at the per-node POST.
 		if !validAliasPattern.MatchString(ref) {
 			return fmt.Errorf(
 				"node ref %q has invalid characters. Refs become server-assigned aliases (and nodeIds), "+
@@ -148,9 +107,7 @@ func preflightTasks(spec *composeSpec) error {
 			)
 		}
 		knownRefs[ref] = true
-		// ExtraNodes only ever contains start-typed nodes (the parse-time
-		// split puts type=="start" -> ExtraNodes, everything else -> Tasks).
-		// Just count starts; no other case can fire by construction.
+		// ExtraNodes only ever holds start nodes; the parse-time split guarantees it.
 		nodeType, _ := node["type"].(string)
 		if nodeType == "start" {
 			startCount++
@@ -173,9 +130,7 @@ func preflightTasks(spec *composeSpec) error {
 			startCount,
 		)
 	}
-	// End nodes always come through the Tasks bucket post-split (end nodes
-	// need an endConfig to emit output, so they go through the full task
-	// creation path). Count end nodes there.
+	// End nodes come through the Tasks bucket post-split: they need an endConfig.
 	endInTasks := 0
 	for _, t := range spec.Tasks {
 		if tt, _ := t["type"].(string); tt == "end" {
@@ -183,17 +138,12 @@ func preflightTasks(spec *composeSpec) error {
 		}
 	}
 	if endInTasks == 0 {
-		// 'end' is conventional but not strictly required; warn-only via
-		// stderr, never block. Keep this open for niche use cases (e.g.
-		// workflows that terminate via 'exception' branches).
+		// Conventional but not required: some workflows terminate via exception branches.
 		fmt.Fprintln(os.Stderr,
 			"# warning: compose spec has no 'end' node. Most workflows need one for the engine to know where to terminate cleanly.")
 	}
 	if endInTasks > 1 {
-		// A workflow must converge to exactly one end node. Surfaced here in
-		// preflight so the apply CREATE path catches it before POSTing (the
-		// CREATE path doesn't run validateWorkflowV2Body). Mirror the start-node
-		// uniqueness check above.
+		// Checked here because the apply CREATE path never runs validateWorkflowV2Body.
 		return fmt.Errorf(
 			"spec has %d 'end' nodes. A workflow must have exactly ONE end node; "+
 				"converge all paths (conditional branches, relationship handles) to a single end.",
@@ -201,16 +151,8 @@ func preflightTasks(spec *composeSpec) error {
 		)
 	}
 
-	// Soft advisory: routing tasks (conditional) with branch
-	// edges targeting exception tasks usually indicate the agent is treating
-	// 'rejected'/'declined'/'manual review' as a failure when they're really
-	// valid workflow outcomes that belong on end nodes (one per branch,
-	// each with its own endConfig.decisionConfig). See the
-	// 'terminationPatterns' schema-guide section. We don't block -- some
-	// workflows legitimately fail-fast on a bad-input conditional branch --
-	// but we want the agent to see this advisory at compose time, not
-	// discover it after deploying a workflow whose executions all show up
-	// as failures in metrics.
+	// Advisory only: some workflows legitimately fail-fast on a bad-input branch, but
+	// a 'rejected' outcome routed to an exception makes every run read as a failure.
 	refType := map[string]string{}
 	for _, t := range spec.Tasks {
 		if r := localRef(t, ""); r != "" {
@@ -229,12 +171,7 @@ func preflightTasks(spec *composeSpec) error {
 	type advise struct{ srcRef, tgtRef, srcType string }
 	advisories := []advise{}
 	for _, e := range spec.Edges {
-		// Mirror the canonical edge normalizer (assembleWorkflowBody at the
-		// bottom of this file): specs may use `from`/`to` as shortcuts for
-		// `sourceNodeId`/`targetNodeId`. The advisory runs in the preflight
-		// pass BEFORE normalization, so without this fallback every edge
-		// authored with the documented shortcut form is invisible and the
-		// advisory finds nothing.
+		// This pass runs BEFORE edge normalization, so the from/to shortcut is resolved here.
 		src, _ := e["sourceNodeId"].(string)
 		if src == "" {
 			src, _ = e["from"].(string)
@@ -268,12 +205,6 @@ func preflightTasks(spec *composeSpec) error {
 		}
 	}
 
-	// Edge topology: every from/to must reference a known ref; reject
-	// duplicate edges and self-loops (almost always bugs). Also reject
-	// unknown edge keys -- the most common is 'branchName' (a natural-
-	// feeling but unsupported alias for 'sourceHandle' that disappears
-	// silently and leaves conditional outgoing edges with sourceHandle:
-	// null, breaking the conditional at runtime).
 	seenEdges := map[string]bool{}
 	for i, edge := range spec.Edges {
 		for k := range edge {
@@ -291,8 +222,6 @@ func preflightTasks(spec *composeSpec) error {
 		}
 		from, _ := edge["from"].(string)
 		to, _ := edge["to"].(string)
-		// Some specs use sourceNodeId/targetNodeId directly with explicit
-		// aliases; if those are present and from/to are absent, fall back.
 		if from == "" {
 			from, _ = edge["sourceNodeId"].(string)
 		}
@@ -302,8 +231,7 @@ func preflightTasks(spec *composeSpec) error {
 		if from == "" || to == "" {
 			return fmt.Errorf("edges[%d]: missing 'from'/'to' (or sourceNodeId/targetNodeId)", i)
 		}
-		// Refs are validated only when they look spec-local (no '-NNNNNN' suffix);
-		// explicit-alias edges may target server-style aliases not in knownRefs.
+		// An explicit-alias edge may target a server-style alias absent from knownRefs.
 		if !isServerAlias(from) && !knownRefs[from] {
 			return fmt.Errorf(
 				"edges[%d]: 'from'=%q is not a known ref. Known refs: %s.",
@@ -335,9 +263,7 @@ func preflightTasks(spec *composeSpec) error {
 		seenEdges[key] = true
 	}
 
-	// Live-backend type list, fetched at most once and only when a type is
-	// missing from the compiled-in mirror. Lets an older CLI accept types the
-	// backend gained after this binary was built instead of hard-rejecting.
+	// Fetched at most once, so an older CLI still accepts types the backend gained later.
 	var liveTaskTypes map[string]bool
 	liveTypesFetched := false
 
@@ -348,19 +274,8 @@ func preflightTasks(spec *composeSpec) error {
 		if label == "" || taskType == "" {
 			return fmt.Errorf("node ref=%q: label and type are required (validated before any POST)", ref)
 		}
-		// Deprecated types are settled BEFORE the validTaskTypes check and
-		// never through the warn-and-proceed path below. This half of the
-		// check is compiled in, so it needs no backend and holds offline.
-		//
-		// Refused only when the type is NEW to the target, which is the rule
-		// the backend applies: a retired type the stored graph already holds is
-		// carried forward with a warning, so a legacy workflow stays editable
-		// and can actually be migrated off it (see deprecatedTaskTypeRefused).
-		//
-		// Settled here means the vocabulary block below is SKIPPED for it: a
-		// retired type is deliberately absent from validTaskTypes, so that
-		// block would otherwise re-diagnose a carried-forward node as an
-		// unknown type and warn about it a second time.
+		// Settled BEFORE the validTaskTypes check: a retired type is deliberately absent
+		// from validTaskTypes, so the vocabulary block below would call it unknown.
 		if deprecatedTaskTypes[taskType] {
 			if deprecatedTaskTypeRefused(taskType, spec.ExistingNodeTypes) {
 				return deprecatedTaskTypeError(fmt.Sprintf("node ref=%q", ref), taskType)
@@ -371,13 +286,8 @@ func preflightTasks(spec *composeSpec) error {
 				liveTaskTypes = fetchLiveTaskTypes()
 				liveTypesFetched = true
 			}
-			// The fetch unions the backend's own `deprecated` list into
-			// deprecatedTaskTypes, so a type retired after this binary shipped
-			// is settled here too -- refused when new, carried forward with a
-			// warning when the target already holds it, and never routed
-			// through the vocabulary diagnosis below (which would call a
-			// carried-forward node unknown: fetchServerTaskTypes filters
-			// retired types out of the live authorable set).
+			// The fetch unions the backend's own deprecated list in, so a type retired after
+			// this binary shipped is settled here too.
 			if deprecatedTaskTypes[taskType] {
 				if deprecatedTaskTypeRefused(taskType, spec.ExistingNodeTypes) {
 					return deprecatedTaskTypeError(fmt.Sprintf("node ref=%q", ref), taskType)
@@ -404,8 +314,7 @@ func preflightTasks(spec *composeSpec) error {
 					ref, taskType, suggestionLine, len(liveTaskTypes),
 				)
 			} else {
-				// Backend unreachable: warn rather than hard-block, then skip
-				// this type's per-type field checks (we have no schema for it).
+				// Backend unreachable: warn rather than block, and skip the per-type checks.
 				warnUnverifiedVocabularyValue(
 					fmt.Sprintf("node ref=%q: task type", ref), taskType, "task-type")
 				if s := closestTaskType(taskType); s != "" {
@@ -414,8 +323,6 @@ func preflightTasks(spec *composeSpec) error {
 			}
 		}
 
-		// Per-type required-field checks. These cover the orphan-task class
-		// of bug seen in iter-3 smoke tests.
 		switch taskType {
 		case "http":
 			if h, present := task["headers"]; present {
@@ -437,11 +344,8 @@ func preflightTasks(spec *composeSpec) error {
 				return fmt.Errorf("node ref=%q: data-store-write task requires dataStoreWriteConfig.tableName", ref)
 			}
 		case "data-store-query":
-			// Mode-aware, mirroring the Hub plugin's own validator and the
-			// runtime: _execute_sql_query reads `sql` and never looks at
-			// tableName, while _execute_simple_query requires tableName.
-			// Demanding tableName unconditionally rejected the only correct
-			// way to author a SQL-mode node.
+			// _execute_sql_query reads `sql` and never tableName; _execute_simple_query needs
+			// tableName, so demanding it unconditionally rejects every correct SQL-mode node.
 			cfg := asMap(task["dataStoreQueryConfig"])
 			mode, _ := cfg["queryMode"].(string)
 			if mode == "" {
@@ -455,11 +359,8 @@ func preflightTasks(spec *composeSpec) error {
 				return fmt.Errorf("node ref=%q: data-store-query task in simple mode requires dataStoreQueryConfig.tableName", ref)
 			}
 		case "document-extraction":
-			// Worth checking here rather than leaving it to the backend: BC
-			// validates documentExtractionConfig at RUN time only (a
-			// half-authored node must stay saveable in the builder), so an
-			// apply that ships one of these mistakes returns 201 and only
-			// fails when a workflow executes it.
+			// BC validates documentExtractionConfig at RUN time only, so an apply that ships
+			// one of these mistakes returns 201 and fails only when a workflow executes it.
 			cfg := asMap(task["documentExtractionConfig"])
 			if len(asMap(cfg["extractionSchema"])) == 0 {
 				return fmt.Errorf(
@@ -470,10 +371,8 @@ func preflightTasks(spec *composeSpec) error {
 					ref,
 				)
 			}
-			// The document source is runtime resolvable, so it legitimately
-			// arrives EITHER as a config value or as an inputMappings entry
-			// (either spelling). Count both, or the recommended wiring would
-			// be reported as a missing source.
+			// The source arrives either as a config value or an inputMappings entry (either
+			// spelling), so both have to count.
 			mappings, _ := task["inputMappings"].(map[string]any)
 			sources := []string{}
 			for _, field := range []string{"documentUrl", "documentBase64", "rawText"} {
@@ -516,10 +415,7 @@ func preflightTasks(spec *composeSpec) error {
 				}
 			}
 		case "spreadsheet-extraction":
-			// Same reason as document-extraction above: BC validates
-			// spreadsheetExtractionConfig at RUN time only, so an apply that
-			// ships a fileless node returns 201 and only fails when a
-			// workflow executes it.
+			// Same as document-extraction: BC validates this config at RUN time only.
 			cfg := asMap(task["spreadsheetExtractionConfig"])
 			mappings, _ := task["inputMappings"].(map[string]any)
 			sources := []string{}
@@ -554,14 +450,8 @@ func preflightTasks(spec *composeSpec) error {
 				)
 			}
 		case "exception":
-			// Canonical wire name is 'errorMessage'. Both the BC API
-			// schema (CreateTaskV2 / CreateTaskVersionV2 in
-			// app/model/workflows_v2/task_schemas.py) and the runtime
-			// activity (exception_activity.py) read it. Old specs that
-			// ship 'message' are promoted to 'errorMessage' server-side
-			// by _promote_legacy_exception_message, so the CLI normalizes
-			// outgoing bodies to errorMessage-only without losing legacy
-			// specs. Strip the legacy key so the body is unambiguous.
+			// Both the BC schema and the runtime read `errorMessage`. Strip the legacy
+			// `message` key so the persisted body is unambiguous.
 			em, _ := task["errorMessage"].(string)
 			m, _ := task["message"].(string)
 			if em == "" && m == "" {
@@ -577,22 +467,12 @@ func preflightTasks(spec *composeSpec) error {
 			if eid == "" && eal == "" {
 				return fmt.Errorf("node ref=%q: child-workflow task requires 'executorId' or 'executorAlias'", ref)
 			}
-			// Server's CreateTaskV2 only declares `executorId`. The runtime
-			// resolves it via find_latest_active_by_alias, so passing a
-			// workflow alias in executorId works. Normalize the spec-only
-			// `executorAlias` key into `executorId` so the persisted task
-			// actually carries the executor pointer (otherwise the key is
-			// silently dropped and the task body has no executor at all).
+			// CreateTaskV2 only declares `executorId`, so a spec-only `executorAlias` is
+			// silently dropped and the task ends up with no executor at all.
 			if eid == "" && eal != "" {
 				task["executorId"] = eal
 			}
 			delete(task, "executorAlias")
-			// child-workflow auto-detects single vs batch from the resolved
-			// type of inputExpression (list -> fan-out, dict -> single). The
-			// legacy runInBatch flag and the hardcoded `input_items` context
-			// key are no longer read by the runtime. Warn so old specs that
-			// relied on the flag get migrated to inputExpression instead of
-			// silently downgrading to a single execution.
 			if rib, _ := task["runInBatch"].(bool); rib {
 				if _, hasExpr := task["inputExpression"].(string); !hasExpr {
 					fmt.Fprintf(os.Stderr,
@@ -621,9 +501,6 @@ func preflightTasks(spec *composeSpec) error {
 					ref, irp)
 			}
 			if dm == "async-batch" {
-				// Hard error, not a warning: async dispatch hands a LIST of rows to
-				// the batch engine, so without inputExpression the node resolves a
-				// dict and fails at runtime. Better to say so at apply time.
 				if _, hasExpr := task["inputExpression"].(string); !hasExpr {
 					return fmt.Errorf(
 						"node ref=%q: child-workflow dispatchMode=\"async-batch\" requires 'inputExpression'. "+
@@ -631,8 +508,6 @@ func preflightTasks(spec *composeSpec) error {
 							"(e.g. \"task_outputs.build-rows.items\").",
 						ref)
 				}
-				// Neither survives into a platform batch: it owns its own dispatch
-				// rate and its own per-row failure handling.
 				for _, inert := range []string{"maxConcurrency", "failurePolicy"} {
 					if _, has := task[inert]; has {
 						fmt.Fprintf(os.Stderr,
@@ -651,31 +526,8 @@ func preflightTasks(spec *composeSpec) error {
 					i, ref)
 			}
 		case "compute-variables":
-			// A compute-variables node's inputMappings keys ARE names in that
-			// node's own activity context, so a custom variable may declare one
-			// as a BARE dependency and read it with inputs.get("<key>").
-			// GraphWorkflow._resolve_task_variables resolves each mapping into
-			// task_logic.resolvedInputs, StandardActivity.run merges those into
-			// the context it hands the method (resolving any entity.* reference
-			// against the database on the way), and
-			// ComputeVariablesActivity._collect_dependencies tests the declared
-			// dependency against that context FIRST.
-			//
-			// This is the ONLY way to read an entity field -- no dependency
-			// namespace addresses one -- and the only way for ONE custom
-			// variable to be shared by several nodes that each map a different
-			// source to the same key, which is how four copied per-persona
-			// expressions become one definition.
-			//
-			// What does NOT work is a value naming no namespace at all, and
-			// that one is worth saying out loud because the check below skips
-			// it (`dot <= 0` continues) and it looks deliberate on the page.
-			// ScopedWorkflowContext._split_reference returns an empty root_key
-			// for a dotless reference and resolve() then returns None without
-			// raising, so the key never reaches resolvedInputs and the variable
-			// is null on EVERY run with nothing to see. The common way to
-			// produce it is the identity projection `k -> k`, which the Hub
-			// writes for a dependency it cannot classify -- a typo included.
+			// A compute-variables node's inputMappings KEYS are names in its own activity
+			// context, so a custom variable may depend on one bare; only the VALUE is checked.
 			if im, _ := task["inputMappings"].(map[string]any); len(im) > 0 {
 				keys := make([]string, 0, len(im))
 				for k := range im {
@@ -685,11 +537,8 @@ func preflightTasks(spec *composeSpec) error {
 				for _, k := range keys {
 					v, _ := im[k].(string)
 					vv := strings.TrimSpace(v)
-					// `__static__::<json>` is the literal escape: no dot, and
-					// `resolve` handles it BEFORE `_split_reference`, so it does
-					// resolve. A per-node constant is precisely the shared-variable
-					// case this check exists for -- warning on it would be a second
-					// false warning in the place the first one was removed from.
+					// `__static__::<json>` has no dot but does resolve: `resolve` handles it before
+					// `_split_reference` ever runs.
 					if v == "" || strings.Contains(v, ".") || strings.HasPrefix(vv, "{{") || strings.HasPrefix(vv, "__static__::") {
 						continue
 					}
@@ -704,10 +553,6 @@ func preflightTasks(spec *composeSpec) error {
 				}
 			}
 		case "customer", "deal", "asset":
-			// sourcesConfig entries control which fields are written/read.
-			// Each entry needs at minimum a 'key' AND a 'type' (the
-			// data-model type, not the schema type) -- the runtime
-			// activity 'Fetch Customer fail 'type'' on missing fields.
 			sources := asSlice(task["sourcesConfig"])
 			for sci, sc := range sources {
 				sm, ok := sc.(map[string]any)
@@ -733,21 +578,10 @@ func preflightTasks(spec *composeSpec) error {
 					)
 				}
 			}
-			// Deal nodes can carry an inline `contacts` list (the field that
-			// drives deal-<id> handles). Like relationshipsConfig.upsertContacts,
-			// a sibling `upsertContacts` bool lets each row omit borrower_id and
-			// resolve/create the borrower by identity instead. When OFF every
-			// row needs borrower_id; when ON a row needs borrower_id OR an
-			// identity (identity_value, or tax_id / identity_key shorthand) AND
-			// persona. Mirrors the relationships preflight below.
 			if taskType == "deal" {
 				dealOp, _ := task["operation"].(string)
-				// READ mode authors contact PICKS, not inline contacts: each pick
-				// narrows the deal's contacts to one on a dealpick-<id> handle.
-				// The write rules below must not run here -- a node switched from
-				// write to read KEEPS its authored `contacts`, and judging them by
-				// the write rules fails a perfectly valid read node (the Hub's
-				// deal plugin validator had the identical hole).
+				// READ mode authors contact PICKS, not inline contacts: a node switched from write
+				// to read KEEPS its authored `contacts`, which the write rules would reject.
 				if dealOp == "read" {
 					readCfg := asMap(task["readDealContactsConfig"])
 					for pi, p := range asSlice(readCfg["picks"]) {
@@ -755,8 +589,7 @@ func preflightTasks(spec *composeSpec) error {
 						if !ok {
 							return fmt.Errorf("node ref=%q: readDealContactsConfig.picks[%d] must be an object", ref, pi)
 						}
-						// A deal contact has no priority column, so take orders by
-						// createdAt -- NOT the relationships node's highest/lowest.
+						// A deal contact has no priority column, so take orders by createdAt.
 						if take, ok := pm["take"].(string); ok && take != "" && take != "oldest" && take != "newest" {
 							return fmt.Errorf(
 								"node ref=%q: readDealContactsConfig.picks[%d].take=%q must be \"oldest\" or \"newest\"",
@@ -764,9 +597,7 @@ func preflightTasks(spec *composeSpec) error {
 							)
 						}
 					}
-					// Zero picks is warn-only in the Hub (the node exposes no
-					// contact branch), not a hard compose error. role_key is a
-					// tenant vocabulary, validated server-side.
+					// Zero picks and role_key are deliberately unchecked (Hub warns; role_key is server-side).
 					break
 				}
 				inlineContacts := asSlice(task["contacts"])
@@ -788,7 +619,6 @@ func preflightTasks(spec *composeSpec) error {
 							ref, ci,
 						)
 					}
-					// upsert path: row must carry an identity to resolve/create.
 					identityField := "tax_id"
 					if k, _ := cm["identity_key"].(string); k != "" {
 						identityField = k
@@ -818,10 +648,7 @@ func preflightTasks(spec *composeSpec) error {
 				}
 			}
 		case "relationships":
-			// Dual-mode node. READ (operation:read) pinpoints EXISTING
-			// relationships via readRelationshipsConfig.picks (each pick resolves
-			// one relationship on a relpick-<id> handle); WRITE (default)
-			// bulk-creates N borrower<->contact links from relationshipsConfig.items.
+			// Dual-mode: operation:read resolves picks, WRITE bulk-creates items.
 			if op, _ := task["operation"].(string); op == "read" {
 				readCfg := asMap(task["readRelationshipsConfig"])
 				readKinds := map[string]bool{
@@ -847,26 +674,15 @@ func preflightTasks(spec *composeSpec) error {
 						)
 					}
 				}
-				// Zero picks is warn-only in the Hub (node produces no output), not
-				// a hard compose error. No inline write items to validate in read
-				// mode. Fall through to the shared structural validator below.
+				// Zero picks is warn-only in the Hub, not a hard compose error.
 				break
 			}
-			// Bulk-create N borrower<->contact links in one activity.
-			// borrower_id and items must each come from either inline
-			// relationshipsConfig or inputMappings -- empty/missing on both
-			// sides would silently create zero rows at runtime.
 			cfg := asMap(task["relationshipsConfig"])
 			mappings, _ := task["inputMappings"].(map[string]any)
 			if mappings == nil {
 				mappings = map[string]any{}
 			}
-			// borrower_id (the anchor borrower) is no longer required here: the
-			// backend resolves it from the workflow primary borrower
-			// (_primary_borrower_id, set by an upstream customer/create-borrower
-			// node or a borrower_id workflow input). An inline/mapped borrower_id
-			// still wins. The "needs a borrower" case is surfaced as a workflow-level
-			// warning in the Hub, not a hard compose-time error.
+			// borrower_id is not required here: the backend resolves the workflow primary borrower.
 			inlineItems := asSlice(cfg["items"])
 			_, hasItemsMapping := mappings["items"]
 			if len(inlineItems) == 0 && !hasItemsMapping {
@@ -877,10 +693,6 @@ func preflightTasks(spec *composeSpec) error {
 					ref,
 				)
 			}
-			// upsertContacts lets items omit contact_id and resolve via identity.
-			// When on, every item still
-			// needs SOMETHING to identify the contact -- either contact_id or
-			// an identity_value (or tax_id / <defaultIdentityKey> as shorthand).
 			upsertContacts, _ := cfg["upsertContacts"].(bool)
 			defaultIdentityKey, _ := cfg["defaultIdentityKey"].(string)
 			legalRepCount := 0
@@ -898,7 +710,6 @@ func preflightTasks(spec *composeSpec) error {
 							ref, ii,
 						)
 					}
-					// upsert path: item must carry an identity to resolve.
 					identityField := "tax_id"
 					if k, _ := im["identity_key"].(string); k != "" {
 						identityField = k
@@ -919,8 +730,7 @@ func preflightTasks(spec *composeSpec) error {
 							ref, ii, identityField,
 						)
 					}
-					// persona presence is checked at runtime (only required if
-					// identity doesn't resolve to an existing borrower).
+					// persona is checked at runtime, only when the identity doesn't already resolve.
 				}
 				if kind, ok := im["relationship"].(string); ok && kind != "" {
 					if err := checkRelationshipKind(kind, fmt.Sprintf("node ref=%q: relationshipsConfig.items[%d]", ref, ii)); err != nil {
@@ -942,30 +752,17 @@ func preflightTasks(spec *composeSpec) error {
 			}
 		}
 
-		// Reuse the type-specific structural validator (conditional
-		// branches, scorecard reference model, mapping-table entries,
-		// rule-tree enums).
 		body, err := json.Marshal(task)
 		if err != nil {
 			return fmt.Errorf("node ref=%q: cannot encode for preflight: %w", ref, err)
 		}
-		// Structural-only: the altdata-enrichment empty-inputKeys check
-		// belongs in validateTaskV2Body (used by manual tasks-v2 create),
-		// not here. Compose's normalize step fills inputKeys from each
-		// source's inputFields automatically; rejecting the spec at preflight
-		// would block work that compose can fix on its own.
-		// spec.ExistingNodeTypes travels with it: the validator carries its own
-		// deprecation gate (it is the only one on the tasks-v2 paths), and
-		// without the target's types it would refuse the carry-forward this
-		// loop just warned about and let through.
+		// Structural-only: normalize fills inputKeys later, so the sourcable check here
+		// would block work compose can fix. ExistingNodeTypes carries the deprecation gate.
 		if err := validateTaskV2BodyStructural(json.RawMessage(body), spec.ExistingNodeTypes); err != nil {
 			return fmt.Errorf("node ref=%q: %w", ref, err)
 		}
 
-		// inputSchema.<field>.type must be in the JSON-Schema-style enum
-		// the runtime accepts. Backend rejects unknown values with a
-		// misleading "permitted: 'array'" message; surface the full
-		// enum here so the agent picks the right value.
+		// The backend rejects an unknown value with a misleading "permitted: 'array'" message.
 		if is, ok := task["inputSchema"].(map[string]any); ok {
 			for fname, fdef := range is {
 				fm, _ := fdef.(map[string]any)
@@ -982,10 +779,6 @@ func preflightTasks(spec *composeSpec) error {
 			}
 		}
 
-		// Conditional task: every branch's condition.field must exist in
-		// inputSchema, otherwise the branch silently never matches at
-		// runtime. Also: inputMappings keys must match inputSchema keys --
-		// stray keys are wired to nothing.
 		if taskType == "conditional" {
 			schemaFields := map[string]bool{}
 			if is, ok := task["inputSchema"].(map[string]any); ok {
@@ -1026,12 +819,6 @@ func preflightTasks(spec *composeSpec) error {
 			}
 		}
 
-		// Mapping namespace check: every inputMappings value with a
-		// dotted path must lead with a valid runtime namespace OR a
-		// known spec-local ref. {{...}} template syntax bypasses the
-		// dotted-path resolver, so skip it. For 'task_outputs.<X>.<rest>'
-		// also validate <X> is known -- typos like 'task_outputs.producre.v'
-		// pass the leading-segment check but break at runtime.
 		if im, ok := task["inputMappings"].(map[string]any); ok {
 			for k, v := range im {
 				s, _ := v.(string)
@@ -1077,10 +864,7 @@ func preflightTasks(spec *composeSpec) error {
 		}
 	}
 
-	// Orphan task detection: every task ref must appear as an edge
-	// endpoint at least once. Tasks unwired from the graph never run
-	// (lint flags them post-publish, but compose should catch earlier
-	// so the user doesn't waste a publish round-trip).
+	// Caught here rather than by lint post-publish, which costs a publish round-trip.
 	connected := map[string]bool{}
 	for _, edge := range spec.Edges {
 		if from, _ := edge["from"].(string); from != "" {
@@ -1108,10 +892,6 @@ func preflightTasks(spec *composeSpec) error {
 		}
 	}
 
-	// DAG topology check: each task's inputMappings can only read from
-	// task_outputs.<X> where X is a transitive ancestor in the edge graph.
-	// Otherwise the value isn't produced when the consumer runs and
-	// surfaces as a runtime KeyError. Built once across the whole spec.
 	ancestors := buildAncestors(spec)
 	for i, task := range spec.Tasks {
 		ref := localRef(task, fmt.Sprintf("t%d", i))
@@ -1128,9 +908,7 @@ func preflightTasks(spec *composeSpec) error {
 			if head != "task_outputs" || middle == "" {
 				continue
 			}
-			// Only validate when the middle segment is a known spec-local
-			// ref (server-style aliases reference workflows we don't have
-			// the topology for).
+			// Server-style aliases reference graphs whose topology we don't have.
 			if !knownRefs[middle] || isServerAlias(middle) {
 				continue
 			}
@@ -1154,9 +932,6 @@ func preflightTasks(spec *composeSpec) error {
 	return nil
 }
 
-// mappingHeadAndMiddle parses 'task_outputs.<middle>.<rest>' or
-// '<head>.<rest>' and returns the leading two dotted segments. Empty
-// strings indicate not-applicable.
 func mappingHeadAndMiddle(s string) (head, middle string) {
 	dot := strings.Index(s, ".")
 	if dot <= 0 {
@@ -1171,12 +946,7 @@ func mappingHeadAndMiddle(s string) (head, middle string) {
 	return head, rest[:dot2]
 }
 
-// buildAncestors does one BFS per task ref over the edge graph and
-// returns ancestors[ref] = {set of refs that can reach ref through
-// edges}. Edges in the spec use ref/from-to so we don't need to wait
-// for server-assigned aliases. Used by the DAG mapping check.
 func buildAncestors(spec *composeSpec) map[string]map[string]bool {
-	// parents[X] = direct predecessors of X
 	parents := map[string]map[string]bool{}
 	for _, edge := range spec.Edges {
 		from, _ := edge["from"].(string)
@@ -1218,11 +988,6 @@ func buildAncestors(spec *composeSpec) map[string]map[string]bool {
 	return ancestors
 }
 
-// validEdgeKeys is the whitelist for edge object keys in the compose spec.
-// 'from'/'to' are spec-local conveniences; 'sourceNodeId'/'targetNodeId' are
-// the canonical API names. 'sourceHandle' wires conditional
-// branches by handle id; 'branchName' was a common typo that silently
-// dropped and broke conditionals at runtime, so we reject it explicitly.
 var validEdgeKeys = map[string]bool{
 	"from":         true,
 	"to":           true,
@@ -1234,22 +999,8 @@ var validEdgeKeys = map[string]bool{
 	"id":           true,
 }
 
-// checkRefVariableCollisions rejects a spec where a node's ref is also the name
-// of a workflow variable. The two are separate scopes at RUNTIME -- a node's
-// output is `task_outputs.<ref>.*` while the variable is a bare name at the
-// context root -- so the collision is not itself a runtime bug. It is a compose
-// bug, because every ref rewriter in apply is an exact string match.
-//
-// The concrete failure is validateNoResidualSpecRefs, the safety net that flags
-// any string exactly equal to a spec-local ref as a missed rewrite. Fields that
-// legitimately hold a bare VARIABLE name -- mappingTableConfig.entries[].
-// inputVariable, compute-variables selectedVariables[], scorecardConfig.
-// totalScoreVariable, and so on -- then read as un-rewritten node refs and abort
-// apply.
-//
-// Excluding those fields one at a time (residualSpecRefExcludedFields) is a
-// losing race against the task schema. Keeping the two namespaces disjoint is
-// the precondition that makes the exact-match check sound in the first place.
+// Not a runtime bug -- the two are separate scopes -- but apply rewrites refs by
+// exact string match, so a field holding the bare variable name aborts the apply.
 func checkRefVariableCollisions(spec *composeSpec, knownRefs map[string]bool) error {
 	type collision struct{ name, scope string }
 	var found []collision
@@ -1286,14 +1037,8 @@ func checkRefVariableCollisions(spec *composeSpec, knownRefs map[string]bool) er
 	)
 }
 
-// objectTypedOutputsByTaskType lists task-type → field-names whose values
-// are objects or arrays at runtime. Template substitution that inlines one
-// of these into an outputJson string field produces invalid JSON; BC's
-// renderer silently falls back to a promoted-scope dump. Lint these so the
-// agent isn't surprised when their custom envelope vanishes.
-//
-// Surveyed from the v2 task type Pydantic models + activity output shapes.
-// Conservative -- list only fields confirmed to produce object/array values.
+// Fields whose runtime value is an object or array: inlining one into an outputJson
+// string makes invalid JSON, and BC silently falls back to a promoted-scope dump.
 var objectTypedOutputsByTaskType = map[string]map[string]bool{
 	"scorecard":          {"score_breakdown": true},
 	"evaluate-rules":     {"alerts": true},
@@ -1301,20 +1046,10 @@ var objectTypedOutputsByTaskType = map[string]map[string]bool{
 	"mapping-table":      {},
 }
 
-// outputJsonTemplateRefRegex extracts {{task_outputs.<alias>.<field>}} refs
-// from an outputJson template string. The first capture group is the alias,
-// the second is the immediate field name (we only check the top-level
-// field; deeper paths into nested objects are typically string/scalar leaves).
+// Only the top-level field is checked; deeper paths are typically scalar leaves.
 var outputJsonTemplateRefRegex = regexp.MustCompile(`\{\{\s*task_outputs\.([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_]+)`)
 
-// lintOutputJsonObjectRefs walks every end task's outputJson and warns
-// (stderr, non-blocking) when a {{task_outputs.X.Y}} placeholder maps to
-// an object/array Y. This catches the bug where a scorecard's
-// `score_breakdown` (or evaluate-rules `alerts`) gets inlined into a JSON
-// template and silently corrupts the rendered output.
 func lintOutputJsonObjectRefs(spec *composeSpec) {
-	// Build an alias -> task-type lookup across both Tasks and ExtraNodes
-	// so we can resolve each {{task_outputs.X.*}} ref to a type.
 	aliasToType := map[string]string{}
 	for _, t := range spec.Tasks {
 		alias := localRef(t, "")
@@ -1365,21 +1100,9 @@ func lintOutputJsonObjectRefs(spec *composeSpec) {
 	}
 }
 
-// lintCanonicalEndNode warns (stderr, non-blocking) when a spec contains
-// both a rule-tree task and an end task but the end node isn't wired in the
-// canonical "single end node" shape: inputMapping `decision_key` pulled from
-// the rule-tree, `decisionConfig.enabled=true`, and `pdfConfig.enabled=true`.
-//
-// The canonical pattern collapses what used to be a conditional + N parallel
-// end nodes (one per outcome) into ONE end node whose `decision_key` tracks
-// the rule-tree's own output -- BC's end_activity records the per-run
-// decision against the execution and renders the PDF without duplicating
-// logic per branch. Skipping any of these three fields is legal (some
-// workflows really do want multiple ends per branch, or no PDF, or no
-// decision recording), so this lint is advisory only.
+// Advisory only: multiple ends per branch, no PDF and no decision recording are
+// all legal shapes.
 func lintCanonicalEndNode(spec *composeSpec) {
-	// Collect rule-tree task refs so the warning can name the upstream alias
-	// the end node should pull decision_key from.
 	var ruleTreeRefs []string
 	for _, t := range spec.Tasks {
 		if ty, _ := t["type"].(string); ty == "rule-tree" {
@@ -1399,7 +1122,6 @@ func lintCanonicalEndNode(spec *composeSpec) {
 		}
 		endRef := localRef(t, "<unnamed-end>")
 
-		// 1. inputMappings.decision_key wired (from a rule-tree, ideally)
 		inputMappings, _ := t["inputMappings"].(map[string]any)
 		hasDecisionKeyMapping := false
 		if inputMappings != nil {
@@ -1408,8 +1130,6 @@ func lintCanonicalEndNode(spec *composeSpec) {
 			}
 		}
 
-		// 2. endConfig.decisionConfig.enabled = true
-		// 3. endConfig.pdfConfig.enabled = true
 		endCfg, _ := t["endConfig"].(map[string]any)
 		decisionEnabled := false
 		pdfEnabled := false
@@ -1441,9 +1161,6 @@ func lintCanonicalEndNode(spec *composeSpec) {
 			missing = append(missing, "endConfig.pdfConfig.enabled=true")
 		}
 
-		// Show the first rule-tree as the suggested source. If multiple exist
-		// the agent likely knows which one matters; the message lists all so
-		// they don't pick blindly.
 		sourceHint := fmt.Sprintf("task_outputs.%s.decision_key", ruleTreeRefs[0])
 		if len(ruleTreeRefs) > 1 {
 			sourceHint = fmt.Sprintf("task_outputs.<one-of:%s>.decision_key", strings.Join(ruleTreeRefs, ","))
@@ -1466,10 +1183,7 @@ func lintCanonicalEndNode(spec *composeSpec) {
 	}
 }
 
-// unknownConditionFields walks a ConditionGroup tree and returns every leaf
-// 'field' value that isn't in the schemaFields set. Used to validate that
-// conditional branches only reference fields the task declares -- otherwise
-// the branch silently never matches at runtime.
+// A branch referencing an undeclared field silently never matches at runtime.
 func unknownConditionFields(group map[string]any, schemaFields map[string]bool) []string {
 	if len(group) == 0 || len(schemaFields) == 0 {
 		return nil
@@ -1481,15 +1195,12 @@ func unknownConditionFields(group map[string]any, schemaFields map[string]bool) 
 		if im == nil {
 			continue
 		}
-		// Nested ConditionGroup
 		if _, isGroup := im["operator"]; isGroup {
 			if _, hasItems := im["items"]; hasItems {
 				missing = append(missing, unknownConditionFields(im, schemaFields)...)
 				continue
 			}
 		}
-		// Leaf ConditionItem -- skip when valueType=variable (those
-		// reference RHS fields that may live on a different scope).
 		field, _ := im["field"].(string)
 		if field == "" {
 			continue
@@ -1501,9 +1212,7 @@ func unknownConditionFields(group map[string]any, schemaFields map[string]bool) 
 	return missing
 }
 
-// validateEntityTypeVsTaskTypes rejects compose specs whose task-type set
-// would render as a broken palette in the Hub for the declared entityType.
-// No-op if entityType is unset (the workflow gets the generic palette).
+// No-op when entityType is unset: the workflow gets the generic palette.
 func validateEntityTypeVsTaskTypes(spec *composeSpec) error {
 	cfg := spec.Config
 	if cfg == nil {

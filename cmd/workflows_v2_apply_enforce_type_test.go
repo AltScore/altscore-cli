@@ -46,8 +46,6 @@ func TestStampEnforceTypeOnlyTouchesNewTypedVariables(t *testing.T) {
 	}
 }
 
-// A re-apply must not weaken a variable's contract: the live enforceType is
-// carried forward when the spec is silent, whatever its value.
 func TestStampEnforceTypeCarriesLiveEnforcementForward(t *testing.T) {
 	spec := map[string]any{
 		"enforced":   varDef("number"),

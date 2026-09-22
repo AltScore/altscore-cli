@@ -6,11 +6,6 @@ import (
 	"testing"
 )
 
-// sampleExportBundle mirrors the /v2/workflows/{id}/export shape: a workflow
-// object whose nodes reference tasks by taskAlias, plus a flat tasks[] array
-// carrying the full backing task bodies. The start node's id ("start") differs
-// from its task alias, the way the Hub assigns ids, and its task has no specRef
-// (Hub-created); the other three tasks carry the specRef the CLI stamped.
 const sampleExportBundle = `{
   "exportVersion": "1.0",
   "sourceAlias": "scoring-pipeline",
@@ -97,7 +92,6 @@ func TestBundleToApplySpec_Shape(t *testing.T) {
 	if _, ok := spec["inputVariables"].(map[string]any)["borrower_id"]; !ok {
 		t.Errorf("inputVariables.borrower_id missing")
 	}
-	// Entity arrays must NOT leak into the spec.
 	if _, ok := spec["scorecards"]; ok {
 		t.Errorf("scorecards array should not be present in apply-spec")
 	}
@@ -107,8 +101,6 @@ func TestBundleToApplySpec_Shape(t *testing.T) {
 		t.Fatalf("nodes = %d, want 4 (%v)", len(byRef), byRef)
 	}
 
-	// A CLI-applied task is keyed by the specRef it was applied with, so the
-	// server matches it by (workflowAlias, specRef) on re-apply.
 	fetch := byRef["fetch-ecu"]
 	if fetch == nil {
 		t.Fatalf("fetch node should be keyed by its specRef; got refs %v", keysOfNodes(byRef))
@@ -122,19 +114,15 @@ func TestBundleToApplySpec_Shape(t *testing.T) {
 	if im, ok := fetch["inputMappings"].(map[string]any); !ok || im["borrower_id"] != "inputs.borrower_id" {
 		t.Errorf("fetch inputMappings missing/wrong: %v", fetch["inputMappings"])
 	}
-	// Identity bookkeeping must be stripped: the server stamps its own.
 	for _, k := range []string{"alias", "specRef", "workflowAlias", "nodeId", "taskAlias", "taskVersion"} {
 		if _, present := fetch[k]; present {
 			t.Errorf("fetch should not carry %q", k)
 		}
 	}
-	// The canvas position travels, so apply's auto-layout stays off.
 	if pos, _ := fetch["position"].(map[string]any); pos == nil || pos["x"] != float64(100) || pos["y"] != float64(200) {
 		t.Errorf("fetch position not carried: %v", fetch["position"])
 	}
 
-	// A Hub-created task has no specRef: it falls back to its alias, never to
-	// the bare node id (which the server does not know).
 	start := byRef["start-aaaaaa"]
 	if start == nil {
 		t.Fatalf("start node should fall back to its alias; got refs %v", keysOfNodes(byRef))
@@ -149,8 +137,6 @@ func TestBundleToApplySpec_Shape(t *testing.T) {
 		t.Errorf("end endConfig not inlined")
 	}
 
-	// Edges name refs, mapped through the node each endpoint points at. The
-	// start node's id is "start", not its alias: a raw copy would dangle.
 	got := specEdgeEndpoints(t, spec)
 	want := []string{"start-aaaaaa->fetch-ecu", "fetch-ecu->score", "score->end"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
@@ -163,9 +149,6 @@ func TestBundleToApplySpec_Shape(t *testing.T) {
 	}
 }
 
-// `diff <a> <b>` keys nodes by alias on both sides: a specRef only appears when
-// the CLI first applies over a Hub-authored task, and alias identity keeps the
-// node matched across that version boundary.
 func TestBundleToApplySpec_AliasModeKeepsAliases(t *testing.T) {
 	spec, err := bundleToApplySpec(json.RawMessage(sampleExportBundle), refFromAlias)
 	if err != nil {
@@ -187,8 +170,6 @@ func TestBundleToApplySpec_AliasModeKeepsAliases(t *testing.T) {
 	}
 }
 
-// An edge pointing at a node the bundle does not have is refused, not copied
-// through as a dangling endpoint apply would then reject with a worse message.
 func TestBundleToApplySpec_UnknownEdgeEndpointIsAnError(t *testing.T) {
 	bundle := strings.Replace(sampleExportBundle, `"targetNodeId": "end-333333"`, `"targetNodeId": "ghost-999999"`, 1)
 	spec, err := bundleToApplySpec(json.RawMessage(bundle), refFromSpecRef)
@@ -202,11 +183,6 @@ func TestBundleToApplySpec_UnknownEdgeEndpointIsAnError(t *testing.T) {
 	}
 }
 
-// TestBundleToApplySpec_RoundTripsToComposeSpec verifies the emitted spec
-// parses into the exact composeSpec struct that `apply` unmarshals, that the
-// split-by-type pass apply runs at parse time classifies nodes correctly
-// (start -> graph-only, everything else -> task-bearing), that every edge
-// endpoint names a node, and that nothing server-owned travels on a node.
 func TestBundleToApplySpec_RoundTripsToComposeSpec(t *testing.T) {
 	spec, err := bundleToApplySpec(json.RawMessage(sampleExportBundle), refFromSpecRef)
 	if err != nil {
@@ -217,8 +193,6 @@ func TestBundleToApplySpec_RoundTripsToComposeSpec(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	// apply rejects the legacy two-bucket shape before unmarshal; the emitted
-	// spec must pass that gate.
 	if err := detectLegacySpecShape(out); err != nil {
 		t.Fatalf("detectLegacySpecShape rejected the apply-spec: %v", err)
 	}
@@ -234,7 +208,6 @@ func TestBundleToApplySpec_RoundTripsToComposeSpec(t *testing.T) {
 		t.Fatalf("parsed nodes = %d, want 4", len(parsed.Nodes))
 	}
 
-	// Replicate apply's parse-time split and check what must NOT be on a node.
 	refs := map[string]bool{}
 	for _, n := range parsed.Nodes {
 		ref, _ := n["ref"].(string)
@@ -263,7 +236,6 @@ func TestBundleToApplySpec_RoundTripsToComposeSpec(t *testing.T) {
 			}
 		}
 	}
-	// The carried position pins the canvas, which is what keeps auto-layout off.
 	if !specHasPinnedPositions(&parsed) {
 		t.Errorf("exported positions should pin the canvas for apply")
 	}
@@ -277,9 +249,6 @@ func keysOfNodes(m map[string]map[string]any) []string {
 	return out
 }
 
-// A live workflow can still be running a retired node type. The exported spec
-// carries it verbatim -- dropping the node would silently change the graph --
-// so the warning is what tells the author the spec will not re-apply as-is.
 func TestBundleToApplySpec_WarnsOnDeprecatedNodeType(t *testing.T) {
 	bundle := strings.Replace(sampleExportBundle,
 		`"type": "scorecard", "label": "Score",
@@ -299,21 +268,13 @@ func TestBundleToApplySpec_WarnsOnDeprecatedNodeType(t *testing.T) {
 	if !strings.Contains(stderr, "DEPRECATED") || !strings.Contains(stderr, "webhook") {
 		t.Errorf("apply-spec export must warn about the deprecated node type, got: %q", stderr)
 	}
-	// And it must say what actually happens: re-applying over the workflow the
-	// spec came from carries the node forward (apply refuses a retired type
-	// only as new authoring), while a new alias makes it new and is refused.
-	// Telling the author the re-apply simply fails sends them off to rewrite a
-	// spec that would have applied.
 	if !strings.Contains(stderr, "carries them forward") || !strings.Contains(stderr, "NEW alias") {
 		t.Errorf("the warning must distinguish re-applying in place from applying under a new alias, got: %q", stderr)
 	}
-	// The node still travels: the warning is advice, not a filter.
 	if got := specNodesByRef(t, spec)["score"]["type"]; got != "webhook" {
 		t.Errorf("node type = %v, want the original webhook (the export must not rewrite the graph)", got)
 	}
 
-	// diff flattens through the same function and must stay quiet: nobody
-	// re-applies a comparison.
 	quiet := captureStderr(t, func() { _, err = bundleToApplySpec(json.RawMessage(bundle), refFromAlias) })
 	if err != nil {
 		t.Fatalf("bundleToApplySpec(refFromAlias): %v", err)

@@ -14,28 +14,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Server-side apply: POST /v2/workflows/apply.
-//
-// Borrower Central accepts the flat authoring spec verbatim: it resolves every
-// spec-local ref to a task alias BEFORE writing, validates the assembled graph with the oracle
-// publish uses, creates or version-bumps the tasks by (workflowAlias, specRef),
-// then creates / drafts+autosaves / publishes the workflow under the edit
-// lock. A rejected spec writes nothing; a mid-write infrastructure failure is
-// unwound server-side. `dryRun` returns the plan (exact ref -> alias map,
-// assembled graph, findings) without taking the lock.
-//
-// The CLI owns authoring sugar and rendering: it parses, normalizes and
-// assembles locally (composeWorkflowBody, posting nothing), then rebuilds the
-// flat spec from the assembled graph plus the captured task bodies and sends
-// it once. References inside bodies are already in the canonical long form
-// (`task_outputs.<ref>`) after assembly with the identity map.
-
 const serverApplyPath = "/v2/workflows/apply"
 
-// serverOwnedTaskKeys are body keys the server assigns or derives from the node
-// entry itself. Sending them is either rejected (alias, nodeId, taskId,
-// taskVersion) or pointless (specRef / workflowAlias: the server stamps its own;
-// position: lifted onto the node).
+// Body keys the server assigns or derives from the node entry: sending them is either
+// rejected or pointless.
 var serverOwnedTaskKeys = map[string]bool{
 	"alias": true, "nodeId": true, "taskId": true, "taskVersion": true,
 	"specRef": true, "workflowAlias": true, "position": true,
@@ -43,18 +25,16 @@ var serverOwnedTaskKeys = map[string]bool{
 
 type serverApplyOptions struct {
 	DryRun bool
-	// nil selects the server's default policy: an update over an ACTIVE version
-	// publishes, a create or an adopted DRAFT stays DRAFT.
+	// nil selects the server's default policy: an update over an ACTIVE version publishes,
+	// a create or an adopted DRAFT stays DRAFT.
 	Publish   *bool
 	ForceLock bool
 	ClientID  string
-	// CreateNew tells the server to create even when a workflow with a
-	// near-identical alias or label already exists in the tenant.
+	// Create even when a workflow with a near-identical alias or label already exists.
 	CreateNew bool
 }
 
-// serverApplyTask is one entry of the response's tasks[]: what happened to the
-// task behind a spec ref. action is created | bumped | unchanged | referenced.
+// action is created | bumped | unchanged | referenced.
 type serverApplyTask struct {
 	Ref           string   `json:"ref"`
 	Alias         string   `json:"alias"`
@@ -82,12 +62,6 @@ type serverApplyResult struct {
 	} `json:"lock"`
 }
 
-// buildFlatSpecForServer rebuilds the flat authoring spec the server accepts
-// from the assembled graph (nodes keyed by their spec-local placeholder) and the
-// task bodies the assembly pass captured. It refuses, naming the node, a spec
-// the server path cannot express: an explicit node `alias` (task aliases are
-// server-assigned; `taskAlias` references an existing task instead) or a node
-// with neither a captured body nor a taskAlias.
 func buildFlatSpecForServer(assembled map[string]any, capture *composeCapture, targetAlias string) (map[string]any, error) {
 	if capture == nil {
 		return nil, fmt.Errorf("apply: assembly recorded no task bodies")
@@ -170,10 +144,8 @@ func buildFlatSpecForServer(assembled map[string]any, capture *composeCapture, t
 	return flat, nil
 }
 
-// applyViaServer sends the flat spec to POST /v2/workflows/apply. A 404/405
-// without an APPLY_* subcode means the backend predates the endpoint and is
-// reported as such (no client-side fallback since v0.35.0); a 400/422 prints
-// the server's findings and returns a one-line error; a 2xx is parsed.
+// A 404/405 without an APPLY_* subcode means the backend predates the endpoint; there is
+// no client-side fallback since v0.35.0.
 func applyViaServer(c *client.Client, cmd *cobra.Command, flat map[string]any, opts serverApplyOptions) (*serverApplyResult, error) {
 	req := map[string]any{
 		"spec":      flat,
@@ -201,8 +173,6 @@ func applyViaServer(c *client.Client, cmd *cobra.Command, flat map[string]any, o
 	}
 	switch {
 	case (status == http.StatusNotFound || status == http.StatusMethodNotAllowed) && !isApplyErrorEnvelope(data):
-		// The route itself is missing (a 404/405 the endpoint produced would
-		// carry an APPLY_* subcode): an older backend.
 		return nil, fmt.Errorf("this backend has no POST /v2/workflows/apply (HTTP %d): upgrade Borrower Central, or use altscore v0.34.x, the last release with the client-side apply pipeline", status)
 	case status >= 200 && status < 300:
 		var res serverApplyResult
@@ -212,9 +182,8 @@ func applyViaServer(c *client.Client, cmd *cobra.Command, flat map[string]any, o
 		return &res, nil
 	}
 	if opts.DryRun {
-		// A preview never aborts on findings: the server attaches the plan it
-		// would have returned to a validation failure, so render it with the
-		// errors instead of failing the preview.
+		// A preview never aborts on findings: the server attaches the plan it would have
+		// returned, so it is rendered together with the errors.
 		if res := planFromValidationFailure(data); res != nil {
 			return res, nil
 		}
@@ -222,7 +191,6 @@ func applyViaServer(c *client.Client, cmd *cobra.Command, flat map[string]any, o
 	return nil, describeServerApplyError(cmd.ErrOrStderr(), status, data)
 }
 
-// serverErrorEnvelope is Borrower Central's error body.
 type serverErrorEnvelope struct {
 	Code    string         `json:"code"`
 	Message string         `json:"message"`
@@ -237,9 +205,6 @@ func parseServerErrorEnvelope(data json.RawMessage) (serverErrorEnvelope, bool) 
 	return env, true
 }
 
-// isApplyErrorEnvelope reports whether a response body is an error the apply
-// endpoint itself produced (an APPLY_* subcode), as opposed to the framework's
-// answer for a route that does not exist.
 func isApplyErrorEnvelope(data json.RawMessage) bool {
 	env, ok := parseServerErrorEnvelope(data)
 	if !ok {
@@ -249,9 +214,6 @@ func isApplyErrorEnvelope(data json.RawMessage) bool {
 	return strings.HasPrefix(subCode, "APPLY_")
 }
 
-// planFromValidationFailure turns a 422 APPLY_VALIDATION_FAILED that carries
-// `details.plan` (a dry run's plan) into a result the preview renderers accept,
-// with the failing validation attached. nil when the body is anything else.
 func planFromValidationFailure(data json.RawMessage) *serverApplyResult {
 	env, ok := parseServerErrorEnvelope(data)
 	if !ok {
@@ -287,9 +249,6 @@ func planFromValidationFailure(data json.RawMessage) *serverApplyResult {
 	return res
 }
 
-// captureFromRefs builds the alias -> ref map printFindingLines uses to show
-// the author's spec-local names instead of the minted aliases the server's
-// findings carry.
 func captureFromRefs(refs map[string]string) *composeCapture {
 	if len(refs) == 0 {
 		return nil
@@ -297,9 +256,6 @@ func captureFromRefs(refs map[string]string) *composeCapture {
 	return &composeCapture{refByNodeID: refs}
 }
 
-// describeServerApplyError prints what the server found (findings, publish
-// errors, the lock holder) and returns the error apply exits with. The subcode
-// decides the rendering; unknown shapes fall back to the envelope's message.
 func describeServerApplyError(w io.Writer, status int, data json.RawMessage) error {
 	env, ok := parseServerErrorEnvelope(data)
 	if !ok {
@@ -384,7 +340,6 @@ func describeServerApplyError(w io.Writer, status int, data json.RawMessage) err
 	return errors.New(msg)
 }
 
-// stringOr reads a string out of a decoded JSON value, or returns def.
 func stringOr(v any, def string) string {
 	if s, ok := v.(string); ok && s != "" {
 		return s
@@ -392,7 +347,6 @@ func stringOr(v any, def string) string {
 	return def
 }
 
-// refsFromAny decodes the validation payload's alias -> ref map.
 func refsFromAny(v any) map[string]string {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -407,8 +361,6 @@ func refsFromAny(v any) map[string]string {
 	return out
 }
 
-// findingsFromAny decodes a findings list that arrived inside a generic error
-// envelope (map[string]any values) into validationFinding.
 func findingsFromAny(v any) []validationFinding {
 	raw, err := json.Marshal(v)
 	if err != nil || len(raw) == 0 || string(raw) == "null" {
@@ -421,9 +373,6 @@ func findingsFromAny(v any) []validationFinding {
 	return findings
 }
 
-// printServerApplySummary writes the plan / outcome the server reported: one
-// line per task (ref -> alias, what happened, version), dropped fields, warning
-// findings, and the publish outcome.
 func printServerApplySummary(w io.Writer, res *serverApplyResult) {
 	counts := map[string]int{}
 	for _, t := range res.Tasks {
@@ -476,10 +425,6 @@ func printServerApplySummary(w io.Writer, res *serverApplyResult) {
 	}
 }
 
-// finishServerApply renders a successful server round trip for the three
-// modes: --diff (exact-identity diff against the tenant), --dry-run (plan +
-// the assembled graph with resolved aliases) and a real apply (summary, entity
-// re-scope, the persisted workflow on stdout).
 func finishServerApply(c *client.Client, cmd *cobra.Command, spec *composeSpec, res *serverApplyResult, existing map[string]any, targetAlias string, diffFlag, dryRun, skipRescope, allowStealOwnership bool) error {
 	errOut := cmd.ErrOrStderr()
 	var planned map[string]any

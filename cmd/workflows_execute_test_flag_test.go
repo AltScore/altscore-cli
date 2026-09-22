@@ -8,8 +8,8 @@ func TestEnsureTestTag(t *testing.T) {
 		{"poc", "poc,test"},
 		{"test", "test"},
 		{"a,test,b", "a,test,b"},
-		{"a, test ,b", "a, test ,b"}, // whitespace-trimmed match -> no dup
-		{"testing", "testing,test"},   // substring is NOT a match
+		{"a, test ,b", "a, test ,b"},
+		{"testing", "testing,test"},
 		{"parity-test", "parity-test,test"},
 	}
 	for _, c := range cases {
@@ -20,22 +20,18 @@ func TestEnsureTestTag(t *testing.T) {
 }
 
 func TestExecHeadersTestFlagInjectsTag(t *testing.T) {
-	// --test with no other tags -> X-Tags: test
 	h := wfv2ExecHeaders{test: true}
 	if got := h.asMap()["X-Tags"]; got != "test" {
 		t.Errorf("test-only: X-Tags = %q, want %q", got, "test")
 	}
-	// --test merges with existing --tags
 	h = wfv2ExecHeaders{tags: "poc", test: true}
 	if got := h.asMap()["X-Tags"]; got != "poc,test" {
 		t.Errorf("test+tags: X-Tags = %q, want %q", got, "poc,test")
 	}
-	// no --test, no tags -> no X-Tags header
 	h = wfv2ExecHeaders{}
 	if _, present := h.asMap()["X-Tags"]; present {
 		t.Error("no flags: X-Tags should be absent")
 	}
-	// --test does not clobber other headers
 	h = wfv2ExecHeaders{test: true, executionMode: "async", testTaskID: "abc"}
 	m := h.asMap()
 	if m["X-Tags"] != "test" || m["X-Execution-Mode"] != "async" || m["X-Test-Task-Id"] != "abc" {
@@ -51,7 +47,6 @@ func TestSetBodyTestMode(t *testing.T) {
 	if !jsonHasTrue(out, "testMode") {
 		t.Errorf("expected testMode=true in %s", string(out))
 	}
-	// preserves existing fields
 	if !jsonHasKey(out, "label") || !jsonHasKey(out, "inputs") {
 		t.Errorf("dropped existing fields: %s", string(out))
 	}

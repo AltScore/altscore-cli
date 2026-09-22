@@ -6,17 +6,10 @@ import (
 	"testing"
 )
 
-// cv builds a customVariable definition the way both a saved workflow and an
-// apply spec carry one.
 func cv(expression, returnValue string) map[string]any {
 	return map[string]any{"expression": expression, "returnValue": returnValue}
 }
 
-// TestOrdinalCodesOf_FlagsTheCodedShapes covers what the advisory exists for: a
-// variable whose entire output vocabulary is a handful of small integers, in the
-// forms a v1 port actually produces -- the -1/0/1 "missing, clean, hit" triple,
-// the bare 0/1 pre-computed boolean, and the float branch (`result = 0.0`) that a
-// real ported expression mixes with integer branches.
 func TestOrdinalCodesOf_FlagsTheCodedShapes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -84,15 +77,6 @@ if n:
 	}
 }
 
-// TestOrdinalCodesOf_LeavesRealComputationAlone is the half that matters most: an
-// advisory that fires on genuine derivations trains the reader to ignore it. Every
-// case here MUST stay silent.
-//
-// The categorical case is the load-bearing one. `fiscalia_indicator` in a live
-// port returns 'GRAVE'/'NO TIENE' -- a named category, which is exactly what the
-// guidance asks a ported indicator to become. Flagging it on the `_indicator`
-// suffix would tell the author to undo the right thing, which is why detection is
-// by shape and the name is never consulted.
 func TestOrdinalCodesOf_LeavesRealComputationAlone(t *testing.T) {
 	cases := []struct {
 		name string
@@ -172,10 +156,6 @@ out['band'] = 0`,
 	}
 }
 
-// TestOrdinalCodesOf_ComparisonIsNotAnAssignment guards the RE2 workaround. Go has
-// no lookahead, so "= not followed by =" is spelled by hand; get it wrong and
-// `result == 0` reads as an assignment, which would disqualify (or worse, count)
-// every variable that tests its own accumulator.
 func TestOrdinalCodesOf_ComparisonIsNotAnAssignment(t *testing.T) {
 	expr := `flag = inputs.get('task_outputs.fetch.flag')
 result = 0
@@ -193,18 +173,11 @@ if result == 1:
 	}
 }
 
-// TestStripTrailingComment_LeavesQuotedLinesIntact proves the conservative choice:
-// a `#` inside a string is not a comment, and cutting there would turn a
-// disqualifying assignment into a line that matches nothing -- a FALSE POSITIVE.
-// Losing a genuine comment on a quoted line costs a miss instead, which is the
-// right way round for an advisory.
 func TestStripTrailingComment_LeavesQuotedLinesIntact(t *testing.T) {
 	line := `    result = tag.split("#")[0]`
 	if got := stripTrailingComment(line); got != line {
 		t.Errorf("quoted line was truncated: %q", got)
 	}
-	// And the variable it belongs to stays unflagged, because that assignment
-	// survives to disqualify it.
 	expr := `tag = inputs.get('task_outputs.fetch.tag') or ""
 result = 0
 if tag:
@@ -214,11 +187,6 @@ if tag:
 	}
 }
 
-// TestAdviseOrdinalCodeVars_AggregatesAndNamesTheReplacement checks the reported
-// line: one line for many variables (a migration carrying twenty must not print
-// twenty), the count against the real denominator, a capped sample, and an advice
-// string that names where the logic should go instead. "Do not do that" with no
-// destination is unactionable.
 func TestAdviseOrdinalCodeVars_AggregatesAndNamesTheReplacement(t *testing.T) {
 	coded := `n = inputs.get('task_outputs.fetch.n')
 result = 0
@@ -257,7 +225,6 @@ if n:
 	if !strings.Contains(line, "a_ind (0/1)") {
 		t.Errorf("line does not sample a variable with its codes: %q", line)
 	}
-	// Capped sample, with the overflow acknowledged rather than dropped silently.
 	if !strings.Contains(line, "(+2 more)") {
 		t.Errorf("sample not capped with a +N more suffix: %q", line)
 	}
@@ -266,8 +233,6 @@ if n:
 	}
 }
 
-// TestAdviseOrdinalCodeVars_SilentWhenNothingIsCoded covers the two ways a
-// workflow earns silence: no variables at all, and no coded ones.
 func TestAdviseOrdinalCodeVars_SilentWhenNothingIsCoded(t *testing.T) {
 	if _, ok := adviseOrdinalCodeVars(nil); ok {
 		t.Error("no customVariables must be silent")
@@ -281,9 +246,6 @@ func TestAdviseOrdinalCodeVars_SilentWhenNothingIsCoded(t *testing.T) {
 	}
 }
 
-// TestPrintReadabilityFindings_KeepsTheBlockShape confirms apply and lint print
-// the same thing: a header, one line per finding, and the guide pointer. Nothing
-// here may be an error or move an exit code -- it is stderr text only.
 func TestPrintReadabilityFindings_KeepsTheBlockShape(t *testing.T) {
 	var buf bytes.Buffer
 	printReadabilityFindings(&buf, nil)

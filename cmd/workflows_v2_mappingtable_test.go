@@ -5,8 +5,6 @@ import (
 	"testing"
 )
 
-// mtTask builds a minimal mapping-table task whose single entry reads inVar.
-// topLevel, when non-nil, seeds the node's caller-supplied inputMappings.
 func mtTask(inVar string, topLevel map[string]any) map[string]any {
 	t := map[string]any{
 		"type":  "mapping-table",
@@ -36,7 +34,6 @@ func mtMappings(t *testing.T, task map[string]any) map[string]any {
 	return m
 }
 
-// Scoped entry inputVariable mirrors into a full-path top-level inputMapping.
 func TestNormalizeMappingTable_ScopedInputVariable_MirrorsFullPath(t *testing.T) {
 	task := mtTask("task_outputs.score-abc.total_score", nil)
 	if err := normalizeMappingTableTask(nil, task, &composeNormalizeOpts{}, true); err != nil {
@@ -48,8 +45,6 @@ func TestNormalizeMappingTable_ScopedInputVariable_MirrorsFullPath(t *testing.T)
 	}
 }
 
-// A bare entry inputVariable with no backing top-level mapping must fail loud
-// (it would 400 at /v2/tasks and silently default-bucket at runtime).
 func TestNormalizeMappingTable_BareInputVariable_NoMapping_Errors(t *testing.T) {
 	task := mtTask("total_score", nil)
 	err := normalizeMappingTableTask(nil, task, &composeNormalizeOpts{}, true)
@@ -59,15 +54,11 @@ func TestNormalizeMappingTable_BareInputVariable_NoMapping_Errors(t *testing.T) 
 	if !strings.Contains(err.Error(), "unscoped bare name") {
 		t.Errorf("error message not actionable: %v", err)
 	}
-	// And it must NOT have fabricated a path-less self-reference.
 	if im, _ := task["inputMappings"].(map[string]any); im["total_score"] == "total_score" {
 		t.Errorf("fabricated path-less mapping despite error: %v", im)
 	}
 }
 
-// A bare entry inputVariable is allowed when the caller supplied an explicit
-// scoped top-level mapping (the runtime resolves it via the context fallback).
-// The mirror must NOT clobber that caller value.
 func TestNormalizeMappingTable_BareInputVariable_WithCallerMapping_OK(t *testing.T) {
 	task := mtTask("total_score", map[string]any{
 		"total_score": "task_outputs.score-abc.total_score",
@@ -81,8 +72,6 @@ func TestNormalizeMappingTable_BareInputVariable_WithCallerMapping_OK(t *testing
 	}
 }
 
-// A bare inputVariable matching a declared workflow input is auto-wrapped to
-// inputs.<name> and then mirrors cleanly.
 func TestNormalizeMappingTable_BareInputVariable_WrapsWorkflowInput(t *testing.T) {
 	task := mtTask("risk_in", nil)
 	opts := &composeNormalizeOpts{InputVariables: map[string]any{"risk_in": map[string]any{"type": "number"}}}
@@ -100,13 +89,12 @@ func TestNormalizeMappingTable_BareInputVariable_WrapsWorkflowInput(t *testing.T
 	}
 }
 
-// mirrorEntryInputsToTopLevel never fabricates a path-less self-reference.
 func TestMirrorEntryInputs_SkipsBareNames(t *testing.T) {
 	task := map[string]any{"inputMappings": map[string]any{}}
 	entries := []any{
-		map[string]any{"inputVariable": "bare_name"},            // skip
-		map[string]any{"inputVariable": "task_outputs.x.score"}, // mirror -> score
-		map[string]any{"inputVariable": "inputs.amount"},        // mirror -> amount
+		map[string]any{"inputVariable": "bare_name"},
+		map[string]any{"inputVariable": "task_outputs.x.score"},
+		map[string]any{"inputVariable": "inputs.amount"},
 	}
 	mirrorEntryInputsToTopLevel(task, entries)
 	im := task["inputMappings"].(map[string]any)
@@ -151,10 +139,6 @@ func TestLastDotSegment(t *testing.T) {
 	}
 }
 
-// --- nested credit-decisioning entity scopes ----------------------------
-
-// seedEntities primes lookupEntity's memo so the normalizers resolve entities
-// with a nil client (no HTTP), and restores it when the test ends.
 func seedEntities(t *testing.T, entities map[string]map[string]any) {
 	t.Helper()
 	prev := entityCache
@@ -162,12 +146,6 @@ func seedEntities(t *testing.T, entities map[string]map[string]any) {
 	t.Cleanup(func() { entityCache = prev })
 }
 
-// reconcileEntityScopes re-stamps every mapping table a scorecard's rules link
-// to, but normalizeScorecardTask only ever checked the scorecard itself. A
-// cross-owned bucket table reachable ONLY through the scorecard therefore
-// cleared pre-flight, the workflow was created and published, and the re-stamp
-// was refused on stderr with everything already persisted -- leaving the table
-// on the old alias and invisible in the new workflow's Hub elements panel.
 func TestNormalizeScorecardTask_NestedMappingTableScope(t *testing.T) {
 	scorecardTask := func() map[string]any {
 		return map[string]any{
@@ -178,9 +156,9 @@ func TestNormalizeScorecardTask_NestedMappingTableScope(t *testing.T) {
 	}
 	cases := []struct {
 		name       string
-		mtAlias    string // the mapping table's current workflowAlias
+		mtAlias    string
 		allowSteal bool
-		wantErr    string // substring; "" = accepted
+		wantErr    string
 	}{
 		{"nested table already owned by this workflow", "target-wf", false, ""},
 		{"nested table unscoped -- apply will claim it", "", false, ""},
@@ -222,9 +200,6 @@ func TestNormalizeScorecardTask_NestedMappingTableScope(t *testing.T) {
 	}
 }
 
-// Same invariant on the rule-tree side: reconcileEntityScopes re-stamps every
-// evaluation-rule the tree references, so pre-flight owns that set too. The
-// recursion existed but only checked decisionKey, never the workflow scope.
 func TestNormalizeRuleTreeTask_NestedEvaluationRuleScope(t *testing.T) {
 	ruleTreeTask := func() map[string]any {
 		return map[string]any{

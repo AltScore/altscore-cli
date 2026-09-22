@@ -5,13 +5,8 @@ import (
 	"strings"
 )
 
-// Small helpers shared by the apply files.
-
-// truncateForError shortens a value for an error message. Residual refs turn up
-// in SQL bodies and JSON templates that are far too long to quote whole, and an
-// error nobody reads to the end names the path for nothing.
-// Counted in runes, not bytes: task labels and aliases carry accented
-// characters, and slicing mid-rune would print a replacement glyph.
+// Counted in runes: labels and aliases carry accents, and slicing mid-rune prints a
+// replacement glyph.
 func truncateForError(s string) string {
 	const max = 160
 	runes := []rune(s)
@@ -21,16 +16,11 @@ func truncateForError(s string) string {
 	return string(runes[:max]) + "..."
 }
 
-// humanizeKey turns "borrower_id" into "Borrower Id", "minScore" into "Min Score",
-// etc. Used to auto-generate display titles for input variables when the spec
-// doesn't supply one.
 func humanizeKey(key string) string {
 	if key == "" {
 		return ""
 	}
-	// Split on _ and -
 	parts := strings.FieldsFunc(key, func(r rune) bool { return r == '_' || r == '-' })
-	// Also split camelCase within each part.
 	var words []string
 	for _, p := range parts {
 		buf := []rune{}
@@ -59,10 +49,8 @@ func humanizeKey(key string) string {
 	return strings.Join(words, " ")
 }
 
-// camelToSnake converts a camelCase wire field to its snake_case spelling.
-// document-extraction's runtime-resolvable fields are accepted by the backend
-// activity under either spelling, so preflight has to recognise both before it
-// can claim a document source is missing.
+// The backend activity accepts document-extraction fields under either spelling, so
+// preflight has to recognise both before it can claim a document source is missing.
 func camelToSnake(field string) string {
 	var out strings.Builder
 	for i, r := range field {
@@ -78,19 +66,14 @@ func camelToSnake(field string) string {
 	return out.String()
 }
 
-// firstNestedSchemaProperty returns the name of the first top-level property of
-// a JSON Schema that is an object, or an array of objects, else "". Used to
-// refuse a schema the ocr-tools provider cannot satisfy: its extraction targets
-// are scalars and list[string] only, so a nested shape there yields nothing
-// rather than failing loudly.
+// Refuses a schema the ocr-tools provider cannot satisfy: its extraction targets are
+// scalars and list[string] only, so a nested shape yields nothing rather than failing.
 func firstNestedSchemaProperty(schema map[string]any) string {
 	props := asMap(schema["properties"])
 	names := make([]string, 0, len(props))
 	for name := range props {
 		names = append(names, name)
 	}
-	// Deterministic report: map iteration order would otherwise name a
-	// different field on each run for a schema with several nested entries.
 	sort.Strings(names)
 	for _, name := range names {
 		prop := asMap(props[name])
@@ -106,9 +89,7 @@ func firstNestedSchemaProperty(schema map[string]any) string {
 	return ""
 }
 
-// isServerAlias reports whether s looks like a server-assigned task alias --
-// the trailing 6-hex-after-dash pattern produced by
-// borrower-central/app/utils/alias_generator.py::generate_task_alias.
+// The trailing 6-hex-after-dash pattern minted by borrower-central's generate_task_alias.
 func isServerAlias(s string) bool {
 	if len(s) < 8 {
 		return false
@@ -126,7 +107,6 @@ func isServerAlias(s string) bool {
 	return true
 }
 
-// sortedKeys returns the keys of m in deterministic order.
 func sortedKeys(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

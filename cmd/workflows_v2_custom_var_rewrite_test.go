@@ -5,9 +5,6 @@ import (
 	"testing"
 )
 
-// refMap used across these tests. `tabla` and `tablas` both exist on purpose:
-// the boundary check has to tell them apart, and a plain substring replace does
-// not. `keep` maps to itself, which the rewriter must skip entirely.
 func testRefMap() map[string]string {
 	return map[string]string{
 		"tablas": "tablas-de-pol-tica-22503b",
@@ -25,19 +22,15 @@ func TestReplaceTaskOutputsRef_Boundaries(t *testing.T) {
 		want string
 	}{
 		{"trailing field", "task_outputs.tablas.gasto", "task_outputs.tablas-de-pol-tica-22503b.gasto"},
-		// Everything below this line was missed while a trailing dot was the
-		// only boundary.
 		{"bare ref", "task_outputs.tablas", "task_outputs.tablas-de-pol-tica-22503b"},
 		{"bracket index", "task_outputs.tablas[0].x", "task_outputs.tablas-de-pol-tica-22503b[0].x"},
 		{"array map", "task_outputs.ola1.arr[].f", "task_outputs.ola-1-identidad-c00e51.arr[].f"},
 		{"dollar prefixed", "SUM($task_outputs.tablas.a, 1)", "SUM($task_outputs.tablas-de-pol-tica-22503b.a, 1)"},
 		{"trailing quote", "inputs['task_outputs.tablas.a']", "inputs['task_outputs.tablas-de-pol-tica-22503b.a']"},
-		// A shorter ref must not match inside a longer one, in either order.
 		{"longer ref wins", "task_outputs.tablas.a", "task_outputs.tablas-de-pol-tica-22503b.a"},
 		{"shorter ref alone", "task_outputs.tabla.a", "task_outputs.tabla-suelta-9f11a2.a"},
 		{"both in one string", "task_outputs.tabla.a + task_outputs.tablas.b",
 			"task_outputs.tabla-suelta-9f11a2.a + task_outputs.tablas-de-pol-tica-22503b.b"},
-		// Untouched: identity mapping, unknown refs, other scopes.
 		{"identity ref", "task_outputs.keep.a", "task_outputs.keep.a"},
 		{"unknown ref", "task_outputs.otro.a", "task_outputs.otro.a"},
 		{"other scope", "inputs.tablas + self.tablas", "inputs.tablas + self.tablas"},
@@ -51,8 +44,6 @@ func TestReplaceTaskOutputsRef_Boundaries(t *testing.T) {
 	}
 }
 
-// The bug this whole change exists for: the formula the client reads lives in
-// simpleConfig.formulaText, which no field-by-name rewriter ever touched.
 func TestRewriteCustomVariableRefs_SimpleConfigFormulaText(t *testing.T) {
 	v := map[string]any{
 		"editorMode": "simple",
@@ -77,7 +68,6 @@ func TestRewriteCustomVariableRefs_SimpleConfigFormulaText(t *testing.T) {
 	}
 }
 
-// Guard on the extraction: the fields that already worked must keep working.
 func TestRewriteCustomVariableRefs_ExistingFields(t *testing.T) {
 	v := map[string]any{
 		"expression":   "result = inputs['task_outputs.tablas.gasto']",
@@ -98,7 +88,6 @@ func TestRewriteCustomVariableRefs_ExistingFields(t *testing.T) {
 	}
 }
 
-// dependencyTypes is keyed BY the ref, and had no coverage at all.
 func TestRewriteCustomVariableRefs_DependencyTypesKeys(t *testing.T) {
 	v := map[string]any{
 		"dependencyTypes": map[string]any{
@@ -117,10 +106,6 @@ func TestRewriteCustomVariableRefs_DependencyTypesKeys(t *testing.T) {
 	}
 }
 
-// A key the author already declared under the destination name owns its slot:
-// carrying the stale one over would replace a correct declaration with an old
-// one. Runs repeatedly because Go map iteration order is random and the
-// two-pass design is what makes the outcome deterministic.
 func TestRewriteCustomVariableRefs_DependencyTypesCollisionKeepsDeclared(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		v := map[string]any{
@@ -141,7 +126,7 @@ func TestRewriteCustomVariableRefs_DependencyTypesCollisionKeepsDeclared(t *test
 }
 
 func TestRewriteCustomVariableRefs_NilAndMissingFields(t *testing.T) {
-	rewriteCustomVariableRefs(nil, testRefMap()) // must not panic
+	rewriteCustomVariableRefs(nil, testRefMap())
 
 	v := map[string]any{"expression": "result = 1"}
 	rewriteCustomVariableRefs(v, testRefMap())
@@ -153,8 +138,6 @@ func TestRewriteCustomVariableRefs_NilAndMissingFields(t *testing.T) {
 	}
 }
 
-// The effective site runs after an identity-map pass in apply, so applying the
-// rewrite twice must equal applying it once.
 func TestRewriteCustomVariableRefs_Idempotent(t *testing.T) {
 	build := func() map[string]any {
 		return map[string]any{
@@ -175,8 +158,6 @@ func TestRewriteCustomVariableRefs_Idempotent(t *testing.T) {
 	}
 }
 
-// Anything nested under a future field is covered by the value walk, which is
-// the point of walking instead of naming fields.
 func TestRewriteCustomVariableRefs_NestedUnknownField(t *testing.T) {
 	v := map[string]any{
 		"algoNuevo": map[string]any{
@@ -193,11 +174,6 @@ func TestRewriteCustomVariableRefs_NestedUnknownField(t *testing.T) {
 	}
 }
 
-// containsTaskOutputsRef is the detector behind validateNoResidualSpecRefs, the
-// guard whose whole job is catching a field the rewriter forgot to walk. It has
-// to agree with replaceTaskOutputsRef: a boundary the detector does not
-// recognise is a residual ref that ships silently, because the safety net would
-// be blind in exactly the shapes the rewriter was.
 func TestContainsTaskOutputsRef_AgreesWithReplace(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -208,17 +184,15 @@ func TestContainsTaskOutputsRef_AgreesWithReplace(t *testing.T) {
 		{"task_outputs.tablas", "tablas", true},
 		{"task_outputs.tablas[0].x", "tablas", true},
 		{"$task_outputs.tablas.a", "tablas", true},
-		{"task_outputs.tablas.a", "tabla", false}, // prefix must not match
+		{"task_outputs.tablas.a", "tabla", false},
 		{"task_outputs.tabla.a", "tabla", true},
-		{"inputs.tablas", "tablas", false}, // other scope
+		{"inputs.tablas", "tablas", false},
 		{"", "tablas", false},
 	}
 	for _, c := range cases {
 		if got := containsTaskOutputsRef(c.in, c.ref); got != c.want {
 			t.Errorf("containsTaskOutputsRef(%q, %q) = %v, want %v", c.in, c.ref, got, c.want)
 		}
-		// The pair must never disagree: if the detector sees the ref, replacing
-		// must change the string, and if it does not, nothing may change.
 		changed := replaceTaskOutputsRef(c.in, c.ref, "srv-alias") != c.in
 		if changed != c.want {
 			t.Errorf("detector/replacer disagree on (%q, %q): contains=%v changed=%v",

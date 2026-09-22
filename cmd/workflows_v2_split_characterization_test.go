@@ -6,27 +6,6 @@ import (
 	"testing"
 )
 
-// Characterization tests for the apply assembly.
-//
-// These pin the OBSERVABLE assembly semantics (graph node ids, edge endpoints +
-// handles, inputMappings/template/customVar ref rewrites, and the per-node task
-// bodies) for a representative spec that exercises every element assembly
-// touches: a conditional with authored branches + labeled edges, a task node
-// whose inputMappings reference other refs, an end node with endConfig, an extra
-// (start) node, and custom variables.
-//
-// They are written against composeWorkflowBody in preview/dry mode: assembly
-// must keep producing ref placeholders and canonical `task_outputs.<ref>`
-// references, which is exactly what buildFlatSpecForServer sends to
-// POST /v2/workflows/apply.
-
-// richSplitSpec returns a fresh spec exercising every assembly element. Fresh
-// maps each call: compose mutates the spec in place.
-//
-// Topological POST order of Tasks is fetch, route, score, end (score depends on
-// fetch; end depends on score; route is edge-ordered after fetch and before
-// score). The start extra node is posted last. So with a server that mints
-// srv-task-N in POST order: fetch=1, route=2, score=3, end=4, start=5.
 func richSplitSpec() *composeSpec {
 	desc := ""
 	return &composeSpec{
@@ -59,9 +38,7 @@ func richSplitSpec() *composeSpec {
 				"expression":   "risk = task_outputs.fetch.amount * 2",
 				"returnValue":  "risk",
 				"dependencies": []any{"task_outputs.fetch.amount"},
-				// Formula mode: the Hub recompiles formulaText on save, so a ref
-				// left here breaks the variable the moment a human edits it.
-				"editorMode": "simple",
+				"editorMode":   "simple",
 				"simpleConfig": map[string]any{
 					"type":        "formula",
 					"formulaText": "$task_outputs.fetch.amount * 2",
@@ -84,7 +61,6 @@ func nodesOf(t *testing.T, wf map[string]any) []map[string]any {
 	if ok {
 		return raw
 	}
-	// Also accept []any (post-marshal round-trips).
 	anyList, ok := wf["nodes"].([]any)
 	if !ok {
 		t.Fatalf("wf[nodes] is not a slice: %T", wf["nodes"])
@@ -134,7 +110,6 @@ func nodeInputMappings(t *testing.T, node map[string]any) map[string]any {
 	return im
 }
 
-// edgeWithHandle finds the edge carrying the given sourceHandle.
 func edgeWithHandle(t *testing.T, wf map[string]any, handle string) map[string]any {
 	t.Helper()
 	for _, e := range edgesOf(t, wf) {
@@ -146,19 +121,13 @@ func edgeWithHandle(t *testing.T, wf map[string]any, handle string) map[string]a
 	return nil
 }
 
-// TestCharacterization_DryAssembly_RefPlaceholders pins the ref-placeholder
-// artifacts the dry (preview) assembly produces -- the exact artifacts the
-// server pre-flight validates.
 func TestCharacterization_DryAssembly_RefPlaceholders(t *testing.T) {
 	capture := newComposeCapture()
-	// c=nil: the fixture uses only http/conditional/end/start types + a
-	// compiled-in operator ("gt"), so assembly needs no network.
 	wf, err := composeWorkflowBody(nil, richSplitSpec(), true, false, true, false, false, true, capture)
 	if err != nil {
 		t.Fatalf("dry assembly failed: %v", err)
 	}
 
-	// Graph node ids are the spec-local refs (placeholders), not server aliases.
 	if got := nodeByLabel(t, wf, "Fetch")["nodeId"]; got != "fetch" {
 		t.Errorf("Fetch nodeId: want ref placeholder %q, got %v", "fetch", got)
 	}
@@ -170,7 +139,6 @@ func TestCharacterization_DryAssembly_RefPlaceholders(t *testing.T) {
 		t.Errorf("Score taskAlias: want %q, got %v", "score", got)
 	}
 
-	// A task node referencing another ref keeps the ref in both long and bare form.
 	im := nodeInputMappings(t, score)
 	if im["amount"] != "task_outputs.fetch.amount" {
 		t.Errorf("Score inputMappings.amount: want long ref, got %v", im["amount"])
@@ -179,13 +147,11 @@ func TestCharacterization_DryAssembly_RefPlaceholders(t *testing.T) {
 		t.Errorf("Score inputMappings.raw: want bare ref, got %v", im["raw"])
 	}
 
-	// Labeled conditional edge keeps its handle and ref endpoints.
 	approve := edgeWithHandle(t, wf, "approve")
 	if approve["sourceNodeId"] != "route" || approve["targetNodeId"] != "score" {
 		t.Errorf("approve edge endpoints: want route->score, got %v->%v", approve["sourceNodeId"], approve["targetNodeId"])
 	}
 
-	// Custom variable keeps the ref in expression + dependencies.
 	cv, _ := wf["customVariables"].(map[string]any)["risk"].(map[string]any)
 	if !strings.Contains(cv["expression"].(string), "task_outputs.fetch.amount") {
 		t.Errorf("risk expression should keep ref: %v", cv["expression"])
@@ -195,7 +161,6 @@ func TestCharacterization_DryAssembly_RefPlaceholders(t *testing.T) {
 		t.Errorf("risk dependency should keep ref: %v", deps[0])
 	}
 
-	// Every backing task body is captured, keyed by its placeholder, and holds refs.
 	if len(capture.tasks) != 5 {
 		t.Fatalf("want 5 captured task bodies (start,fetch,route,score,end); got %d (%v)", len(capture.tasks), keysOf(capture.tasks))
 	}

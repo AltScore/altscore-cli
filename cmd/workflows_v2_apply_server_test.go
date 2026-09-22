@@ -12,10 +12,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// serverApplySpec is start -> fetch -> enrich -> end with every reference
-// surface the server path must carry through unchanged: an inputMappings long
-// form, an http body template, a PDF sourcesConfig taskAlias and a custom
-// variable keyed by a dependency.
 func serverApplySpec() *composeSpec {
 	return &composeSpec{
 		Alias:    "smoke-apply",
@@ -59,9 +55,6 @@ func serverApplyTestCmd() (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
 	return cmd, &out, &errb
 }
 
-// The flat spec the server receives is the authored spec after normalization:
-// one entry per node with its ref, graph fields and inline body, refs kept in
-// the canonical long form, and none of the server-assigned keys.
 func TestBuildFlatSpecForServer_RoundTripsTheAssembly(t *testing.T) {
 	capture := newComposeCapture()
 	wf, err := composeWorkflowBody(nil, serverApplySpec(), true, false, true, false, false, true, capture)
@@ -100,7 +93,6 @@ func TestBuildFlatSpecForServer_RoundTripsTheAssembly(t *testing.T) {
 			t.Errorf("node %s lacks the auto-layout position", ref)
 		}
 	}
-	// start has a body-less entry; the server mints its backing task.
 	if byRef["start"]["type"] != "start" {
 		t.Errorf("start node: %v", byRef["start"])
 	}
@@ -139,7 +131,6 @@ func TestBuildFlatSpecForServer_RoundTripsTheAssembly(t *testing.T) {
 	if edges[2]["from"] != "enrich" || edges[2]["to"] != "end" || edges[2]["sourceHandle"] != "ok" {
 		t.Errorf("third edge: %v", edges[2])
 	}
-	// customVariables travel with refs intact (the server resolves them).
 	cvs := flat["customVariables"].(map[string]any)
 	total := cvs["total"].(map[string]any)
 	deps, _ := total["dependencyTypes"].(map[string]any)
@@ -148,8 +139,6 @@ func TestBuildFlatSpecForServer_RoundTripsTheAssembly(t *testing.T) {
 	}
 }
 
-// Task aliases are server-assigned: a spec that sets one on a node is refused
-// before any request, naming the node and pointing at `taskAlias`.
 func TestBuildFlatSpecForServer_RefusesExplicitNodeAlias(t *testing.T) {
 	spec := serverApplySpec()
 	spec.Tasks[0]["alias"] = "fetch-explicit"
@@ -172,10 +161,6 @@ func TestBuildFlatSpecForServer_RefusesExplicitNodeAlias(t *testing.T) {
 	}
 }
 
-// 404 and 405 (POST on a path an older backend only knows as GET /{id}) mean
-// the endpoint does not exist. There is no client-side fallback any more: the
-// error names the missing endpoint and the last release that had one, and
-// exactly one request was made.
 func TestApplyViaServer_UnavailableOnOlderBackend(t *testing.T) {
 	for _, status := range []int{http.StatusNotFound, http.StatusMethodNotAllowed} {
 		var calls int32
@@ -197,7 +182,6 @@ func TestApplyViaServer_UnavailableOnOlderBackend(t *testing.T) {
 	}
 }
 
-// A 2xx is parsed; the request carries the spec and the options verbatim.
 func TestApplyViaServer_SendsOptionsAndParsesResult(t *testing.T) {
 	var got map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -241,8 +225,6 @@ func TestApplyViaServer_SendsOptionsAndParsesResult(t *testing.T) {
 	}
 }
 
-// A 422 APPLY_VALIDATION_FAILED renders the server's findings and reports that
-// nothing was created.
 func TestApplyViaServer_ValidationFailurePrintsFindings(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
@@ -260,7 +242,6 @@ func TestApplyViaServer_ValidationFailurePrintsFindings(t *testing.T) {
 		t.Fatalf("expected a validation error naming the count, got %v", err)
 	}
 	out := errb.String()
-	// No refs map in this envelope: the alias is shown as-is.
 	for _, want := range []string{"[ERROR] NO_END_NODES", "[WARN] SOURCE_INPUT_NOT_FED", `(node "fetch-a1")`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stderr missing %q; got:\n%s", want, out)
@@ -268,8 +249,6 @@ func TestApplyViaServer_ValidationFailurePrintsFindings(t *testing.T) {
 	}
 }
 
-// A preview never aborts on findings: the 422 carries the plan the server
-// would have returned, and the renderer gets it with the failing validation.
 func TestApplyViaServer_DryRunValidationFailureReturnsThePlan(t *testing.T) {
 	body := `{"code":"UnprocessableEntity","message":"rejected","details":{"errorSubCode":"APPLY_VALIDATION_FAILED",
 		"validation":{"valid":false,"skippedNodeIds":[],"refs":{"fetch-a1b2c3":"fetch"},"findings":[
@@ -293,22 +272,18 @@ func TestApplyViaServer_DryRunValidationFailureReturnsThePlan(t *testing.T) {
 	}
 	printServerApplySummary(errb, res)
 	out := errb.String()
-	// The finding names the minted alias; the rendering maps it back to the ref.
 	for _, want := range []string{"would be REFUSED", `[ERROR] TASK_REFERENCE_NOT_UPSTREAM (node "fetch")`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary missing %q; got:\n%s", want, out)
 		}
 	}
 
-	// The same 422 on a real apply is an error.
 	cmd, _, _ = serverApplyTestCmd()
 	if _, err := applyViaServer(c, cmd, map[string]any{"alias": "smoke-apply"}, serverApplyOptions{}); err == nil {
 		t.Fatal("a real apply must fail on APPLY_VALIDATION_FAILED")
 	}
 }
 
-// A 404 that the endpoint ITSELF produced (APPLY_* subcode) is not "older
-// backend": it is rendered as the server's own error, not as a missing endpoint.
 func TestApplyViaServer_404WithApplyEnvelopeIsARealError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -323,7 +298,6 @@ func TestApplyViaServer_404WithApplyEnvelopeIsARealError(t *testing.T) {
 	}
 }
 
-// An empty category is "not set", never the empty enum value.
 func TestBuildFlatSpecForServer_DropsEmptyCategory(t *testing.T) {
 	spec := serverApplySpec()
 	spec.Category = ""
@@ -341,7 +315,6 @@ func TestBuildFlatSpecForServer_DropsEmptyCategory(t *testing.T) {
 	}
 }
 
-// A 400 APPLY_SPEC_INVALID renders the structural findings the same way.
 func TestApplyViaServer_SpecInvalidPrintsFindings(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -361,7 +334,6 @@ func TestApplyViaServer_SpecInvalidPrintsFindings(t *testing.T) {
 	}
 }
 
-// A lock held by someone else names the holder and points at --force-lock.
 func TestApplyViaServer_LockConflictNamesHolder(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusConflict)
@@ -382,7 +354,6 @@ func TestApplyViaServer_LockConflictNamesHolder(t *testing.T) {
 	}
 }
 
-// A publish-rule rejection says what was written and where.
 func TestDescribeServerApplyError_PublishRejected(t *testing.T) {
 	var errb bytes.Buffer
 	err := describeServerApplyError(&errb, http.StatusUnprocessableEntity, json.RawMessage(`{"code":"VALIDATION_ERROR","message":"x","details":{"errorSubCode":"APPLY_PUBLISH_REJECTED","errors":["Node 'a': unfed"],"applied":{"workflowId":"draft-1","status":"DRAFT","tasks":[]}}}`))
@@ -392,15 +363,12 @@ func TestDescribeServerApplyError_PublishRejected(t *testing.T) {
 	if !strings.Contains(errb.String(), "Node 'a': unfed") {
 		t.Errorf("stderr:\n%s", errb.String())
 	}
-	// Unknown envelopes still surface code, message and subcode.
 	err = describeServerApplyError(&errb, 423, json.RawMessage(`{"code":"LOCKED","message":"Workflow is locked by another user","details":{"errorSubCode":"X"}}`))
 	if err == nil || !strings.Contains(err.Error(), "HTTP 423 LOCKED: Workflow is locked by another user [errorSubCode=X]") {
 		t.Errorf("generic rendering: %v", err)
 	}
 }
 
-// With the server plan both sides carry real aliases: a relabel is `~`, not
-// `-` + `+`.
 func TestDiffWorkflow_AliasIdentityKeepsRelabelAsChange(t *testing.T) {
 	var gets int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

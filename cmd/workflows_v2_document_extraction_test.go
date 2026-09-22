@@ -5,10 +5,6 @@ import (
 	"testing"
 )
 
-// document-extraction is a backend task type as of borrower-central #1794. It
-// must be in the compiled-in mirror so preflight accepts it without a live
-// meta round-trip: an unknown-locally type is a HARD error whenever the backend
-// is reachable and does not list it, and only warns-and-proceeds when it does.
 func TestValidTaskTypes_DocumentExtraction(t *testing.T) {
 	if !validTaskTypes["document-extraction"] {
 		t.Fatalf("document-extraction must be in validTaskTypes")
@@ -57,10 +53,6 @@ func TestPreflightTasks_DocumentExtractionAccepted(t *testing.T) {
 	}
 }
 
-// The document source is runtime resolvable, and wiring it through
-// inputMappings is the RECOMMENDED shape (it keeps the ref out of the config
-// body, which the per-type ref rewriter would never rewrite). Preflight must
-// not report that as a missing source.
 func TestPreflightTasks_DocumentExtractionSourceFromMapping(t *testing.T) {
 	for _, key := range []string{"documentUrl", "document_url"} {
 		spec := docExtractionSpec(docExtractionTask("dx", map[string]any{
@@ -86,8 +78,6 @@ func TestPreflightTasks_DocumentExtractionMissingSource(t *testing.T) {
 }
 
 func TestPreflightTasks_DocumentExtractionAmbiguousSource(t *testing.T) {
-	// One in the config, one mapped: the count spans both, since the runtime
-	// sees a single merged context and raises AMBIGUOUS_DOCUMENT_SOURCE.
 	spec := docExtractionSpec(docExtractionTask("dx", map[string]any{
 		"documentUrl":      "https://example.test/doc.pdf",
 		"extractionSchema": scalarSchema(),
@@ -102,8 +92,7 @@ func TestPreflightTasks_DocumentExtractionAmbiguousSource(t *testing.T) {
 }
 
 func TestPreflightTasks_DocumentExtractionEmptySchema(t *testing.T) {
-	// BC validates extractionSchema at RUN time only, so without this check an
-	// apply persists the node, returns 201 and fails on the first execution.
+	// BC validates extractionSchema at run time only, so without this check apply 201s and the run fails.
 	spec := docExtractionSpec(docExtractionTask("dx", map[string]any{
 		"documentUrl": "https://example.test/doc.pdf",
 	}, nil))
@@ -116,9 +105,6 @@ func TestPreflightTasks_DocumentExtractionEmptySchema(t *testing.T) {
 	}
 }
 
-// ocr-tools extraction targets are scalars and list[string] only, so a nested
-// shape yields nothing instead of failing loudly. Rejected for that provider
-// and accepted for llm, which handles nested objects natively.
 func TestPreflightTasks_DocumentExtractionNestedSchemaByProvider(t *testing.T) {
 	nested := map[string]any{
 		"type": "object",
@@ -181,8 +167,6 @@ func TestFirstNestedSchemaProperty(t *testing.T) {
 			"",
 		},
 		{
-			// Deterministic: map iteration order must not decide which field
-			// the error names.
 			"several nested, lowest name wins",
 			map[string]any{"properties": map[string]any{
 				"zeta":  map[string]any{"type": "object"},

@@ -5,9 +5,6 @@ import (
 	"testing"
 )
 
-// dealTask builds a deal write task body for these tests. contacts is the
-// inline contacts list (sibling to upsertContacts) that drives deal-<id>
-// handles and, with upsertContacts on, borrower-by-identity upsert.
 func dealTask(ref string, upsertContacts bool, contacts []any) map[string]any {
 	t := map[string]any{
 		"ref":       ref,
@@ -30,7 +27,6 @@ func dealTask(ref string, upsertContacts bool, contacts []any) map[string]any {
 	return t
 }
 
-// dealSpec wraps a deal task in a minimal preflight-passing spec.
 func dealSpec(label string, deal map[string]any) *composeSpec {
 	return &composeSpec{
 		Label:      label,
@@ -41,8 +37,6 @@ func dealSpec(label string, deal map[string]any) *composeSpec {
 	}
 }
 
-// TestPreflightTasks_DealContactsBorrowerIdPasses: upsertContacts off and each
-// row carries borrower_id -- the existing-borrower attach path. Passes.
 func TestPreflightTasks_DealContactsBorrowerIdPasses(t *testing.T) {
 	spec := dealSpec("Deal borrower ids", dealTask("attach-deal", false, []any{
 		map[string]any{"id": "0", "borrower_id": "brw_customer", "role_key": "customer", "is_primary": true},
@@ -53,8 +47,6 @@ func TestPreflightTasks_DealContactsBorrowerIdPasses(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_DealContactsUpsertTaxIdPasses: upsertContacts on, row
-// carries tax_id shorthand + persona. The customer-upsert path. Passes.
 func TestPreflightTasks_DealContactsUpsertTaxIdPasses(t *testing.T) {
 	spec := dealSpec("Deal upsert tax_id", dealTask("attach-deal", true, []any{
 		map[string]any{"tax_id": "20-12345678-9", "persona": "individual", "role_key": "customer", "is_primary": true},
@@ -64,8 +56,6 @@ func TestPreflightTasks_DealContactsUpsertTaxIdPasses(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_DealContactsUpsertExplicitIdentityPasses: explicit
-// identity_key + identity_value + persona resolves. Passes.
 func TestPreflightTasks_DealContactsUpsertExplicitIdentityPasses(t *testing.T) {
 	spec := dealSpec("Deal upsert explicit", dealTask("attach-deal", true, []any{
 		map[string]any{"identity_key": "email", "identity_value": "co@example.com", "persona": "business", "role_key": "guarantor"},
@@ -75,8 +65,6 @@ func TestPreflightTasks_DealContactsUpsertExplicitIdentityPasses(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_DealContactsUpsertBorrowerIdShortCircuits: a borrower_id
-// row under upsert needs no identity/persona -- it short-circuits. Passes.
 func TestPreflightTasks_DealContactsUpsertBorrowerIdShortCircuits(t *testing.T) {
 	spec := dealSpec("Deal upsert mixed", dealTask("attach-deal", true, []any{
 		map[string]any{"borrower_id": "brw_customer", "role_key": "customer"},
@@ -87,9 +75,6 @@ func TestPreflightTasks_DealContactsUpsertBorrowerIdShortCircuits(t *testing.T) 
 	}
 }
 
-// TestPreflightTasks_DealContactsUpsertMissingIdentity: upsertContacts on but
-// row has neither borrower_id nor any identity -- reject. This is the
-// silent-skip bug the preflight catches.
 func TestPreflightTasks_DealContactsUpsertMissingIdentity(t *testing.T) {
 	spec := dealSpec("Deal upsert no identity", dealTask("attach-deal", true, []any{
 		map[string]any{"persona": "individual", "role_key": "customer"},
@@ -103,8 +88,6 @@ func TestPreflightTasks_DealContactsUpsertMissingIdentity(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_DealContactsUpsertMissingPersona: identity present but no
-// persona -- reject (can't create the borrower without it).
 func TestPreflightTasks_DealContactsUpsertMissingPersona(t *testing.T) {
 	spec := dealSpec("Deal upsert no persona", dealTask("attach-deal", true, []any{
 		map[string]any{"tax_id": "20-12345678-9", "role_key": "customer"},
@@ -118,8 +101,6 @@ func TestPreflightTasks_DealContactsUpsertMissingPersona(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_DealContactsMissingBorrowerIdHintsAtFlag: missing
-// borrower_id with upsert off should mention the upsertContacts flag.
 func TestPreflightTasks_DealContactsMissingBorrowerIdHintsAtFlag(t *testing.T) {
 	spec := dealSpec("Deal no borrower no upsert", dealTask("attach-deal", false, []any{
 		map[string]any{"tax_id": "20-12345678-9", "persona": "individual", "role_key": "customer"},
@@ -133,8 +114,6 @@ func TestPreflightTasks_DealContactsMissingBorrowerIdHintsAtFlag(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_DealNoContactsPasses: a deal task with no inline contacts
-// at all is unaffected by the new preflight. Passes.
 func TestPreflightTasks_DealNoContactsPasses(t *testing.T) {
 	spec := dealSpec("Deal no contacts", dealTask("attach-deal", false, nil))
 	if err := preflightTasks(spec); err != nil {
@@ -142,11 +121,6 @@ func TestPreflightTasks_DealNoContactsPasses(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_DealContactsSourcesConfigRejected: the legacy
-// deal_contacts (plural) / deal_contact (singular) sourcesConfig contact-
-// attachment paths are no longer supported. A deal node carrying such a
-// sourcesConfig entry must be rejected with a migration message pointing at
-// the inline `contacts` field.
 func TestPreflightTasks_DealContactsSourcesConfigRejected(t *testing.T) {
 	for _, srcType := range []string{"deal_contacts", "deal_contact"} {
 		deal := dealTask("attach-deal", false, nil)
@@ -165,13 +139,6 @@ func TestPreflightTasks_DealContactsSourcesConfigRejected(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// READ operation: readDealContactsConfig.picks -> dealpick-<id> handles
-// ---------------------------------------------------------------------------
-
-// dealReadTask builds a deal READ task carrying contact picks. leftoverContacts
-// simulates a node authored in write mode and later switched to read: the
-// `contacts` list stays in the body and must not be judged by the write rules.
 func dealReadTask(ref string, picks []any, leftoverContacts []any) map[string]any {
 	t := map[string]any{
 		"ref":       ref,
@@ -193,8 +160,6 @@ func dealReadTask(ref string, picks []any, leftoverContacts []any) map[string]an
 	return t
 }
 
-// TestPreflightTasks_DealReadPicksPass: role/primary filters and both take
-// values are accepted.
 func TestPreflightTasks_DealReadPicksPass(t *testing.T) {
 	spec := dealSpec("Deal read picks", dealReadTask("read-deal", []any{
 		map[string]any{"id": "g", "role_key": "guarantor", "take": "oldest"},
@@ -206,9 +171,6 @@ func TestPreflightTasks_DealReadPicksPass(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_DealReadIgnoresLeftoverContacts: the write-mode rules must
-// NOT run on a read node. These leftover rows carry no borrower_id and no
-// identity with upsert off -- fatal in write mode, irrelevant in read mode.
 func TestPreflightTasks_DealReadIgnoresLeftoverContacts(t *testing.T) {
 	spec := dealSpec("Deal read leftovers", dealReadTask("read-deal", []any{
 		map[string]any{"id": "g", "role_key": "guarantor"},
@@ -220,9 +182,6 @@ func TestPreflightTasks_DealReadIgnoresLeftoverContacts(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_DealReadPickBadTakeFails: take is oldest|newest -- the
-// relationships node's highest|lowest is a different vocabulary because a deal
-// contact has no priority column.
 func TestPreflightTasks_DealReadPickBadTakeFails(t *testing.T) {
 	spec := dealSpec("Deal read bad take", dealReadTask("read-deal", []any{
 		map[string]any{"id": "g", "role_key": "guarantor", "take": "highest"},
@@ -236,8 +195,6 @@ func TestPreflightTasks_DealReadPickBadTakeFails(t *testing.T) {
 	}
 }
 
-// TestPreflightTasks_DealReadPickNotObjectFails: a non-object pick is a shape
-// error worth catching before the POST.
 func TestPreflightTasks_DealReadPickNotObjectFails(t *testing.T) {
 	spec := dealSpec("Deal read bad pick", dealReadTask("read-deal", []any{"guarantor"}, nil))
 	err := preflightTasks(spec)
@@ -249,10 +206,6 @@ func TestPreflightTasks_DealReadPickNotObjectFails(t *testing.T) {
 	}
 }
 
-// TestValidateNoResidualSpecRefs_DealRoleKeyIsALiteral: a deal role that reads
-// the same as a node ref is a legitimate literal, not a missed ref rewrite.
-// This exact collision (node ref="customer", role_key="customer") used to abort
-// apply MID-POST, after tasks were already created and with no rollback.
 func TestValidateNoResidualSpecRefs_DealRoleKeyIsALiteral(t *testing.T) {
 	refMap := map[string]string{"customer": "borrower-ca89d5", "guarantor": "aval-77f0e1"}
 
@@ -282,8 +235,6 @@ func TestValidateNoResidualSpecRefs_DealRoleKeyIsALiteral(t *testing.T) {
 	})
 
 	t.Run("a real missed ref on the same task still fails", func(t *testing.T) {
-		// The exclusion must be scoped to role_key, not to the deal type: an
-		// unknown ref-bearing field on a deal body must still be caught.
 		body := map[string]any{
 			"type":            "deal",
 			"someNewRefField": "customer",

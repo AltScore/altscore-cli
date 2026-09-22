@@ -12,21 +12,8 @@ import (
 	"github.com/AltScore/altscore-cli/internal/client"
 )
 
-// Handoff readability advisories.
-//
-// These check the three things that decide whether the analyst who INHERITS a
-// workflow can read it. They are all invisible to the runtime -- a workflow that
-// trips every one of them executes identically -- which is exactly why nothing
-// else catches them and why they rot silently until the client opens the builder
-// and finds `pjex_cat_final_limit_amount` where a label should be.
-//
-// Advisory by construction: written to a writer, contributing nothing to
-// lintReport.Issues, so the exit code never moves. Findings are AGGREGATED --
-// one line per practice with a capped sample, never one line per variable. A
-// workflow with 218 untitled variables must not print 218 lines.
-
-// readabilityFinding is one practice's verdict: how many objects tripped it, a
-// short sample to make it actionable, and the advice.
+// Advisory by construction: a finding never moves the exit code, and each practice prints
+// ONE aggregated line -- a workflow with 218 untitled variables must not print 218.
 type readabilityFinding struct {
 	Practice string
 	Count    int
@@ -51,9 +38,6 @@ func (f readabilityFinding) line() string {
 	return fmt.Sprintf("#   [%s] %d of %d -- %s%s\n", f.Practice, f.Count, f.Total, f.Advice, sample)
 }
 
-// adviseHandoffReadability emits ONE aggregated advisory block covering every
-// practice that has something to say. rules may be nil when the caller could not
-// fetch them; that practice is then simply not reported (never guessed at).
 func adviseHandoffReadability(wf map[string]any, endTasks []map[string]any, rules []any, w io.Writer) {
 	if w == nil {
 		return
@@ -75,9 +59,6 @@ func adviseHandoffReadability(wf map[string]any, endTasks []map[string]any, rule
 	printReadabilityFindings(w, findings)
 }
 
-// printReadabilityFindings emits the aggregated block. Split out because `apply`
-// reports the subset of these practices that needs no server fetch (see
-// adviseOrdinalCodeVars) and must print it in the same shape as lint does.
 func printReadabilityFindings(w io.Writer, findings []readabilityFinding) {
 	if w == nil || len(findings) == 0 {
 		return
@@ -90,12 +71,6 @@ func printReadabilityFindings(w io.Writer, findings []readabilityFinding) {
 	fmt.Fprintf(w, "#   see `altscore workflows-v2 schema-guide handoffReadability`\n")
 }
 
-// adviseVariableTitles flags custom variables with no `title`.
-//
-// The Hub renders `variable.title || variable.name` in the elements panel, the
-// compute-variables node overlay, every variable picker and the PDF. Without a
-// title the reader gets the raw snake_case name, which is the author's shorthand
-// and not the business term the client uses.
 func adviseVariableTitles(customVariables map[string]any) (readabilityFinding, bool) {
 	total := len(customVariables)
 	if total == 0 {
@@ -126,23 +101,11 @@ func adviseVariableTitles(customVariables map[string]any) (readabilityFinding, b
 	}, true
 }
 
-// barePlaceholder matches an htmlBlock body that is nothing but a single
-// {placeholder} -- the signature of HTML assembled in Python and piped through
-// one variable, rather than authored in the section.
+// An htmlBlock body that is nothing but one {placeholder}: markup assembled in Python.
 var barePlaceholder = regexp.MustCompile(`^\s*\{[A-Za-z0-9_-]+\}\s*$`)
 
-// advisePDFSections flags the two ways a PDF stops being editable without Python:
-// a section with no title, and an htmlBlock whose whole body is one placeholder.
-//
-// It deliberately says NOTHING about a data-source section being absent:
-// includeAllSources auto-wires those at render time, so "missing" is the normal,
-// recommended shape and warning on it would mislead.
-//
-// endConfig lives in two places depending on the caller. An apply spec carries it
-// INLINE on the node; GET /v2/workflows/{id} does NOT embed task bodies at all
-// (an end node there has only data.inputMappings), so lint has to fetch the end
-// task and pass it in via endTasks. Reading only the node would make this check a
-// silent no-op on every saved workflow.
+// Says nothing about an ABSENT data-source section: includeAllSources wires those at render
+// time. endTasks is passed in because GET /v2/workflows/{id} does not embed task bodies.
 func advisePDFSections(nodes []any, endTasks []map[string]any) []readabilityFinding {
 	pdfConfigs := make([]map[string]any, 0, 1)
 	for _, n := range nodes {
@@ -227,13 +190,9 @@ func advisePDFSections(nodes []any, endTasks []map[string]any) []readabilityFind
 	return out
 }
 
-// provenanceDescription matches a description that records where the rule CAME
-// FROM instead of what it checks. Migration notes are for the engineer doing the
-// port; the client reads this field in the builder and in the report.
+// A description that records where the rule CAME FROM instead of what it checks.
 var provenanceDescription = regexp.MustCompile(`(?i)\b(ported|migrated|copied|imported|carried over)\s+(from|out of)\b|\bfrom\s+v[0-9]+\b|\blegacy\s+(rule|engine|workflow)\b`)
 
-// adviseRuleDescriptions flags evaluation rules whose description is empty or is
-// pure migration provenance.
 func adviseRuleDescriptions(rules []any) (readabilityFinding, bool) {
 	if len(rules) == 0 {
 		return readabilityFinding{}, false
@@ -265,18 +224,8 @@ func adviseRuleDescriptions(rules []any) (readabilityFinding, bool) {
 	}, true
 }
 
-// fetchWorkflowRules pulls the evaluation rules scoped to a workflow alias so
-// lint can judge their descriptions. Fail-open: any error yields nil and the
-// rule-descriptions practice is simply not reported.
-//
-// The filter key is `workflow-alias`. `workflowAlias` and `workflow_alias` are
-// accepted by the endpoint and SILENTLY IGNORED -- they return the tenant's
-// unfiltered first page, which would make this advisory judge other workflows'
-// rules. Do not "tidy" this into camelCase.
-// fetchEndTaskBodies resolves the task body behind every end node, because
-// GET /v2/workflows/{id} returns nodes WITHOUT their task bodies -- pdfConfig
-// lives on the task, not the node. Fail-open per task: one unreadable end task
-// costs that task's findings, not the whole advisory.
+// GET /v2/workflows/{id} returns nodes WITHOUT their task bodies, and pdfConfig lives on
+// the task. Fail-open per task.
 func fetchEndTaskBodies(c *client.Client, nodes []any) []map[string]any {
 	if c == nil {
 		return nil
@@ -300,8 +249,6 @@ func fetchEndTaskBodies(c *client.Client, nodes []any) []map[string]any {
 	return out
 }
 
-// fetchPersistedTask GETs the latest version of a task by alias and returns its
-// body as a generic map.
 func fetchPersistedTask(c *client.Client, alias string) (map[string]any, error) {
 	data, _, err := c.Do("GET", "borrower_central", "/v2/tasks/"+alias, nil)
 	if err != nil {
@@ -314,6 +261,8 @@ func fetchPersistedTask(c *client.Client, alias string) (map[string]any, error) 
 	return task, nil
 }
 
+// The filter key is `workflow-alias`. `workflowAlias` and `workflow_alias` are accepted and
+// SILENTLY IGNORED, returning the tenant's unfiltered first page. Do not tidy to camelCase.
 func fetchWorkflowRules(c *client.Client, alias string) []any {
 	if c == nil || alias == "" {
 		return nil

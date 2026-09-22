@@ -1,21 +1,5 @@
 package cmd
 
-// `workflows-v2 diff` compares two EXISTING workflow versions.
-//
-// This is not the same job as `apply --diff`, which previews a spec against a
-// live workflow and only needs the fields apply itself mutates. Here the
-// interesting differences live INSIDE the task bodies: a condition's operator, a
-// notice's message, an auto-generated inputSchema, a compute-variable
-// expression. So both sides are flattened through bundleToApplySpec, which
-// inlines each node's backing task body, and every body field is compared.
-//
-// It also reports which tasks are missing `specRef`. A task version bump drops
-// the pair unless the writer supplies it, and the builder does not, so a task
-// with no specRef is one a human edited in the Hub. On a CLI-authored workflow
-// that makes the census a reliable list of builder-touched nodes -- which is the
-// fastest way to split a diff into "the tool generated this" and "somebody
-// decided this", two populations that need opposite review.
-
 import (
 	"encoding/json"
 	"fmt"
@@ -89,8 +73,8 @@ type diffReport struct {
 	InputVarsChanged []varDelta `json:"inputVariablesChanged"`
 }
 
-// nodeFieldDropList are per-node keys that differ between any two versions as
-// bookkeeping, never as an authored change. Reporting them buries the real diff.
+// Per-node keys that differ between any two versions as bookkeeping, never as an authored
+// change. Reporting them buries the real diff.
 var nodeFieldDropList = map[string]bool{
 	"ref":         true,
 	"taskVersion": true,
@@ -158,24 +142,19 @@ symptom of the specRef loss above.`,
 	return cmd
 }
 
-// loadSideForDiff fetches one version's export bundle once and derives both the
-// flattened spec and the summary (including the specRef census) from it.
 func loadSideForDiff(c clientDoer, id string) (map[string]any, sideSummary, error) {
 	raw, _, err := c.Do("GET", "borrower_central", "/v2/workflows/"+id+"/export", nil)
 	if err != nil {
 		return nil, sideSummary{}, fmt.Errorf("diff: export %s: %w", id, err)
 	}
 
-	// Alias identity: a task keeps its alias across version bumps, while its
-	// specRef appears the first time the CLI applies over a Hub-authored task,
-	// so alias keeps the two sides of that boundary matched.
 	spec, err := bundleToApplySpec(raw, refFromAlias)
 	if err != nil {
 		return nil, sideSummary{}, fmt.Errorf("diff: flatten %s: %w", id, err)
 	}
 
-	// The version lives at the bundle ROOT as sourceVersion; bundle.workflow
-	// carries only the authoring body (no version, no status).
+	// The version lives at the bundle ROOT as sourceVersion; bundle.workflow carries only
+	// the authoring body.
 	var bundle struct {
 		SourceAlias   string           `json:"sourceAlias"`
 		SourceVersion any              `json:"sourceVersion"`
@@ -215,16 +194,13 @@ func loadSideForDiff(c clientDoer, id string) (map[string]any, sideSummary, erro
 	return spec, side, nil
 }
 
-// clientDoer is the one client method this command needs, so the diff can be
-// exercised without a live backend.
+// The one client method this command needs, so a diff can be exercised without a backend.
 type clientDoer interface {
 	Do(method, module, path string, body any) (json.RawMessage, int, error)
 }
 
-// fetchWorkflowStatus is best-effort: ACTIVE-vs-DRAFT is the context that makes
-// a version comparison readable ("am I diffing a live workflow against a draft
-// somebody is still editing?"), but the export bundle does not carry status, and
-// failing the whole diff over a decoration would be the wrong trade.
+// Best-effort: the export bundle carries no status, and failing a whole diff over a
+// decoration would be the wrong trade.
 func fetchWorkflowStatus(c clientDoer, id string) string {
 	raw, _, err := c.Do("GET", "borrower_central", "/v2/workflows/"+id, nil)
 	if err != nil {
@@ -282,9 +258,8 @@ func buildDiffReport(specA map[string]any, sideA sideSummary, specB map[string]a
 	sort.Strings(onlyA)
 	sort.Strings(onlyB)
 
-	// An alias rotation shows up as one ref missing on each side for the same
-	// (type, label). Pair those off as renames so they do not read as a node
-	// having been deleted and a different one added.
+	// An alias rotation shows up as one ref missing on each side for the same (type, label).
+	// Pairing them off keeps it from reading as a delete plus an unrelated add.
 	claimed := map[string]bool{}
 	for _, refA := range onlyA {
 		identity := nodeIdentity(a[refA])
@@ -312,7 +287,6 @@ func buildDiffReport(specA map[string]any, sideA sideSummary, specB map[string]a
 		}
 	}
 
-	// Shared refs plus renamed pairs both get a body comparison.
 	pairs := make([][2]string, 0, len(a))
 	for ref := range a {
 		if _, has := b[ref]; has {
@@ -365,8 +339,6 @@ func buildDiffReport(specA map[string]any, sideA sideSummary, specB map[string]a
 	return r
 }
 
-// specEdgeSet keys edges by (from, sourceHandle, to). apply-spec edges use
-// from/to holding node refs, so the triple is comparable across versions.
 func specEdgeSet(spec map[string]any) map[edgeTriple]bool {
 	out := map[edgeTriple]bool{}
 	for _, e := range toMapSlice(spec["edges"]) {

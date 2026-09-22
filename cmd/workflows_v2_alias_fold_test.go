@@ -2,9 +2,6 @@ package cmd
 
 import "testing"
 
-// The predicted alias must equal the one Borrower Central mints, or entities
-// get stamped with a workflowAlias no workflow has and the pickers go blind.
-// These pairs mirror app/utils/tests/test_alias_slugs.py on the server.
 func TestSlugifyWorkflowLabel_FoldsDiacriticsLikeTheServer(t *testing.T) {
 	cases := map[string]string{
 		"Customer Onboarding":                  "customer-onboarding",

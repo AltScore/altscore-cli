@@ -8,10 +8,6 @@ import (
 	"time"
 )
 
-// The cache sits behind every vocabulary fetcher; fetchServerTaskTypes is the
-// representative. $HOME is redirected so the test never touches the user's
-// real ~/.config/altscore.
-
 func vocabularyServer(t *testing.T, status int, body string, calls *int32) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -72,9 +68,6 @@ func TestVocabularyCache_ExpiresAfterTTL(t *testing.T) {
 	}
 }
 
-// A failed fetch caches nothing: the next lookup tries the backend again, and
-// a stale entry is never served as a fallback (that would reject values the
-// backend has since added).
 func TestVocabularyCache_FailureIsNotCached(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	var calls int32
@@ -91,8 +84,6 @@ func TestVocabularyCache_FailureIsNotCached(t *testing.T) {
 	}
 }
 
-// Entries are keyed by the backend the client will hit, so two backends never
-// read each other's vocabulary.
 func TestVocabularyCache_KeyedByBackendURL(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	var callsA, callsB int32
@@ -111,12 +102,6 @@ func TestVocabularyCache_KeyedByBackendURL(t *testing.T) {
 	}
 }
 
-// The taskTypes section carries a `deprecated` array alongside `values`. It is
-// UNIONED into the compiled-in deprecatedTaskTypes map rather than replacing
-// it: the compiled-in entries are what makes the refusal work offline, and the
-// live half lets BC retire a type without a CLI release. A type BC reports as
-// deprecated never comes back as authorable, even while it is still listed
-// under `values` (which is BC's actual shape -- it keeps parsing them).
 func TestFetchServerTaskTypes_UnionsTheServerDeprecatedList(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	var calls int32
@@ -140,9 +125,6 @@ func TestFetchServerTaskTypes_UnionsTheServerDeprecatedList(t *testing.T) {
 	}
 }
 
-// An older backend answers without the key. That must leave the compiled-in
-// list untouched and still return the live values -- the offline refusal is
-// the compiled-in map's job, not the payload's.
 func TestFetchServerTaskTypes_MissingDeprecatedKeyIsHarmless(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	var calls int32

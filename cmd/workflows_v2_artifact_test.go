@@ -2,21 +2,12 @@ package cmd
 
 import "testing"
 
-// The compiled-in validTaskTypes map mirrors the backend TaskType enum by hand.
-// A missing entry makes `apply` reject an artifact node as an unknown type AFTER
-// the earlier tasks in the compose loop have already been created, and no
-// rollback path exists -- so the mirror is the thing worth pinning.
 func TestArtifact_MirrorCarriesTheTaskType(t *testing.T) {
 	if !validTaskTypes["artifact"] {
 		t.Fatal("artifact must validate offline from the compiled-in validTaskTypes mirror")
 	}
 }
 
-// A node ref and an artifact alias are separate namespaces, and "usuarios" or
-// "sucursales" is a natural name in both -- which is exactly why the backend
-// field is spelled artifactAlias and not alias. The residual-ref validator runs
-// INSIDE the POST loop, so a false positive there aborts after tasks have
-// already been created and nothing rolls them back.
 func TestArtifact_AliasAndColumnsAreNotTreatedAsResidualRefs(t *testing.T) {
 	body := map[string]any{
 		"type": "artifact",
@@ -35,8 +26,6 @@ func TestArtifact_AliasAndColumnsAreNotTreatedAsResidualRefs(t *testing.T) {
 	}
 }
 
-// The exclusion must not blind the validator to a real residual ref elsewhere
-// in the same body: inputMappings still has to be rewritten.
 func TestArtifact_AResidualRefInInputMappingsStillAborts(t *testing.T) {
 	body := map[string]any{
 		"type": "artifact",
@@ -51,10 +40,6 @@ func TestArtifact_AResidualRefInInputMappingsStillAborts(t *testing.T) {
 	}
 }
 
-// residualSpecRefExcludedFields is shared with the REWRITER and the dependency
-// scanner, not just the validator, so moving the alias out of it has to be
-// checked on that side too: the literal must survive rewriting unrenamed, and
-// the mapping beside it must still be rewritten to the server-assigned alias.
 func TestArtifact_RewriteLeavesTheLiteralAndStillRewritesTheMapping(t *testing.T) {
 	task := map[string]any{
 		"type": "artifact",
@@ -80,8 +65,6 @@ func TestArtifact_RewriteLeavesTheLiteralAndStillRewritesTheMapping(t *testing.T
 	}
 }
 
-// artifact is a live type, not a retired one: apply must not refuse it with the
-// deprecation message.
 func TestArtifact_IsNotDeprecated(t *testing.T) {
 	if deprecatedTaskTypes["artifact"] {
 		t.Fatal("artifact is a current task type and must not be in deprecatedTaskTypes")

@@ -8,14 +8,7 @@ import (
 	"testing"
 )
 
-// --- the operator mirror ----------------------------------------------------
-
-// canonicalConditionOperators is borrower-central's canonical vocabulary,
-// app/model/evaluation_rules/condition_operators.py and
-// app/service/condition_evaluator.py (WORKFLOW_CONDITION_OPERATORS), which are
-// kept in step there by a guard test. Every one of these is what a `get` or an
-// `export` returns, because ConditionItem canonicalises on read -- so every one
-// of them lands back in `apply` on the next round trip.
+// Mirrors borrower-central's WORKFLOW_CONDITION_OPERATORS (app/service/condition_evaluator.py).
 var canonicalConditionOperators = []string{
 	"equals", "not_equals",
 	"greater_than", "greater_than_or_equals", "less_than", "less_than_or_equals",
@@ -27,9 +20,6 @@ var canonicalConditionOperators = []string{
 	"array_contains_any", "array_contains_all",
 }
 
-// preHundredOneConditionOperators is the mirror exactly as it shipped before
-// #101. Asserted so widening the list can never silently drop a spelling that
-// used to apply cleanly: back-compat is the whole constraint here.
 var preHundredOneConditionOperators = []string{
 	"eq", "neq",
 	"gt", "gte", "lt", "lte",
@@ -67,9 +57,6 @@ func TestConditionOperators_MirrorKeepsEveryPre101Spelling(t *testing.T) {
 	}
 }
 
-// The five operators that had no accepted spelling at all before #101. Offline
-// they were a hard apply failure, and is_not_empty is the one used against the
-// altdata failure sentinel, so this is not a hypothetical set.
 func TestConditionOperators_PreviouslyUnspellableOperators(t *testing.T) {
 	defer resetLiveConditionOperators()
 	resetLiveConditionOperators()
@@ -80,9 +67,6 @@ func TestConditionOperators_PreviouslyUnspellableOperators(t *testing.T) {
 	}
 }
 
-// A symbol operator is repaired to canonical by BC's ConditionItem rather than
-// rejected (its own test asserts that), so the CLI must not be stricter than
-// the write boundary it validates against.
 func TestConditionOperators_SymbolAliasesAreAccepted(t *testing.T) {
 	defer resetLiveConditionOperators()
 	resetLiveConditionOperators()
@@ -93,8 +77,6 @@ func TestConditionOperators_SymbolAliasesAreAccepted(t *testing.T) {
 	}
 }
 
-// An operator no backend has ever served must still be fatal offline: widening
-// the mirror must not turn it into a rubber stamp.
 func TestConditionOperators_UnknownStaysFatal(t *testing.T) {
 	defer resetLiveConditionOperators()
 	resetLiveConditionOperators()
@@ -102,8 +84,6 @@ func TestConditionOperators_UnknownStaysFatal(t *testing.T) {
 		t.Fatal("an operator unknown to every source must stay fatal")
 	}
 }
-
-// --- lint: merging the oracle's findings ------------------------------------
 
 func TestMergeServerFindings_DropsTheLocalCopyOfTheSameProblem(t *testing.T) {
 	report := lintReport{Issues: []lintIssue{
@@ -131,15 +111,12 @@ func TestMergeServerFindings_DropsTheLocalCopyOfTheSameProblem(t *testing.T) {
 	if server != 3 {
 		t.Errorf("expected the 3 server findings kept, got %d", server)
 	}
-	// Only the orphan check survives locally: the oracle covered the other two.
 	if local != 1 {
 		t.Errorf("expected 1 local issue to survive dedup, got %d", local)
 	}
 	if !strings.Contains(report.Issues[0].Message, "fully disconnected") {
 		t.Errorf("the surviving local issue should be the orphan one, got %q", report.Issues[0].Message)
 	}
-	// The dangling task reference -- the finding this whole change exists for --
-	// must arrive with its code so a reader can grep for it.
 	found := false
 	for _, issue := range report.Issues {
 		if issue.Code == "TASK_REFERENCE_NOT_IN_GRAPH" && issue.Severity == "warning" {
@@ -151,7 +128,6 @@ func TestMergeServerFindings_DropsTheLocalCopyOfTheSameProblem(t *testing.T) {
 	}
 }
 
-// A finding for one node must not silence the same check on a different node.
 func TestMergeServerFindings_DedupIsPerNode(t *testing.T) {
 	report := lintReport{Issues: []lintIssue{
 		{Severity: "error", Source: "local", NodeID: "n1", serverCode: "NODE_MISSING_TASK_REFERENCE", Message: "n1 local"},
@@ -174,8 +150,6 @@ func TestMergeServerFindings_DedupIsPerNode(t *testing.T) {
 	}
 }
 
-// A local issue with no server equivalent is never dropped, even when the
-// oracle reported plenty of other things.
 func TestMergeServerFindings_KeepsLocalOnlyChecks(t *testing.T) {
 	report := lintReport{Issues: []lintIssue{
 		{Severity: "error", Source: "local", NodeID: "dup", Message: "duplicate nodeId (2 occurrences)"},
@@ -189,8 +163,6 @@ func TestMergeServerFindings_KeepsLocalOnlyChecks(t *testing.T) {
 	}
 }
 
-// Unknown severities are treated as warnings, never dropped: the server owns the
-// vocabulary and lint must not swallow a finding it cannot classify.
 func TestMergeServerFindings_UnknownSeverityBecomesWarning(t *testing.T) {
 	report := lintReport{Issues: []lintIssue{}}
 	mergeServerFindings(&report, []validationFinding{
@@ -200,8 +172,6 @@ func TestMergeServerFindings_UnknownSeverityBecomesWarning(t *testing.T) {
 		t.Fatalf("expected one warning-severity issue, got %+v", report.Issues)
 	}
 }
-
-// --- lint: talking to the oracle -------------------------------------------
 
 func TestFetchWorkflowValidation_PostsTheDefinitionVerbatim(t *testing.T) {
 	var calls int32
@@ -230,14 +200,11 @@ func TestFetchWorkflowValidation_PostsTheDefinitionVerbatim(t *testing.T) {
 	if atomic.LoadInt32(&calls) != 1 {
 		t.Errorf("expected exactly one validate call, got %d", calls)
 	}
-	// `status` is load-bearing: the oracle resolves task bodies under the
-	// drafts-float / published-pin rule for the submitted status.
 	for _, want := range []string{`"workflow"`, `"status":"ACTIVE"`} {
 		if !strings.Contains(gotBody, want) {
 			t.Errorf("request body missing %s; got: %s", want, gotBody)
 		}
 	}
-	// No inline task bodies: the server resolves them from the repository.
 	if strings.Contains(gotBody, `"tasks"`) {
 		t.Errorf("lint must not send an inline tasks map; got: %s", gotBody)
 	}
@@ -246,8 +213,6 @@ func TestFetchWorkflowValidation_PostsTheDefinitionVerbatim(t *testing.T) {
 	}
 }
 
-// Fail open on every unusable answer, and say which kind it was: an old backend
-// and a contract mismatch are different problems for whoever reads the note.
 func TestFetchWorkflowValidation_FailsOpenWithADistinctReason(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -279,8 +244,6 @@ func TestFetchWorkflowValidation_FailsOpenWithADistinctReason(t *testing.T) {
 	}
 }
 
-// The local pass must stamp every issue it produces, including any check added
-// later: an unsourced issue in the JSON is unattributable.
 func TestLintWorkflowV2_StampsEveryIssueAsLocal(t *testing.T) {
 	report := lintWorkflowV2(map[string]any{
 		"id":    "wf-1",

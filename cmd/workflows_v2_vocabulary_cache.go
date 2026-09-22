@@ -10,31 +10,13 @@ import (
 	"github.com/AltScore/altscore-cli/internal/config"
 )
 
-// On-disk cache for the workflows-v2 vocabulary sections apply consults when a
-// value is missing from its compiled-in mirror: task types, condition
-// operators, workflow categories, relationship kinds and inputSchema types.
-// Each is served by GET /v1/meta/workflows-v2-schema?section=<name>, a static
-// derivation of the backend's enums that changes only on a backend deploy.
-//
-// Without the cache every apply that uses a value newer than this binary paid
-// one GET per vocabulary, and an offline run could not check the value at all
-// (it warned and proceeded). With it the first miss in 24 hours fetches and the
-// rest read the file, so a value the backend published yesterday is validated
-// strictly even when the backend is unreachable today.
-//
-// Only a fresh entry is authoritative. A stale one is never used as a fallback:
-// rejecting a value against a list the backend has since extended would be a
-// false rejection, which is the one failure the live lookup exists to prevent.
-// Entries are keyed by the Borrower Central base URL the client will hit, so a
-// --base-url override or another environment never reads another backend's
-// vocabulary. Every I/O failure is silent and degrades to a plain GET.
-
+// Only a fresh entry is authoritative: rejecting a value against a list the backend
+// has since extended would be a false rejection, the one failure the live lookup prevents.
 const (
 	vocabularyCacheFile = "workflows-v2-vocabulary.json"
 	vocabularyCacheTTL  = 24 * time.Hour
 )
 
-// vocabularyNow is the clock the cache reads; tests move it past the TTL.
 var vocabularyNow = time.Now
 
 type vocabularyCacheEntry struct {
@@ -42,10 +24,6 @@ type vocabularyCacheEntry struct {
 	Body      json.RawMessage `json:"body"`
 }
 
-// fetchMetaSection returns the raw body of one schema-guide section, from the
-// cache when a fresh entry exists and from the backend otherwise. Returns nil
-// when the section cannot be obtained; callers fall back to their compiled-in
-// mirror exactly as they did before the cache existed.
 func fetchMetaSection(c *client.Client, section string) json.RawMessage {
 	base, err := c.ModuleBaseURL("borrower_central")
 	if err != nil {

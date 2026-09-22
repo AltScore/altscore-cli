@@ -2,17 +2,8 @@ package cmd
 
 import "sort"
 
-// Canvas geometry for auto-layout. Mirrors the Hub's "Align" button
-// (handleAutoLayout in
-// altscore-ai-chat/components/workflow-builder-v2/canvas/WorkflowCanvas.tsx),
-// which uses COL_GAP=120 / ROW_GAP=60 around each node's MEASURED box.
-//
-// The CLI has no DOM, so it assumes a uniform card. layoutNodeW is the Hub's
-// fixed node width (w-[250px] in canvas/nodes/WorkflowNode.tsx); layoutNodeH is
-// a deliberately generous stand-in for the content-dependent height so rows
-// never collide before the Hub has measured anything. Pressing Align in the Hub
-// afterwards tightens the spacing but reproduces the same columns and row
-// order.
+// Mirrors the Hub's Align button (COL_GAP 120 / ROW_GAP 60 around each measured box).
+// The CLI has no DOM, so the height is a generous stand-in and rows never collide.
 const (
 	layoutNodeW  = 250.0
 	layoutNodeH  = 140.0
@@ -20,28 +11,12 @@ const (
 	layoutRowGap = 60.0
 )
 
-// autoLayoutNodes rewrites every node's `position` so the graph reads
-// left-to-right with no overlapping cards and no edge pointing backwards.
-// Nodes are matched to edges by `nodeId`; edges are read via edgeEndpoints, so
-// this works on both spec-local refs and resolved server aliases.
-//
-// Port of the Hub's three passes:
-//  1. longest-path leveling (Kahn order) -> column per node. A node sits one
-//     column right of its DEEPEST parent, so a diamond's short arm can't land
-//     left of the node feeding it (the pre-#2503 shortest-path BFS did).
-//  2. barycenter crossing reduction -> row order within each column, 4
-//     alternating down/up sweeps.
-//  3. stack each column by row pitch, centered on y=0.
-//
-// Nodes stranded by a cycle, and nodes with no edges at all, land in a
-// trailing column -- the Hub's "unconnected" bucket.
 func autoLayoutNodes(nodes []map[string]any, edges []map[string]any) {
 	if len(nodes) == 0 {
 		return
 	}
 
-	// Node order drives every tie-break below, so the output is deterministic
-	// for a given spec.
+	// Node order drives every tie-break below, so a given spec always lays out the same.
 	ids := make([]string, 0, len(nodes))
 	indexByID := make(map[string]int, len(nodes))
 	for i, n := range nodes {
@@ -59,10 +34,8 @@ func autoLayoutNodes(nodes []map[string]any, edges []map[string]any) {
 		return
 	}
 
-	// Adjacency. Self-edges, edges to unknown nodes, and duplicate edges are
-	// dropped: each would inflate in-degree past the number of real parents, so
-	// Kahn would never reach zero and the node would be exiled to the
-	// unconnected column for what is really a harmless spec redundancy.
+	// Self-edges, edges to unknown nodes and duplicates are dropped: each inflates in-degree
+	// past the number of real parents, and Kahn would then never reach zero.
 	children := make(map[string][]string, len(ids))
 	parents := make(map[string][]string, len(ids))
 	inDegree := make(map[string]int, len(ids))
@@ -91,8 +64,8 @@ func autoLayoutNodes(nodes []map[string]any, edges []map[string]any) {
 		inDegree[tgt]++
 	}
 
-	// Pass 1: longest-path leveling. Presence in `level` means "resolved";
-	// a node the queue never reaches (cycle member) stays absent.
+	// Presence in `level` means resolved; a node the queue never reaches (a cycle member)
+	// stays absent and lands in the trailing unconnected column.
 	level := make(map[string]int, len(ids))
 	remaining := make(map[string]int, len(ids))
 	for _, id := range ids {
@@ -134,9 +107,6 @@ func autoLayoutNodes(nodes []map[string]any, edges []map[string]any) {
 	}
 	sort.Ints(sortedLevels)
 
-	// Pass 2: barycenter crossing reduction. Order each column by the average
-	// normalized position of its neighbours in the adjacent column; nodes with
-	// no neighbour there keep their own relative slot.
 	reorderByNeighbors := func(lvl, refLvl int, neighborsOf map[string][]string) {
 		list := levelNodes[lvl]
 		if len(list) < 2 {
@@ -198,9 +168,6 @@ func autoLayoutNodes(nodes []map[string]any, edges []map[string]any) {
 		}
 	}
 
-	// Pass 3: place. Uniform cards mean a fixed column/row pitch and no
-	// per-column width math (the Hub centers narrower nodes inside a wider
-	// column; every node here is the same width).
 	colPitch := layoutNodeW + layoutColGap
 	rowPitch := layoutNodeH + layoutRowGap
 	place := func(column int, ids []string) {
@@ -226,10 +193,8 @@ func autoLayoutNodes(nodes []map[string]any, edges []map[string]any) {
 	}
 }
 
-// specHasPinnedPositions reports whether the author pinned a canvas position on
-// any node in the spec. Auto-layout stays out of a hand-placed canvas: pinning
-// one node and letting the layout move the rest would produce a graph that
-// matches neither intent.
+// Auto-layout stays out of a hand-placed canvas: pinning one node and moving the rest
+// would produce a graph that matches neither intent.
 func specHasPinnedPositions(spec *composeSpec) bool {
 	for _, buckets := range [][]map[string]any{spec.ExtraNodes, spec.Tasks} {
 		for _, n := range buckets {

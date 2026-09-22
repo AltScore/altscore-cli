@@ -9,8 +9,6 @@ import (
 	"github.com/AltScore/altscore-cli/internal/client"
 )
 
-// Target resolution: which workflow, if any, the spec reconciles against.
-
 func findWorkflowByAlias(c *client.Client, alias string) (map[string]any, string, error) {
 	active, err := queryLatestWorkflowByAliasStatus(c, alias, "ACTIVE")
 	if err != nil {
@@ -29,19 +27,8 @@ func findWorkflowByAlias(c *client.Client, alias string) (map[string]any, string
 	return nil, "", nil
 }
 
-// workflowNodeTypes collects the `type` of every node in a live workflow
-// payload -- the set the deprecation gate diffs the incoming spec against, so a
-// retired type the target already holds is recognised as a carry-forward rather
-// than as new authoring (see deprecatedTaskTypeRefused).
-//
-// No request of its own: findWorkflowByAlias already returns the full node
-// list. GET /v2/workflows?alias=... serves the same DTO as the single-workflow
-// GET and drops only config.taskSnapshots (borrower-central
-// app/model/workflows_v2/workflows.py::to_api_dto), so nodes[].type is present
-// on the listing payload apply has in hand before assembly.
-//
-// nil in, nil out: a create has no target, so it carries nothing forward and
-// every deprecated type stays refused.
+// The set the deprecation gate diffs an incoming spec against: a retired type the target
+// already holds is a carry-forward, not new authoring.
 func workflowNodeTypes(workflow map[string]any) map[string]bool {
 	if workflow == nil {
 		return nil
@@ -55,9 +42,7 @@ func workflowNodeTypes(workflow map[string]any) map[string]bool {
 	return out
 }
 
-// queryLatestWorkflowByAliasStatus returns the highest-version workflow matching
-// alias+status, or nil when none match. BC handlers have historically ignored
-// the query filters, so we also filter client-side after parsing.
+// BC handlers have historically ignored the query filters, hence the client-side match.
 func queryLatestWorkflowByAliasStatus(c *client.Client, alias, status string) (map[string]any, error) {
 	if alias == "" {
 		return nil, nil
@@ -72,10 +57,8 @@ func queryLatestWorkflowByAliasStatus(c *client.Client, alias, status string) (m
 	if err != nil {
 		return nil, err
 	}
-	// BC list endpoints return a JSON array at top level.
 	var arr []map[string]any
 	if jerr := json.Unmarshal(data, &arr); jerr != nil {
-		// Some endpoints wrap in {items: [...], total: ...}; tolerate both.
 		var wrapped struct {
 			Items []map[string]any `json:"items"`
 		}
@@ -99,7 +82,6 @@ func queryLatestWorkflowByAliasStatus(c *client.Client, alias, status string) (m
 		return nil, nil
 	}
 	if len(matches) > 1 {
-		// Pick the highest version.
 		best := matches[0]
 		bestV := 0
 		if v, ok := best["version"].(float64); ok {
@@ -116,24 +98,8 @@ func queryLatestWorkflowByAliasStatus(c *client.Client, alias, status string) (m
 	return matches[0], nil
 }
 
-// slugifyWorkflowLabel mirrors borrower-central's
-// app/utils/workflow_alias.py:slugify_workflow_label so compose can predict
-// the alias the server derives for a spec without an explicit `alias`. Knowing
-// it up-front matters because credit-decisioning entities (evaluation-rules,
-// rule-trees, mapping-tables, scorecards) only show up in a workflow's builder
-// pickers when their workflowAlias matches the workflow's alias: a label like
-// "All 5 types" silently slugs to "all-5-types", and entities stamped with
-// "all-types" become invisible.
-//
-// Rules (must match BC byte-for-byte):
-//   - fold diacritics to their base letter (BC: NFKD + drop combining marks),
-//     so "Validación" slugs to "validacion", never "validaci-n"
-//   - lowercase + strip
-//   - replace any run of non-[a-z0-9] with "-"
-//   - collapse repeated "-"
-//   - trim leading/trailing "-"
-//   - cap at 100 chars
-//   - default to "workflow" when empty
+// Mirrors borrower-central's app/utils/workflow_alias.py:slugify_workflow_label byte for
+// byte: an entity whose workflowAlias misses the derived alias never shows in the pickers.
 func slugifyWorkflowLabel(label string) string {
 	s := strings.ToLower(strings.TrimSpace(foldDiacritics(label)))
 	var b strings.Builder
@@ -158,11 +124,8 @@ func slugifyWorkflowLabel(label string) string {
 	return out
 }
 
-// diacriticBase maps every Latin letter that NFKD decomposes into a base
-// letter plus combining marks (Latin-1 Supplement and Latin Extended-A) to
-// that base letter. Letters NFKD leaves alone (ß, æ, ø, đ, ł, þ) are absent
-// on purpose: the server does not fold them either, so they still become a
-// hyphen in the slug. Kept as a table so the binary stays free of x/text.
+// Letters NFKD leaves alone (ss, ae, o-slash, d-stroke, l-stroke, thorn) are absent on
+// purpose: the server does not fold them either, so they still become a hyphen.
 var diacriticBase = map[rune]rune{
 	'À': 'A', 'Á': 'A', 'Â': 'A', 'Ã': 'A', 'Ä': 'A', 'Å': 'A', 'Ā': 'A', 'Ă': 'A', 'Ą': 'A',
 	'à': 'a', 'á': 'a', 'â': 'a', 'ã': 'a', 'ä': 'a', 'å': 'a', 'ā': 'a', 'ă': 'a', 'ą': 'a',
@@ -191,9 +154,8 @@ var diacriticBase = map[rune]rune{
 	'Ź': 'Z', 'Ż': 'Z', 'Ž': 'Z', 'ź': 'z', 'ż': 'z', 'ž': 'z',
 }
 
-// foldDiacritics strips accents the way BC's fold_to_ascii does for the
-// letters that matter to alias derivation, and also drops stray combining
-// marks (U+0300..U+036F) so a decomposed input folds the same as a composed one.
+// Stray combining marks (U+0300..U+036F) are dropped too, so a decomposed input folds the
+// same as a composed one.
 func foldDiacritics(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))

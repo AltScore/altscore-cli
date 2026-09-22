@@ -19,15 +19,12 @@ func TestAdviseVariableTitlesFlagsOnlyUntitled(t *testing.T) {
 	if f.Count != 2 || f.Total != 4 {
 		t.Fatalf("want 2 of 4, got %d of %d", f.Count, f.Total)
 	}
-	// Sorted, so the sample is stable across runs (map iteration is not).
 	if got := strings.Join(f.Sample, ","); got != "final_decision,pjex_cat_final_limit_amount" {
 		t.Fatalf("unexpected sample: %q", got)
 	}
 }
 
 func TestAdviseVariableTitlesSilentWhenAllTitled(t *testing.T) {
-	// Afecor's shape: every custom variable carries a title. The advisory must
-	// say nothing at all rather than emit a zero-count line.
 	if _, ok := adviseVariableTitles(map[string]any{
 		"age":               map[string]any{"title": "Edad"},
 		"antig_edad_afecor": map[string]any{"title": "Antigüedad AFECOR"},
@@ -39,7 +36,6 @@ func TestAdviseVariableTitlesSilentWhenAllTitled(t *testing.T) {
 	}
 }
 
-// endNodeWithPDF builds the apply-spec shape, where endConfig sits inline on the node.
 func endNodeWithPDF(pdf map[string]any) []any {
 	return []any{map[string]any{
 		"type":      "end",
@@ -52,19 +48,16 @@ func TestAdvisePDFSectionsFlagsUntitledAndPythonHTML(t *testing.T) {
 		"enabled":           true,
 		"includeAllSources": true,
 		"sourcesConfig": []any{
-			// La Fabril's shape: no title, body is one placeholder fed by Python.
 			map[string]any{
 				"type":       "htmlBlock",
 				"title":      "",
 				"components": []any{map[string]any{"content": "{rules_html}"}},
 			},
-			// Afecor's shape: a retitled override of an auto-wired section.
 			map[string]any{
 				"type":      "scorecard",
 				"title":     "Desgloce Puntaje",
 				"taskAlias": "scorecard-921a52",
 			},
-			// Authored HTML with placeholders: the recommended shape, not flagged.
 			map[string]any{
 				"type":       "htmlBlock",
 				"title":      "Resumen",
@@ -89,10 +82,7 @@ func TestAdvisePDFSectionsFlagsUntitledAndPythonHTML(t *testing.T) {
 }
 
 func TestAdvisePDFSectionsReadsTaskBodyNotJustNode(t *testing.T) {
-	// GET /v2/workflows/{id} returns end nodes WITHOUT endConfig -- pdfConfig
-	// only exists on the fetched task. Reading the node alone would make this
-	// check a silent no-op on every saved workflow, which is the regression
-	// this test exists to prevent.
+	// GET /v2/workflows/{id} returns end nodes WITHOUT endConfig: pdfConfig only exists on the fetched task.
 	nodes := []any{map[string]any{
 		"type":      "end",
 		"taskAlias": "end-3af1fd",
@@ -118,16 +108,12 @@ func TestAdvisePDFSectionsReadsTaskBodyNotJustNode(t *testing.T) {
 }
 
 func TestAdvisePDFSectionsIgnoresDisabledAndEmpty(t *testing.T) {
-	// pdfConfig.enabled=false: nothing renders, so nothing to advise on.
 	if got := advisePDFSections(endNodeWithPDF(map[string]any{
 		"enabled":       false,
 		"sourcesConfig": []any{map[string]any{"type": "htmlBlock", "title": ""}},
 	}), nil); len(got) != 0 {
 		t.Fatalf("disabled pdf: want 0 findings, got %d", len(got))
 	}
-	// enabled + empty sourcesConfig is the RECOMMENDED overlay shape: the
-	// runtime auto-wires every data-source ancestor. Warning here is the exact
-	// mistake the removed silent-PDF lint made.
 	if got := advisePDFSections(endNodeWithPDF(map[string]any{
 		"enabled":           true,
 		"includeAllSources": true,
@@ -162,7 +148,6 @@ func TestAdviseRuleDescriptionsSilentWhenClean(t *testing.T) {
 	}); ok {
 		t.Fatal("expected no finding when every rule states its business rule")
 	}
-	// nil means "could not fetch", NOT "no rules": staying silent is the point.
 	if _, ok := adviseRuleDescriptions(nil); ok {
 		t.Fatal("expected no finding when rules could not be fetched")
 	}
@@ -181,7 +166,6 @@ func TestProvenanceDescriptionDoesNotOverfire(t *testing.T) {
 			t.Errorf("should be flagged as provenance: %q", d)
 		}
 	}
-	// Real business descriptions that merely contain "from" must survive.
 	clean := []string{
 		"El aplicante no registra procesos en el Consejo de la Judicatura",
 		"Cliente con deuda vencida reportada from SRI en los ultimos 12 meses",
@@ -196,7 +180,6 @@ func TestProvenanceDescriptionDoesNotOverfire(t *testing.T) {
 }
 
 func TestAdviseHandoffReadabilityAggregatesAndStaysSilent(t *testing.T) {
-	// 218 untitled variables must produce ONE line, not 218.
 	cv := map[string]any{}
 	for i := 0; i < 218; i++ {
 		cv[string(rune('a'+i%26))+strings.Repeat("x", i/26+1)] = map[string]any{}
@@ -211,7 +194,6 @@ func TestAdviseHandoffReadabilityAggregatesAndStaysSilent(t *testing.T) {
 		t.Fatalf("missing the variable-titles finding: %s", out)
 	}
 
-	// A clean workflow prints nothing at all.
 	buf.Reset()
 	adviseHandoffReadability(map[string]any{
 		"customVariables": map[string]any{"age": map[string]any{"title": "Edad"}},
@@ -220,6 +202,5 @@ func TestAdviseHandoffReadabilityAggregatesAndStaysSilent(t *testing.T) {
 		t.Fatalf("clean workflow must print nothing, got: %s", buf.String())
 	}
 
-	// A nil writer must not panic.
 	adviseHandoffReadability(map[string]any{"customVariables": cv}, nil, nil, nil)
 }

@@ -15,8 +15,6 @@ import (
 	"github.com/AltScore/altscore-cli/internal/config"
 )
 
-// newTestClient builds a client.Client wired to the given httptest server URL.
-// Avoids touching the real config file or auth flow.
 func newTestClient(t *testing.T, baseURL string) *client.Client {
 	t.Helper()
 	cfg := &config.Config{
@@ -35,10 +33,6 @@ func newTestClient(t *testing.T, baseURL string) *client.Client {
 	return c
 }
 
-// TestPollExecutionWait_SucceedsAfterRunning is the canonical happy-path:
-// two RUNNING polls, then completed. Verifies the loop terminates, the final
-// JSON carries through, and verbose mode prints status transitions for each
-// node.
 func TestPollExecutionWait_SucceedsAfterRunning(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -96,7 +90,6 @@ func TestPollExecutionWait_SucceedsAfterRunning(t *testing.T) {
 	if got := atomic.LoadInt32(&calls); got < 3 {
 		t.Errorf("expected at least 3 polls, got %d", got)
 	}
-	// Final payload should carry through verbatim.
 	var env map[string]any
 	if err := json.Unmarshal(data, &env); err != nil {
 		t.Fatalf("final JSON not parseable: %v", err)
@@ -104,11 +97,10 @@ func TestPollExecutionWait_SucceedsAfterRunning(t *testing.T) {
 	if s, _ := env["status"].(string); s != "completed" {
 		t.Errorf("final status field = %q, want completed", s)
 	}
-	// Verbose should have streamed each transition. Check a couple.
 	transcript := stderr.String()
 	for _, want := range []string{
-		"n1 - -> running",      // first appearance
-		"n2 - -> pending",      // first appearance
+		"n1 - -> running",
+		"n2 - -> pending",
 		"n1 running -> completed",
 		"n2 pending -> running",
 		"n2 running -> completed",
@@ -119,9 +111,6 @@ func TestPollExecutionWait_SucceedsAfterRunning(t *testing.T) {
 	}
 }
 
-// TestPollExecutionWait_Timeout asserts that when the loop never sees a
-// terminal status it returns ExitCodeError{Code: 2} rather than blocking
-// forever.
 func TestPollExecutionWait_Timeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -145,8 +134,6 @@ func TestPollExecutionWait_Timeout(t *testing.T) {
 	}
 }
 
-// TestPollExecutionWait_TransientErrorThenSucceeds verifies the single-flake
-// retry behavior: one HTTP 500 doesn't abort the wait, but two in a row do.
 func TestPollExecutionWait_TransientErrorThenSucceeds(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -172,8 +159,6 @@ func TestPollExecutionWait_TransientErrorThenSucceeds(t *testing.T) {
 	}
 }
 
-// TestExtractExecutionID sanity-checks the submit-response parsing for both
-// the flat shape (current async response) and a nested "data" wrapper.
 func TestExtractExecutionID(t *testing.T) {
 	flat := json.RawMessage(`{"executionId":"e1"}`)
 	if id := extractExecutionID(flat); id != "e1" {
@@ -189,8 +174,6 @@ func TestExtractExecutionID(t *testing.T) {
 	}
 }
 
-// TestExtractFailureDetail covers the failure-detail surface PR1 adds, plus
-// the fallback to error.message when failureReason is absent.
 func TestExtractFailureDetail(t *testing.T) {
 	withReason := json.RawMessage(`{"status":"failed","failedNodeId":"n3","failureReason":"boom"}`)
 	node, reason := extractFailureDetail(withReason)

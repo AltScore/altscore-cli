@@ -6,17 +6,8 @@ import (
 	"unicode"
 )
 
-// Client-facing text authored in Spanish with every accent dropped is the most
-// common cosmetic defect in a CLI-built workflow: the generator scripts are
-// written in ASCII and nobody goes back over 70 rule labels. The Hub and the
-// PDF render UTF-8 fine, so the client reads "Cedula", "Opinion", "Garantias"
-// on every screen. Fixing it after publish is a script plus one PATCH per rule.
-//
-// The detector is deliberately narrow. It does not guess the language of a
-// string; it looks for words that in Spanish are always written with a
-// diacritic and that are NOT also English words, spelled without it, in a
-// string that carries no non-ASCII character at all. "Opinion", "revision" and
-// "decision" are excluded because an English tenant uses them legitimately.
+// Deliberately narrow: only words that in Spanish always carry a diacritic and are not
+// also English words. "Opinion", "revision" and "decision" are excluded for that reason.
 var foldedSpanishWords = map[string]string{
 	"cedula": "cédula", "direccion": "dirección", "garantia": "garantía", "garantias": "garantías",
 	"validacion": "validación", "evaluacion": "evaluación", "informacion": "información",
@@ -43,9 +34,8 @@ var foldedSpanishWords = map[string]string{
 }
 
 func init() {
-	// "solicitud" and "informe" carry no accent; they are listed above only to
-	// document that common credit words WITHOUT a diacritic must not be added
-	// by mistake, and are removed here so they never match.
+	// The empty values mark common credit words that carry NO accent, listed only so they
+	// are not added by mistake, and dropped here so they never match.
 	for w, accented := range foldedSpanishWords {
 		if accented == "" {
 			delete(foldedSpanishWords, w)
@@ -53,8 +43,6 @@ func init() {
 	}
 }
 
-// diacriticsMissing reports the folded Spanish words found in s, or nil when s
-// is not ASCII-only (the author does use accents there) or has none.
 func diacriticsMissing(s string) []string {
 	for _, r := range s {
 		if r > unicode.MaxASCII {
@@ -74,8 +62,6 @@ func diacriticsMissing(s string) []string {
 	return hits
 }
 
-// adviseDiacritics aggregates the check over every human-facing string it is
-// handed. Empty strings are ignored; Total counts the rest.
 func adviseDiacritics(texts []string) (readabilityFinding, bool) {
 	var flagged []string
 	total := 0
@@ -112,9 +98,6 @@ func shorten(s string, n int) string {
 	return string(r[:n]) + "..."
 }
 
-// humanStringsFromSpec collects what a client will read out of an apply spec:
-// workflow label and description, node labels, variable and input titles, PDF
-// titles and section titles, htmlBlock bodies.
 func humanStringsFromSpec(spec *composeSpec) []string {
 	if spec == nil {
 		return nil
@@ -131,9 +114,7 @@ func humanStringsFromSpec(spec *composeSpec) []string {
 	return out
 }
 
-// humanStringsFromWorkflow is the saved-workflow counterpart used by lint. End
-// task bodies come separately (GET /v2/workflows/{id} does not embed them) and
-// rules are the tenant's evaluation-rules for the alias.
+// End task bodies come separately: GET /v2/workflows/{id} does not embed them.
 func humanStringsFromWorkflow(wf map[string]any, endTasks []map[string]any, rules []any) []string {
 	var out []string
 	if s, _ := wf["label"].(string); s != "" {

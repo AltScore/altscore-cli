@@ -12,12 +12,9 @@ func TestDiacriticsMissing_FlagsFoldedSpanishOnlyInASCIIStrings(t *testing.T) {
 	}{
 		{"Cedula de inscripcion al RFC de la empresa no vigente", []string{"cédula", "inscripción"}},
 		{"Garantias inmuebles sin valor catastral extraido", []string{"garantías"}},
-		// Already accented: the author uses diacritics here, nothing to say.
 		{"Cédula de inscripción al RFC", nil},
-		// English tenants: none of these are in the list.
 		{"Opinion of counsel received; revision pending; decision recorded", nil},
 		{"Fetch ECU bureau", nil},
-		// A word that never carries an accent must not be flagged.
 		{"Solicitud de credito", []string{"crédito"}},
 		{"", nil},
 	}
@@ -41,8 +38,7 @@ func TestAdviseDiacritics_AggregatesAndStaysSilentOnCleanText(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a finding")
 	}
-	// "Opinion" is also an English word, so that string is deliberately NOT
-	// counted: 2 of the 5 non-empty strings.
+	// "Opinion" is also an English word, so that string is deliberately not counted.
 	if f.Practice != "diacritics" || f.Count != 2 || f.Total != 5 {
 		t.Errorf("finding = %+v, want practice diacritics, 2 of 5", f)
 	}
@@ -94,9 +90,7 @@ func TestHumanStringsFromSpec_ReadsLabelsTitlesAndPDFSections(t *testing.T) {
 			t.Errorf("missing %q in %v", want, got)
 		}
 	}
-	// Validacion Documentos, Antiguedad del RFC, Dias desde emision, Garantias
-	// Excluidas, Revision Documentacion. "Revision Empresa" and "Motivo de
-	// exclusion" are not flagged: revision and exclusion are English words too.
+	// revision and exclusion are English words too, so those two strings are not flagged.
 	f, ok := adviseDiacritics(got)
 	if !ok || f.Count != 5 {
 		t.Errorf("expected exactly 5 flagged strings, got %+v", f)

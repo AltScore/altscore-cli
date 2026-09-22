@@ -2,9 +2,6 @@ package cmd
 
 import "testing"
 
-// The schema-guide command has three shapes the skill relies on: the index
-// (no args), one section, and one task type under tasks. --full is the only
-// way to get the whole guide, and a section argument wins over it.
 func TestWfv2SchemaGuidePath(t *testing.T) {
 	cases := []struct {
 		name string

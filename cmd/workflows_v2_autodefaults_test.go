@@ -6,7 +6,6 @@ import (
 	"testing"
 )
 
-// endNode returns the single end task from a spec for assertions.
 func endTask(spec *composeSpec) map[string]any {
 	for _, t := range spec.Tasks {
 		if tt, _ := t["type"].(string); tt == "end" {
@@ -66,10 +65,10 @@ func TestApplyAutoEndDefaults_CallerValuesWin(t *testing.T) {
 		t.Errorf("billable_id not filled: %v", im["billable_id"])
 	}
 	pdf := end["endConfig"].(map[string]any)["pdfConfig"].(map[string]any)
-	if pdf["title"] != "Custom" { // preserved
+	if pdf["title"] != "Custom" {
 		t.Errorf("pdf title lost: %v", pdf["title"])
 	}
-	if pdf["enabled"] != true || pdf["pdfGenerationRequired"] != true { // forced anyway
+	if pdf["enabled"] != true || pdf["pdfGenerationRequired"] != true {
 		t.Errorf("pdf not forced over caller cfg: %v", pdf)
 	}
 }
@@ -84,7 +83,6 @@ func TestApplyAutoEndDefaults_AmbiguousCustomerWarnsAndSkipsWiring(t *testing.T)
 		if _, has := im["borrower_id"]; has {
 			t.Errorf("n=%d: borrower_id should NOT be wired when ambiguous", n)
 		}
-		// PDF is still forced regardless of customer ambiguity.
 		pdf := end["endConfig"].(map[string]any)["pdfConfig"].(map[string]any)
 		if pdf["enabled"] != true {
 			t.Errorf("n=%d: pdf should still be forced", n)
@@ -99,9 +97,9 @@ func TestNormalizeEntityWriteTask_DealContactIdentityValue(t *testing.T) {
 	task := map[string]any{
 		"type": "deal",
 		"contacts": []any{
-			map[string]any{"id": "0", "tax_id": "{{inputs.a}}"},                           // -> identity_value from tax_id
-			map[string]any{"id": "1", "identity_key": "email", "email": "{{inputs.b}}"},   // -> from email
-			map[string]any{"id": "2", "tax_id": "x", "identity_value": "{{inputs.keep}}"}, // caller wins
+			map[string]any{"id": "0", "tax_id": "{{inputs.a}}"},
+			map[string]any{"id": "1", "identity_key": "email", "email": "{{inputs.b}}"},
+			map[string]any{"id": "2", "tax_id": "x", "identity_value": "{{inputs.keep}}"},
 		},
 	}
 	if err := normalizeEntityWriteTask(task, &composeNormalizeOpts{AutoDefaults: true}); err != nil {
@@ -136,11 +134,6 @@ func TestNormalizeEntityWriteTask_DealContactsSkippedWhenOptOut(t *testing.T) {
 	}
 }
 
-// --- persona-as-task-property (vs forced workflow input) -----------------
-
-// Default: no persona input declared and no persona mapping -> persona is set
-// as a task literal ("individual"), and NOT wired as an input or inputSchema
-// field. The runtime reads CustomerTaskData.persona.
 func TestNormalizeEntityWriteTask_PersonaDefaultsToTaskLiteral(t *testing.T) {
 	task := map[string]any{"type": "customer", "operation": "write", "key": "person_id"}
 	if err := normalizeEntityWriteTask(task, &composeNormalizeOpts{}); err != nil {
@@ -161,7 +154,6 @@ func TestNormalizeEntityWriteTask_PersonaDefaultsToTaskLiteral(t *testing.T) {
 	}
 }
 
-// Agent-set task literal persona is preserved (e.g. "business" for a RUC flow).
 func TestNormalizeEntityWriteTask_PersonaLiteralPreserved(t *testing.T) {
 	task := map[string]any{"type": "customer", "operation": "write", "persona": "business"}
 	if err := normalizeEntityWriteTask(task, &composeNormalizeOpts{}); err != nil {
@@ -172,12 +164,6 @@ func TestNormalizeEntityWriteTask_PersonaLiteralPreserved(t *testing.T) {
 	}
 }
 
-// Opt-in via a declared workflow input: persona keeps the input path -- the
-// task gets an inputs.persona mapping and no literal. The inputSchema.persona
-// display entry is NO LONGER authored here: BC's DerivedSchemaService derives
-// it into derivedSchema server-side (#1526), and BC's create validator keeps a
-// persona mapping even when inputSchema doesn't declare it (shape-check only,
-// never prune). Only the load-bearing inputMappings wiring stays.
 func TestNormalizeEntityWriteTask_PersonaInputPath(t *testing.T) {
 	task := map[string]any{"type": "customer", "operation": "write"}
 	opts := &composeNormalizeOpts{InputVariables: map[string]any{"persona": map[string]any{"type": "string"}}}
@@ -198,8 +184,6 @@ func TestNormalizeEntityWriteTask_PersonaInputPath(t *testing.T) {
 	}
 }
 
-// A persona mapping to a non-input source (custom.*) is left untouched and no
-// task literal is injected -- the mapping supplies persona at runtime.
 func TestNormalizeEntityWriteTask_PersonaCustomMappingLeftAlone(t *testing.T) {
 	task := map[string]any{
 		"type":          "customer",
@@ -218,8 +202,6 @@ func TestNormalizeEntityWriteTask_PersonaCustomMappingLeftAlone(t *testing.T) {
 	}
 }
 
-// composeSpec.Description is a pointer so an explicit "" (blank it) is
-// distinguishable from an omitted field (leave untouched).
 func TestComposeSpec_DescriptionPointerSemantics(t *testing.T) {
 	var withEmpty composeSpec
 	if err := json.Unmarshal([]byte(`{"label":"x","description":""}`), &withEmpty); err != nil {
@@ -237,20 +219,11 @@ func TestComposeSpec_DescriptionPointerSemantics(t *testing.T) {
 	}
 }
 
-// --- pdfConfig defaults are fill-only-if-absent, per key -----------------
-
-// --no-auto-defaults' help text promises "Each only fills an absent field;
-// caller-supplied values always win". pdfConfig used to break that promise by
-// stamping enabled/pdfGenerationRequired unconditionally, so an author who set
-// {"enabled": false} to make a smoke run side-effect-free got a real PDF anyway.
-// The granularity is the KEY, not the pdfConfig object: writing an unrelated
-// pdfConfig key expresses no opinion on `enabled` and still gets the default.
 func TestApplyAutoEndDefaults_PdfConfigFillsOnlyAbsentKeys(t *testing.T) {
-	// absent is the sentinel for "this key must not exist afterwards".
 	const absent = "<absent>"
 	cases := []struct {
 		name         string
-		pdf          map[string]any // nil = no pdfConfig key at all
+		pdf          map[string]any
 		wantEnabled  any
 		wantRequired any
 	}{
@@ -290,8 +263,6 @@ func TestApplyAutoEndDefaults_PdfConfigFillsOnlyAbsentKeys(t *testing.T) {
 	}
 }
 
-// Opting out of the PDF must not disturb the sibling borrower_id/billable_id
-// wiring -- the two defaults are independent.
 func TestApplyAutoEndDefaults_PdfOptOutKeepsBorrowerWiring(t *testing.T) {
 	spec := baseSpecWithCustomers(1)
 	endTask(spec)["endConfig"] = map[string]any{"pdfConfig": map[string]any{"enabled": false}}

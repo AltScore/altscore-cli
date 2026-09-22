@@ -8,38 +8,12 @@ import (
 	"github.com/AltScore/altscore-cli/internal/client"
 )
 
-// Post-apply re-scoping of credit-decisioning entities to the workflow alias.
-
-// reconcileEntityScopes walks every credit-decisioning entity reachable from
-// the spec's tasks and stamps its `workflowAlias` to targetAlias when the
-// entity is currently UNSCOPED (workflowAlias is empty) or ALREADY matches
-// the target. When the entity is CROSS-OWNED -- its workflowAlias points at
-// a different workflow -- the reconciler refuses to re-stamp unless the
-// caller passed --allow-steal-ownership. Each v2 workflow owns its credit-
-// decisioning entities 1:1; silently transferring ownership breaks the
-// previous owner's Hub element panel (entities only appear in the panel
-// when their workflowAlias matches the workflow's alias).
-//
-// The preflight check in validateEntityWorkflowAliasMatch catches cross-
-// ownership before any mutation happens, so this second guard exists only
-// for the narrow window where the entity's owner changes between preflight
-// and reconcile (concurrent apply on the same tenant, manual update, etc.).
-//
-// Walks:
-//   - scorecard task -> scorecard entity -> nested rules[*].mappingTableCode
-//   - rule-tree task -> rule-tree entity -> nested rules[*].ruleCode
-//   - evaluate-rules task -> rulesConfig[*].ruleCode
-//   - mapping-table task -> mappingTableConfig.entries[*].mappingTableCode
-//
-// All stamps are PATCH /v1/{resource}/{id} with {"workflowAlias": "<alias>"}.
-// Errors are surfaced per-entity to stderr (one log line each) and the rest
-// of the walk continues -- partial reconciliation is better than nothing.
+// Each v2 workflow owns its credit-decisioning entities 1:1, and an entity shows only in the
+// element panel of the workflow its alias names, so ownership is never stolen silently.
 func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias string, allowStealOwnership bool, errOut io.Writer) error {
 	if c == nil || targetAlias == "" {
 		return nil
 	}
-	// Local memo to avoid re-stamping the same entity twice when multiple
-	// tasks reference it (e.g. two scorecard tasks sharing a mapping table).
 	stamped := map[string]bool{}
 
 	stamp := func(resource, ref string) {
@@ -64,11 +38,6 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 		if actual == targetAlias {
 			return
 		}
-		// Cross-owned guard: refuse to steal ownership from another
-		// workflow unless the user explicitly opted in. Preflight has
-		// already raised this as a hard error in the normal path; this
-		// branch only fires if the entity's owner changed between
-		// preflight and reconcile.
 		if actual != "" && !allowStealOwnership {
 			fmt.Fprintf(errOut,
 				"# REFUSED to re-scope %s %q (id=%s): currently owned by workflow %q, "+
@@ -84,15 +53,11 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 			return
 		}
 		fmt.Fprintf(errOut, "# scoped %s %s to %s\n", resource, ref, targetAlias)
-		// Refresh memoized entity in lookupEntity's cache so a subsequent
-		// validator (or a follow-on apply run) sees the new scope. lookupEntity
-		// caches the entity map itself; mutate in place.
+		// lookupEntity caches this map, so mutating in place is what refreshes a
+		// later validator or follow-on apply.
 		entity["workflowAlias"] = targetAlias
 	}
 
-	// Walk tasks in the spec (also covers ExtraNodes-end if the end task
-	// somehow ends up holding a credit-decisioning reference, which the
-	// schema doesn't allow today but the walk is cheap).
 	walkTasks := func(tasks []map[string]any) {
 		for _, t := range tasks {
 			tt, _ := t["type"].(string)
@@ -107,7 +72,6 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 					code, _ = cfg["scorecardId"].(string)
 				}
 				stamp("scorecards", code)
-				// Nested mapping tables on every rule.
 				entity, _ := lookupEntity(c, "scorecards", code, false)
 				if entity != nil {
 					if rules, ok := entity["rules"].([]any); ok {
