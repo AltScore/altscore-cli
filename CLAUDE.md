@@ -19,7 +19,7 @@ altscore-cli/
 │   ├── root.go                            # registerResources(), rootCmd wiring
 │   ├── resource.go                        # ResourceDef + registerResource() generic CRUD
 │   ├── workflows.go                       # v1 group: execute, execute-by-alias, input-schema-guide, update-schema; ResourceDef Name:"workflows" in root.go
-│   ├── workflows_v2.go                    # 25 of the 36 wfv2 subcommands: all but the 7 graph edits, apply, lint and import
+│   ├── workflows_v2.go                    # every wfv2 subcommand but the 7 graph edits, apply, lint, import and diff
 │   ├── workflows_v2_apply.go              # makeWfv2ApplyCmd: flags + RunE (parse -> target -> assemble -> POST /v2/workflows/apply)
 │   ├── workflows_v2_apply_spec.go         # composeSpec, detectLegacySpecShape, per-node helpers (localRef, edgeEndpoints)
 │   ├── workflows_v2_apply_target.go       # findWorkflowByAlias, slugifyWorkflowLabel
@@ -67,21 +67,21 @@ The skill is edited under `internal/skill/assets/altscore-cli/` and ships inside
 
 ## workflows-v2 (the CLI's largest surface)
 
-A ResourceDef group (`cmd/root.go`, `Name: "workflows-v2"`, `BasePath: /v2/workflows`, `BodyValidator: validateWorkflowV2Body`) extended with 36 hand-written subcommands (36 `wfv2Group.AddCommand` calls at `cmd/root.go:866-903`).
+A ResourceDef group (`cmd/root.go`, `Name: "workflows-v2"`, `BasePath: /v2/workflows`, `BodyValidator: validateWorkflowV2Body`) extended with hand-written subcommands, registered in one block of `wfv2Group.AddCommand` calls inside `registerResources()`. How many there are today: `grep -c 'wfv2Group.AddCommand' cmd/root.go`.
 
 | Group | Commands |
 | --- | --- |
 | Authoring | `apply` (alias `compose`), `diff`, `lint`, `import`, `export`, `duplicate` |
 | Graph edits (the 7 helpers) | `add-node`, `remove-node`, `add-edge`, `remove-edge`, `set-variable`, `unset-variable`, `set-mapping` |
 | Mapping endpoints | `update-mapping`, `resolve-mappings` |
-| Lifecycle | `publish`, `create-draft`, `revert`, `archive`, `restore`, `versions`, `get-version` |
+| Lifecycle | `publish`, `create-draft`, `revert`, `archive`, `restore`, `versions`, `get-version`, `set-visibility` |
 | Locking | `lock` (group), `autosave` |
 | Execution | `execute`, `execute-by-alias`, `execute-batch`, `execute-batch-by-alias`, `batch`, `executions`, `download`, `schedule` |
 | Introspection | `schema-guide`, `sources-status`, `external-sources-status`, `ai` |
 
 Each of the 7 graph-edit helpers wraps lock + fetch + mutate + autosave + release, via `mutateAndAutosaveV2` in `cmd/workflows_v2_helpers.go`. The two mapping endpoints do not: `makeWfv2UpdateMappingCmd` and `makeWfv2ResolveMappingsCmd` live in `cmd/workflows_v2.go` and are single bare calls (PUT `/v2/workflows/{id}/update_mapping_workflow`, GET `/v2/workflows/{id}/resolve-mappings`) with no lock and no autosave.
 
-`tasks-v2` is a separate top-level group (`cmd/tasks_v2.go`, registered at `cmd/root.go:905`) for `/v2/tasks`: `list`, `get`, `create`, `create-version`, `delete`. (`get-soap-methods` was removed with the `soap` task type.)
+`tasks-v2` is a separate top-level group (`cmd/tasks_v2.go`, added from `registerResources()` via `registerTasksV2(rootCmd)`) for `/v2/tasks`: `list`, `get`, `create`, `create-version`, `delete`. (`get-soap-methods` was removed with the `soap` task type.)
 
 ### Non-negotiables
 
@@ -121,11 +121,19 @@ The CLI uses a generic resource builder pattern. `ResourceDef` in `cmd/resource.
 
 There are TWO registration mechanisms and `cmd/root.go` shows only one of them, so grepping root.go for a command name can come up empty even though the command exists.
 
-Mechanism 1, via root.go. `func init()` (`cmd/root.go:44`) sets rootCmd's persistent flags, adds `schema` / `tools` / `version` directly, then calls `registerResources()` (call at `:55`, defined at `cmd/root.go:58`), which holds every ResourceDef plus:
-- ResourceDefs that live in their own file: `cmd/external_source_configs.go:17`, wired via `registerExternalSourceConfigs()` at `cmd/root.go:907`.
-- Non-CRUD groups built in their own file and only added from root: `registerTasksV2(rootCmd)` (:905), `makeCreditAccountsGroupCmd()` (:910), `makePaymentOrdersGroupCmd("payment-orders")` / `("disbursements")` (:911-912), `makeDpasGroupCmd()` (:913), `makeAnalyticsGroupCmd()` (:916), `makeDecisionsGroupCmd()` (:701).
+Mechanism 1, via root.go. `func init()` in `cmd/root.go` sets rootCmd's persistent flags, adds `schema` / `tools` / `version` directly, then calls `registerResources()` (same file), which holds every ResourceDef plus:
+- ResourceDefs that live in their own file: the `registerResource(ResourceDef{...})` call in `cmd/external_source_configs.go`, wired via `registerExternalSourceConfigs()`.
+- Non-CRUD groups built in their own file and only added from root: `registerTasksV2(rootCmd)`, `makeCreditAccountsGroupCmd()`, `makePaymentOrdersGroupCmd("payment-orders")` / `("disbursements")`, `makeDpasGroupCmd()`, `makeAnalyticsGroupCmd()`, `makeDecisionsGroupCmd()`.
 
-Mechanism 2, invisible from root.go. 10 files self-register their command from their own `func init()` and are never named in root.go: api.go, altdata.go, config.go, env.go, help.go, login.go, profiles.go, refresh_token.go, update.go, update_check.go. The command name is not always the basename: help.go registers `topics` (cobra supplies `help` itself), update_check.go registers the hidden `__update-check`, refresh_token.go registers `refresh-token`. To tell the two mechanisms apart: `grep -ln "func init()" cmd/*.go` returns 11 files, and the 10 that are not root.go are exactly this list.
+Mechanism 2, invisible from root.go. These files self-register their command from their own `func init()` and are never named in root.go: api.go, altdata.go, config.go, env.go, help.go, login.go, profiles.go, refresh_token.go, update.go, update_check.go. The command name is not always the basename: help.go registers `topics` (cobra supplies `help` itself), update_check.go registers the hidden `__update-check`, refresh_token.go registers `refresh-token`.
+
+A `func init()` on its own does not tell the mechanisms apart: a file can have one that registers nothing (today `cmd/workflows_v2_diacritics.go`, whose init prunes a word map), and `cmd/resource.go` calls `rootCmd.AddCommand` from `registerResource()` rather than from an init. A self-registering file has both, so ask for both:
+
+```
+grep -l "func init()" cmd/*.go | xargs grep -l "rootCmd.AddCommand"
+```
+
+Everything that comes back except `cmd/root.go` is mechanism 2.
 
 ### Adding a new resource
 
