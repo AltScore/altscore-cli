@@ -430,6 +430,13 @@ func rewriteRefsInTemplate(s string, refMap map[string]string, localMappings map
 	return out, nil
 }
 
+func rewriteBareTaskAlias(m map[string]any, refMap map[string]string) {
+	alias, _ := m["taskAlias"].(string)
+	if server, found := refMap[alias]; found && alias != "" {
+		m["taskAlias"] = server
+	}
+}
+
 // An ALLOWLIST for the shapes only a typed case can handle: a bare <ref>.<field>
 // head, a bare {{token}} expanded through inputMappings, an unknown head as a typo.
 func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) error {
@@ -475,22 +482,17 @@ func rewriteRefsInTaskTemplates(task map[string]any, refMap map[string]string) e
 			// taskAlias is looked up directly against the workflow's task list, so a spec-local
 			// ref that survives here renders an empty PDF section.
 			if pdfCfg, _ := endCfg["pdfConfig"].(map[string]any); pdfCfg != nil {
-				if sources, ok := pdfCfg["sourcesConfig"].([]any); ok {
-					for idx, src := range sources {
-						sm, _ := src.(map[string]any)
-						if sm == nil {
-							continue
-						}
-						alias, _ := sm["taskAlias"].(string)
-						if alias == "" {
-							continue
-						}
-						if server, found := refMap[alias]; found {
-							sm["taskAlias"] = server
-							sources[idx] = sm
+				for _, src := range asSlice(pdfCfg["sourcesConfig"]) {
+					sm, _ := src.(map[string]any)
+					if sm == nil {
+						continue
+					}
+					rewriteBareTaskAlias(sm, refMap)
+					for _, card := range asSlice(sm["mappingCards"]) {
+						if cm, _ := card.(map[string]any); cm != nil {
+							rewriteBareTaskAlias(cm, refMap)
 						}
 					}
-					pdfCfg["sourcesConfig"] = sources
 				}
 			}
 			// The sections carry {{task_outputs.<ref>}} templates, and a stale ref resolves to
