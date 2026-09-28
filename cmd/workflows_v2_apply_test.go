@@ -53,6 +53,40 @@ func TestRewriteRefsInTaskTemplates_EndPdfConfig(t *testing.T) {
 	}
 }
 
+func TestRewriteRefsInTaskTemplates_MappingCardTaskAlias(t *testing.T) {
+	refMap := map[string]string{
+		"grades":  "voc-mt-grades-1a2b3c",
+		"scoring": "voc-mt-score-4d5e6f",
+	}
+	cards := []any{
+		map[string]any{"variable": "score_decision", "taskAlias": "scoring", "fullWidth": true, "outOf": 1000},
+		map[string]any{"variable": "el_grade"},
+		map[string]any{"variable": "pd_grade", "taskAlias": "voc-mt-score-4d5e6f"},
+	}
+	section := map[string]any{"type": "mapping-table", "taskAlias": "grades", "mappingDisplay": "cards", "mappingCards": cards}
+	task := map[string]any{
+		"type": "end",
+		"endConfig": map[string]any{
+			"pdfConfig": map[string]any{"sourcesConfig": []any{map[string]any{"type": "htmlBlock"}, section}},
+		},
+	}
+	if err := rewriteRefsInTaskTemplates(task, refMap); err != nil {
+		t.Fatalf("rewriteRefsInTaskTemplates: %v", err)
+	}
+	if got := section["taskAlias"]; got != "voc-mt-grades-1a2b3c" {
+		t.Errorf("section taskAlias = %v, want voc-mt-grades-1a2b3c", got)
+	}
+	want := []any{"voc-mt-score-4d5e6f", nil, "voc-mt-score-4d5e6f"}
+	for i, card := range cards {
+		if got := card.(map[string]any)["taskAlias"]; got != want[i] {
+			t.Errorf("mappingCards[%d].taskAlias = %v, want %v", i, got, want[i])
+		}
+	}
+	if err := validateNoResidualSpecRefs(task, refMap, "test"); err != nil {
+		t.Errorf("rewritten body still carries a spec ref: %v", err)
+	}
+}
+
 func TestValidateNoResidualSpecRefs(t *testing.T) {
 	refMap := map[string]string{
 		"score": "scorecard-059a48",
