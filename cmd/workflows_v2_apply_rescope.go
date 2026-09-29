@@ -16,11 +16,11 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 	}
 	stamped := map[string]bool{}
 
-	stamp := func(resource, ref string) {
+	stamp := func(resource, ref, scope string) {
 		if ref == "" {
 			return
 		}
-		entity, _ := lookupEntity(c, resource, ref, false)
+		entity, _ := lookupEntity(c, resource, ref, scope, false)
 		if entity == nil {
 			// Best-effort: missing entity already warned by normalize.
 			return
@@ -71,8 +71,9 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 				if code == "" {
 					code, _ = cfg["scorecardId"].(string)
 				}
-				stamp("scorecards", code)
-				entity, _ := lookupEntity(c, "scorecards", code, false)
+				entity, _ := lookupEntity(c, "scorecards", code, targetAlias, false)
+				nestedScope := entityOwnerOr(entity, targetAlias)
+				stamp("scorecards", code, targetAlias)
 				if entity != nil {
 					if rules, ok := entity["rules"].([]any); ok {
 						for _, rraw := range rules {
@@ -84,7 +85,7 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 							if mt == "" {
 								mt, _ = rm["mappingTableId"].(string)
 							}
-							stamp("mapping-tables", mt)
+							stamp("mapping-tables", mt, nestedScope)
 						}
 					}
 				}
@@ -97,8 +98,9 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 				if code == "" {
 					code, _ = cfg["ruleTreeId"].(string)
 				}
-				stamp("rule-trees", code)
-				entity, _ := lookupEntity(c, "rule-trees", code, false)
+				entity, _ := lookupEntity(c, "rule-trees", code, targetAlias, false)
+				nestedScope := entityOwnerOr(entity, targetAlias)
+				stamp("rule-trees", code, targetAlias)
 				if entity != nil {
 					if rules, ok := entity["rules"].([]any); ok {
 						for _, rraw := range rules {
@@ -110,7 +112,7 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 							if rc == "" {
 								rc, _ = rm["ruleId"].(string)
 							}
-							stamp("evaluation-rules", rc)
+							stamp("evaluation-rules", rc, nestedScope)
 						}
 					}
 				}
@@ -125,7 +127,7 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 					if rc == "" {
 						rc, _ = rm["ruleId"].(string)
 					}
-					stamp("evaluation-rules", rc)
+					stamp("evaluation-rules", rc, targetAlias)
 				}
 			case "mapping-table":
 				cfg, _ := t["mappingTableConfig"].(map[string]any)
@@ -142,7 +144,7 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 					if mt == "" {
 						mt, _ = em["mappingTableId"].(string)
 					}
-					stamp("mapping-tables", mt)
+					stamp("mapping-tables", mt, targetAlias)
 				}
 			}
 		}

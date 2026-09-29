@@ -1040,42 +1040,71 @@ func warnIfDecisionKeyUnknown(c *client.Client, decisionKey, ruleCode, context s
 
 // Runs in dry-run too: skipping it would make the preview a different shape.
 // dryRun stays in the signature for symmetry with the sibling normalizers.
-func lookupEntity(c *client.Client, resource, codeOrID string, dryRun bool) (map[string]any, error) {
+// BC keys codes by (tenant, code, workflowAlias) and resolves them the same way: owner's copy first, tenant-wide after.
+func lookupEntity(c *client.Client, resource, codeOrID, workflowAlias string, dryRun bool) (map[string]any, error) {
 	_ = dryRun
 	if codeOrID == "" {
 		return nil, nil
 	}
+	if workflowAlias != "" {
+		if e := queryEntityByCode(c, resource, codeOrID, workflowAlias); e != nil {
+			return e, nil
+		}
+	}
+	return queryEntityByCode(c, resource, codeOrID, ""), nil
+}
+
+func queryEntityByCode(c *client.Client, resource, codeOrID, workflowAlias string) map[string]any {
 	cacheKey := resource + "|" + codeOrID
+	if workflowAlias != "" {
+		cacheKey += "|" + workflowAlias
+	}
 	if cached, ok := entityCache[cacheKey]; ok {
-		return cached, nil
+		return cached
 	}
 	if c == nil {
-		return nil, nil
+		return nil
 	}
 	q := url.Values{}
 	q.Set("code", codeOrID)
+	if workflowAlias != "" {
+		q.Set("workflow-alias", workflowAlias)
+	}
 	q.Set("per-page", "5")
 	path := "/v1/" + resource + "?" + q.Encode()
 	data, _, err := c.Do("GET", "borrower_central", path, nil)
 	if err != nil {
-		return nil, nil // best-effort, suppress
+		return nil // best-effort, suppress
 	}
 	var arr []map[string]any
 	if err := json.Unmarshal(data, &arr); err != nil {
-		return nil, nil
+		return nil
 	}
 	for _, e := range arr {
+		if workflowAlias != "" {
+			if owner, _ := e["workflowAlias"].(string); owner != workflowAlias {
+				continue
+			}
+		}
 		if code, _ := e["code"].(string); code == codeOrID {
 			entityCache[cacheKey] = e
-			return e, nil
+			return e
 		}
-		if id, _ := e["id"].(string); id == codeOrID {
+		if id, _ := e["id"].(string); workflowAlias == "" && id == codeOrID {
 			entityCache[cacheKey] = e
-			return e, nil
+			return e
 		}
 	}
 	entityCache[cacheKey] = nil
-	return nil, nil
+	return nil
+}
+
+// A nested code (a tree's rules, a scorecard's tables) resolves under its parent's own alias, as BC's runtime does.
+func entityOwnerOr(entity map[string]any, fallback string) string {
+	if owner, _ := entity["workflowAlias"].(string); owner != "" {
+		return owner
+	}
+	return fallback
 }
 
 func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
@@ -1101,7 +1130,7 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *com
 		if ref == "" {
 			ref = id
 		}
-		entity, _ := lookupEntity(c, "evaluation-rules", ref, dryRun)
+		entity, _ := lookupEntity(c, "evaluation-rules", ref, predictedAlias, dryRun)
 		if entity == nil && c != nil {
 			if err := missingEntityHandler(opts, dryRun, "evaluation-rules", ref); err != nil {
 				return fmt.Errorf("rulesConfig[%d]: %w", i, err)
@@ -1212,7 +1241,7 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *comp
 		if ref == "" {
 			ref = id
 		}
-		entity, _ := lookupEntity(c, "mapping-tables", ref, dryRun)
+		entity, _ := lookupEntity(c, "mapping-tables", ref, predictedAlias, dryRun)
 		if entity == nil && c != nil {
 			if err := missingEntityHandler(opts, dryRun, "mapping-tables", ref); err != nil {
 				return fmt.Errorf("entries[%d]: %w", i, err)
@@ -1274,7 +1303,7 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, opts *compose
 	if ref == "" {
 		ref = id
 	}
-	entity, _ := lookupEntity(c, "scorecards", ref, dryRun)
+	entity, _ := lookupEntity(c, "scorecards", ref, predictedAlias, dryRun)
 	if entity == nil && c != nil {
 		if err := missingEntityHandler(opts, dryRun, "scorecards", ref); err != nil {
 			return err
@@ -1301,7 +1330,7 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, opts *compose
 				if mref == "" {
 					continue
 				}
-				mtEntity, _ := lookupEntity(c, "mapping-tables", mref, dryRun)
+				mtEntity, _ := lookupEntity(c, "mapping-tables", mref, entityOwnerOr(entity, predictedAlias), dryRun)
 				if mtEntity == nil {
 					continue
 				}
@@ -1351,7 +1380,7 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeN
 	if ref == "" {
 		ref = id
 	}
-	entity, _ := lookupEntity(c, "rule-trees", ref, dryRun)
+	entity, _ := lookupEntity(c, "rule-trees", ref, predictedAlias, dryRun)
 	if entity == nil && c != nil {
 		if err := missingEntityHandler(opts, dryRun, "rule-trees", ref); err != nil {
 			return err
@@ -1376,7 +1405,7 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeN
 				if rref == "" {
 					continue
 				}
-				ruleEntity, _ := lookupEntity(c, "evaluation-rules", rref, dryRun)
+				ruleEntity, _ := lookupEntity(c, "evaluation-rules", rref, entityOwnerOr(entity, predictedAlias), dryRun)
 				if ruleEntity == nil {
 					continue
 				}
