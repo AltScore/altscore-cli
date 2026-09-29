@@ -414,7 +414,7 @@ func printScopeConflicts(out io.Writer, c *client.Client, spec *composeSpec, tar
 			return
 		}
 		seen[key] = true
-		entity, _ := lookupEntity(c, resource, ref, false)
+		entity, _ := lookupEntity(c, resource, ref, targetAlias, false)
 		if entity == nil {
 			return
 		}

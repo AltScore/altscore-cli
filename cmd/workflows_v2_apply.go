@@ -49,15 +49,17 @@ After either path apply walks the spec's dependency graph and stamps every
 referenced credit-decisioning entity (scorecards, rule-trees, evaluation-
 rules, mapping-tables, and nested rules within them) to the workflow's
 alias -- but only when the entity is currently UNSCOPED or ALREADY scoped
-to this workflow. If an entity is owned by ANOTHER workflow, apply refuses
-to silently transfer ownership and errors out with a clone-the-entity
-suggestion. Each v2 workflow owns its credit-decisioning entities 1:1;
-silently re-stamping a cross-owned entity makes it disappear from the
-previous owner's Hub element panel. Pass --allow-steal-ownership to
-override (rare: workflow rename / identity migration / decommissioning the
-old owner). Pass --skip-rescope to disable the entire rescope step (then
-a stale scope shows as a hard error in normalize and the agent has to fix
-it manually).
+to this workflow. A code resolves under this workflow's alias first, as
+the runtime does, so another workflow's entity with the same code is only
+matched when this workflow has none. If an entity is owned by ANOTHER
+workflow, apply refuses to silently transfer ownership and errors out with
+a clone-the-entity suggestion. Each v2 workflow owns its
+credit-decisioning entities 1:1; silently re-stamping a cross-owned entity
+makes it disappear from the previous owner's Hub element panel. Pass
+--allow-steal-ownership to override (rare: workflow rename / identity
+migration / decommissioning the old owner). Pass --skip-rescope to disable
+the entire rescope step (then a stale scope shows as a hard error in
+normalize and the agent has to fix it manually).
 
 DRAFT vs publish: the create path saves the workflow in DRAFT by default,
 mirror of the Hub editor's save-then-publish flow. A DRAFT executes its full
