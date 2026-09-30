@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/AltScore/altscore-cli/internal/client"
@@ -742,17 +743,50 @@ func lookupAltdataSourceStatus(c *client.Client, sourceID, version string, dryRu
 	return nil, errSourceNotFound
 }
 
+// Bounds the page walk in case a backend ignores `page` and keeps answering page 1.
+const maxCatalogPages = 50
+
+// fetchSourceCatalog reads EVERY page of a paginated catalog. sources-status held 226 rows
+// against per-page 200 (2026-09-30), and reading page 1 alone made every source sorted after
+// it (USA-PUB-0006, 0008, 0015...) a false "not found" that refused the whole apply.
+// A path without per-page is one response, as before.
 func fetchSourceCatalog(c *client.Client, path string) ([]map[string]any, error) {
 	if cached, ok := sourceCatalogListCache[path]; ok {
 		return cached, nil
 	}
-	data, _, err := c.Do("GET", "borrower_central", path, nil)
+	target, err := url.Parse(path)
 	if err != nil {
-		return nil, err
-	}
-	var sources []map[string]any
-	if err := json.Unmarshal(data, &sources); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	perPage, _ := strconv.Atoi(target.Query().Get("per-page"))
+	var sources []map[string]any
+	previousFirst := ""
+	for page := 1; page <= maxCatalogPages; page++ {
+		if perPage > 0 {
+			q := target.Query()
+			q.Set("page", strconv.Itoa(page))
+			target.RawQuery = q.Encode()
+		}
+		data, _, err := c.Do("GET", "borrower_central", target.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		var batch []map[string]any
+		if err := json.Unmarshal(data, &batch); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
+		first := ""
+		if len(batch) > 0 {
+			first = fmt.Sprint(batch[0]["sourceId"], "|", batch[0]["sourceVersion"])
+		}
+		if page > 1 && first == previousFirst {
+			break // the backend ignored `page` and answered page 1 again
+		}
+		sources = append(sources, batch...)
+		if perPage <= 0 || len(batch) < perPage {
+			break
+		}
+		previousFirst = first
 	}
 	sourceCatalogListCache[path] = sources
 	return sources, nil
