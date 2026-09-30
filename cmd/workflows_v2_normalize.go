@@ -749,7 +749,9 @@ const maxCatalogPages = 50
 // fetchSourceCatalog reads EVERY page of a paginated catalog. sources-status held 226 rows
 // against per-page 200 (2026-09-30), and reading page 1 alone made every source sorted after
 // it (USA-PUB-0006, 0008, 0015...) a false "not found" that refused the whole apply.
-// A path without per-page is one response, as before.
+// A path without per-page is one response, as before. A walk that ends on neither a short
+// page nor a repeated one is an error, never a cached partial catalog: a partial catalog is
+// exactly the false "not found" this exists to prevent.
 func fetchSourceCatalog(c *client.Client, path string) ([]map[string]any, error) {
 	if cached, ok := sourceCatalogListCache[path]; ok {
 		return cached, nil
@@ -760,7 +762,8 @@ func fetchSourceCatalog(c *client.Client, path string) ([]map[string]any, error)
 	}
 	perPage, _ := strconv.Atoi(target.Query().Get("per-page"))
 	var sources []map[string]any
-	previousFirst := ""
+	previousPage := ""
+	complete := false
 	for page := 1; page <= maxCatalogPages; page++ {
 		if perPage > 0 {
 			q := target.Query()
@@ -775,21 +778,32 @@ func fetchSourceCatalog(c *client.Client, path string) ([]map[string]any, error)
 		if err := json.Unmarshal(data, &batch); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
-		first := ""
-		if len(batch) > 0 {
-			first = fmt.Sprint(batch[0]["sourceId"], "|", batch[0]["sourceVersion"])
-		}
-		if page > 1 && first == previousFirst {
-			break // the backend ignored `page` and answered page 1 again
+		// Compared on every row, so a page whose first row merely coincides is still kept.
+		key := catalogPageKey(batch)
+		if page > 1 && key == previousPage {
+			complete = true // the backend ignored `page` and answered the same page again
+			break
 		}
 		sources = append(sources, batch...)
 		if perPage <= 0 || len(batch) < perPage {
+			complete = true
 			break
 		}
-		previousFirst = first
+		previousPage = key
+	}
+	if !complete {
+		return nil, fmt.Errorf("fetch %s: catalog exceeds %d pages", path, maxCatalogPages)
 	}
 	sourceCatalogListCache[path] = sources
 	return sources, nil
+}
+
+func catalogPageKey(batch []map[string]any) string {
+	var b strings.Builder
+	for _, row := range batch {
+		fmt.Fprint(&b, row["sourceId"], "|", row["sourceVersion"], "\n")
+	}
+	return b.String()
 }
 
 func lookupAltdataSourceInputFields(c *client.Client, sourceID, version string, dryRun bool) ([]string, error) {
