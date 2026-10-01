@@ -828,8 +828,14 @@ func makeWfv2ExecutionsCmd() *cobra.Command {
 	var search string
 
 	cmd := &cobra.Command{
-		Use:     "executions <id>",
-		Short:   "List executions for a v2 workflow",
+		Use:   "executions <id>",
+		Short: "List executions for a v2 workflow",
+		Long: `List executions for a v2 workflow.
+
+Each item is the internal v2 execution record: the End node's results sit under
+output.standard_output and output.custom_output. Integrations read the same run
+as output and customOutput from 'altscore executions get-output <executionId>'
+(GET /v1/executions/{id}/output).`,
 		Args:    cobra.ExactArgs(1),
 		Example: `  altscore workflows-v2 executions <id> --per-page 20 --sort-by createdAt --sort-direction desc`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1534,7 +1540,10 @@ Use --execution-mode sync (default) or async.
 Pass --wait to submit async and poll until the execution reaches a terminal
 state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 --verbose prints per-node status transitions to stderr. Exits 0 on completed,
-1 on failed/cancelled/timed_out, 2 on the local --timeout firing.`,
+1 on failed/cancelled/timed_out, 2 on the local --timeout firing. --wait prints
+the internal v2 execution record (End results under output.standard_output and
+output.custom_output); integrations read the same run as output and customOutput
+from 'altscore executions get-output <executionId>'.`,
 		Example: `  altscore workflows-v2 execute <id> --body '{"borrower_id":"abc"}'
   altscore workflows-v2 execute <id> --body '{...}' --execution-mode async --tags smoke
   altscore workflows-v2 execute <id> --body '{...}' --wait --timeout 10m`,
@@ -1612,7 +1621,10 @@ recent published version), consistent with how 'altdata describe' and
 Pass --wait to submit async and poll until the execution reaches a terminal
 state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
 --verbose prints per-node status transitions to stderr. Exits 0 on completed,
-1 on failed/cancelled/timed_out, 2 on the local --timeout firing.`,
+1 on failed/cancelled/timed_out, 2 on the local --timeout firing. --wait prints
+the internal v2 execution record (End results under output.standard_output and
+output.custom_output); integrations read the same run as output and customOutput
+from 'altscore executions get-output <executionId>'.`,
 		Args: cobra.RangeArgs(1, 2),
 		Example: `  altscore workflows-v2 execute-by-alias my-wf --body '{...}'
   altscore workflows-v2 execute-by-alias my-wf latest --body '{...}'
