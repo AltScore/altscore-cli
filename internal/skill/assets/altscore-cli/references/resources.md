@@ -99,7 +99,9 @@ altscore executions get-output-attachments <execution-id>
 altscore executions get-output-attachments <execution-id> | jq '.[].url'
 ```
 
-> **Per-task vs envelope outputs.** v2 declarative tasks (altdata-enrichment, scorecard, rule-tree, mapping-table, evaluate-rules, conditional, http) do NOT write into the top-level `output` envelope. So `executions get-output | jq '.output'` is `null` and `.customOutput` may look empty for a workflow whose tasks didn't explicitly emit `w_*` keys.
+> **Per-task vs envelope outputs.** v2 declarative tasks (altdata-enrichment, scorecard, rule-tree, mapping-table, evaluate-rules, conditional, http) do NOT write into the top-level `output` envelope; only the End node does. For a v2 run, `executions get-output | jq '.output'` is the white-box standard output (score, scorecard, rules, decision, ...) when the End node has `endConfig.standardOutput.enabled: true`, and the stub `{"is_success": true}` otherwise. `.customOutput` is `endConfig.outputJson`, or the type-keyed dump below when that is unset.
+>
+> **Same run, different key names.** `GET /v1/executions/{id}/output` (`executions get-output`) is what integrations read, and it uses the v1 names: `output` and `customOutput`. `workflows-v2 executions <workflowId>` and `workflows-v2 execute --wait` print the internal v2 execution record instead, where the same objects sit under `output.standard_output` and `output.custom_output`. A sync `execute` answers with `executionOutput` and `executionCustomOutput`, as v1 does. To compare a v2 run against v1, read `executions get-output`.
 >
 > The runtime stores per-task results in two different surfaces depending on the engine variant:
 > - `GET /v1/executions/{id}/state` — `state.data_flow.task_outputs.<taskAlias>` (alias-keyed). Hub debug panel reads this. Only present for in-flight or state-persisting executions; often 404 for completed sync v2 runs.
