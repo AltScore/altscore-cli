@@ -223,6 +223,8 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 		printReadabilityFindings(os.Stderr, []readabilityFinding{f})
 	}
 
+	adviseWorkflowStructure(structureGraphFromSpec(spec), os.Stderr)
+
 	// persona is a property of the workflow's DESIGN (a cedula flow is always "individual"), so
 	// it lives on the entity-write task as a literal unless the author opted into it per run.
 	personaAsInput := false

@@ -54,9 +54,15 @@ altscore workflows-v2 schema-guide examples       # full scoring_pipeline templa
 
 The whole guide is ~50k tokens; `--full` prints it, and nothing in this file needs it. Fetch the section that answers the question in front of you.
 
-#### Discovery before authoring (infer first, ask only what nobody wrote down)
+#### Discovery before authoring: a guided question path (infer first, then ask in short rounds)
 
-"Create a workflow that does X" and "change workflow Y so that Z" leave decisions open. Most of them are already written down somewhere in the tenant; a few are business policy that only the user knows. Read the first group, ask the second with the **AskUserQuestion** tool, then build. One round, at most 4 questions, 2 to 4 options each, the option you would pick first and labelled `(Recommended)`. Skip the round when nothing survives the reads.
+"Create a workflow that does X" and "change workflow Y so that Z" leave decisions open. Most of them are already written down somewhere in the tenant; a few are business policy that only the user knows. Read the first group. Walk the user through the second as a **path of short rounds** with the **AskUserQuestion** tool, so they answer a few concrete choices at a time instead of reviewing a design:
+
+1. **Frame.** Restate in one line what you inferred (who is evaluated, country, sources, decision keys, the closest sibling workflow). Then ask only the framing policy that survives the reads: what ends the application versus goes to a human, what happens when a gating source fails, where the cutoffs come from.
+2. **Details** (only when round 1 opened them). Questions that exist because of an answer: a review lane exists, so which findings go there; the user supplies the cutoffs, so what are they.
+3. **Confirm the plan.** Before writing the spec, one question: the node path in one line plus the two or three choices you made on the user's behalf, options `Build it (Recommended)` and `Change <choice>`. The engineer reacts to a proposal instead of holding the design in their head.
+
+Every round: at most 4 questions, 2 to 4 options each, the option you would pick first and labelled `(Recommended)`; at most 8 questions across the whole path. Skip any round with nothing left to ask. Never ask what a read answers.
 
 **Infer first. Never ask these; read them.**
 
@@ -88,13 +94,13 @@ Anything the spec can default is yours as well: labels, positions, aliases and r
 | The brief and the tenant disagree | a field the brief names is missing on the test borrower, a sample value has the opposite shape, an alias the brief names is not in `workflows-v2 list` | the options ARE the disagreement: which side is right, or what the missing piece should be |
 | A rule you want to write has no line in the brief | you are about to copy a rule family from a sibling workflow, or add a "sanity" rule the brief never asked for | add it; add it as informative (no decision impact); leave it out `(Recommended)` |
 
-Example round for "create a KYB workflow for Ecuadorian SMEs" in a tenant that already runs a KYC flow. Read: company, ECU and origination from the request; sources from `sources-status --country ECU`; a `review` key from `decisions list`; write targets, output shape and `dataAge` from the KYC export. Ask three things: what happens when the registry or judicial source fails mid-run; which findings reject outright versus go to review; whether owners and legal representatives are screened, since the country has an ownership source. Do not ask who is evaluated, which country, which sources, where the decision lands, or whether to publish. Restate the answers in one line, then write the spec.
+Example path for "create a KYB workflow for Ecuadorian SMEs" in a tenant that already runs a KYC flow. Read: company, ECU and origination from the request; sources from `sources-status --country ECU`; a `review` key from `decisions list`; write targets, output shape and `dataAge` from the KYC export. Round 1 asks three things: what happens when the registry or judicial source fails mid-run; which findings reject outright versus go to review; whether owners and legal representatives are screened, since the country has an ownership source. Round 2 is skipped: nothing new opened. Round 3 shows `start -> sources -> conditional (rejects / review) -> end` with the choices made for the user (30-day reuse of paid data, reason codes in the output) and asks to build. Do not ask who is evaluated, which country, which sources, where the decision lands, or whether to publish.
 
 **Every open point in the brief is a question.** A brief that carries a "pending / to confirm" list (a fiscal cutoff month, how a registry identifies a kind of asset, a catalogue that has not arrived) hands you the question list ready-made. Each unchecked item becomes either a question in the round or an explicit `TODO` placeholder the user has seen; never a silently assumed value. The same goes for a "conservative by default" principle in the brief: when you cannot confirm something the brief says must be confirmed (an asset class against a list that does not exist yet), the conservative outcome is the default and the deviation is a question, not a judgment call you make alone.
 
 **Mid-build unknowns get a second round, not an analogy.** The first round covers what the reads surfaced. New unknowns appear while building (an alias the brief spelled differently from the tenant, a package alias nobody stated, a subflow output the brief does not say whether to consume). Each is a question. Deriving an identifier from a sibling's pattern ("the other ten documents end in `_info`") is the single most expensive shortcut an agent takes: it looks right, publishes, and is wrong in a way only the client notices.
 
-**When AskUserQuestion is unavailable** (print mode `-p`, background jobs, some SDK hosts) do not guess and mutate. Write down the assumptions you would have asked about, build the spec under them, run `apply --dry-run` (or `--diff` for an update) and stop. Report the plan and the open questions; apply only after the user answers.
+**When AskUserQuestion is unavailable** (print mode `-p`, background jobs, some SDK hosts), the path still runs, through files. Write the exact payload the tool would have taken to `./questions.json`, `{"questions":[{"question","header","options":[{"label","description"}],"multiSelect"}]}`, and end your turn without building. The answers come back in `./answers.json` as `{"answers":{"<question text>":"<chosen label or free text>"}}`, the tool's own semantics; continue the path from there. An answer marked "no preference" means: take your recommended option and record it as an assumption. If no answers ever arrive, build under the recommended options, run `apply --dry-run` (or `--diff` for an update), list every assumption, and stop; apply only after the user answers.
 
 #### Authoring loop (how to work a tenant without breaking the person next to you)
 
@@ -121,6 +127,40 @@ These rules exist because a correct workflow can still cost the engineer next to
 - Every further tenant write needs an explicit go in the current message. "Esto es feedback", "what did you do here", "why did you...", a critique or a question is a READ-ONLY turn: answer, propose, wait. Acting on feedback the moment it arrives is what makes an engineer shout STOP while they are editing the same workflow in the Hub.
 - Never publish while the user is inside the Hub editor. Ask "are you out of the flow?" before taking the lock, even when `lock get` says it is free (locks expire; tabs do not).
 - When the user asks for a table or a block that already exists as data (a package, a task output), read it from the source; do not extend decision logic to carry presentation.
+
+#### Default structure: wire directly, decide in entities, compute only indicators
+
+This is the shape productive tenants run. Write it by default and deviate only for the exceptions in point 3.
+
+1. **Wire every input directly in the node that consumes it** (`inputMappings`), by deep path:
+
+   | Value | Path |
+   |---|---|
+   | workflow input | `inputs.<name>`, `inputs.<object>.<field>` |
+   | entity ids | `task_outputs.<customerRef>.borrower_id`, `task_outputs.<dealRef>.deal_id` |
+   | altdata | `task_outputs.<altdataRef>.<SOURCE_ID>.data.<field>`; raw nested `....sourceData.<path>`; success gate `....isSuccess` |
+   | decision outputs | `task_outputs.<scorecardRef>.total_score`, `task_outputs.<mappingTableRef>.<outputVariable>`, `task_outputs.<ruleTreeRef>.decision_key`; one breakdown row `task_outputs.<scorecardRef>.score_breakdown[field='<f>'][0].<prop>` |
+   | database | `entity.borrower.<group>.<key>` |
+
+   A custom variable that only re-exposes, renames, casts or `.get()`s one of these is never needed.
+2. **The decision lives in entities, not in Python.** `decision_key` comes from a rule-tree: hard gates first, then the band. Score bands and code-to-label maps are mapping tables; thresholds are evaluation rules or scorecards, versioned and editable without a republish. Rule-tree, scorecard and evaluate-rules inputs take deep paths directly, so gate on `isSuccess`, a status or a hit count with no variable in between. The usual chain is altdata -> indicator compute -> scorecard -> mapping-table (score to band) -> rule-tree -> End. Create the entities first ([credit-decisioning](credit-decisioning.md)), then reference them from the spec.
+3. **Python computes indicators, one scalar each.** A variable earns its place when it combines two or more values (ratio, age, date delta, a multi-step formula), aggregates a list, builds a per-party list for a fan-out (filtering alone is `inputExpression: "inputs.<list>[<field>=<value>]"`), parses a raw payload once, normalises text, renders HTML for a PDF block, or is a scoped probe (below). Return a number, string or boolean, never an object; name it `snake_case` after the value; `onError: "null"` and let the rule handle "no data".
+4. **Limits productive tenants stay under:** at most 6 variables per compute node, compute nodes at most a third of the graph, no `self.` chain longer than 2, under about 1,000 code chars per variable unless it is HTML, parsing or iteration. Past those the Python is a rules engine; move it into entities.
+5. **Never in a variable:** a threshold, a band, a gate, a decision key, a label map, a constant, or a re-check of `isSuccess`.
+
+```json
+{"ref": "policy", "type": "rule-tree", "label": "Credit policy",
+ "ruleTreeConfig": {"ruleTreeCode": "<policy-tree>", "inputMappings": {
+   "bureau_ok":      "task_outputs.bureau.<SOURCE_ID>.isSuccess",
+   "score_band":     "task_outputs.score-band.score_band",
+   "debt_to_income": "task_outputs.indicators.debt_to_income"}}},
+{"ref": "end", "type": "end", "label": "End",
+ "inputMappings": {"borrower_id": "task_outputs.applicant.borrower_id",
+                   "decision_key": "task_outputs.policy.decision_key"},
+ "endConfig": {"decisionConfig": {"enabled": true, "decisionType": "final"}}}
+```
+
+`apply` and `lint` print a `[structure]` advisory for each break of these rules, naming the fix.
 
 #### Recommended path: `apply` (declarative create-or-update)
 
@@ -598,7 +638,7 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 
 **Deep paths into altdata output**: an `altdata-enrichment` task outputs the entire package object on `sources_output_packages`. To map a single field into a downstream conditional/compute-variables task, use the deep form: `task_outputs.<altdataAlias>.<sourceId>.data.<fieldName>`. No intermediate compute-variables required.
 
-**Prefer direct assignment over passthrough compute-variables.** As a rule, don't add a `compute-variables` custom variable whose expression only re-exposes a single reference (e.g. `result = inputs.is_active`). Wire that source straight into the consuming node's `inputMappings` instead — a passthrough variable is an extra node, an extra `task_outputs` hop, and another place to drift. Reserve `compute-variables` for real transformation (arithmetic, conditionals, coercion, aggregation). **Exception — scoped probes are NOT passthroughs:** a single-handle-scoped probe node whose var reads a per-item scalar (`result = inputs.get("task_outputs.attach-deal.deal_contact_id")`) is the *required* way to surface a scoped value (see "The scoped compute-variables pattern" below) — direct assignment would lose the per-item scope. The "extract-raw then derive-indicators" two-stage compute pattern is also fine; only a true no-op re-expose is the anti-pattern.
+**Direct assignment is the default** (see "Default structure" above): wire a reference straight into the consuming node's `inputMappings` instead of re-exposing it through a variable. **Exception — scoped probes are NOT passthroughs:** a single-handle-scoped probe node whose var reads a per-item scalar (`result = inputs.get("task_outputs.attach-deal.deal_contact_id")`) is the *required* way to surface a scoped value (see "The scoped compute-variables pattern" below) — direct assignment would lose the per-item scope. The "extract-raw then derive-indicators" two-stage compute pattern is also fine; only a true no-op re-expose is the anti-pattern.
 
 **Bare `<alias>.<field>` resolves fine** at runtime — the backend resolver accepts the bare-alias form (WITH a dot), and `apply` deliberately emits it for cross-task references. Both `task_outputs.<server-alias>.<rest>` and the bare `<alias>.<rest>` form are valid.
 

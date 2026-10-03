@@ -184,6 +184,21 @@ Findings are aggregated -- one line per practice with a capped sample, never
 one line per variable. It NEVER contributes an issue and never moves the exit
 code. See 'altscore workflows-v2 schema-guide handoffReadability'.
 
+Also to stderr only, a STRUCTURE advisory ("[structure]" lines) says where the
+logic should live: values wired directly in each node, decisions made by
+entities, Python kept for real computation. Each line names the node or
+variable and its fix:
+  - decision_key (or standardOutput.decision) fed by a Python variable
+    instead of a rule-tree
+  - variables a deep path or a literal replaces: passthroughs (a cast
+    included), extract-only .get chains, constants and empty expressions
+  - a compute node with more than 6 variables, or more than 2 chained
+    through self.
+  - a variable over 1,000 code chars that is not HTML, parsing or iteration
+  - a variable that returns an object (one scalar per variable)
+HTML builders, parsing and multi-value arithmetic are left alone. Like the
+readability advisory it never contributes an issue or moves the exit code.
+
 Exits with non-zero status if any issue is found, from either source. Pass
 --local-only for the pre-#101 behaviour.`,
 		Example: `  altscore workflows-v2 lint <id>
@@ -224,10 +239,10 @@ Exits with non-zero status if any issue is found, from either source. Pass
 				adviseExtractionProbes(cv, asSlice(wf["nodes"]))
 			}
 			wfAlias, _ := wf["alias"].(string)
-			adviseHandoffReadability(wf,
-				fetchEndTaskBodies(c, asSlice(wf["nodes"])),
-				fetchWorkflowRules(c, wfAlias),
-				cmd.ErrOrStderr())
+			endTasks := fetchEndTaskBodies(c, asSlice(wf["nodes"]))
+			adviseHandoffReadability(wf, endTasks, fetchWorkflowRules(c, wfAlias), cmd.ErrOrStderr())
+			computeTasks := fetchTaskBodiesOfType(c, asSlice(wf["nodes"]), "compute-variables")
+			adviseWorkflowStructure(structureGraphFromWorkflow(wf, append(endTasks, computeTasks...)), cmd.ErrOrStderr())
 			raw, _ := json.Marshal(report)
 			if err := output.RawJSON(json.RawMessage(raw)); err != nil {
 				return err

@@ -78,6 +78,13 @@ apply fetches the existing workflow (if any) and prints a per-section diff
 of metadata, tasks, edges, inputVariables, customVariables, and any entity-
 scope conflicts, keyed by real task alias. No API mutations.
 
+Every mode (--dry-run, --diff and a real apply) prints offline advisories to
+stderr before the apply request. The "[structure]" lines flag a decision made
+in Python instead of a rule-tree, variables a deep path or a literal replaces,
+oversized or self.-chained compute nodes, and object-returning variables; each
+names the node or variable and the fix. Advisories never change the exit code
+(see 'workflows-v2 lint --help').
+
 Spec format (see file header for full reference):
   - label, alias?, category, description, status (DRAFT default)
   - inputVariables, customVariables
