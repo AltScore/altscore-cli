@@ -83,7 +83,7 @@ altscore borrowers set-test <id> --enable         # mark as test (cascades to ch
 altscore borrowers set-test <id> --disable        # clear (won't un-toggle independent children)
 ```
 
-Full test mode (`set-test` + filters + `--is-test`): borrowers, identities, documents, deals, assets, borrower-fields, deal-fields, asset-fields, points-of-contact, deal-contacts, authorizations, metrics, artifacts, data-models, evaluators, evaluation-rules, policy-rules, rule-trees. Filter-only (no `set-test`): executions, execution-batches.
+Full test mode (`set-test` + filters + `--is-test`): borrowers, identities, documents, deals, assets, borrower-fields, deal-fields, asset-fields, points-of-contact, deal-contacts, authorizations, artifacts, data-models, evaluators, evaluation-rules, policy-rules, rule-trees. Filter-only (no `set-test`): executions, execution-batches.
 
 ## Critical traps (read before mutating)
 
