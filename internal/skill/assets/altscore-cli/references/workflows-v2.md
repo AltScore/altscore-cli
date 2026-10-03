@@ -2,9 +2,9 @@
 
 > Building a KYC, KYB, or onboarding flow? Read [kyc-kyb-habits](kyc-kyb-habits.md) first — tenant/country-agnostic structure (orchestrator vs per-party child, identity & idempotency, two-layer decisioning) that complements the build mechanics below.
 
-> **⚠️ STOP — read this before doing anything.**
+> **Create and update v2 workflows with `apply`.**
 >
-> If the user asks "create a v2 workflow that does X" — or "update workflow Y to do Z" — run **`altscore workflows-v2 apply`** with a single spec file. `apply` is declarative: it reconciles the spec against the tenant. If no workflow shares the spec's alias, it creates one (POST tasks + POST workflow); if one already exists, it updates in place (fresh tasks + create-draft + lock + autosave + publish, same workflow id and alias retained). One verb, one validation pipeline, no fork-vs-update branch for the agent.
+> To create or update a v2 workflow, run **`altscore workflows-v2 apply`** with a single spec file. Borrower Central reconciles the spec against the tenant in one all-or-nothing request. It creates the workflow when no workflow has the spec's alias; otherwise it updates it in place (same id and alias; unchanged tasks are left alone, changed ones are version-bumped).
 >
 > Do not call `workflows-v2 create` directly with hand-built nodes — that path produces orphan nodes (no `taskAlias`) that save successfully but break the Hub UI (`GET /v2/tasks/null` 404 for every node). The CLI rejects orphan-node bodies at write time with an error pointing at apply; if you see that error, you're on the wrong path — switch to apply.
 >
@@ -23,7 +23,7 @@
 >    ```
 >    Operators: `eq, neq, gt, gte, lt, lte, contains, startsWith, endsWith, in, notIn, between, isNull, isNotNull, arrayContainsAny, arrayContainsAll, isAltdataEmpty, isAltdataNotCalculated, isAltdataError, isAltdataNull, isNotAltdataNull`. `valueType` is `"value"` (literal) or `"variable"` (reference to another inputSchema field). Field is `isElse` (camelCase), not `is_else`.
 >
-> 2. **`altdata-enrichment` tasks need `inputKeys` to wire source-required fields.** Each source (e.g. `ECU-PUB-0002`) declares `inputFields` like `personId`, `taxId`. The task must include `inputKeys: {"personId": "{{personId}}", "taxId": "{{taxId}}"}` matched against an `inputSchema` that declares those keys, plus `dataAge` (cache TTL minutes, default 30) and `packageAlias` (where to store results) on each `sourcesConfig` entry. `apply` auto-derives `inputKeys` by querying `sources-status` for each source's `inputFields` — use it.
+> 2. **`altdata-enrichment` tasks need `inputKeys` to wire source-required fields.** Each source (e.g. `ECU-PUB-0002`) declares `inputFields` like `personId`, `taxId`. The task must include `inputKeys: {"personId": "{{personId}}", "taxId": "{{taxId}}"}` matched against an `inputSchema` that declares those keys, plus `packageAlias` (where to store results) on each `sourcesConfig` entry. Leave `dataAge` unset unless the user chose a freshness window, because an authored value overrides the freshness the source publishes. `apply` auto-derives `inputKeys` by querying `sources-status` for each source's `inputFields` — use it.
 >
 > Run `altscore workflows-v2 schema-guide conditions` and `... schema-guide tasks <type>` for the canonical reference.
 
@@ -36,7 +36,7 @@ Workflows V2 is the API surface for the visual graph builder in the Hub. It uses
 
 This is **not** v1 (`/v1/workflows`). Use v2 for anything created in the visual editor.
 
-**Key insight: tasks first, then workflow.** **Every** graph node — including `start`, `end`, and `conditional` — needs a `taskAlias`. The Hub creates trivial backing tasks (just `type` + `label`) for start/end so it can render them. Verified by inspecting working tenant workflows: every node has a non-null `taskAlias`. Use `apply`, which creates a backing task for every node automatically.
+**Key insight: tasks first, then workflow.** **Every** graph node — including `start`, `end`, and `conditional` — needs a `taskAlias`. The Hub creates trivial backing tasks (just `type` + `label`) for start/end so it can render them. Use `apply`, which creates a backing task for every node automatically.
 
 After creating a workflow, run `altscore workflows-v2 lint <id>` to verify there are no orphan nodes, dangling edges, or duplicate ids. The lint command also runs the same checks as the create-time validator and is the fastest way to triage a misbehaving workflow.
 
@@ -98,7 +98,7 @@ Example round for "create a KYB workflow for Ecuadorian SMEs" in a tenant that a
 
 #### Authoring loop (how to work a tenant without breaking the person next to you)
 
-These rules come from a real session in which an agent built a 36-node workflow correctly and still cost the delivery engineer an afternoon: a duplicate workflow under a typo'd alias, 233 alerts and 4 decisions written to a real borrower by live test runs, a task version bumped under a draft the engineer was editing in the Hub, and three rounds of "that was feedback, not a go".
+These rules exist because a correct workflow can still cost the engineer next to you an afternoon: a duplicate workflow under a mistyped alias, alerts and decisions written to a real borrower by live test runs, a task version bumped under a draft being edited in the Hub, and feedback treated as a go-ahead.
 
 **Before the first write.**
 
@@ -149,11 +149,11 @@ Both paths share the same validation + normalize pipeline (`preflightTasks`, per
 - `evaluate-rules` task → each `rulesConfig[*].ruleCode` evaluation rule.
 - `mapping-table` task → each `mappingTableConfig.entries[*].mappingTableCode` mapping table.
 
-Each successful stamp logs to stderr (`# scoped <resource> <code> to <alias>`). This is the fix for the "four -v2 sibling workflows all share a scorecard scoped to the original alias" bug — apply makes the workflow→entity scope mapping reflect the spec, automatically. Pass `--skip-rescope` to opt out (then a stale scope shows as a hard error in normalize and the agent has to fix it manually).
+Each successful stamp logs to stderr (`# scoped <resource> <code> to <alias>`). Pass `--skip-rescope` to opt out (then a stale scope shows as a hard error in normalize and the agent has to fix it manually).
 
 **Entity ownership rule.** Each v2 workflow owns its credit-decisioning entities 1:1. A workflow's spec must NOT reference an entity whose `workflowAlias` is currently another workflow's alias. If you want the same logic in two workflows, **clone the entity** with a new code (e.g. `kyc-sc` and `kyb-sc` instead of one shared `scoring-sc`). Apply now refuses to silently steal ownership; pass `--allow-steal-ownership` if you really do want to transfer. Codes are unique per workflow, not per tenant: apply resolves a code under the target workflow's alias first (a tree's rules and a scorecard's tables under the parent's alias), exactly as the runtime does, so each workflow may own its own `DR_R001`; only a code no entity under that alias carries falls back to the tenant-wide match and its ownership check.
 
-**Refs vs aliases.** The spec uses `ref` as a stable spec-local key. Edges and inputMappings reference tasks by `ref`, and apply rewrites them with the server-assigned aliases at task-create time. You can also pass an explicit `alias` on the workflow itself (`spec.alias`) — apply uses it both to resolve the target and to keep `workflowAlias` stable across re-applies. Edges use `from`/`to` as shortcuts for `sourceNodeId`/`targetNodeId`.
+**Refs vs aliases.** The spec uses `ref` as a stable spec-local key. Edges and inputMappings reference tasks by `ref`, and Borrower Central resolves each ref to its task alias during apply. You can also pass an explicit `alias` on the workflow itself (`spec.alias`) — apply uses it both to resolve the target and to keep `workflowAlias` stable across re-applies. Edges use `from`/`to` as shortcuts for `sourceNodeId`/`targetNodeId`.
 
 ```bash
 cat > /tmp/spec.json <<'EOF'
@@ -241,7 +241,7 @@ altscore workflows-v2 publish <id>                              # standalone pub
 
 #### Canonical end-node pattern (single end, not N parallel ends)
 
-When a spec contains a `rule-tree` task, the recommended end-node shape is **one** end node fed directly by the rule-tree -- not N parallel ends behind a `conditional` router. BC's `end_activity` already promotes four fields from the end task's resolved input context onto the execution record automatically (see `borrower-central/app/temporal/activities/end_activity.py:339-360`):
+When a spec contains a `rule-tree` task, the recommended end-node shape is **one** end node fed directly by the rule-tree -- not N parallel ends behind a `conditional` router. BC's end activity promotes four fields from the end task's resolved input context onto the execution record automatically:
 
 | Context key | Execution-record field | Source |
 |---|---|---|
@@ -254,7 +254,7 @@ Wired this way, the rule-tree's per-run decision string flows through to BC's de
 
 > **Auto-defaults (on by default; `--no-auto-defaults` to skip).** apply injects three convenience defaults so common specs don't have to hand-wire them — each only fills an **absent** field, so caller-supplied values always win:
 > 1. **End-node `borrower_id` + `billable_id`** — wired to the single `customer` node's `borrower_id` output (`task_outputs.<customer-ref>.borrower_id`). Skipped with a stderr warning when the spec has 0 or >1 customer nodes (ambiguous — wire them yourself). `billable_id` defaults to `borrower_id` in `end_activity` anyway; both are set for clarity.
-> 2. **End-node PDF generation** — `endConfig.pdfConfig.enabled` and `pdfGenerationRequired` are **forced** to `true` (other pdfConfig fields like `title`/`subtitle` are preserved). This is a force, not a fill: a spec setting `enabled:false` is overridden — use `--no-auto-defaults` if you genuinely want no PDF.
+> 2. **End-node PDF generation** — `endConfig.pdfConfig.enabled` defaults to `true` when the key is absent, and `pdfGenerationRequired` defaults to `true` when the report is on. Other pdfConfig fields are preserved, and an explicit `enabled: false` keeps the report off.
 > 3. **Deal-contact `identity_value`** — for each inline deal `contact`, if `identity_value` is absent it's copied from the field named by the contact's `identity_key` (default `tax_id`, which is also set when absent). The source value may itself be an `{{inputs.*}}` or `{{task_outputs.*}}` template. Without this, a contact carrying only `tax_id` resolves its borrower upsert to a null identity.
 
 Canonical shape:
@@ -286,9 +286,9 @@ Canonical shape:
 
 **When multiple end nodes are correct.** Rare, but legal: post-decision tasks differ per branch (one branch hits an external webhook the other doesn't), or per-branch `htmlSections` that aren't expressible as `{decision_key}` substitutions. In those cases keep the conditional + N ends, but still wire `decision_key` on every end's `inputMappings`.
 
-> **DRAFT vs publish (test before you publish).** apply's CREATE path saves workflows in `status: "DRAFT"` by default — mirrors the Hub's "save-then-publish" editor flow. A DRAFT executes its **full graph faithfully** — node execution is never gated by status (the engine reads nodes straight from the workflow doc), so a DRAFT run is a real, complete test run. Publishing only changes which version the **alias** serves (the alias resolves to the latest `ACTIVE` version). So to validate before going live, execute the DRAFT **by its workflow id** (or by alias in test mode) — you do **not** have to publish untested work to run it. Pass `--publish` on apply when you *do* want it live immediately; the UPDATE path always publishes (apply treats the spec as desired state). `workflows-v2 execute` prints an informational stderr note when the targeted version isn't `ACTIVE`; pass `--skip-status-check` to silence it. (Earlier docs claimed a DRAFT "skips every node and emits null output" — that was never true of the engine; corrected May 2026.)
+> **DRAFT vs publish (test before you publish).** apply's CREATE path saves workflows in `status: "DRAFT"` by default — mirrors the Hub's "save-then-publish" editor flow. A DRAFT executes its **full graph faithfully** — node execution is never gated by status (the engine reads nodes straight from the workflow doc), so a DRAFT run is a real, complete test run. Publishing only changes which version the **alias** serves (the alias resolves to the latest `ACTIVE` version). So to validate before going live, execute the DRAFT **by its workflow id** (or by alias in test mode) — you do **not** have to publish untested work to run it. Pass `--publish` on apply when you *do* want it live immediately; the UPDATE path always publishes (apply treats the spec as desired state). `workflows-v2 execute` prints an informational stderr note when the targeted version isn't `ACTIVE`; pass `--skip-status-check` to silence it.
 
-> **Canvas auto-layout (on by default; `--no-layout` to skip).** apply positions nodes in left-to-right columns using the same algorithm as the Hub builder's **Align** button: longest-path leveling (every edge points forward, so a diamond's short arm never draws backwards into the join) plus barycenter row ordering to reduce crossings. Do NOT hand-write `position` on spec nodes — pinning it on *any* node disables auto-layout for the whole graph (apply says so on stderr) and you inherit responsibility for the entire canvas. Positions are recomputed on every apply, including the UPDATE path, so a re-applied spec always opens tidy. Before this existed, composed workflows shipped every node on `y=0` at a 200px pitch — narrower than the Hub's 250px card — so they opened as one overlapping row with every branch collapsed on itself.
+> **Canvas auto-layout (on by default; `--no-layout` to skip).** apply positions nodes in left-to-right columns using the same algorithm as the Hub builder's **Align** button: longest-path leveling (every edge points forward, so a diamond's short arm never draws backwards into the join) plus barycenter row ordering to reduce crossings. Do NOT hand-write `position` on spec nodes — pinning it on *any* node disables auto-layout for the whole graph (apply says so on stderr) and you inherit responsibility for the entire canvas. Positions are recomputed on every apply, including the UPDATE path, so a re-applied spec always opens tidy.
 
 If the agent asks for help building or updating a workflow, default to apply. Other paths exist for special cases:
 
@@ -305,7 +305,7 @@ altscore tasks-v2 create --body '{
   "alias":"fetch-ecu",
   "label":"Fetch ECU bureau",
   "type":"altdata-enrichment",
-  "sourcesConfig":[{"sourceId":"ECU-PUB-0002","version":"v1","dataAge":30,"packageAlias":"ecu_pub_0002"}],
+  "sourcesConfig":[{"sourceId":"ECU-PUB-0002","version":"v1","packageAlias":"ecu_pub_0002"}],
   "borrowerIdField":"personId",
   "inputSchema":{"personId":{"type":"string"},"taxId":{"type":"string"}},
   "inputKeys":{"personId":"{{personId}}","taxId":"{{taxId}}"},
@@ -324,8 +324,8 @@ altscore tasks-v2 create-version fetch-ecu --body '{
   "label":"Fetch ECU bureau v2",
   "type":"altdata-enrichment",
   "sourcesConfig":[
-    {"sourceId":"ECU-PUB-0002","version":"v1","dataAge":30,"packageAlias":"ecu_pub_0002"},
-    {"sourceId":"ECU-PUB-0014","version":"v1","dataAge":30,"packageAlias":"ecu_pub_0014"}
+    {"sourceId":"ECU-PUB-0002","version":"v1","packageAlias":"ecu_pub_0002"},
+    {"sourceId":"ECU-PUB-0014","version":"v1","packageAlias":"ecu_pub_0014"}
   ],
   "inputKeys":{"personId":"{{personId}}","taxId":"{{taxId}}"}
 }'
@@ -358,7 +358,7 @@ altscore tasks-v2 list --alias-prefix co2- --per-page 100 | jq -r '.[].alias' > 
 xargs -n1 altscore tasks-v2 delete < /tmp/orphans.txt
 ```
 
-Per-type config lives in `altscore workflows-v2 schema-guide tasks <type>`: the hand-written notes and traps for that type plus its fields introspected from the backend model, served live. This file does not restate it. The table that used to sit here had drifted from the runtime (`conditional` branches carry `conditions`, a ConditionGroup, and `isElse`; an `expression` string is silently dropped and the branch becomes a no-op), which is exactly why a copy is worse than a pointer. Two nesting traps are worth keeping in view because the API accepts the wrong shape with a 201:
+Per-type config lives in `altscore workflows-v2 schema-guide tasks <type>`: the hand-written notes and traps for that type plus its fields introspected from the backend model, served live. This file does not restate it, because a copy drifts from the runtime. Two nesting traps are worth keeping in view because the API accepts the wrong shape with a 201:
 
 - `category`: every field nests INSIDE `categoryConfig`; a top-level `operation` is silently swallowed by the customer/deal/asset field of the same name.
 - `end`: PDF generation is `endConfig.pdfConfig` on the end task, not a task type.
@@ -426,11 +426,7 @@ Read `renewCount`, not `lockId`: a frozen `renewCount` with `expiresAt` at
 a live Hub tab. `lockId` survives a same-tab re-acquire, so it never proves the
 lock is the same grant.
 
-All lock subcommands accept an alias **or** an id (an id is resolved to its alias
-first). Locks are alias-keyed, so addressing one by raw id used to hit a key
-nothing had written: `force-release` answered `{"success": true}` while the real
-lock stayed put until its TTL, and `lock get` reported a false all-clear
-(HQ #1228).
+All lock subcommands accept an alias **or** an id; an id is resolved to its alias first, because locks are alias-keyed.
 
 #### Lifecycle
 
@@ -615,8 +611,8 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 Secrets live in a **tenant-wide** store (`/v1/stores/secrets`), not on the workflow. The Hub surfaces it as the "Secrets" card on the workflow *detail* page, which makes it look workflow-scoped — it is not; every workflow in the tenant sees the same entries. Each entry is one `secretId` holding `{"value": "<the secret>"}` (the Hub's dialog always writes the `value` key, and the runtime reads exactly that key).
 
 ```bash
-altscore api GET  borrower_central /v1/stores/secrets
-altscore api POST borrower_central /v1/stores/secrets \
+altscore api GET  /v1/stores/secrets
+altscore api POST /v1/stores/secrets \
   --body '{"id": "openai-api-key", "secret": {"value": "sk-..."}}'
 ```
 
@@ -698,7 +694,6 @@ altscore execution-batches list --filter parent-execution-id=<parentExecutionId>
 - **`schedule preview/validate`** don't take a workflow ID. Standalone cron checkers.
 - **`execute --execution-mode async`** returns only `executionId`. Poll `executions <id>` for status.
 - **`ai suggest-mappings`** returns 503 when the tenant has no LLM configured. Treat as a soft failure.
-- **No tasks LIST endpoint.** Discover task aliases via the workflows that use them, or via the Hub UI.
 - **`secrets.<name>` is not a scope.** To read a stored secret in a node, declare a `secret`-typed `inputSchema` field whose `default` is the secretId — see "Secrets" above.
 - **`dispatchMode: "async-batch"` needs `inputExpression`.** Async dispatch batches over a list; without one the node resolves a dict and fails at runtime, so preflight refuses it. `maxConcurrency` and `failurePolicy` are INERT in that mode (the platform batch owns concurrency and per-row failure) and preflight warns if you set them. `invalidRowPolicy` is read only in that mode.
 - **An async-batch node's children are invisible to the run that launched them.** `executions list --filter parent-execution-id=<parent>` returns NOTHING for one, because the batch engine creates its own rows. Go parent -> batch (`execution-batches list --filter parent-execution-id=`) -> rows (`executions list --filter execution-batch-id=`). Note the executions query name is `execution-batch-id` while the response field is `batchId`; `--filter batch-id=` is not a real filter and is silently ignored, so it returns the whole unfiltered list.
