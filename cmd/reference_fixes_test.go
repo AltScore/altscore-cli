@@ -84,15 +84,13 @@ func TestMetricsHasNoSetTestCommand(t *testing.T) {
 
 func TestAltdataUsesSourceIdAlias(t *testing.T) {
 	// documentation/handler.py declares Query(..., alias="sourceId") as REQUIRED on
-	// both data-dictionary and output-example, so `source_id` is a hard 400.
+	// data-dictionary, so `source_id` is a hard 400. output-example is no longer called.
 	src := readCmdSource(t, "altdata.go")
 	if strings.Contains(src, "source_id=") {
 		t.Error("altdata still sends source_id; BC requires the sourceId alias and 400s otherwise")
 	}
-	for _, want := range []string{"data-dictionary?sourceId=", "output-example?sourceId="} {
-		if !strings.Contains(src, want) {
-			t.Errorf("expected %q in altdata.go", want)
-		}
+	if !strings.Contains(src, "data-dictionary?sourceId=") {
+		t.Error(`expected "data-dictionary?sourceId=" in altdata.go`)
 	}
 }
 

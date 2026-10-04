@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,6 +44,14 @@ type ResourceDef struct {
 	HasTestFilter  bool                                  // adds only --include-tests/--test-only on list (no set-test, no create flag)
 	WorkflowAlias  bool                                  // adds --workflow-alias <alias> on create/update; injects "workflowAlias" into the body. Without it the entity will not appear in the workflow builder's pickers.
 	BodyValidator  func(body *json.RawMessage) error     // optional hook called before POST/PATCH; may normalize the body in place; aborts the request if it returns an error
+	CompactList    *CompactList                          // when set, list reads every page and prints one compact row per item; --full prints the raw items
+}
+
+// CompactList is a list's default discovery shape: an item reduced to the fields that say
+// which ones exist, so a list of large objects stays readable.
+type CompactList struct {
+	Fields string                        // the compact row's fields, for --help
+	Row    func(item map[string]any) any // projects one raw item
 }
 
 // registerResource creates a Cobra command group for the resource and adds
@@ -83,12 +92,35 @@ func makeListCmd(def ResourceDef) *cobra.Command {
 	var page int
 	var includeTests bool
 	var testOnly bool
+	var full bool
 
 	hasTestFlags := def.HasTestMode || def.HasTestFilter
 
 	long := fmt.Sprintf(`Query %s. Returns a paginated JSON array.
 
 Use --filter for field-based filters, --per-page and --page for pagination.`, def.Name)
+	example := fmt.Sprintf(`  # List first 10 %s
+  altscore %s list --per-page 10
+
+  # With filter
+  altscore %s list --filter status=active
+
+  # Pipe to jq
+  altscore %s list | jq '.[].id'`, def.Name, def.Name, def.Name, def.Name)
+	if def.CompactList != nil {
+		long = fmt.Sprintf(`Query %s. By default every page is read and each item is one compact row:
+  %s
+stderr says how many rows printed. --full prints the raw items instead;
+--page (with --per-page) reads one page only. --filter narrows either shape.`, def.Name, def.CompactList.Fields)
+		example = fmt.Sprintf(`  # Every item, compact
+  altscore %s list
+
+  # With filter
+  altscore %s list --filter status=ACTIVE
+
+  # The raw items, one page
+  altscore %s list --full --page 1 --per-page 10`, def.Name, def.Name, def.Name)
+	}
 
 	if hasTestFlags {
 		long += "\n\nTest records are excluded by default. Use --include-tests or --test-only to see them."
@@ -97,21 +129,18 @@ Use --filter for field-based filters, --per-page and --page for pagination.`, de
 		long += "\n\nAvailable filters (pass via --filter key=value):\n" + def.FilterHelp
 	}
 	if def.ResponseSchema != "" {
-		long += "\n\nResponse fields:\n" + def.ResponseSchema
+		label := "Response fields"
+		if def.CompactList != nil {
+			label += " (--full)"
+		}
+		long += "\n\n" + label + ":\n" + def.ResponseSchema
 	}
 
 	cmd := &cobra.Command{
-		Use:   "list",
-		Short: fmt.Sprintf("List %s", def.Name),
-		Long:  long,
-		Example: fmt.Sprintf(`  # List first 10 %s
-  altscore %s list --per-page 10
-
-  # With filter
-  altscore %s list --filter status=active
-
-  # Pipe to jq
-  altscore %s list | jq '.[].id'`, def.Name, def.Name, def.Name, def.Name),
+		Use:     "list",
+		Short:   fmt.Sprintf("List %s", def.Name),
+		Long:    long,
+		Example: example,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
 			if err != nil {
@@ -173,23 +202,98 @@ Use --filter for field-based filters, --per-page and --page for pagination.`, de
 				path += "?" + strings.Join(params, "&")
 			}
 
+			if def.CompactList != nil && page == 0 {
+				items, err := fetchEveryPage(c, def.Module, path, listItemKey)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(cmd.ErrOrStderr(), "# %d %s, every page read%s\n", len(items), def.Name, compactListShape(full))
+				if full {
+					return output.JSON(items)
+				}
+				return printCompactRows(compactListRows(items, def.CompactList.Row))
+			}
+
 			data, _, err := c.Do("GET", def.Module, path, nil)
 			if err != nil {
 				return err
 			}
-			return output.RawJSON(data)
+			if def.CompactList == nil || full {
+				return output.RawJSON(data)
+			}
+			var items []map[string]any
+			if err := json.Unmarshal(data, &items); err != nil {
+				return fmt.Errorf("parse %s: %w", def.Name, err)
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(), "# %d %s on page %d%s; omit --page to read every page\n", len(items), def.Name, page, compactListShape(false))
+			return printCompactRows(compactListRows(items, def.CompactList.Row))
 		},
 	}
 
 	cmd.Flags().StringArrayVar(&filters, "filter", nil, "field filter in key=value format (repeatable)")
 	cmd.Flags().IntVar(&perPage, "per-page", 0, "items per page (default: from config)")
-	cmd.Flags().IntVar(&page, "page", 0, "page number (default: 1)")
+	if def.CompactList != nil {
+		cmd.Flags().IntVar(&page, "page", 0, "read this page only instead of every page")
+		cmd.Flags().BoolVar(&full, "full", false, "print the raw items instead of compact rows")
+	} else {
+		cmd.Flags().IntVar(&page, "page", 0, "page number (default: 1)")
+	}
 	if hasTestFlags {
 		cmd.Flags().BoolVar(&includeTests, "include-tests", false, "include test records in results")
 		cmd.Flags().BoolVar(&testOnly, "test-only", false, "return only test records")
 	}
 
 	return cmd
+}
+
+func compactListShape(full bool) string {
+	if full {
+		return " (raw items)"
+	}
+	return " (compact rows; --full prints the raw items)"
+}
+
+// printCompactRows prints a JSON array with one row per line: still a single document for jq,
+// and a row per line is what makes a compact listing scannable.
+func printCompactRows[T any](rows []T) error {
+	var b bytes.Buffer
+	b.WriteString("[")
+	for i, row := range rows {
+		var line bytes.Buffer
+		enc := json.NewEncoder(&line)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(row); err != nil {
+			return fmt.Errorf("cannot encode output: %w", err)
+		}
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n  ")
+		b.Write(bytes.TrimRight(line.Bytes(), "\n"))
+	}
+	if len(rows) > 0 {
+		b.WriteString("\n")
+	}
+	b.WriteString("]\n")
+	_, err := os.Stdout.Write(b.Bytes())
+	return err
+}
+
+func compactListRows(items []map[string]any, row func(map[string]any) any) []any {
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, row(item))
+	}
+	return out
+}
+
+// An item without an id (a grouped listing) is keyed by its whole body.
+func listItemKey(item map[string]any) string {
+	if id, ok := item["id"].(string); ok && id != "" {
+		return id
+	}
+	b, _ := json.Marshal(item)
+	return string(b)
 }
 
 func makeGetCmd(def ResourceDef) *cobra.Command {

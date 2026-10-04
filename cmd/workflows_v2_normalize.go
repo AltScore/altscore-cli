@@ -148,7 +148,7 @@ func validateTaskV2Body(body json.RawMessage, existingTypes map[string]bool) err
 func errAltdataMissingInputKeys(cause error) error {
 	return fmt.Errorf(
 		"altdata-enrichment task with non-empty sourcesConfig but empty inputKeys, and the CLI could not derive them (%w) -- "+
-			"the Hub UI will show an unwired source. Run 'altscore workflows-v2 sources-status --filter id=<SOURCE_ID>' "+
+			"the Hub UI will show an unwired source. Run 'altscore altdata describe <SOURCE_ID>' "+
 			"to see the source's required inputFields, then add an inputKeys entry per field, "+
 			`e.g. inputKeys: {"personId": "{{personId}}"}.`, cause)
 }
@@ -683,10 +683,13 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 // Separates a genuinely bad reference from a transport blip, which callers tolerate.
 var errSourceNotFound = errors.New("source not found in any catalog")
 
+// One path, so apply and the altdata lookups share fetchSourceCatalog's cache entry.
+const altdataSourcesStatusPath = "/v2/workflows/sources-status?per-page=200"
+
 // The union of both catalogs is what a node may reference; the microservice is
 // first so its entry wins when an id exists in both.
 var sourceStatusCatalogs = []string{
-	"/v2/workflows/sources-status?per-page=200",
+	altdataSourcesStatusPath,
 	"/v2/workflows/external-sources-status",
 }
 
@@ -756,21 +759,32 @@ func fetchSourceCatalog(c *client.Client, path string) ([]map[string]any, error)
 	if cached, ok := sourceCatalogListCache[path]; ok {
 		return cached, nil
 	}
+	sources, err := fetchEveryPage(c, "borrower_central", path, sourceRowKey)
+	if err != nil {
+		return nil, err
+	}
+	sourceCatalogListCache[path] = sources
+	return sources, nil
+}
+
+// fetchEveryPage walks a paginated list endpoint for fetchSourceCatalog and the compact
+// listings. rowKey names a row stably across two reads (no volatile stats), so the
+// repeated-page check survives a field that changed between requests.
+func fetchEveryPage(c *client.Client, module, path string, rowKey func(map[string]any) string) ([]map[string]any, error) {
 	target, err := url.Parse(path)
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	perPage, _ := strconv.Atoi(target.Query().Get("per-page"))
-	var sources []map[string]any
+	rows := []map[string]any{}
 	previousPage := ""
-	complete := false
 	for page := 1; page <= maxCatalogPages; page++ {
 		if perPage > 0 {
 			q := target.Query()
 			q.Set("page", strconv.Itoa(page))
 			target.RawQuery = q.Encode()
 		}
-		data, _, err := c.Do("GET", "borrower_central", target.String(), nil)
+		data, _, err := c.Do("GET", module, target.String(), nil)
 		if err != nil {
 			return nil, err
 		}
@@ -779,31 +793,30 @@ func fetchSourceCatalog(c *client.Client, path string) ([]map[string]any, error)
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
 		// Compared on every row, so a page whose first row merely coincides is still kept.
-		key := catalogPageKey(batch)
+		key := pageKey(batch, rowKey)
 		if page > 1 && key == previousPage {
-			complete = true // the backend ignored `page` and answered the same page again
-			break
+			return rows, nil // the backend ignored `page` and answered the same page again
 		}
-		sources = append(sources, batch...)
+		rows = append(rows, batch...)
 		if perPage <= 0 || len(batch) < perPage {
-			complete = true
-			break
+			return rows, nil
 		}
 		previousPage = key
 	}
-	if !complete {
-		return nil, fmt.Errorf("fetch %s: catalog exceeds %d pages", path, maxCatalogPages)
-	}
-	sourceCatalogListCache[path] = sources
-	return sources, nil
+	return nil, fmt.Errorf("fetch %s: list exceeds %d pages", path, maxCatalogPages)
 }
 
-func catalogPageKey(batch []map[string]any) string {
+func pageKey(batch []map[string]any, rowKey func(map[string]any) string) string {
 	var b strings.Builder
 	for _, row := range batch {
-		fmt.Fprint(&b, row["sourceId"], "|", row["sourceVersion"], "\n")
+		b.WriteString(rowKey(row))
+		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+func sourceRowKey(row map[string]any) string {
+	return fmt.Sprint(row["sourceId"], "|", row["sourceVersion"])
 }
 
 func lookupAltdataSourceInputFields(c *client.Client, sourceID, version string, dryRun bool) ([]string, error) {

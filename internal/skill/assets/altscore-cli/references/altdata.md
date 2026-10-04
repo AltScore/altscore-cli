@@ -4,37 +4,20 @@ Discovery commands query Borrower Central (work in all environments). Execution 
 
 ### Discovery flow (canonical order)
 
-> **Use `describe` as the pre-flight.** It is the one-shot primitive: hits sources-status once, auto-resolves the latest version, and returns metadata + versions + inputFields + outputKeys in a single JSON document. Reach for `dictionary` / `sample` / `sources` only when you need something `describe` doesn't surface.
->
-> **If `altscore altdata describe` says "unknown command"**, the installed CLI is older than this skill: run `altscore update`, then `altscore skill status`.
-
-> **Valid `--filter` keys for sources are `country`, `status`, and `search` only.** The backend silently ignores unknown keys (including `sourceId`) and returns the full catalog; for a single source use `altdata describe <id>`.
+1. **Which sources are available.** `altscore workflows-v2 sources-status` (the same rows as `altscore altdata sources`) reads every page and prints one compact row per source version: `sourceId`, `version`, `name`, `status`, `enabled`, `requiredInputs`. stderr says `# N of M sources`. Narrow with `--search <text>` (id, version, name), `--country <ISO3>` or `--status active`, and read stderr after a filter: it counts what was hidden. A country filter never returns INT (international) sources such as sanctions lists, and `--status active` drops every down, failing or retired version. `--full` adds `outputSchema` (megabytes for the catalog); picking a source never needs it.
+2. **ONE source's fields.** `altscore altdata describe <sourceId>`: versions, `inputFields` with their requirement, top-level `outputKeys`. Then `altscore altdata dictionary <sourceId> [version]` for every output field with its type and description. Both resolve the latest version when omitted and search every catalog page; a miss names the closest ids.
+3. **A field across sources.** `altscore altdata search "credit score"` (`--country MX` narrows).
 
 ```bash
-# 1. Find candidates (default --per-page is 200, returns the full ~170-source catalog in one call)
-altscore altdata sources --filter search="credit"
-altscore altdata sources --filter country=USA --filter status=active
-
-# 2. Pre-flight a candidate (the canonical step before composing)
-altscore altdata describe USA-PUB-0001                       # auto-resolves latest version
-altscore altdata describe USA-PUB-0001 --version v1          # pin a specific version
-altscore altdata describe USA-PUB-0001 | jq '{inputFields, outputKeys, latestVersion}'
-
-# 3. Drill into specifics only if needed
-altscore altdata dictionary USA-PUB-0001                     # field defs (latest version auto-resolved)
-altscore altdata dictionary USA-PUB-0001 v1                  # pin version
-altscore altdata sample USA-PUB-0001                         # example output (latest)
-altscore altdata sample USA-PUB-0001 v1
-altscore altdata search "credit score"                       # cross-source field search
-altscore altdata search "address" --country MX
+altscore workflows-v2 sources-status --search credit
+altscore altdata describe <sourceId> | jq '{inputFields, outputKeys, latestVersion}'
+altscore altdata dictionary <sourceId> v1
 ```
 
-**Anti-patterns (avoid):**
-- Walking pages of `altscore altdata sources` to inspect a single source — use `describe`.
-- `altscore altdata sources --filter sourceId=<X>` — silently returns the full catalog (the backend ignores unknown filter keys). Use `describe <X>` instead.
-- Reading `.id` off the `sources` list — each list item's `.id` is `null`; the source identifier is `.sourceId` (the value `describe <id>` takes). Filter/extract with `.sourceId`, not `.id`.
-- Calling `dictionary` or `sample` without a version — both now auto-resolve the latest, no need to chain a separate sources call first.
-- Using `workflows-v2 sources-status` for general discovery — it's the same endpoint as `altdata sources` but lives under workflows-v2 because apply-time normalization needs it; for agents browsing the catalog, prefer `altdata sources` / `altdata describe`.
+**Anti-patterns:**
+- `--filter sourceId=<X>`, or any key but `country`, `status`, `search`: the backend ignores it (the CLI warns). Use `describe <X>`.
+- Reading one source out of `--full`: use `describe`.
+- Reading `.id` off a raw row: the identifier is `.sourceId`.
 
 ### Data Requests (production only)
 

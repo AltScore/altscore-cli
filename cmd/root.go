@@ -822,6 +822,7 @@ describes the DAG: which tasks run, how data flows between them, and retry behav
 		Module:        "borrower_central",
 		Actions:       []string{"list", "get", "create", "update", "delete"},
 		BodyValidator: validateWorkflowV2Body,
+		CompactList:   wfv2CompactList,
 		Description: `Manage v2 workflows (visual builder graph DAGs).
 
 v2 workflows have draft/active/archived lifecycle states, version history,

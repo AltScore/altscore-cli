@@ -44,8 +44,8 @@ Every one of these is cheaper to read than to ask, and it turns the intake from 
 | Whether v2 work already exists there | `altscore workflows-v2 list --filter is-latest=true` — an in-flight migration has DRAFTs |
 | What v1 is still running | `altscore workflows list`, and the v1 executions behind it (they are the parity corpus) |
 | Which workflows the legacy repo defines | the repo itself, once you know where it is: the v1 evaluator modules and their entry points |
-| Sources, decision keys, data models available in the target tenant | `sources-status --status active`, `decisions list`, `data-models list` |
-| The tenant's house style for output shape and write targets | `workflows-v2 export <closest sibling id> --format apply-spec` |
+| Sources, decision keys, data models available in the target tenant | `sources-status` (compact, every source version), `decisions list`, `data-models list` |
+| The tenant's house style for output shape and write targets | the closest sibling's skeleton, read with jq as in [workflows-v2](workflows-v2.md#discovery-before-authoring-a-guided-question-path-infer-first-then-ask-in-short-rounds), never the whole export |
 
 #### Step 2 — the intake round (AskUserQuestion)
 

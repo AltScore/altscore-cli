@@ -69,12 +69,19 @@ Every round: at most 4 questions, 2 to 4 options each, the option you would pick
 | Decision | Where the answer is |
 |---|---|
 | Who is evaluated, which country, which stage of the customer's process | the request itself. "KYB for Ecuadorian SMEs" is a company, ECU, origination. |
-| Which sources, their required inputs, what they can detect | `altscore workflows-v2 sources-status --country <ISO3> --status active`, then `altscore altdata describe <id>` |
+| Which sources, their required inputs, what they can detect | `altscore workflows-v2 sources-status`: every source version, one compact row with its `requiredInputs`. A `--country` filter hides INT (international) sources such as sanctions lists; stderr counts what a filter hid. Then `altdata describe <id>` and `altdata dictionary <id>` for ONE source's field paths |
 | Decision vocabulary, whether a review lane exists | `altscore decisions list`: the registered keys are the only ones a run can write. A brief that says `approve/review/reject` while the tenant registers `passes/pending/fails` is mapped BY LABEL, and the mapping is restated to the user in one line |
-| Write targets, output shape, input payload, PDF or not, freshness of paid sources | the tenant's closest existing workflow: `workflows-v2 list --filter is-latest=true`, then `export <id> --format apply-spec` and read its `inputSchema`, end node, `decisionConfig` and `sourcesConfig.dataAge`. Mirror it. |
+| Write targets, output shape, input payload, PDF or not, freshness of paid sources | the tenant's closest existing workflow: `workflows-v2 list --filter is-latest=true` (one compact row per workflow), its skeleton (below), then only its `inputSchema`, end node, `decisionConfig` and `sourcesConfig.dataAge`. Mirror it. |
 | Fields available on borrower and deal, and what a real value looks like | `altscore data-models list`, then `borrower-fields list --filter borrower-id=<test borrower>` and `packages content <id>` on the test case. A null sample is a question, not a guess |
 | Structure: orchestrator plus per-party child, fan-out, two-layer decisioning | [kyc-kyb-habits](kyc-kyb-habits.md) |
 | Whether a change is visible to others (update path) | `workflows-v2 schedule get <id>`, and other workflows whose `child-workflow` nodes carry this alias as `executorId` |
+
+Read a sibling a piece at a time; an unpiped export prints every task body:
+
+```bash
+altscore workflows-v2 export <id> --format apply-spec | jq '{nodes: [.nodes[] | {ref, type, label}], edges}'
+altscore workflows-v2 export <id> --format apply-spec | jq '.nodes[] | select(.ref == "<ref>")'
+```
 
 Anything the spec can default is yours as well: labels, positions, aliases and refs, branch ids, `inputKeys`, publish policy (DRAFT on create). Never ask which field a task type uses; read `schema-guide tasks <type>`.
 
@@ -94,7 +101,7 @@ Anything the spec can default is yours as well: labels, positions, aliases and r
 | The brief and the tenant disagree | a field the brief names is missing on the test borrower, a sample value has the opposite shape, an alias the brief names is not in `workflows-v2 list` | the options ARE the disagreement: which side is right, or what the missing piece should be |
 | A rule you want to write has no line in the brief | you are about to copy a rule family from a sibling workflow, or add a "sanity" rule the brief never asked for | add it; add it as informative (no decision impact); leave it out `(Recommended)` |
 
-Example path for "create a KYB workflow for Ecuadorian SMEs" in a tenant that already runs a KYC flow. Read: company, ECU and origination from the request; sources from `sources-status --country ECU`; a `review` key from `decisions list`; write targets, output shape and `dataAge` from the KYC export. Round 1 asks three things: what happens when the registry or judicial source fails mid-run; which findings reject outright versus go to review; whether owners and legal representatives are screened, since the country has an ownership source. Round 2 is skipped: nothing new opened. Round 3 shows `start -> sources -> conditional (rejects / review) -> end` with the choices made for the user (30-day reuse of paid data, reason codes in the output) and asks to build. Do not ask who is evaluated, which country, which sources, where the decision lands, or whether to publish.
+Example path for "create a KYB workflow for Ecuadorian SMEs" in a tenant that already runs a KYC flow. Read: company, ECU and origination from the request; sources from `sources-status` (the ECU rows plus the INT ones a country filter hides); a `review` key from `decisions list`; write targets, output shape and `dataAge` from the KYC export. Round 1 asks three things: what happens when the registry or judicial source fails mid-run; which findings reject outright versus go to review; whether owners and legal representatives are screened, since the country has an ownership source. Round 2 is skipped: nothing new opened. Round 3 shows `start -> sources -> conditional (rejects / review) -> end` with the choices made for the user (30-day reuse of paid data, reason codes in the output) and asks to build. Do not ask who is evaluated, which country, which sources, where the decision lands, or whether to publish.
 
 **Every open point in the brief is a question.** A brief that carries a "pending / to confirm" list (a fiscal cutoff month, how a registry identifies a kind of asset, a catalogue that has not arrived) hands you the question list ready-made. Each unchecked item becomes either a question in the round or an explicit `TODO` placeholder the user has seen; never a silently assumed value. The same goes for a "conservative by default" principle in the brief: when you cannot confirm something the brief says must be confirmed (an asset class against a list that does not exist yet), the conservative outcome is the default and the deviation is a question, not a judgment call you make alone.
 
@@ -117,7 +124,7 @@ These rules exist because a correct workflow can still cost the engineer next to
 - Execute in test mode: `workflows-v2 execute <id> --test` (or `execute-by-alias ... --test`). Live runs write alerts and decisions on real borrowers, cannot be deleted (`DELETE /v1/executions` is 405), and are what the client sees in the Hub. A live run happens only when the user asks for one by name.
 - `workflows-v2 lock get <alias>` before ANY write to a workflow, or to a task its nodes pin at `taskVersion: null` (a draft always floats to the latest task version, so bumping the task changes the draft under the editor's feet). If `canEdit` is false, stop and report who holds it; never `force-release` a live Hub tab.
 - Define before you reference: autosave the custom variable first, then create the task version that selects it. The reverse order leaves the draft pointing at a variable that does not exist and the Hub shows an error to whoever has it open.
-- Re-export before you patch (`export <id> --format apply-spec`). After the first publish the tenant is the source of truth, not your generator scripts: the engineer renames nodes, moves them, adds nodes in the Hub. Regenerating from your scripts erases that work. `apply` re-adopts Hub-authored nodes by their alias, so a re-exported spec round-trips.
+- Re-export before you patch (`export <id> --format apply-spec > spec.json`). After the first publish the tenant is the source of truth, not your generator scripts: the engineer renames nodes, moves them, adds nodes in the Hub. Regenerating from your scripts erases that work. `apply` re-adopts Hub-authored nodes by their alias, so a re-exported spec round-trips.
 - Human-facing strings (node labels, rule labels and descriptions, PDF section titles, alert messages, HTML headings) are in the client's language with its diacritics: `Cédula`, `Opinión`, `Garantías`, never `Cedula`, `Opinion`, `Garantias`. `lint` and `apply` print a `[diacritics]` advisory when they see the folded form; fixing 72 rule labels afterwards is a script plus 72 PATCHes.
 - Group evaluators by business subject (company, legal representative, guarantor, operation), not by which compute node happens to feed them. The PDF section titles are read by a credit committee.
 - Mapping tables translate in the direction the DATA dictates: read one real value of the input field first. A borrower field that already holds a code (`corn`) maps code to label, not free text to code. When the sample is null, ask.
@@ -332,7 +339,7 @@ Canonical shape:
 
 If the agent asks for help building or updating a workflow, default to apply. Other paths exist for special cases:
 
-- **Clone-and-modify** (highest success when a similar workflow exists): `export <similar-id>` → edit JSON → `import --new-label "..."`. Import validates the bundle against the destination tenant before writing and refuses if it references a scorecard/rule-tree/mapping-table/evaluation-rule that is neither there nor in the bundle.
+- **Clone-and-modify** (highest success when a similar workflow exists): `export <similar-id> > wf.json` → edit JSON → `import --new-label "..."`. Import validates the bundle against the destination tenant before writing and refuses if it references a scorecard/rule-tree/mapping-table/evaluation-rule that is neither there nor in the bundle.
 - **Incremental edit on an existing workflow**: hold a lock + use `add-node`/`add-edge`/`set-mapping`/`set-variable` helpers (see Helpers section below)
 - **Manual** (only if you need explicit control): `tasks-v2 create` per task, then `workflows-v2 create --body @workflow.json` with hand-built nodes
 
@@ -558,7 +565,7 @@ altscore workflows-v2 batch terminate <batch-id>
 #### Sources and AI helpers
 
 ```bash
-altscore workflows-v2 sources-status --country ECU --status active
+altscore workflows-v2 sources-status          # every source version, compact; --full adds outputSchema
 altscore workflows-v2 external-sources-status
 
 altscore workflows-v2 ai suggest-mappings --body '{
@@ -612,7 +619,7 @@ altscore data-models list --filter key=<KEY>                 # custom field refs
 altscore api GET "/v1/rules?alias=<ALIAS>"                   # rule refs
 ```
 
-`altdata describe` is the one-shot pre-flight: it returns the source's metadata, available versions, required input fields, and outputSchema keys in a single call. Prefer it over chaining `altdata sources` + `altdata dictionary` + `altdata sample`.
+`altdata describe` is the one-shot pre-flight: metadata, versions, required input fields and top-level output keys in one call; `altdata dictionary <id>` adds every output field.
 
 #### Variable resolution syntax (templates and mappings)
 
