@@ -39,7 +39,7 @@ func TestApplyViaServer_CreateNewIsSentOnlyWhenSet(t *testing.T) {
 func TestDescribeServerApplyError_AliasNearMatch(t *testing.T) {
 	var errb bytes.Buffer
 	body := `{"code":"ConflictError","message":"no workflow has alias 'validacion-documentos-persona-moral' but 1 existing workflow is one typo away","details":{"errorSubCode":"APPLY_ALIAS_NEAR_MATCH","alias":"validacion-documentos-persona-moral","candidates":[{"alias":"validaci-n-documentos-persona-moral","label":"Validación Documentos Persona Moral","status":"DRAFT","version":1,"workflowId":"c988be3b","reason":"alias"}]}}`
-	err := describeServerApplyError(&errb, http.StatusConflict, json.RawMessage(body))
+	err := describeServerApplyError(&errb, http.StatusConflict, json.RawMessage(body), "")
 	if err == nil {
 		t.Fatal("expected an error")
 	}

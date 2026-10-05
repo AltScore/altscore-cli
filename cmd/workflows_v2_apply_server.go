@@ -188,7 +188,8 @@ func applyViaServer(c *client.Client, cmd *cobra.Command, flat map[string]any, o
 			return res, nil
 		}
 	}
-	return nil, describeServerApplyError(cmd.ErrOrStderr(), status, data)
+	targetAlias, _ := flat["alias"].(string)
+	return nil, describeServerApplyError(cmd.ErrOrStderr(), status, data, targetAlias)
 }
 
 type serverErrorEnvelope struct {
@@ -256,7 +257,7 @@ func captureFromRefs(refs map[string]string) *composeCapture {
 	return &composeCapture{refByNodeID: refs}
 }
 
-func describeServerApplyError(w io.Writer, status int, data json.RawMessage) error {
+func describeServerApplyError(w io.Writer, status int, data json.RawMessage, workflowAlias string) error {
 	env, ok := parseServerErrorEnvelope(data)
 	if !ok {
 		detail := strings.TrimSpace(string(data))
@@ -273,7 +274,7 @@ func describeServerApplyError(w io.Writer, status int, data json.RawMessage) err
 	switch {
 	case subCode == "APPLY_SPEC_INVALID":
 		findings := findingsFromAny(env.Details["findings"])
-		printFindingLines(w, "ERROR", findings, nil)
+		printFindingLines(w, "ERROR", findings, nil, workflowAlias)
 		return fmt.Errorf("server rejected the spec with %d finding(s) (see above); nothing was created", len(findings))
 
 	case subCode == "APPLY_VALIDATION_FAILED":
@@ -281,8 +282,8 @@ func describeServerApplyError(w io.Writer, status int, data json.RawMessage) err
 		findings := findingsFromAny(validation["findings"])
 		errs, warns := partitionFindings(findings)
 		capture := captureFromRefs(refsFromAny(validation["refs"]))
-		printFindingLines(w, "ERROR", errs, capture)
-		printFindingLines(w, "WARN", warns, capture)
+		printFindingLines(w, "ERROR", errs, capture, workflowAlias)
+		printFindingLines(w, "WARN", warns, capture, workflowAlias)
 		return fmt.Errorf("server pre-write validation failed with %d error(s) (see above); nothing was created", len(errs))
 
 	case subCode == "APPLY_PUBLISH_REJECTED":
@@ -406,11 +407,11 @@ func printServerApplySummary(w io.Writer, res *serverApplyResult) {
 	capture := captureFromRefs(res.Validation.Refs)
 	if len(errs) > 0 {
 		fmt.Fprintf(w, "# server validation: %d error(s) -- a real apply would be REFUSED and write nothing:\n", len(errs))
-		printFindingLines(w, "ERROR", errs, capture)
+		printFindingLines(w, "ERROR", errs, capture, res.WorkflowAlias)
 	}
 	if len(warns) > 0 {
 		fmt.Fprintf(w, "# server validation: %d warning(s) (apply proceeds):\n", len(warns))
-		printFindingLines(w, "WARN", warns, capture)
+		printFindingLines(w, "WARN", warns, capture, res.WorkflowAlias)
 	}
 	if res.DryRun {
 		return

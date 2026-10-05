@@ -356,14 +356,14 @@ func TestApplyViaServer_LockConflictNamesHolder(t *testing.T) {
 
 func TestDescribeServerApplyError_PublishRejected(t *testing.T) {
 	var errb bytes.Buffer
-	err := describeServerApplyError(&errb, http.StatusUnprocessableEntity, json.RawMessage(`{"code":"VALIDATION_ERROR","message":"x","details":{"errorSubCode":"APPLY_PUBLISH_REJECTED","errors":["Node 'a': unfed"],"applied":{"workflowId":"draft-1","status":"DRAFT","tasks":[]}}}`))
+	err := describeServerApplyError(&errb, http.StatusUnprocessableEntity, json.RawMessage(`{"code":"VALIDATION_ERROR","message":"x","details":{"errorSubCode":"APPLY_PUBLISH_REJECTED","errors":["Node 'a': unfed"],"applied":{"workflowId":"draft-1","status":"DRAFT","tasks":[]}}}`), "")
 	if err == nil || !strings.Contains(err.Error(), "DRAFT draft-1") {
 		t.Fatalf("expected the draft id in the error, got %v", err)
 	}
 	if !strings.Contains(errb.String(), "Node 'a': unfed") {
 		t.Errorf("stderr:\n%s", errb.String())
 	}
-	err = describeServerApplyError(&errb, 423, json.RawMessage(`{"code":"LOCKED","message":"Workflow is locked by another user","details":{"errorSubCode":"X"}}`))
+	err = describeServerApplyError(&errb, 423, json.RawMessage(`{"code":"LOCKED","message":"Workflow is locked by another user","details":{"errorSubCode":"X"}}`), "")
 	if err == nil || !strings.Contains(err.Error(), "HTTP 423 LOCKED: Workflow is locked by another user [errorSubCode=X]") {
 		t.Errorf("generic rendering: %v", err)
 	}

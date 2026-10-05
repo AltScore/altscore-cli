@@ -137,7 +137,10 @@ These rules exist because a correct workflow can still cost the engineer next to
 
 #### Default structure: wire directly, decide in entities, compute only indicators
 
-This is the shape productive tenants run. Write it by default and deviate only for the exceptions in point 3.
+This is the shape productive tenants run. Write it by default and deviate only for the exceptions in point 3. Two rules are not defaults, `apply` refuses a spec that breaks them:
+
+- Every node `ref` matches `^[a-z0-9][a-z0-9-]*$`: kebab-case (`end-review`, never `end_review`), no underscores, uppercase or spaces.
+- Exactly one end node. Every branch converges on it; `decision_key` from the rule-tree carries the outcome, not which end ran.
 
 1. **Wire every input directly in the node that consumes it** (`inputMappings`), by deep path:
 
@@ -171,7 +174,7 @@ This is the shape productive tenants run. Write it by default and deviate only f
 
 #### Recommended path: `apply` (declarative create-or-update)
 
-For "Create a workflow that does X" — or "Update workflow Y to do Z" — use `workflows-v2 apply`. It takes a single spec and reconciles it against the tenant. Use `--dry-run` first to inspect what will be sent (the dry-run output also tells you which branch will fire: CREATE or UPDATE).
+For "Create a workflow that does X" — or "Update workflow Y to do Z" — use `workflows-v2 apply`. It takes a single spec and reconciles it against the tenant. Use `--dry-run` first to inspect what will be sent (the dry-run output also tells you which branch will fire: CREATE or UPDATE). It lists every blocking problem at once, each with its fix: fix all of them before the next dry-run.
 
 Use `--diff` to preview changes against the current tenant state before mutating. Pairs well with the UPDATE path — see exactly what version-bump will change before pulling the trigger. The diff renders structural deltas on metadata, nodes (added/removed/changed, matched by task alias), edges, input/customVariables, and any entity-scope conflicts the apply would touch. Read-only: no `/v2/tasks` POSTs, no `/v2/workflows` mutations, no entity PATCHes. Mutually exclusive with `--dry-run` and `--publish`.
 
@@ -286,9 +289,9 @@ altscore workflows-v2 apply --body @/tmp/spec.json --skip-rescope  # do not auto
 altscore workflows-v2 publish <id>                              # standalone publish step
 ```
 
-#### Canonical end-node pattern (single end, not N parallel ends)
+#### Canonical end-node pattern (one end, fed by the rule-tree)
 
-When a spec contains a `rule-tree` task, the recommended end-node shape is **one** end node fed directly by the rule-tree -- not N parallel ends behind a `conditional` router. BC's end activity promotes four fields from the end task's resolved input context onto the execution record automatically:
+A spec has exactly one end node (`apply` refuses more). When it contains a `rule-tree` task, feed that end directly from the rule-tree, not through a `conditional` router. BC's end activity promotes four fields from the end task's resolved input context onto the execution record automatically:
 
 | Context key | Execution-record field | Source |
 |---|---|---|
@@ -330,8 +333,6 @@ Canonical shape:
 ```
 
 > **outputJson template syntax.** Bare placeholders like `{{borrower_id}}` and `{{decision_key}}` do NOT resolve in BC's `VariableResolver` -- only `{{inputs.X}}`, `{{task_outputs.X.Y}}`, `{{custom.X}}`, `{{system.X}}`, and bare-alias `{{<alias>.<field>}}` (with a dot). A bare key stays literal, corrupts the rendered JSON, and the runtime silently falls back to the promoted-scope dump (your custom envelope vanishes with no error). The `inputMappings` short-name keys (`borrower_id`, `decision_key`) drive BC's per-context promotion (`result['decision_key']`, `result['borrower_id']` on the execution record) and PDF section enrichment -- but NOT outputJson substitution. Always use the long form (`{{task_outputs.<ref>.decision_key}}`) in outputJson, even when the same key is also in `inputMappings`. To stamp the workflow's own execution id into the output, use `{{system.workflow_execution_id}}` -- the key is `workflow_execution_id`, NOT `execution_id` (see the System scope note under "Variable resolution syntax").
-
-**When multiple end nodes are correct.** Rare, but legal: post-decision tasks differ per branch (one branch hits an external webhook the other doesn't), or per-branch `htmlSections` that aren't expressible as `{decision_key}` substitutions. In those cases keep the conditional + N ends, but still wire `decision_key` on every end's `inputMappings`.
 
 > **DRAFT vs publish (test before you publish).** apply's CREATE path saves workflows in `status: "DRAFT"` by default — mirrors the Hub's "save-then-publish" editor flow. A DRAFT executes its **full graph faithfully** — node execution is never gated by status (the engine reads nodes straight from the workflow doc), so a DRAFT run is a real, complete test run. Publishing only changes which version the **alias** serves (the alias resolves to the latest `ACTIVE` version). So to validate before going live, execute the DRAFT **by its workflow id** (or by alias in test mode) — you do **not** have to publish untested work to run it. Pass `--publish` on apply when you *do* want it live immediately; the UPDATE path always publishes (apply treats the spec as desired state). `workflows-v2 execute` prints an informational stderr note when the targeted version isn't `ACTIVE`; pass `--skip-status-check` to silence it.
 
