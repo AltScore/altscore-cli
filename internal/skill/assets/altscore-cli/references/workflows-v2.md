@@ -4,7 +4,7 @@
 
 > **Create and update v2 workflows with `apply`.**
 >
-> To create or update a v2 workflow, run **`altscore workflows-v2 apply`** with a single spec file. Borrower Central reconciles the spec against the tenant in one all-or-nothing request. It creates the workflow when no workflow has the spec's alias; otherwise it updates it in place (same id and alias; unchanged tasks are left alone, changed ones are version-bumped).
+> To create or update a v2 workflow, run **`altscore workflows-v2 apply`** with a single spec file. Borrower Central reconciles the spec against the tenant in one request: a rejected spec writes nothing, a publish rejection leaves the tasks and a DRAFT in place (`APPLY_PUBLISH_REJECTED`), and a mid-write failure is rolled back, with the error saying when rollback was incomplete. It creates the workflow when no workflow has the spec's alias; otherwise it updates it in place (same id and alias; unchanged tasks are left alone, changed ones are version-bumped).
 >
 > Do not call `workflows-v2 create` directly with hand-built nodes — that path produces orphan nodes (no `taskAlias`) that save successfully but break the Hub UI (`GET /v2/tasks/null` 404 for every node). The CLI rejects orphan-node bodies at write time with an error pointing at apply; if you see that error, you're on the wrong path — switch to apply.
 >
@@ -36,7 +36,7 @@ Workflows V2 is the API surface for the visual graph builder in the Hub. It uses
 
 This is **not** v1 (`/v1/workflows`). Use v2 for anything created in the visual editor.
 
-**Key insight: tasks first, then workflow.** **Every** graph node — including `start`, `end`, and `conditional` — needs a `taskAlias`. The Hub creates trivial backing tasks (just `type` + `label`) for start/end so it can render them. Use `apply`, which creates a backing task for every node automatically.
+**Key insight: tasks first, then workflow.** **Every** graph node — including `start`, `end`, and `conditional` — needs a `taskAlias`. The Hub creates trivial backing tasks (just `type` + `label`) for start/end so it can render them. In an `apply` spec you write none of these: `apply` creates a backing task for every node automatically, `start` included (`{"ref": "start", "type": "start", "label": "Start"}` is enough).
 
 After creating a workflow, run `altscore workflows-v2 lint <id>` to verify there are no orphan nodes, dangling edges, or duplicate ids. The lint command also runs the same checks as the create-time validator and is the fastest way to triage a misbehaving workflow.
 

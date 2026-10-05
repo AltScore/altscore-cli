@@ -124,7 +124,7 @@ There are TWO registration mechanisms and `cmd/root.go` shows only one of them, 
 
 Mechanism 1, via root.go. `func init()` in `cmd/root.go` sets rootCmd's persistent flags, adds `schema` / `tools` / `skill` / `version` directly, then calls `registerResources()`, which holds every ResourceDef plus:
 - ResourceDefs that live in their own file: `cmd/external_source_configs.go:17`, wired via `registerExternalSourceConfigs()`.
-- Non-CRUD groups built in their own file and only added from root: `registerTasksV2(rootCmd)`, `registerSourceTestCases()`, `makeCreditAccountsGroupCmd()`, `makePaymentOrdersGroupCmd("payment-orders")` / `("disbursements")`, `makeDpasGroupCmd()`, `makeAnalyticsGroupCmd()`, `makeDecisionsGroupCmd()`.
+- Non-CRUD groups built in their own file and only added from root: `registerTasksV2(rootCmd)`, `makeCreditAccountsGroupCmd()`, `makePaymentOrdersGroupCmd("payment-orders")` / `("disbursements")`, `makeDpasGroupCmd()`, `makeAnalyticsGroupCmd()`, `makeDecisionsGroupCmd()`. `registerSourceTestCases()` also lives in its own file but is a `registerResource` group with extra content commands.
 
 Mechanism 2, invisible from root.go. 10 files self-register their command from their own `func init()` and are never named in root.go: api.go, altdata.go, config.go, env.go, help.go, login.go, profiles.go, refresh_token.go, update.go, update_check.go. The command name is not always the basename: help.go registers `topics` (cobra supplies `help` itself), update_check.go registers the hidden `__update-check`, refresh_token.go registers `refresh-token`. Not every `func init()` registers a command (`workflows_v2_diacritics.go` builds a word table); the 10 listed are the non-root files whose init calls `rootCmd.AddCommand`.
 
