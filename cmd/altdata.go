@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -65,7 +66,8 @@ Uses the Borrower Central module -- works in all environments.
 Available filters (pass via --filter key=value):
   status                Source status (e.g. "active")
   country               Country of the sourceId (e.g. "ECU"); never returns INT sources
-  search                Free-text search across sourceId, version and name`,
+  search                Free-text search across sourceId, version and name
+                        (id= and sourceId= are read as search)`,
 		Example: `  # Every source version, compact
   altscore altdata sources
   altscore altdata sources --filter search=credit
@@ -200,6 +202,9 @@ func sourceFilterValues(filters []string, stderr io.Writer) (url.Values, error) 
 		}
 		switch key {
 		case "country", "status", "search":
+		case "id", "sourceId", "sourceID", "source":
+			fmt.Fprintf(stderr, "# --filter %s=%s read as search=%s (the catalog filters by country, status and search)\n", key, value, value)
+			key = "search"
 		default:
 			fmt.Fprintf(stderr, "# warning: sources-status has no %q filter (only country, status, search) and ignores it; for one source run 'altscore altdata describe <sourceId>'\n", key)
 		}
@@ -337,6 +342,10 @@ func makeAltdataDictionaryCmd() *cobra.Command {
 If <version> is omitted, the latest enabled version is auto-resolved via
 sources-status.
 
+A source with no data dictionary is answered from its outputSchema instead:
+every output path (data.<field>, ...) with its type, no descriptions, and a
+note on stderr.
+
 Uses the Borrower Central module -- works in all environments.
 
 Response fields:
@@ -357,7 +366,7 @@ Response fields:
 			if len(args) == 2 {
 				version = args[1]
 			}
-			data, err := fetchAltdataDictionary(c, args[0], version)
+			data, err := fetchAltdataDictionary(c, args[0], version, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
@@ -367,7 +376,7 @@ Response fields:
 }
 
 // An empty version resolves to the latest one in the catalog.
-func fetchAltdataDictionary(c *client.Client, sourceID, version string) (json.RawMessage, error) {
+func fetchAltdataDictionary(c *client.Client, sourceID, version string, stderr io.Writer) (json.RawMessage, error) {
 	if version == "" {
 		resolved, err := resolveLatestSourceVersion(c, sourceID)
 		if err != nil {
@@ -376,8 +385,11 @@ func fetchAltdataDictionary(c *client.Client, sourceID, version string) (json.Ra
 		version = resolved
 	}
 	path := fmt.Sprintf("/v1/documentation/data-dictionary?sourceId=%s&version=%s", sourceID, version)
-	data, _, err := c.Do("GET", "borrower_central", path, nil)
+	data, status, err := c.Do("GET", "borrower_central", path, nil)
 	if err != nil {
+		if status == http.StatusNotFound {
+			return dictionaryFromOutputSchema(c, sourceID, version, stderr)
+		}
 		return nil, err
 	}
 	return data, nil
@@ -456,7 +468,7 @@ func makeAltdataSampleCmd() *cobra.Command {
 func makeAltdataDescribeCmd() *cobra.Command {
 	var version string
 	cmd := &cobra.Command{
-		Use:   "describe <source-id>",
+		Use:   "describe <source-id> [version]",
 		Short: "One-shot pre-flight summary for a data source",
 		Long: `Pre-flight summary for a single AltData source.
 
@@ -465,8 +477,8 @@ outputSchema keys into one JSON document. Use this as the canonical first stop
 before composing a workflow that uses the source -- it answers "what versions
 exist?", "what does this source need?", and "what does it return?" in one call.
 
-If --version is omitted, the latest enabled version is auto-resolved via
-sources-status. The id is looked up across every page of the catalog.
+The version is the second argument or --version, as in 'dictionary'; without
+either, the latest enabled version is auto-resolved via sources-status. The id is looked up across every page of the catalog.
 
 Uses the Borrower Central module -- works in all environments.
 
@@ -491,13 +503,20 @@ Response shape:
 		Example: `  # Pre-flight on a single source
   altscore altdata describe USA-PUB-0001
 
-  # Pin a specific version
+  # Pin a specific version (positional, like dictionary, or --version)
+  altscore altdata describe USA-PUB-0001 v1
   altscore altdata describe USA-PUB-0001 --version v1
 
   # Pipe straight into jq
   altscore altdata describe USA-PUB-0001 | jq '{inputFields, outputKeys}'`,
-		Args: cobra.ExactArgs(1),
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 2 {
+				if version != "" && version != args[1] {
+					return fmt.Errorf("version given twice: %q as an argument and %q as --version; keep one", args[1], version)
+				}
+				version = args[1]
+			}
 			c, err := loadClient()
 			if err != nil {
 				return err

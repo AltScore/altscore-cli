@@ -135,6 +135,7 @@ func renameToCamel(m map[string]any, shortKey, camelKey, context string) (bool, 
 // workflows the Hub flags.
 func makeWfv2LintCmd() *cobra.Command {
 	var localOnly bool
+	var specBody string
 	cmd := &cobra.Command{
 		Use:   "lint <id>",
 		Short: "Inspect an existing v2 workflow: the server validation oracle plus local structural checks",
@@ -203,8 +204,16 @@ Exits with non-zero status if any issue is found, from either source. Pass
 --local-only for the pre-#101 behaviour.`,
 		Example: `  altscore workflows-v2 lint <id>
   altscore workflows-v2 lint <id> --local-only`,
-		Args: cobra.ExactArgs(1),
+		Args: func(cmd *cobra.Command, args []string) error {
+			if specBody != "" {
+				return nil
+			}
+			return cobra.ExactArgs(1)(cmd, args)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if specBody != "" {
+				return fmt.Errorf("lint checks a SAVED workflow by id; for a spec file run 'altscore workflows-v2 apply --body %s --dry-run' (the same server oracle plus every local check, nothing written)", specBody)
+			}
 			c, err := loadClient()
 			if err != nil {
 				return err
@@ -265,6 +274,8 @@ Exits with non-zero status if any issue is found, from either source. Pass
 			"The oracle owns every reference-integrity rule, so this hides dangling task refs, "+
 			"unfed source inputs and unconsumed input variables -- use it only when a script "+
 			"cannot tolerate the wider finding set")
+	cmd.Flags().StringVar(&specBody, "body", "", "")
+	_ = cmd.Flags().MarkHidden("body")
 	return cmd
 }
 

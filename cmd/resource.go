@@ -112,14 +112,18 @@ Use --filter for field-based filters, --per-page and --page for pagination.`, de
   %s
 stderr says how many rows printed. --full prints the raw items instead;
 --page (with --per-page) reads one page only. --filter narrows either shape.`, def.Name, def.CompactList.Fields)
+		filterExample := "status=ACTIVE"
+		if def.WorkflowAlias {
+			filterExample = "workflow-alias=<workflow-alias>"
+		}
 		example = fmt.Sprintf(`  # Every item, compact
   altscore %s list
 
   # With filter
-  altscore %s list --filter status=ACTIVE
+  altscore %s list --filter %s
 
   # The raw items, one page
-  altscore %s list --full --page 1 --per-page 10`, def.Name, def.Name, def.Name)
+  altscore %s list --full --page 1 --per-page 10`, def.Name, def.Name, filterExample, def.Name)
 	}
 
 	if hasTestFlags {

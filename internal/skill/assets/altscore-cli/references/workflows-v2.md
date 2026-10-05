@@ -21,7 +21,7 @@
 >      {"id": "branch-else", "label": "Reject", "isElse": true, "order": 1, "conditions": null}
 >    ]
 >    ```
->    Operators: `eq, neq, gt, gte, lt, lte, contains, startsWith, endsWith, in, notIn, between, isNull, isNotNull, arrayContainsAny, arrayContainsAll, isAltdataEmpty, isAltdataNotCalculated, isAltdataError, isAltdataNull, isNotAltdataNull`. `valueType` is `"value"` (literal) or `"variable"` (reference to another inputSchema field). Field is `isElse` (camelCase), not `is_else`.
+>    Operators, written in snake_case (`apply` rewrites a camelCase spelling to it, because the backend evaluates an unknown operator to False with no error): `equals`/`eq`, `not_equals`/`neq`, `gt`, `gte`, `lt`, `lte`, `contains`, `not_contains`, `starts_with`, `ends_with`, `in`, `not_in`, `between`, `is_null`, `is_not_null`, `is_empty`, `is_not_empty`, `is_true`, `is_false`, `array_contains_any`/`_all`/`_none`, `is_altdata_empty`, `is_altdata_not_calculated`, `is_altdata_error`, `is_altdata_null`, `is_not_altdata_null`. Presence, emptiness and prefixes are operators, so they need no length or prefix variable. `valueType` is `"value"` (literal) or `"variable"` (reference to another inputSchema field). Field is `isElse` (camelCase), not `is_else`.
 >
 > 2. **`altdata-enrichment` tasks need `inputKeys` to wire source-required fields.** Each source (e.g. `ECU-PUB-0002`) declares `inputFields` like `personId`, `taxId`. The task must include `inputKeys: {"personId": "{{personId}}", "taxId": "{{taxId}}"}` matched against an `inputSchema` that declares those keys, plus `packageAlias` (where to store results) on each `sourcesConfig` entry. Leave `dataAge` unset unless the user chose a freshness window, because an authored value overrides the freshness the source publishes. `apply` auto-derives `inputKeys` by querying `sources-status` for each source's `inputFields` — use it.
 >
@@ -48,11 +48,12 @@ altscore workflows-v2 schema-guide architecture   # the tasks-first explanation
 altscore workflows-v2 schema-guide nodes          # node shape (camelCase: nodeId, label, taskAlias, ...)
 altscore workflows-v2 schema-guide edges          # edge shape (sourceNodeId, targetNodeId)
 altscore workflows-v2 schema-guide tasks deal     # ONE task type: hand-written notes + introspected fields (1-4k tokens)
-altscore workflows-v2 schema-guide tasks          # every type at once (~24k tokens); only when comparing types
+altscore workflows-v2 schema-guide tasks          # every type, one row each; notes=false means fields only, no narrative
+altscore workflows-v2 schema-guide --search extraction   # every place the guide mentions a word, with the command that opens it
 altscore workflows-v2 schema-guide examples       # full scoring_pipeline template
 ```
 
-The whole guide is ~50k tokens; `--full` prints it, and nothing in this file needs it. Fetch the section that answers the question in front of you.
+The whole guide is ~50k tokens; `--full` prints it, and nothing in this file needs it. Fetch the section that answers the question in front of you, and look a word up with `--search`, never `--full | jq`.
 
 #### Discovery before authoring: a guided question path (infer first, then ask in short rounds)
 
@@ -71,18 +72,18 @@ Every round: at most 4 questions, 2 to 4 options each, the option you would pick
 | Decision | Where the answer is |
 |---|---|
 | Who is evaluated, which country, which stage of the customer's process | the request itself. "KYB for Ecuadorian SMEs" is a company, ECU, origination. |
-| Which sources, their required inputs, what they can detect | `altscore workflows-v2 sources-status`: every source version, one compact row with its `requiredInputs`. A `--country` filter hides INT (international) sources such as sanctions lists; stderr counts what a filter hid. Then `altdata describe <id>` and `altdata dictionary <id>` for ONE source's field paths |
+| Which sources, their required inputs, what they can detect | `altscore workflows-v2 sources-status --country <ISO3>` (or `--search <word>`): one compact row per source version with its `requiredInputs`; the unfiltered catalog is about 40 KB. A `--country` filter hides INT (international) sources such as sanctions lists; stderr counts what a filter hid. Then `altdata describe <id>` and `altdata dictionary <id>` for ONE source's field paths |
 | Decision vocabulary, whether a review lane exists | `altscore decisions list`: the registered keys are the only ones a run can write. A brief that says `approve/review/reject` while the tenant registers `passes/pending/fails` is mapped BY LABEL, and the mapping is restated to the user in one line |
 | Write targets, output shape, input payload, PDF or not, freshness of paid sources | the tenant's closest existing workflow: `workflows-v2 list --filter is-latest=true` (one compact row per workflow), its skeleton (below), then only its `inputSchema`, end node, `decisionConfig` and `sourcesConfig.dataAge`. Mirror it. |
 | Fields available on borrower and deal, and what a real value looks like | `altscore data-models list`, then `borrower-fields list --filter borrower-id=<test borrower>` and `packages content <id>` on the test case. A null sample is a question, not a guess |
 | Structure: orchestrator plus per-party child, fan-out, two-layer decisioning | [kyc-kyb-habits](kyc-kyb-habits.md) |
 | Whether a change is visible to others (update path) | `workflows-v2 schedule get <id>`, and other workflows whose `child-workflow` nodes carry this alias as `executorId` |
 
-Read a sibling a piece at a time; an unpiped export prints every task body:
+Read a sibling or a child with `--format outline` (inputs, graph, variable types, the end node's output keys: a few KB); the apply-spec inlines every task body:
 
 ```bash
-altscore workflows-v2 export <id> --format apply-spec | jq '{nodes: [.nodes[] | {ref, type, label}], edges}'
-altscore workflows-v2 export <id> --format apply-spec | jq '.nodes[] | select(.ref == "<ref>")'
+altscore workflows-v2 export <id> --format outline
+altscore workflows-v2 export <id> --format apply-spec | jq '.nodes[] | select(.ref == "<ref>")'   # one node's body
 ```
 
 Anything the spec can default is yours as well: labels, positions, aliases and refs, branch ids, `inputKeys`, publish policy (DRAFT on create). Never ask which field a task type uses; read `schema-guide tasks <type>`.
@@ -157,13 +158,15 @@ This is the shape productive tenants run. Write it by default and deviate only f
    | workflow input | `inputs.<name>`, `inputs.<object>.<field>` |
    | entity ids | `task_outputs.<customerRef>.borrower_id`, `task_outputs.<dealRef>.deal_id` |
    | altdata | `task_outputs.<altdataRef>.<SOURCE_ID>.data.<field>`; raw nested `....sourceData.<path>`; success gate `....isSuccess` |
-   | decision outputs | `task_outputs.<scorecardRef>.total_score`, `task_outputs.<mappingTableRef>.<outputVariable>`, `task_outputs.<ruleTreeRef>.decision_key`; one breakdown row `task_outputs.<scorecardRef>.score_breakdown[field='<f>'][0].<prop>` |
+   | decision outputs | `task_outputs.<scorecardRef>.total_score`, `task_outputs.<mappingTableRef>.<outputVariable>`, `task_outputs.<ruleTreeRef>.decision_key` (the reason: `....<outputVariable>_rule_label`, `_rule_code`); one breakdown row `task_outputs.<scorecardRef>.score_breakdown[field='<f>'][0].<prop>` |
    | database | `entity.borrower.<group>.<key>` |
+   | child workflow | `task_outputs.<childRef>.<key the child's End outputJson emits>`; fan-out `....items[].output`, `....summary.failed` |
+   | document extraction | `task_outputs.<ref>.fields.<name>`, `....missingFields`, `....isSuccess` |
 
-   A custom variable that only re-exposes, renames, casts or `.get()`s one of these is never needed.
+   A custom variable that only re-exposes, renames, casts or `.get()`s one of these is never needed. Inputs and outputs of `contact`, `notices`, `document-extraction` and a child workflow: [node-contracts](node-contracts.md).
 2. **The decision lives in entities, not in Python.** `decision_key` comes from a rule-tree: hard gates first, then the band. Score bands and code-to-label maps are mapping tables; thresholds are evaluation rules or scorecards, versioned and editable without a republish. Rule-tree, scorecard and evaluate-rules inputs take deep paths directly, so gate on `isSuccess`, a status or a hit count with no variable in between. The usual chain is altdata -> indicator compute -> scorecard -> mapping-table (score to band) -> rule-tree -> End. Create the entities first ([credit-decisioning](credit-decisioning.md)), then reference them from the spec.
    First means after the question path's answers and before the first dry-run.
-3. **Python computes indicators, one scalar each.** A variable earns its place when it combines two or more values (ratio, age, date delta, a multi-step formula), aggregates a list, builds a per-party list for a fan-out (filtering alone is `inputExpression: "inputs.<list>[<field>=<value>]"`), parses a raw payload once, normalises text, renders HTML for a PDF block, or is a scoped probe (below). Return a number, string or boolean, never an object; name it `snake_case` after the value; `onError: "null"` and let the rule handle "no data".
+3. **Python computes indicators, one scalar each.** A variable earns its place when it combines two or more values (ratio, age, date delta, a multi-step formula), aggregates a list, builds a per-party list for a fan-out over several parties (filtering alone is `inputExpression: "inputs.<list>[<field>=<value>]"`; one party is a plain child call, not a one-element batch), parses a raw payload once, normalises text, renders HTML for a PDF block, or is a scoped probe (below). Return a number, string or boolean, never an object; name it `snake_case` after the value; `onError: "null"` and let the rule handle "no data".
 4. **Limits productive tenants stay under:** at most 6 variables per compute node, compute nodes at most a third of the graph, no `self.` chain longer than 2, under about 1,000 code chars per variable unless it is HTML, parsing or iteration. Past those the Python is a rules engine; move it into entities.
 5. **Never in a variable:** a threshold, a band, a gate, a decision key, a label map, a constant, or a re-check of `isSuccess`.
 
@@ -580,7 +583,7 @@ altscore workflows-v2 batch terminate <batch-id>
 #### Sources and AI helpers
 
 ```bash
-altscore workflows-v2 sources-status          # every source version, compact; --full adds outputSchema
+altscore workflows-v2 sources-status --country ECU   # source versions, compact; --full adds outputSchema
 altscore workflows-v2 external-sources-status
 
 altscore workflows-v2 ai suggest-mappings --body '{
@@ -660,7 +663,7 @@ The runtime resolver accepts these leading namespaces — anything else fails wi
 
 **Deep paths into altdata output**: an `altdata-enrichment` task outputs the entire package object on `sources_output_packages`. To map a single field into a downstream conditional/compute-variables task, use the deep form: `task_outputs.<altdataAlias>.<sourceId>.data.<fieldName>`. No intermediate compute-variables required.
 
-**Direct assignment is the default** (see "Default structure" above): wire a reference straight into the consuming node's `inputMappings` instead of re-exposing it through a variable. **Exception — scoped probes are NOT passthroughs:** a single-handle-scoped probe node whose var reads a per-item scalar (`result = inputs.get("task_outputs.attach-deal.deal_contact_id")`) is the *required* way to surface a scoped value (see "The scoped compute-variables pattern" below) — direct assignment would lose the per-item scope. The "extract-raw then derive-indicators" two-stage compute pattern is also fine; only a true no-op re-expose is the anti-pattern.
+**Direct assignment is the default** (see "Default structure" above): wire a reference straight into the consuming node's `inputMappings` instead of re-exposing it through a variable. **Exception — scoped probes are NOT passthroughs:** a single-handle-scoped probe node whose var reads a per-item scalar (`result = inputs.get("task_outputs.attach-deal.deal_contact_id")`) is the *required* way to surface a scoped value (see "The scoped compute-variables pattern" below) — direct assignment would lose the per-item scope.
 
 **Bare `<alias>.<field>` resolves fine** at runtime — the backend resolver accepts the bare-alias form (WITH a dot), and `apply` deliberately emits it for cross-task references. Both `task_outputs.<server-alias>.<rest>` and the bare `<alias>.<rest>` form are valid.
 
@@ -771,6 +774,8 @@ A single `deal` task can attach the customer plus an arbitrary number of guarant
 ```jsonc
 "nodes": [
   // ... start node + any upstream tasks ...
+  // A parent sees only the child's End outputJson: the reads of verify-customer below need
+  // that child to emit borrower_id there.
   {"ref": "verify-customer",   "type": "child-workflow", "executorId": "kyc-individual-ar",
    "inputMappings": {"tax_id": "inputs.customer_tax_id"}},
 

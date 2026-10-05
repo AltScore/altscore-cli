@@ -71,6 +71,8 @@ altscore schema borrowers                    # create + update + response + filt
 altscore schema borrowers --action create    # just create body fields
 ```
 
+v2 workflow and task shapes are not in this registry: `altscore workflows-v2 schema-guide tasks <type>`.
+
 ### Test mode (UAT)
 
 Most entities support `isTest` for UAT data in production. Test records are **excluded from list results by default**.
@@ -121,6 +123,7 @@ Load the file that matches the task:
 | Core entities | [references/resources.md](references/resources.md) | borrowers, identities, documents, deals, executions (two-surface outputs), packages |
 | Workflows v1 | [references/workflows-v1.md](references/workflows-v1.md) | workflow-tasks, task-tests, v1 workflows, input-schema reference, DAG data-flow rules |
 | v1 -> v2 migration | [references/v1-migration.md](references/v1-migration.md) | the intake round (login pre-flight, tenant, legacy repo, workflow list), where the doctrine is served from, and the three porting rules parity does not check |
+| Node contracts | [references/node-contracts.md](references/node-contracts.md) | `contact` and End `emailReport`, `notices`, `document-extraction`, reading a child workflow's output: inputs, outputs, run-time traps the schema guide does not narrate |
 | Workflows v2 | [references/workflows-v2.md](references/workflows-v2.md) | discovery round, authoring loop (test mode, locks, feedback turns), `apply`, tasks-v2, CRUD, lock dance, lifecycle, schedules, import/export, execute, helpers, variable resolution, atomic deal patterns |
 | Credit decisioning | [references/credit-decisioning.md](references/credit-decisioning.md) | mapping-tables, scorecards, evaluation-rules, decisions, rule-trees, pitfalls |
 | KYC/KYB good habits | [references/kyc-kyb-habits.md](references/kyc-kyb-habits.md) | tenant/country-agnostic structural habits for onboarding & screening flows — read before authoring a KYC/KYB/onboarding workflow |

@@ -296,17 +296,57 @@ func TestAltdataSourcesSharesTheCompactListing(t *testing.T) {
 		t.Fatalf("a filter without = must fail before any request, got %v after %d", err, len(f.requests()))
 	}
 
-	stdout, stderr, err := runListCmd(t, makeAltdataSourcesCmd(), "--filter", "country=ECU", "--filter", "sourceId=ECU-PUB-0001")
+	stdout, stderr, err := runListCmd(t, makeAltdataSourcesCmd(), "--filter", "country=ECU", "--filter", "groupId=bureau")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rows := decodeRows(t, stdout); len(rows) != 150 || rows[0]["version"] != "v1" {
 		t.Fatalf("expected the 150 compact ECU rows, got %d", len(rows))
 	}
-	for _, want := range []string{`no "sourceId" filter`, "# 150 of 230 sources", "# country=ECU hid 80: by sourceId prefix 50 USA, 30 INT"} {
+	for _, want := range []string{`no "groupId" filter`, "# 150 of 230 sources", "# country=ECU hid 80: by sourceId prefix 50 USA, 30 INT"} {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("stderr must contain %q, got:\n%s", want, stderr)
 		}
+	}
+}
+
+// "--filter sourceId=X" used to be ignored and answered with the whole catalog.
+func TestSourceIDFilterIsReadAsSearch(t *testing.T) {
+	f := newFakeListBackend(t, fakeSourceCatalog(), nil)
+	routeLoadClientTo(t, f.URL)
+
+	for _, cmd := range []*cobra.Command{makeAltdataSourcesCmd(), makeWfv2SourcesStatusCmd()} {
+		stdout, stderr, err := runListCmd(t, cmd, "--filter", "sourceId=ECU-PUB-0001")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows := decodeRows(t, stdout)
+		if len(rows) != 1 || rows[0]["sourceId"] != "ECU-PUB-0001" {
+			t.Fatalf("%s: expected only ECU-PUB-0001, got %d rows", cmd.Name(), len(rows))
+		}
+		if !strings.Contains(stderr, "read as search=ECU-PUB-0001") || strings.Contains(stderr, "warning") {
+			t.Errorf("%s: stderr must say the filter was read as a search, got:\n%s", cmd.Name(), stderr)
+		}
+	}
+}
+
+func TestSourcesStatusTipOnlyWhenUnfiltered(t *testing.T) {
+	f := newFakeListBackend(t, fakeSourceCatalog(), nil)
+	routeLoadClientTo(t, f.URL)
+
+	_, stderr, err := runListCmd(t, makeWfv2SourcesStatusCmd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "--country <ISO3> or --search <word>") {
+		t.Errorf("an unfiltered listing must say how to narrow it, got:\n%s", stderr)
+	}
+	_, stderr, err = runListCmd(t, makeWfv2SourcesStatusCmd(), "--country", "ECU")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stderr, "narrows it") {
+		t.Errorf("a filtered listing must not carry the tip, got:\n%s", stderr)
 	}
 }
 

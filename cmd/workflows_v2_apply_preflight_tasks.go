@@ -76,7 +76,7 @@ func preflightTasks(spec *composeSpec) error {
 					"node ref=%q: unknown task type %q. %s"+
 						"The live backend was also consulted and does not list this type either (%d types). "+
 						"Run 'altscore workflows-v2 schema-guide taskTypes' for the live list, or "+
-						"'altscore workflows-v2 schema-guide tasks | jq \".tasks.perType | keys\"' for the active palette.",
+						"'altscore workflows-v2 schema-guide tasks' for every type, one row each.",
 					ref, taskType, suggestionLine, len(liveTaskTypes),
 				)
 			} else {

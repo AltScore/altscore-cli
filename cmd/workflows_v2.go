@@ -1149,6 +1149,13 @@ scorecards, rule trees, and mapping tables. Suitable for piping to a file:
                        altscore workflows-v2 export <id> --format apply-spec \
                          | altscore workflows-v2 apply
 
+  outline            What a sibling or a parent needs, a few KB: alias, label,
+                     inputVariables (type, required, title, default),
+                     customVariables (name -> type), nodes (ref, type, label),
+                     edges, and each end node's outputJson keys. Read a
+                     workflow's shape with this; export apply-spec only to
+                     change it.
+
 REFS (apply-spec): a task the CLI applied carries its original spec-local ref
 as specRef, and that is what each node's 'ref' becomes, so applying the export
 back reports every task unchanged. A task authored in the Hub has no specRef
@@ -1160,13 +1167,13 @@ to refs; node positions are kept, so apply leaves the canvas as it was.`,
   altscore workflows-v2 export <id> --format apply-spec > spec.json
   altscore workflows-v2 export <id> --format apply-spec | altscore workflows-v2 apply
 
-  # A sibling's skeleton only (the full spec inlines every task body)
-  altscore workflows-v2 export <id> --format apply-spec | jq '{nodes: [.nodes[] | {ref, type, label}], edges}'`,
+  # A workflow's shape only: inputs, graph, variables, end output keys
+  altscore workflows-v2 export <id> --format outline`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			switch format {
-			case "bundle", "apply-spec":
+			case "bundle", "apply-spec", "outline":
 			default:
-				return fmt.Errorf("--format must be \"bundle\" or \"apply-spec\", got %q", format)
+				return fmt.Errorf("--format must be \"bundle\", \"apply-spec\" or \"outline\", got %q", format)
 			}
 			c, err := loadClient()
 			if err != nil {
@@ -1184,6 +1191,9 @@ to refs; node positions are kept, so apply leaves the canvas as it was.`,
 			if err != nil {
 				return err
 			}
+			if format == "outline" {
+				return output.JSON(applySpecOutline(spec))
+			}
 			out, err := json.Marshal(spec)
 			if err != nil {
 				return fmt.Errorf("encode apply-spec: %w", err)
@@ -1191,7 +1201,7 @@ to refs; node positions are kept, so apply leaves the canvas as it was.`,
 			return output.RawJSON(json.RawMessage(out))
 		},
 	}
-	cmd.Flags().StringVar(&format, "format", "bundle", `output shape: "bundle" (raw export) or "apply-spec" (flat spec for 'apply')`)
+	cmd.Flags().StringVar(&format, "format", "bundle", `output shape: "bundle" (raw export), "apply-spec" (flat spec for 'apply') or "outline" (inputs, graph, variables, end output keys; a few KB)`)
 	return cmd
 }
 
@@ -1876,6 +1886,7 @@ func makeWfv2SourcesStatusCmd() *cobra.Command {
 	var page int
 	var perPage int
 	var full bool
+	var filters []string
 
 	cmd := &cobra.Command{
 		Use:   "sources-status",
@@ -1885,6 +1896,7 @@ func makeWfv2SourcesStatusCmd() *cobra.Command {
 ` + sourceListingHelp,
 		Example: `  # Every source version, compact (JSON on stdout, counts on stderr)
   altscore workflows-v2 sources-status
+  altscore workflows-v2 sources-status --country ECU
   altscore workflows-v2 sources-status --search registry
   altscore workflows-v2 sources-status | jq -r '.[] | "\(.sourceId) \(.version) \(.name) \(.requiredInputs)"'
 
@@ -1895,11 +1907,14 @@ func makeWfv2SourcesStatusCmd() *cobra.Command {
   # Raw rows with outputSchema (hundreds of KB)
   altscore workflows-v2 sources-status --full --search registry`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			q, err := sourceFilterValues(filters, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
 			c, err := loadClient()
 			if err != nil {
 				return err
 			}
-			q := url.Values{}
 			if status != "" {
 				q.Set("status", status)
 			}
@@ -1909,6 +1924,9 @@ func makeWfv2SourcesStatusCmd() *cobra.Command {
 			if search != "" {
 				q.Set("search", search)
 			}
+			if len(q) == 0 && page == 0 && !full {
+				fmt.Fprintln(cmd.ErrOrStderr(), "# the whole catalog is about 40 KB; --country <ISO3> or --search <word> narrows it to a few rows")
+			}
 			return sourceListing{filters: q, page: page, perPage: perPage, full: full}.run(c, cmd.ErrOrStderr())
 		},
 	}
@@ -1916,6 +1934,7 @@ func makeWfv2SourcesStatusCmd() *cobra.Command {
 	cmd.Flags().StringVar(&status, "status", "", "filter by status, comma-separated (stderr counts what it hid)")
 	cmd.Flags().StringVar(&country, "country", "", "filter by the sourceId's country, comma-separated (never returns INT sources; stderr counts what it hid)")
 	cmd.Flags().StringVar(&search, "search", "", "free-text search across sourceId, version and name")
+	cmd.Flags().StringArrayVar(&filters, "filter", nil, "country, status or search as key=value, as in 'altdata sources' (id= and sourceId= are read as search)")
 	cmd.Flags().IntVar(&page, "page", 0, "read this page only instead of every page")
 	cmd.Flags().IntVar(&perPage, "per-page", 0, fmt.Sprintf("page size of the walk, or of --page (default %d)", defaultAltdataPerPage))
 	cmd.Flags().BoolVar(&full, "full", false, "print the raw rows, outputSchema and stats included")
@@ -2037,6 +2056,7 @@ func wfv2SchemaGuidePath(args []string, full bool) string {
 
 func makeWfv2SchemaGuideCmd() *cobra.Command {
 	var full bool
+	var search string
 	cmd := &cobra.Command{
 		Use:   "schema-guide [section] [type]",
 		Short: "Canonical reference for v2 workflow shape (nodes, edges, tasks, examples, ...)",
@@ -2047,27 +2067,68 @@ With no argument it prints the INDEX: every section with a one-line summary
 and its approximate token cost. Pick a section from there. The whole guide
 is ~50k tokens and is only printed with --full.
 
-  schema-guide                 the index (section names, summaries, sizes)
-  schema-guide <section>       one section: nodes, edges, variables, mappings, composeSpec, ...
-  schema-guide tasks <type>    one task type: hand-written notes + introspected fields
-  schema-guide --full          everything at once`,
+  schema-guide                   the index (section names, summaries, sizes)
+  schema-guide <section>         one section: nodes, edges, variables, mappings, composeSpec, ...
+  schema-guide tasks             every task type, one row each; notes=false means fields only
+  schema-guide tasks <type>      one task type: hand-written notes + introspected fields
+                                 (a near miss such as "compute" resolves to the one type it can mean)
+  schema-guide --search <word>   every place the whole guide mentions <word>, each with the
+                                 command that prints its section (instead of --full | jq)
+  schema-guide --full            everything at once (schema-guide tasks --full: the raw tasks section)`,
 		Example: `  altscore workflows-v2 schema-guide
   altscore workflows-v2 schema-guide composeSpec
+  altscore workflows-v2 schema-guide tasks
   altscore workflows-v2 schema-guide tasks deal
-  altscore workflows-v2 schema-guide tasks | jq '.tasks.perType | keys'`,
+  altscore workflows-v2 schema-guide --search extraction`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if search != "" && len(args) > 0 {
+				return fmt.Errorf("--search looks through the whole guide; drop the section argument (%s)", strings.Join(args, " "))
+			}
 			c, err := loadClient()
 			if err != nil {
 				return err
+			}
+			stderr := cmd.ErrOrStderr()
+			if search != "" {
+				data, _, err := c.Do("GET", "borrower_central", wfv2SchemaGuidePath(nil, true), nil)
+				if err != nil {
+					return err
+				}
+				matches, total, err := searchGuide(data, search, 25)
+				if err != nil {
+					return err
+				}
+				shown := ""
+				if total > len(matches) {
+					shown = fmt.Sprintf(", first %d shown; narrow the word for the rest", len(matches))
+				}
+				fmt.Fprintf(stderr, "# %d match(es) for %q in the guide%s. 'open' prints the section holding each one\n", total, search, shown)
+				if total == 0 {
+					fmt.Fprintln(stderr, "# the guide says nothing about it; 'altscore workflows-v2 schema-guide' lists every section")
+				}
+				return output.JSON(matches)
+			}
+			if len(args) == 2 && args[0] == "tasks" {
+				if t, changed := resolveTaskTypeName(args[1], validTaskTypes); changed {
+					fmt.Fprintf(stderr, "# task type %q read as %q\n", args[1], t)
+					args = []string{args[0], t}
+				}
 			}
 			data, _, err := c.Do("GET", "borrower_central", wfv2SchemaGuidePath(args, full), nil)
 			if err != nil {
 				return err
 			}
+			if len(args) == 1 && args[0] == "tasks" && !full {
+				if index, err := compactTaskTypeIndex(data); err == nil {
+					fmt.Fprintf(stderr, "# %d task types; notes=false means introspected fields only, no hand-written notes. 'schema-guide tasks <type>' prints one; --full prints the raw section\n", len(index.Types))
+					return output.JSON(index)
+				}
+			}
 			return output.RawJSON(data)
 		},
 	}
-	cmd.Flags().BoolVar(&full, "full", false, "Print the whole guide (~50k tokens) instead of the index")
+	cmd.Flags().BoolVar(&full, "full", false, "Print the whole guide (~50k tokens) instead of the index; with 'tasks', the raw tasks section")
+	cmd.Flags().StringVar(&search, "search", "", "find a word anywhere in the guide: path, the command that opens it, and a snippet")
 	return cmd
 }
