@@ -75,7 +75,7 @@ Structured notices with severity levels. Returned in `ExecutionOutput.notices`:
 ]}
 ```
 
-Severity values: `"info"`, `"error"`, `"debug"`. Debug notices are logged but not returned to the client.
+Severity values: `"info"`, `"error"`, `"debug"`. Debug notices are logged but not returned to the client. This is the v1 engine; a v2 `notices` node takes `info`, `warning` or `error` ([node-contracts](node-contracts.md)).
 
 ### `w_schedule_callback`
 

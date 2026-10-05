@@ -699,3 +699,23 @@ func TestComposeWorkflowBodyPrintsStructureAdvisory(t *testing.T) {
 		t.Fatalf("decision taken from a task output must not be flagged, got:\n%s", stderr)
 	}
 }
+
+func TestGuardedExtractionReadsAsTheDeepPath(t *testing.T) {
+	cases := []struct {
+		name, expr string
+		want       pyShapeKind
+	}{
+		{"guard on the container", "d = inputs.get(\"task_outputs.doc.extraction\") or {}\nresult = d.get(\"name\") if d else None", shapeExtract},
+		{"is not None guard", "x = inputs.get(\"task_outputs.doc.extraction\")\nresult = x.get(\"name\") if x is not None else None", shapeExtract},
+		{"inverted guard", "x = inputs.get(\"task_outputs.doc.extraction\")\nresult = None if x is None else x[\"name\"]", shapeExtract},
+		{"guard on the value itself", "result = inputs.get(\"task_outputs.doc.extraction\") if inputs.get(\"task_outputs.doc.extraction\") else \"\"", shapePassthrough},
+		{"guard on another value is a gate", "result = inputs.get(\"task_outputs.doc.name\") if inputs.get(\"task_outputs.doc.isSuccess\") else None", shapeTransform},
+		{"a computed fallback is a transform", "x = inputs.get(\"task_outputs.doc.extraction\")\nresult = x.get(\"name\") if x else x.get(\"alias\")", shapeTransform},
+		{"a guard deeper than the value is a transform", "x = inputs.get(\"task_outputs.doc.extraction\")\nresult = x if x.get(\"name\") else None", shapeTransform},
+	}
+	for _, tc := range cases {
+		if got := analyzePythonVariable(tc.expr, "result"); got.kind != tc.want {
+			t.Errorf("%s: got kind %d, want %d", tc.name, got.kind, tc.want)
+		}
+	}
+}

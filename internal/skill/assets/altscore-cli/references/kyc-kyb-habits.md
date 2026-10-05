@@ -19,13 +19,13 @@ Read this **before authoring** a KYC/KYB/onboarding workflow. For the mechanics 
 
 - **Screen sanctions / PEP / adverse-media for *every* onboarded party** — KYC and KYB, primary and related. Beneficial owners and guarantors get screened too, not just the applicant.
 - **Distinguish "source failed" from "source said no."** Gate on an explicit success flag (`isSuccess`), not on data-presence — a timeout must not read as a clean result.
-- **Keep raw data separate from derived signals.** Extract raw fields in one step, normalize them into indicators/signals in the next. Rules then depend on portable indicators, not on a specific provider's response shape — which is what lets the same logic move across countries. (Two-stage `compute-variables`: `extract-raw` → `derive-indicators`; expressions live in `workflow.customVariables`.)
+- **Wire provider fields directly; compute only real indicators.** A rule, scorecard or mapping table reads a source field by its deep path (`task_outputs.<ref>.<SOURCE_ID>.data.<field>`, success gate `....isSuccess`); copying it into a variable first adds a node and a failure mode, nothing else. Compute a variable only when it derives something (a ratio, a date delta, a count across a list), one scalar each. Country portability lives in the versioned decision entities, not in an extraction layer.
 
 #### Decisioning
 
 - **Two layers, never one.** A numeric **score** (creditworthiness/risk) *and* a set of **hard gates** (sanctions hit, dissolved entity, identity mismatch, revoked document → reject regardless of score). Don't bury a hard stop inside a score. (Scorecard for the number; rule-tree for the gates.)
 - **Keep country/tenant logic inside versioned decision artifacts**, bound by code. The workflow graph stays country-agnostic; locale-specific thresholds live in the scorecard/rule-tree/mapping you can version and audit.
-- **Emit a structured, explainable decision** — a `decision_key` *plus* the reason/rule that fired — and write it back onto the deal/entity. Mark only the authoritative step as the final decision (`decisionType: final`); children and dispatchers stay `preliminary`/disabled.
+- **Emit a structured, explainable decision** — a `decision_key` *plus* the reason/rule that fired — and write it back onto the deal/entity. The rule-tree already outputs both: `task_outputs.<ruleTreeRef>.decision_key`, the fired rule as `<outputVariable>_rule_code` / `<outputVariable>_rule_label`, and every rule's hit and inputs as `<outputVariable>_rules`. Map those; never rebuild a reason in Python. Mark only the authoritative step as the final decision (`decisionType: final`); children and dispatchers stay `preliminary`/disabled.
 
 #### KYB adds (beyond KYC)
 

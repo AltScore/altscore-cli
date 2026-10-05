@@ -257,7 +257,57 @@ func (e *pyEval) expr() (pyVal, bool) {
 			return left, false
 		}
 	}
+	if e.peekName(0, "if") {
+		return e.guarded(left)
+	}
 	return left, true
+}
+
+// `d.get("k") if d else None` and `None if x is None else x["k"]`: a guard on the value
+// itself, or on what it is read from, with a constant fallback is `value or default`. The deep
+// path already resolves to null when the value is absent.
+func (e *pyEval) guarded(then pyVal) (pyVal, bool) {
+	e.pos++
+	negate := false
+	if e.peekName(0, "not") {
+		e.pos++
+		negate = true
+	}
+	cond, ok := e.primary()
+	if !ok {
+		return cond, false
+	}
+	switch {
+	case e.peekName(0, "is") && e.peekName(1, "not") && e.peekName(2, "None"):
+		e.pos += 3
+	case e.peekName(0, "is") && e.peekName(1, "None"):
+		e.pos += 2
+		negate = !negate
+	case e.peekOp(0, "!=") && e.peekName(1, "None"):
+		e.pos += 2
+	}
+	if !e.peekName(0, "else") {
+		return then, false
+	}
+	e.pos++
+	alt, ok := e.primary()
+	if !ok {
+		return alt, false
+	}
+	value, fallback := then, alt
+	if negate {
+		value, fallback = alt, then
+	}
+	if fallback.kind != pvConst || value.kind != pvPath || cond.kind != pvPath || cond.root != value.root ||
+		cond.cast != "" || len(cond.segs) > len(value.segs) {
+		return value, false
+	}
+	for i, seg := range cond.segs {
+		if value.segs[i] != seg {
+			return value, false
+		}
+	}
+	return value, true
 }
 
 // `x or <default>` keeps x: the fallback is a default, not a second value.

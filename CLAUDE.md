@@ -60,7 +60,7 @@ altscore-cli/
 │   └── skill/                             # go:embed of the Claude Code skill + install/refresh (cmd/skill.go)
 │       └── assets/altscore-cli/
 │           ├── SKILL.md
-│           └── references/                # 13 files incl. workflows-v2.md, workflows-v1.md
+│           └── references/                # 14 files incl. workflows-v2.md, workflows-v1.md
 └── .claude/skills/altscore-cli -> ../../internal/skill/assets/altscore-cli   # symlink: repo-local loading
 ```
 
