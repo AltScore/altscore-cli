@@ -227,13 +227,17 @@ func adviseRuleDescriptions(rules []any) (readabilityFinding, bool) {
 // GET /v2/workflows/{id} returns nodes WITHOUT their task bodies, and pdfConfig lives on
 // the task. Fail-open per task.
 func fetchEndTaskBodies(c *client.Client, nodes []any) []map[string]any {
+	return fetchTaskBodiesOfType(c, nodes, "end")
+}
+
+func fetchTaskBodiesOfType(c *client.Client, nodes []any, nodeType string) []map[string]any {
 	if c == nil {
 		return nil
 	}
 	var out []map[string]any
 	for _, n := range nodes {
 		nm := asMap(n)
-		if strings.ToLower(fmt.Sprint(nm["type"])) != "end" {
+		if strings.ToLower(fmt.Sprint(nm["type"])) != nodeType {
 			continue
 		}
 		alias, _ := nm["taskAlias"].(string)

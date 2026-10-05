@@ -278,3 +278,164 @@ func TestApplyAutoEndDefaults_PdfOptOutKeepsBorrowerWiring(t *testing.T) {
 		t.Errorf("pdfConfig.enabled = %v, want false", pdf["enabled"])
 	}
 }
+
+func defaultsBlockSpec(end map[string]any, applicant map[string]any) *composeSpec {
+	customer := map[string]any{"ref": "applicant", "type": "customer", "label": "Applicant", "operation": "write",
+		"key": "person_id", "inputMappings": map[string]any{"person_id": "inputs.person_id"}}
+	for k, v := range applicant {
+		customer[k] = v
+	}
+	endNode := map[string]any{"ref": "end", "type": "end", "label": "End"}
+	for k, v := range end {
+		endNode[k] = v
+	}
+	return &composeSpec{
+		Alias:          "defaults-block",
+		Label:          "Defaults block",
+		Category:       "EVALUATION",
+		InputVariables: map[string]any{"person_id": map[string]any{"type": "string", "required": true}},
+		ExtraNodes:     []map[string]any{{"ref": "start", "type": "start", "label": "Start"}},
+		Tasks:          []map[string]any{customer, endNode},
+		Edges:          []map[string]any{{"from": "start", "to": "applicant"}, {"from": "applicant", "to": "end"}},
+	}
+}
+
+func composeDefaultsBlock(t *testing.T, spec *composeSpec, autoDefaults bool) (block, stderr string) {
+	t.Helper()
+	capture := newComposeCapture()
+	var err error
+	stderr = captureStderr(t, func() {
+		_, err = composeWorkflowBody(nil, spec, true, false, true, false, autoDefaults, true, capture)
+	})
+	if err != nil {
+		t.Fatalf("compose: %v", err)
+	}
+	var buf strings.Builder
+	printAppliedDefaults(&buf, capture.defaults)
+	return buf.String(), stderr
+}
+
+func TestAppliedDefaultsBlock_ListsEveryDefaultApplyFilled(t *testing.T) {
+	block, _ := composeDefaultsBlock(t, defaultsBlockSpec(nil, nil), true)
+
+	if n := strings.Count(block, "# defaults applied (confirm with the user or set them explicitly):"); n != 1 {
+		t.Fatalf("want exactly one heading, got %d:\n%s", n, block)
+	}
+	for _, want := range []string{
+		"#   end: endConfig.pdfConfig.enabled = true -- a PDF report is generated on every run",
+		"#   end: endConfig.pdfConfig.pdfGenerationRequired = true -- a failed PDF render fails the run",
+		`#   end: inputMappings.borrower_id = "task_outputs.applicant.borrower_id" -- `,
+		`#   end: inputMappings.billable_id = "task_outputs.applicant.borrower_id" -- `,
+		"#   end: endConfig.decisionConfig.enabled = false (server default) -- no decision is recorded on the execution",
+		`#   applicant: persona = "individual" -- `,
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("block missing %q:\n%s", want, block)
+		}
+	}
+	if strings.Contains(block, "pdfConfig.enabled = true (server default)") {
+		t.Errorf("apply filled the PDF itself; it must not be reported twice:\n%s", block)
+	}
+}
+
+func TestAppliedDefaultsBlock_SilentWhenTheSpecSetsThem(t *testing.T) {
+	end := map[string]any{
+		"inputMappings": map[string]any{"borrower_id": "task_outputs.applicant.borrower_id", "billable_id": "task_outputs.applicant.borrower_id"},
+		"endConfig": map[string]any{
+			"pdfConfig":      map[string]any{"enabled": true, "pdfGenerationRequired": false},
+			"decisionConfig": map[string]any{"enabled": true, "decisionType": "final"},
+		},
+	}
+	for _, auto := range []bool{true, false} {
+		block, stderr := composeDefaultsBlock(t, defaultsBlockSpec(end, map[string]any{"persona": "business"}), auto)
+		if block != "" {
+			t.Errorf("auto-defaults=%v: block must be silent when the spec sets every field, got:\n%s", auto, block)
+		}
+		if strings.Contains(stderr, "defaults applied") {
+			t.Errorf("auto-defaults=%v: assembly must not print the block itself:\n%s", auto, stderr)
+		}
+	}
+}
+
+func TestAppliedDefaultsBlock_ReportsServerDefaultsWithoutAutoDefaults(t *testing.T) {
+	block, _ := composeDefaultsBlock(t, defaultsBlockSpec(map[string]any{
+		"endConfig": map[string]any{"decisionConfig": map[string]any{"enabled": true}},
+	}, nil), false)
+
+	for _, want := range []string{
+		"#   end: endConfig.pdfConfig.enabled = true (server default) -- ",
+		`#   end: endConfig.decisionConfig.decisionType = "final" (server default) -- `,
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("block missing %q:\n%s", want, block)
+		}
+	}
+	for _, absent := range []string{"pdfGenerationRequired", "inputMappings.borrower_id", "decisionConfig.enabled"} {
+		if strings.Contains(block, absent) {
+			t.Errorf("--no-auto-defaults: %q must not be listed:\n%s", absent, block)
+		}
+	}
+}
+
+func TestCanonicalEndAdvisoryAgreesWithTheDefaultsBlock(t *testing.T) {
+	spec := func(pdf map[string]any) *composeSpec {
+		endCfg := map[string]any{"decisionConfig": map[string]any{"enabled": true, "decisionType": "final"}}
+		if pdf != nil {
+			endCfg["pdfConfig"] = pdf
+		}
+		return &composeSpec{
+			Alias:      "advisory-agrees",
+			Label:      "Advisory agrees",
+			Category:   "EVALUATION",
+			ExtraNodes: []map[string]any{{"ref": "start", "type": "start", "label": "Start"}},
+			Tasks: []map[string]any{
+				{"ref": "policy", "type": "rule-tree", "label": "Policy",
+					"ruleTreeConfig": map[string]any{"ruleTreeCode": "policy_tree", "outputVariable": "decision_key"}},
+				{"ref": "end", "type": "end", "label": "End",
+					"inputMappings": map[string]any{"decision_key": "task_outputs.policy.decision_key"},
+					"endConfig":     endCfg},
+			},
+			Edges: []map[string]any{{"from": "start", "to": "policy"}, {"from": "policy", "to": "end"}},
+		}
+	}
+	const missingPdf = "endConfig.pdfConfig.enabled=true"
+
+	for _, auto := range []bool{true, false} {
+		block, stderr := composeDefaultsBlock(t, spec(nil), auto)
+		if strings.Contains(stderr, missingPdf) {
+			t.Errorf("auto-defaults=%v: advisory calls the PDF missing while the run generates it:\n%s", auto, stderr)
+		}
+		if !strings.Contains(block, "end: endConfig.pdfConfig.enabled = true") {
+			t.Errorf("auto-defaults=%v: block must report the PDF default:\n%s", auto, block)
+		}
+	}
+
+	block, stderr := composeDefaultsBlock(t, spec(map[string]any{"enabled": false}), true)
+	if !strings.Contains(stderr, missingPdf) {
+		t.Errorf("an explicit enabled=false is a real gap the advisory must still name:\n%s", stderr)
+	}
+	if strings.Contains(block, "pdfConfig.enabled") {
+		t.Errorf("an explicit enabled=false is not a default:\n%s", block)
+	}
+}
+
+func TestNormalizeEntityWriteTask_RecordsDealContactDefaults(t *testing.T) {
+	var applied appliedDefaults
+	task := map[string]any{
+		"type": "deal", "specRef": "deal",
+		"contacts": []any{map[string]any{"id": "0", "tax_id": "{{inputs.a}}"}},
+	}
+	if err := normalizeEntityWriteTask(task, &composeNormalizeOpts{AutoDefaults: true, Defaults: &applied}); err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	printAppliedDefaults(&buf, applied)
+	for _, want := range []string{
+		`#   deal: contacts[id=0].identity_key = "tax_id" -- `,
+		`#   deal: contacts[id=0].identity_value = "{{inputs.a}}" -- copied from the contact's tax_id`,
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("block missing %q:\n%s", want, buf.String())
+		}
+	}
+}

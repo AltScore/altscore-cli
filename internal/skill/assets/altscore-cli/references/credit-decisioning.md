@@ -5,7 +5,7 @@ Four entity types power the credit-decisioning v2 task surface. They live at `/v
 > **`workflowAlias` is load-bearing — set it on every entity.**
 > The v2 builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias`. An entity created without one is invisible to that workflow, even though the entity itself is fine. Always pass `--workflow-alias <alias>` (matches the workflow's `alias`) on `create`, `update`, and `import`. The CLI prints a stderr warning on `create` if neither the flag nor a body field sets it.
 >
-> **The workflow's alias is server-derived from its label** — `"Customer Onboarding"` slugifies to `customer-onboarding`, `"All 5 types"` to `all-5-types`. The body's `alias` field is silently dropped on `workflows-v2 create` (but `apply` honors `spec.alias` explicitly). A common trap: stamping entities with a guess like `customer-onboarding-v1` when the workflow's actual alias becomes `customer-onboarding-v-1`. Run `altscore workflows-v2 apply --body @spec.json --dry-run` first — it prints the predicted alias up front and tells you what to pass to `--workflow-alias` on entity creates. Better: skip the manual --workflow-alias stamping entirely and rely on `apply`'s auto-rescope to fix it post-create. Or compute it locally: lowercase, replace non-`[a-z0-9]+` with `-`, collapse repeated `-`, trim, cap at 100 chars.
+> **Order: answers, alias, entities, then the first dry-run.** The question path's answers come first ([workflows-v2](workflows-v2.md#discovery-before-authoring-a-guided-question-path-infer-first-then-ask-in-short-rounds)): they decide the cutoffs, lanes and gates the entities hold. Set `spec.alias` explicitly (without it the alias is slugified from the label, and a guess like `customer-onboarding-v1` misses a real `customer-onboarding-v-1`; `workflows-v2 create` drops a body `alias`, `apply` honors it). Then create every entity the spec references with `--workflow-alias <spec.alias>`, and only then run the first `apply --dry-run`: the server checks each code on the tenant, so a dry-run before they exist fails with `*_NOT_FOUND`, each line naming the create command. `apply`'s auto-rescope re-stamps a wrong alias after a real apply; it cannot create a missing entity.
 
 #### Mapping tables — `mapping-tables`
 
@@ -124,12 +124,13 @@ References evaluation rules by id and/or code in a specific order with an `isDef
 
 #### Building a workflow that uses them (apply)
 
-The four matching v2 task types — `evaluate-rules`, `mapping-table`, `scorecard`, `rule-tree` — reference these entities. `apply` validates references against the tenant (best-effort warnings) and pre-fills `outputSchema` with the canonical runtime fields so downstream tasks see the right available outputs.
+The four matching v2 task types — `evaluate-rules`, `mapping-table`, `scorecard`, `rule-tree` — reference these entities by code. The server refuses a code the tenant does not have (`*_NOT_FOUND`), so create the entities after the answers and before the first dry-run; `apply` also pre-fills `outputSchema` with the canonical runtime fields so downstream tasks see the right available outputs.
 
 ```bash
 cat > /tmp/credit-spec.json <<'EOF'
 {
   "label": "Credit decisioning pipeline",
+  "alias": "credit-pipeline",
   "category": "EVALUATION",
   "inputVariables": {"borrower_id": {"type": "string", "required": true}},
   "nodes": [
@@ -165,6 +166,8 @@ cat > /tmp/credit-spec.json <<'EOF'
   ]
 }
 EOF
+# after the answers: entities first, stamped with spec.alias (likewise scorecards, mapping-tables, evaluation-rules)
+altscore rule-trees create --workflow-alias credit-pipeline --body @tree.json
 altscore workflows-v2 apply --body @/tmp/credit-spec.json --dry-run
 altscore workflows-v2 apply --body @/tmp/credit-spec.json --publish
 ```

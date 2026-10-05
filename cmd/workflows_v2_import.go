@@ -126,11 +126,11 @@ func reportImportFindings(cmd *cobra.Command, data json.RawMessage) {
 	errs, warns := partitionFindings(env.Validation.Findings)
 	if len(warns) > 0 {
 		fmt.Fprintf(errOut, "# import: %d warning(s) about this tenant:\n", len(warns))
-		printFindingLines(errOut, "WARN", warns, nil)
+		printFindingLines(errOut, "WARN", warns, nil, "")
 	}
 	if len(errs) > 0 {
 		fmt.Fprintf(errOut, "# import: %d error(s) carried over from the source workflow:\n", len(errs))
-		printFindingLines(errOut, "ERROR", errs, nil)
+		printFindingLines(errOut, "ERROR", errs, nil, "")
 		fmt.Fprintln(errOut, "# the workflow WAS imported; fix these before publishing it.")
 	}
 }

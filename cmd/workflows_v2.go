@@ -1158,7 +1158,10 @@ to refs; node positions are kept, so apply leaves the canvas as it was.`,
 		Args: cobra.ExactArgs(1),
 		Example: `  altscore workflows-v2 export <id> > my-wf.json
   altscore workflows-v2 export <id> --format apply-spec > spec.json
-  altscore workflows-v2 export <id> --format apply-spec | altscore workflows-v2 apply`,
+  altscore workflows-v2 export <id> --format apply-spec | altscore workflows-v2 apply
+
+  # A sibling's skeleton only (the full spec inlines every task body)
+  altscore workflows-v2 export <id> --format apply-spec | jq '{nodes: [.nodes[] | {ref, type, label}], edges}'`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			switch format {
 			case "bundle", "apply-spec":
@@ -1872,11 +1875,25 @@ func makeWfv2SourcesStatusCmd() *cobra.Command {
 	var search string
 	var page int
 	var perPage int
+	var full bool
 
 	cmd := &cobra.Command{
-		Use:     "sources-status",
-		Short:   "List AltData source status (used by v2 enrichment tasks)",
-		Example: `  altscore workflows-v2 sources-status --country ECU --status active`,
+		Use:   "sources-status",
+		Short: "List every AltData source version an altdata-enrichment node can use, one compact row each",
+		Long: `List the AltData source catalog that altdata-enrichment nodes reference.
+
+` + sourceListingHelp,
+		Example: `  # Every source version, compact (JSON on stdout, counts on stderr)
+  altscore workflows-v2 sources-status
+  altscore workflows-v2 sources-status --search registry
+  altscore workflows-v2 sources-status | jq -r '.[] | "\(.sourceId) \(.version) \(.name) \(.requiredInputs)"'
+
+  # Then ONE source's field paths
+  altscore altdata describe <sourceId>
+  altscore altdata dictionary <sourceId>
+
+  # Raw rows with outputSchema (hundreds of KB)
+  altscore workflows-v2 sources-status --full --search registry`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
 			if err != nil {
@@ -1892,30 +1909,55 @@ func makeWfv2SourcesStatusCmd() *cobra.Command {
 			if search != "" {
 				q.Set("search", search)
 			}
-			if page > 0 {
-				q.Set("page", strconv.Itoa(page))
-			}
-			if perPage > 0 {
-				q.Set("per-page", strconv.Itoa(perPage))
-			}
-			path := "/v2/workflows/sources-status"
-			if encoded := q.Encode(); encoded != "" {
-				path += "?" + encoded
-			}
-			data, _, err := c.Do("GET", "borrower_central", path, nil)
-			if err != nil {
-				return err
-			}
-			return output.RawJSON(data)
+			return sourceListing{filters: q, page: page, perPage: perPage, full: full}.run(c, cmd.ErrOrStderr())
 		},
 	}
 
-	cmd.Flags().StringVar(&status, "status", "", "filter by status")
-	cmd.Flags().StringVar(&country, "country", "", "filter by country")
-	cmd.Flags().StringVar(&search, "search", "", "free-text search")
-	cmd.Flags().IntVar(&page, "page", 0, "page (1-indexed)")
-	cmd.Flags().IntVar(&perPage, "per-page", 0, "page size")
+	cmd.Flags().StringVar(&status, "status", "", "filter by status, comma-separated (stderr counts what it hid)")
+	cmd.Flags().StringVar(&country, "country", "", "filter by the sourceId's country, comma-separated (never returns INT sources; stderr counts what it hid)")
+	cmd.Flags().StringVar(&search, "search", "", "free-text search across sourceId, version and name")
+	cmd.Flags().IntVar(&page, "page", 0, "read this page only instead of every page")
+	cmd.Flags().IntVar(&perPage, "per-page", 0, fmt.Sprintf("page size of the walk, or of --page (default %d)", defaultAltdataPerPage))
+	cmd.Flags().BoolVar(&full, "full", false, "print the raw rows, outputSchema and stats included")
 	return cmd
+}
+
+// A raw list item carries its whole graph; the compact row only says which workflow versions exist.
+var wfv2CompactList = &CompactList{
+	Fields: "id, alias, label, status, version, isLatest, updatedAt (one row per version)",
+	Row:    compactWorkflowRow,
+}
+
+type compactWorkflow struct {
+	ID        any `json:"id"`
+	Alias     any `json:"alias"`
+	Label     any `json:"label"`
+	Status    any `json:"status"`
+	Version   any `json:"version"`
+	IsLatest  any `json:"isLatest"`
+	UpdatedAt any `json:"updatedAt,omitempty"`
+}
+
+// A grouped item (--filter grouped=true) names id, alias and updatedAt primaryId, workflowAlias and lastModified.
+func compactWorkflowRow(item map[string]any) any {
+	return compactWorkflow{
+		ID:        firstNonNull(item, "id", "primaryId"),
+		Alias:     firstNonNull(item, "alias", "workflowAlias"),
+		Label:     item["label"],
+		Status:    item["status"],
+		Version:   item["version"],
+		IsLatest:  item["isLatest"],
+		UpdatedAt: firstNonNull(item, "updatedAt", "lastModified"),
+	}
+}
+
+func firstNonNull(item map[string]any, keys ...string) any {
+	for _, k := range keys {
+		if v := item[k]; v != nil {
+			return v
+		}
+	}
+	return nil
 }
 
 func makeWfv2ExternalSourcesStatusCmd() *cobra.Command {

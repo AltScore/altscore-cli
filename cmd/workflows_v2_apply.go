@@ -78,6 +78,16 @@ apply fetches the existing workflow (if any) and prints a per-section diff
 of metadata, tasks, edges, inputVariables, customVariables, and any entity-
 scope conflicts, keyed by real task alias. No API mutations.
 
+Every mode (--dry-run, --diff and a real apply) prints offline advisories to
+stderr before the apply request. The "[structure]" lines flag a decision made
+in Python instead of a rule-tree, variables a deep path or a literal replaces,
+oversized or self.-chained compute nodes, and object-returning variables; each
+names the node or variable and the fix. Advisories never change the exit code
+(see 'workflows-v2 lint --help'). One "# defaults applied" block then lists
+every value the run will use that the spec did not set (PDF report, decision
+recording, borrower wiring, persona, package aliases): confirm them with the
+user or set them in the spec, which silences the line.
+
 Spec format (see file header for full reference):
   - label, alias?, category, description, status (DRAFT default)
   - inputVariables, customVariables
@@ -203,6 +213,7 @@ End-node output (endConfig on the 'end' node):
 			if err != nil {
 				return err
 			}
+			printAppliedDefaults(cmd.ErrOrStderr(), capture.defaults)
 
 			flat, err := buildFlatSpecForServer(workflow, capture, targetAlias)
 			if err != nil {

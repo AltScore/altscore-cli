@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // Mirrors the Hub palette filter (ComponentsMenu.tsx CUSTOMER_HIDDEN_TYPES /
@@ -22,252 +23,17 @@ var dealHiddenTypes = map[string]bool{
 }
 
 // Fully local except at most one read-only lookup when a task type is unknown to
-// this build (fetchLiveTaskTypes). Fail-fast, so nothing caught here reaches the server.
+// this build (fetchLiveTaskTypes). Nothing caught here reaches the server, and every
+// independent problem lands in one error so a single dry-run shows them all.
 func preflightTasks(spec *composeSpec) error {
-	// These fail with opaque backend errors otherwise.
-	if err := checkWorkflowAlias(spec.Alias); err != nil {
-		return err
-	}
-	if err := checkWorkflowCategory(spec.Category); err != nil {
-		return err
-	}
-	for name, def := range spec.InputVariables {
-		dm, _ := def.(map[string]any)
-		if dm == nil {
-			continue
-		}
-		t, _ := dm["type"].(string)
-		if t == "" {
-			continue
-		}
-		if err := checkInputSchemaType(t, fmt.Sprintf("workflow.inputVariables.%s.type", name)); err != nil {
-			return err
-		}
-	}
-
-	// Collected upfront so forward references in inputMappings can be validated.
-	knownRefs := map[string]bool{}
-	knownAliases := map[string]bool{}
-	for i, task := range spec.Tasks {
-		ref := localRef(task, fmt.Sprintf("t%d", i))
-		if !validAliasPattern.MatchString(ref) {
-			return fmt.Errorf(
-				"node ref %q has invalid characters. Refs become server-assigned aliases (and nodeIds), "+
-					"so must be lowercase alphanumeric with internal dashes only "+
-					"(regex: ^[a-z0-9][a-z0-9-]*$). Don't use spaces, underscores, slashes, uppercase, or other punctuation.",
-				ref,
-			)
-		}
-		if knownRefs[ref] {
-			return fmt.Errorf(
-				"node duplicate ref %q -- two tasks share the same spec-local key. "+
-					"Compose's edge rewriter only records the LAST ref-to-alias mapping, so the earlier "+
-					"task ends up with no incident edges (silent orphan). Give each task a unique 'ref'.",
-				ref,
-			)
-		}
-		knownRefs[ref] = true
-		if alias, _ := task["alias"].(string); alias != "" {
-			if !validAliasPattern.MatchString(alias) {
-				return fmt.Errorf(
-					"node ref=%q: alias %q has invalid characters. Aliases end up in URL paths "+
-						"so must be lowercase alphanumeric with internal dashes only "+
-						"(regex: ^[a-z0-9][a-z0-9-]*$). "+
-						"Don't use spaces, slashes, uppercase, or punctuation.",
-					ref, alias,
-				)
-			}
-			if knownAliases[alias] {
-				return fmt.Errorf(
-					"node ref=%q: duplicate explicit alias %q -- two tasks declare the same alias. "+
-						"The second create either version-bumps the first or 409s. "+
-						"Either drop the alias on one (compose will pick a unique one) or pick distinct aliases.",
-					ref, alias,
-				)
-			}
-			knownAliases[alias] = true
-		}
-	}
-	startCount := 0
-	for i, node := range spec.ExtraNodes {
-		ref := localRef(node, fmt.Sprintf("n%d", i))
-		if !validAliasPattern.MatchString(ref) {
-			return fmt.Errorf(
-				"node ref %q has invalid characters. Refs become server-assigned aliases (and nodeIds), "+
-					"so must be lowercase alphanumeric with internal dashes only "+
-					"(regex: ^[a-z0-9][a-z0-9-]*$). Don't use spaces, underscores, slashes, uppercase, or other punctuation.",
-				ref,
-			)
-		}
-		if knownRefs[ref] {
-			return fmt.Errorf(
-				"node duplicate ref %q -- collides with another node's 'ref'. "+
-					"Give each node a unique 'ref'.",
-				ref,
-			)
-		}
-		knownRefs[ref] = true
-		// ExtraNodes only ever holds start nodes; the parse-time split guarantees it.
-		nodeType, _ := node["type"].(string)
-		if nodeType == "start" {
-			startCount++
-		}
-	}
-	if err := checkRefVariableCollisions(spec, knownRefs); err != nil {
-		return err
-	}
-	if startCount == 0 {
-		return fmt.Errorf(
-			"spec has no 'start' node. Every workflow needs exactly one start node; " +
-				"the engine doesn't know where to begin without it. Add " +
-				`{"ref": "start", "type": "start", "label": "Start"} to nodes[].`,
-		)
-	}
-	if startCount > 1 {
-		return fmt.Errorf(
-			"spec has %d 'start' nodes. Every workflow needs exactly ONE start; "+
-				"multiple starts make the engine's traversal non-deterministic. Drop the extras.",
-			startCount,
-		)
-	}
-	// End nodes come through the Tasks bucket post-split: they need an endConfig.
-	endInTasks := 0
-	for _, t := range spec.Tasks {
-		if tt, _ := t["type"].(string); tt == "end" {
-			endInTasks++
-		}
-	}
-	if endInTasks == 0 {
-		// Conventional but not required: some workflows terminate via exception branches.
-		fmt.Fprintln(os.Stderr,
-			"# warning: compose spec has no 'end' node. Most workflows need one for the engine to know where to terminate cleanly.")
-	}
-	if endInTasks > 1 {
-		// Checked here because the apply CREATE path never runs validateWorkflowV2Body.
-		return fmt.Errorf(
-			"spec has %d 'end' nodes. A workflow must have exactly ONE end node; "+
-				"converge all paths (conditional branches, relationship handles) to a single end.",
-			endInTasks,
-		)
-	}
-
-	// Advisory only: some workflows legitimately fail-fast on a bad-input branch, but
-	// a 'rejected' outcome routed to an exception makes every run read as a failure.
-	refType := map[string]string{}
-	for _, t := range spec.Tasks {
-		if r := localRef(t, ""); r != "" {
-			if tt, _ := t["type"].(string); tt != "" {
-				refType[r] = tt
-			}
-		}
-	}
-	for _, n := range spec.ExtraNodes {
-		if r := localRef(n, ""); r != "" {
-			if tt, _ := n["type"].(string); tt != "" {
-				refType[r] = tt
-			}
-		}
-	}
-	type advise struct{ srcRef, tgtRef, srcType string }
-	advisories := []advise{}
-	for _, e := range spec.Edges {
-		// This pass runs BEFORE edge normalization, so the from/to shortcut is resolved here.
-		src, _ := e["sourceNodeId"].(string)
-		if src == "" {
-			src, _ = e["from"].(string)
-		}
-		tgt, _ := e["targetNodeId"].(string)
-		if tgt == "" {
-			tgt, _ = e["to"].(string)
-		}
-		if src == "" || tgt == "" {
-			continue
-		}
-		st := refType[src]
-		tt := refType[tgt]
-		if st == "conditional" && tt == "exception" {
-			advisories = append(advisories, advise{src, tgt, st})
-		}
-	}
-	if len(advisories) > 0 {
-		fmt.Fprintf(os.Stderr,
-			"# advice: spec has %d branch edge(s) from a conditional targeting an exception task.\n"+
-				"# advice: exception tasks fail the workflow (isSuccess=false). For VALID decision outcomes\n"+
-				"# advice: like 'reject', 'manual_review', 'declined' -- which are expected business results,\n"+
-				"# advice: not errors -- prefer a separate end node per branch, each with its own\n"+
-				"# advice: endConfig.decisionConfig.enabled=true so the decision is recorded via\n"+
-				"# advice: /v1/executions/{id}/decisions. See 'workflows-v2 schema-guide terminationPatterns'.\n"+
-				"# advice: Reserve exception tasks for genuine error paths (missing required input, upstream\n"+
-				"# advice: HTTP 5xx, unrecoverable state) where the workflow truly could not complete.\n",
-			len(advisories))
-		for _, a := range advisories {
-			fmt.Fprintf(os.Stderr, "# advice:   %s (%s) -> %s (exception)\n", a.srcRef, a.srcType, a.tgtRef)
-		}
-	}
-
-	seenEdges := map[string]bool{}
-	for i, edge := range spec.Edges {
-		for k := range edge {
-			if !validEdgeKeys[k] {
-				hint := ""
-				if k == "branchName" || k == "branch_name" || k == "branch" {
-					hint = " (use 'sourceHandle' instead -- conditional branches are wired by branch_<idx> or 'branch-else')"
-				} else if k == "fromHandle" {
-					hint = " (did you mean 'sourceHandle'?)"
-				} else if k == "toHandle" {
-					hint = " (did you mean 'targetHandle'?)"
-				}
-				return fmt.Errorf("edges[%d]: unknown key %q%s. Valid keys: from, to, sourceNodeId, targetNodeId, sourceHandle, targetHandle, label, id.", i, k, hint)
-			}
-		}
-		from, _ := edge["from"].(string)
-		to, _ := edge["to"].(string)
-		if from == "" {
-			from, _ = edge["sourceNodeId"].(string)
-		}
-		if to == "" {
-			to, _ = edge["targetNodeId"].(string)
-		}
-		if from == "" || to == "" {
-			return fmt.Errorf("edges[%d]: missing 'from'/'to' (or sourceNodeId/targetNodeId)", i)
-		}
-		// An explicit-alias edge may target a server-style alias absent from knownRefs.
-		if !isServerAlias(from) && !knownRefs[from] {
-			return fmt.Errorf(
-				"edges[%d]: 'from'=%q is not a known ref. Known refs: %s.",
-				i, from, strings.Join(sortedKeys(knownRefs), ", "),
-			)
-		}
-		if !isServerAlias(to) && !knownRefs[to] {
-			return fmt.Errorf(
-				"edges[%d]: 'to'=%q is not a known ref. Known refs: %s.",
-				i, to, strings.Join(sortedKeys(knownRefs), ", "),
-			)
-		}
-		if from == to {
-			return fmt.Errorf(
-				"edges[%d]: self-loop on %q -- a node can't be its own source AND target. "+
-					"Almost always a copy-paste bug; if it's intentional, build the cycle through an intermediate node.",
-				i, from,
-			)
-		}
-		handle, _ := edge["sourceHandle"].(string)
-		key := from + "|" + handle + "->" + to
-		if seenEdges[key] {
-			return fmt.Errorf(
-				"edges[%d]: duplicate edge %s->%s (same sourceHandle %q). "+
-					"Drop the duplicate; the workflow graph already has it.",
-				i, from, to, handle,
-			)
-		}
-		seenEdges[key] = true
-	}
+	knownRefs, problems := preflightSpecShape(spec)
 
 	// Fetched at most once, so an older CLI still accepts types the backend gained later.
 	var liveTaskTypes map[string]bool
 	liveTypesFetched := false
 
-	for i, task := range spec.Tasks {
+	// Node-local: each task stops at its own first problem, and every task is checked.
+	checkTask := func(i int, task map[string]any) error {
 		ref := localRef(task, fmt.Sprintf("t%d", i))
 		label, _ := task["label"].(string)
 		taskType, _ := task["type"].(string)
@@ -362,14 +128,13 @@ func preflightTasks(spec *composeSpec) error {
 			// BC validates documentExtractionConfig at RUN time only, so an apply that ships
 			// one of these mistakes returns 201 and fails only when a workflow executes it.
 			cfg := asMap(task["documentExtractionConfig"])
+			// Schema and source are independent, so both are reported in one pass.
+			var missing []string
 			if len(asMap(cfg["extractionSchema"])) == 0 {
-				return fmt.Errorf(
-					"node ref=%q: document-extraction task requires a non-empty "+
-						"documentExtractionConfig.extractionSchema (a JSON Schema with type 'object' "+
+				missing = append(missing,
+					"requires a non-empty documentExtractionConfig.extractionSchema (a JSON Schema with type 'object' "+
 						"and at least one entry in 'properties') -- it is the contract the provider "+
-						"is asked to fill, and an empty one fails at run time, not on write",
-					ref,
-				)
+						"is asked to fill, and an empty one fails at run time, not on write")
 			}
 			// The source arrives either as a config value or an inputMappings entry (either
 			// spelling), so both have to count.
@@ -389,12 +154,13 @@ func preflightTasks(spec *composeSpec) error {
 				}
 			}
 			if len(sources) == 0 {
-				return fmt.Errorf(
-					"node ref=%q: document-extraction task requires exactly one document source. "+
+				missing = append(missing,
+					"requires exactly one document source. "+
 						"Set documentUrl, documentBase64 or rawText in documentExtractionConfig, or wire "+
-						"one of those keys through inputMappings to an upstream output",
-					ref,
-				)
+						"one of those keys through inputMappings to an upstream output")
+			}
+			if len(missing) > 0 {
+				return fmt.Errorf("node ref=%q: document-extraction task %s", ref, strings.Join(missing, "; it also "))
 			}
 			if len(sources) > 1 {
 				return fmt.Errorf(
@@ -862,33 +628,328 @@ func preflightTasks(spec *composeSpec) error {
 				}
 			}
 		}
+		return nil
+	}
+	shapeOK := len(problems) == 0
+	for i, task := range spec.Tasks {
+		if err := checkTask(i, task); err != nil {
+			problems = append(problems, err)
+		}
+	}
+	// The graph checks need sound edges: an edge still naming a renamed ref would make
+	// its node read as unreachable, a second report of the same mistake.
+	if shapeOK {
+		problems = append(problems, preflightGraphReachability(spec, knownRefs)...)
+	}
+	if len(problems) > 0 {
+		return joinPreflightProblems(problems)
+	}
+	adviseConditionalToException(spec)
+	return nil
+}
+
+// Spec-wide checks: workflow fields, node identity, start/end counts and edges. None
+// depends on another passing, so every one that fails is returned.
+func preflightSpecShape(spec *composeSpec) (map[string]bool, []error) {
+	var problems []error
+	add := func(err error) {
+		if err != nil {
+			problems = append(problems, err)
+		}
+	}
+	// These fail with opaque backend errors otherwise.
+	add(checkWorkflowAlias(spec.Alias))
+	add(checkWorkflowCategory(spec.Category))
+	inputNames := make([]string, 0, len(spec.InputVariables))
+	for name := range spec.InputVariables {
+		inputNames = append(inputNames, name)
+	}
+	sort.Strings(inputNames)
+	for _, name := range inputNames {
+		dm, _ := spec.InputVariables[name].(map[string]any)
+		if t, _ := dm["type"].(string); t != "" {
+			add(checkInputSchemaType(t, fmt.Sprintf("workflow.inputVariables.%s.type", name)))
+		}
 	}
 
-	// Caught here rather than by lint post-publish, which costs a publish round-trip.
+	// Collected upfront so forward references in inputMappings can be validated.
+	knownRefs := map[string]bool{}
+	knownAliases := map[string]bool{}
+	var badRefs []string
+	var identity []error
+	for i, task := range spec.Tasks {
+		ref := localRef(task, fmt.Sprintf("t%d", i))
+		if !validAliasPattern.MatchString(ref) {
+			badRefs = append(badRefs, ref)
+		}
+		if knownRefs[ref] {
+			identity = append(identity, fmt.Errorf(
+				"node duplicate ref %q -- two tasks share the same spec-local key. "+
+					"Compose's edge rewriter only records the LAST ref-to-alias mapping, so the earlier "+
+					"task ends up with no incident edges (silent orphan). Give each task a unique 'ref'.",
+				ref,
+			))
+		}
+		knownRefs[ref] = true
+		if alias, _ := task["alias"].(string); alias != "" {
+			if !validAliasPattern.MatchString(alias) {
+				identity = append(identity, fmt.Errorf(
+					"node ref=%q: alias %q has invalid characters. Aliases end up in URL paths "+
+						"so must be lowercase alphanumeric with internal dashes only "+
+						"(regex: ^[a-z0-9][a-z0-9-]*$). "+
+						"Don't use spaces, slashes, uppercase, or punctuation.",
+					ref, alias,
+				))
+			}
+			if knownAliases[alias] {
+				identity = append(identity, fmt.Errorf(
+					"node ref=%q: duplicate explicit alias %q -- two tasks declare the same alias. "+
+						"The second create either version-bumps the first or 409s. "+
+						"Either drop the alias on one (compose will pick a unique one) or pick distinct aliases.",
+					ref, alias,
+				))
+			}
+			knownAliases[alias] = true
+		}
+	}
+	startCount := 0
+	for i, node := range spec.ExtraNodes {
+		ref := localRef(node, fmt.Sprintf("n%d", i))
+		if !validAliasPattern.MatchString(ref) {
+			badRefs = append(badRefs, ref)
+		}
+		if knownRefs[ref] {
+			identity = append(identity, fmt.Errorf(
+				"node duplicate ref %q -- collides with another node's 'ref'. "+
+					"Give each node a unique 'ref'.",
+				ref,
+			))
+		}
+		knownRefs[ref] = true
+		// ExtraNodes only ever holds start nodes; the parse-time split guarantees it.
+		if nodeType, _ := node["type"].(string); nodeType == "start" {
+			startCount++
+		}
+	}
+	problems = append(problems, invalidRefProblems(badRefs, knownRefs)...)
+	problems = append(problems, identity...)
+	add(checkRefVariableCollisions(spec, knownRefs))
+	if startCount == 0 {
+		add(fmt.Errorf(
+			"spec has no 'start' node. Every workflow needs exactly one start node; " +
+				"the engine doesn't know where to begin without it. Add " +
+				`{"ref": "start", "type": "start", "label": "Start"} to nodes[].`,
+		))
+	}
+	if startCount > 1 {
+		add(fmt.Errorf(
+			"spec has %d 'start' nodes. Every workflow needs exactly ONE start; "+
+				"multiple starts make the engine's traversal non-deterministic. Drop the extras.",
+			startCount,
+		))
+	}
+	// End nodes come through the Tasks bucket post-split: they need an endConfig.
+	var endRefs []string
+	for i, t := range spec.Tasks {
+		if tt, _ := t["type"].(string); tt == "end" {
+			endRefs = append(endRefs, localRef(t, fmt.Sprintf("t%d", i)))
+		}
+	}
+	if len(endRefs) == 0 {
+		// Conventional but not required: some workflows terminate via exception branches.
+		fmt.Fprintln(os.Stderr,
+			"# warning: compose spec has no 'end' node. Most workflows need one for the engine to know where to terminate cleanly.")
+	}
+	if len(endRefs) > 1 {
+		// Checked here because the apply CREATE path never runs validateWorkflowV2Body.
+		add(fmt.Errorf(
+			"spec has %d 'end' nodes (%s). A workflow must have exactly ONE end node; "+
+				"converge all paths (conditional branches, relationship handles) to a single end: keep one, "+
+				"point the other ends' edges at it, and let decision_key (from a rule-tree) carry the outcome.",
+			len(endRefs), strings.Join(endRefs, ", "),
+		))
+	}
+
+	problems = append(problems, edgeProblems(spec, knownRefs)...)
+	problems = append(problems, missingReturnValueProblems(spec.CustomVariables)...)
+	return knownRefs, problems
+}
+
+var pyAssignedNameRegex = regexp.MustCompile(`(?m)^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(?:[^=]|$)`)
+
+// Mirrors BC's CUSTOM_VAR_MISSING_RETURN_VALUE so it arrives with the other problems
+// instead of one dry-run later. An expression with no `=` is a bare literal whose
+// returnValue the assembly fills in, so it is skipped here exactly as the server sees it.
+func missingReturnValueProblems(customVars map[string]any) []error {
+	names := make([]string, 0, len(customVars))
+	for name := range customVars {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var problems []error
+	for _, name := range names {
+		v, _ := customVars[name].(map[string]any)
+		expression, _ := v["expression"].(string)
+		returnValue, _ := v["returnValue"].(string)
+		if strings.TrimSpace(expression) == "" || strings.TrimSpace(returnValue) != "" || !strings.Contains(expression, "=") {
+			continue
+		}
+		assigned := map[string]bool{}
+		for _, m := range pyAssignedNameRegex.FindAllStringSubmatch(expression, -1) {
+			assigned[m[1]] = true
+		}
+		hint := ""
+		if assigned["result"] {
+			hint = ` (e.g. "result")`
+		} else if len(assigned) == 1 {
+			for only := range assigned {
+				hint = fmt.Sprintf(" (e.g. %q)", only)
+			}
+		}
+		problems = append(problems, fmt.Errorf(
+			"customVariables[%q]: returnValue is empty, so the runtime wraps the expression with `return None` "+
+				"and the variable always outputs null. Set returnValue to the name of the variable the expression assigns%s.",
+			name, hint,
+		))
+	}
+	return problems
+}
+
+func edgeProblems(spec *composeSpec, knownRefs map[string]bool) []error {
+	var problems []error
+	seenEdges := map[string]bool{}
+	for i, edge := range spec.Edges {
+		keys := make([]string, 0, len(edge))
+		for k := range edge {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if validEdgeKeys[k] {
+				continue
+			}
+			hint := ""
+			if k == "branchName" || k == "branch_name" || k == "branch" {
+				hint = " (use 'sourceHandle' instead -- conditional branches are wired by branch_<idx> or 'branch-else')"
+			} else if k == "fromHandle" {
+				hint = " (did you mean 'sourceHandle'?)"
+			} else if k == "toHandle" {
+				hint = " (did you mean 'targetHandle'?)"
+			}
+			problems = append(problems, fmt.Errorf("edges[%d]: unknown key %q%s. Valid keys: from, to, sourceNodeId, targetNodeId, sourceHandle, targetHandle, label, id.", i, k, hint))
+		}
+		from, _ := edge["from"].(string)
+		to, _ := edge["to"].(string)
+		if from == "" {
+			from, _ = edge["sourceNodeId"].(string)
+		}
+		if to == "" {
+			to, _ = edge["targetNodeId"].(string)
+		}
+		if from == "" || to == "" {
+			problems = append(problems, fmt.Errorf("edges[%d]: missing 'from'/'to' (or sourceNodeId/targetNodeId)", i))
+			continue
+		}
+		// An explicit-alias edge may target a server-style alias absent from knownRefs.
+		if !isServerAlias(from) && !knownRefs[from] {
+			problems = append(problems, fmt.Errorf(
+				"edges[%d]: 'from'=%q is not a known ref. Known refs: %s.",
+				i, from, strings.Join(sortedKeys(knownRefs), ", "),
+			))
+		}
+		if !isServerAlias(to) && !knownRefs[to] {
+			problems = append(problems, fmt.Errorf(
+				"edges[%d]: 'to'=%q is not a known ref. Known refs: %s.",
+				i, to, strings.Join(sortedKeys(knownRefs), ", "),
+			))
+		}
+		if from == to {
+			problems = append(problems, fmt.Errorf(
+				"edges[%d]: self-loop on %q -- a node can't be its own source AND target. "+
+					"Almost always a copy-paste bug; if it's intentional, build the cycle through an intermediate node.",
+				i, from,
+			))
+			continue
+		}
+		handle, _ := edge["sourceHandle"].(string)
+		key := from + "|" + handle + "->" + to
+		if seenEdges[key] {
+			problems = append(problems, fmt.Errorf(
+				"edges[%d]: duplicate edge %s->%s (same sourceHandle %q). "+
+					"Drop the duplicate; the workflow graph already has it.",
+				i, from, to, handle,
+			))
+		}
+		seenEdges[key] = true
+	}
+	return problems
+}
+
+// One entry per bad ref, each with a spelling that is valid and not already taken.
+func invalidRefProblems(badRefs []string, knownRefs map[string]bool) []error {
+	taken := map[string]bool{}
+	for r := range knownRefs {
+		if validAliasPattern.MatchString(r) {
+			taken[r] = true
+		}
+	}
+	reported := map[string]bool{}
+	var problems []error
+	for _, ref := range badRefs {
+		if reported[ref] {
+			continue
+		}
+		reported[ref] = true
+		base := kebabRef(ref)
+		fix := base
+		for n := 2; taken[fix]; n++ {
+			fix = fmt.Sprintf("%s-%d", base, n)
+		}
+		taken[fix] = true
+		problems = append(problems, fmt.Errorf(
+			"node ref %q has invalid characters: use %q, and rename it in edges[] (from/to) and every reference too "+
+				"(task_outputs.%s.*). Refs become task aliases and nodeIds, so they must match ^[a-z0-9][a-z0-9-]*$ "+
+				"(kebab-case: no underscores, uppercase or spaces).",
+			ref, fix, ref,
+		))
+	}
+	return problems
+}
+
+// camelCase splits at the case change so "identityGate" reads "identity-gate", not "identitygate".
+func kebabRef(ref string) string {
+	var b strings.Builder
+	var prev rune
+	for _, r := range ref {
+		if unicode.IsUpper(r) && (unicode.IsLower(prev) || unicode.IsDigit(prev)) {
+			b.WriteByte('-')
+		}
+		b.WriteRune(r)
+		prev = r
+	}
+	return slugifyWorkflowLabel(b.String())
+}
+
+// Caught here rather than by lint post-publish, which costs a publish round-trip.
+func preflightGraphReachability(spec *composeSpec, knownRefs map[string]bool) []error {
+	var problems []error
 	connected := map[string]bool{}
 	for _, edge := range spec.Edges {
-		if from, _ := edge["from"].(string); from != "" {
-			connected[from] = true
-		} else if from, _ := edge["sourceNodeId"].(string); from != "" {
-			connected[from] = true
-		}
-		if to, _ := edge["to"].(string); to != "" {
-			connected[to] = true
-		} else if to, _ := edge["targetNodeId"].(string); to != "" {
-			connected[to] = true
-		}
+		from, to := edgeEndpoints(edge)
+		connected[from] = true
+		connected[to] = true
 	}
 	for i, task := range spec.Tasks {
 		ref := localRef(task, fmt.Sprintf("t%d", i))
 		taskType, _ := task["type"].(string)
 		if !connected[ref] {
-			return fmt.Errorf(
+			problems = append(problems, fmt.Errorf(
 				"tasks[%d] (ref=%q, type=%q) has no incident edges -- it's unreachable. "+
 					"Add at least one 'edges' entry connecting %q to the rest of the graph, "+
 					"or remove the task. (Standalone annotations belong in the top-level "+
 					"'notes' array, not as graph nodes.)",
 				i, ref, taskType, ref,
-			)
+			))
 		}
 	}
 
@@ -896,11 +957,13 @@ func preflightTasks(spec *composeSpec) error {
 	for i, task := range spec.Tasks {
 		ref := localRef(task, fmt.Sprintf("t%d", i))
 		im, _ := task["inputMappings"].(map[string]any)
-		if im == nil {
-			continue
+		keys := make([]string, 0, len(im))
+		for k := range im {
+			keys = append(keys, k)
 		}
-		for k, v := range im {
-			s, _ := v.(string)
+		sort.Strings(keys)
+		for _, k := range keys {
+			s, _ := im[k].(string)
 			if s == "" || strings.HasPrefix(strings.TrimSpace(s), "{{") {
 				continue
 			}
@@ -913,23 +976,100 @@ func preflightTasks(spec *composeSpec) error {
 				continue
 			}
 			if middle == ref {
-				return fmt.Errorf(
+				problems = append(problems, fmt.Errorf(
 					"node ref=%q: inputMappings[%q]=%q references its own output -- "+
 						"a task cannot consume its own task_outputs.<self>. Did you mean a different ref?",
 					ref, k, s,
-				)
+				))
+				continue
 			}
 			if !ancestors[ref][middle] {
-				return fmt.Errorf(
+				problems = append(problems, fmt.Errorf(
 					"node ref=%q: inputMappings[%q]=%q references task_outputs.%s.* but "+
 						"%q is not an ancestor of %q in the edge graph (it doesn't run before this task). "+
 						"At runtime task_outputs.%s won't exist yet -- add an edge from %q to %q (directly or transitively) or remove the mapping.",
 					ref, k, s, middle, middle, ref, middle, middle, ref,
-				)
+				))
 			}
 		}
 	}
-	return nil
+	return problems
+}
+
+type preflightProblems []error
+
+func (p preflightProblems) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "spec has %d problems, all found before the apply request was sent; fix every one, then dry-run again:", len(p))
+	for i, err := range p {
+		fmt.Fprintf(&b, "\n  %d. %s", i+1, err)
+	}
+	return b.String()
+}
+
+func (p preflightProblems) Unwrap() []error { return p }
+
+// A single problem keeps its own message, so the common case reads exactly as before.
+func joinPreflightProblems(problems []error) error {
+	if len(problems) == 1 {
+		return problems[0]
+	}
+	return preflightProblems(problems)
+}
+
+// Advisory only: some workflows legitimately fail-fast on a bad-input branch, but
+// a 'rejected' outcome routed to an exception makes every run read as a failure.
+func adviseConditionalToException(spec *composeSpec) {
+	refType := map[string]string{}
+	for _, t := range spec.Tasks {
+		if r := localRef(t, ""); r != "" {
+			if tt, _ := t["type"].(string); tt != "" {
+				refType[r] = tt
+			}
+		}
+	}
+	for _, n := range spec.ExtraNodes {
+		if r := localRef(n, ""); r != "" {
+			if tt, _ := n["type"].(string); tt != "" {
+				refType[r] = tt
+			}
+		}
+	}
+	type advise struct{ srcRef, tgtRef, srcType string }
+	advisories := []advise{}
+	for _, e := range spec.Edges {
+		// This pass runs BEFORE edge normalization, so the from/to shortcut is resolved here.
+		src, _ := e["sourceNodeId"].(string)
+		if src == "" {
+			src, _ = e["from"].(string)
+		}
+		tgt, _ := e["targetNodeId"].(string)
+		if tgt == "" {
+			tgt, _ = e["to"].(string)
+		}
+		if src == "" || tgt == "" {
+			continue
+		}
+		if refType[src] == "conditional" && refType[tgt] == "exception" {
+			advisories = append(advisories, advise{src, tgt, refType[src]})
+		}
+	}
+	if len(advisories) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"# advice: spec has %d branch edge(s) from a conditional targeting an exception task.\n"+
+			"# advice: exception tasks fail the workflow (isSuccess=false). For VALID decision outcomes\n"+
+			"# advice: like 'reject', 'manual_review', 'declined' -- which are expected business results,\n"+
+			"# advice: not errors -- route the branch to the workflow's single end node and let decision_key\n"+
+			"# advice: (from a rule-tree) carry the outcome, with endConfig.decisionConfig.enabled=true so it is\n"+
+			"# advice: recorded via /v1/executions/{id}/decisions. See 'workflows-v2 schema-guide terminationPatterns'.\n"+
+			"# advice: Reserve exception tasks for genuine error paths (missing required input, upstream\n"+
+			"# advice: HTTP 5xx, unrecoverable state) where the workflow truly could not complete.\n",
+		len(advisories))
+	for _, a := range advisories {
+		fmt.Fprintf(os.Stderr, "# advice:   %s (%s) -> %s (exception)\n", a.srcRef, a.srcType, a.tgtRef)
+	}
 }
 
 func mappingHeadAndMiddle(s string) (head, middle string) {
@@ -1100,8 +1240,8 @@ func lintOutputJsonObjectRefs(spec *composeSpec) {
 	}
 }
 
-// Advisory only: multiple ends per branch, no PDF and no decision recording are
-// all legal shapes.
+// Advisory only: no PDF and no decision recording are legal shapes. More than one end
+// is not, and preflightSpecShape has already refused it.
 func lintCanonicalEndNode(spec *composeSpec) {
 	var ruleTreeRefs []string
 	for _, t := range spec.Tasks {
@@ -1132,19 +1272,14 @@ func lintCanonicalEndNode(spec *composeSpec) {
 
 		endCfg, _ := t["endConfig"].(map[string]any)
 		decisionEnabled := false
-		pdfEnabled := false
 		if endCfg != nil {
 			if dc, ok := endCfg["decisionConfig"].(map[string]any); ok {
 				if en, ok := dc["enabled"].(bool); ok && en {
 					decisionEnabled = true
 				}
 			}
-			if pc, ok := endCfg["pdfConfig"].(map[string]any); ok {
-				if en, ok := pc["enabled"].(bool); ok && en {
-					pdfEnabled = true
-				}
-			}
 		}
+		pdfEnabled, _ := endPdfSetting(t)
 
 		if hasDecisionKeyMapping && decisionEnabled && pdfEnabled {
 			continue
@@ -1168,7 +1303,7 @@ func lintCanonicalEndNode(spec *composeSpec) {
 
 		fmt.Fprintf(os.Stderr,
 			"# warning: end task %q is not wired as a canonical single-end node "+
-				"-- missing: %s. The canonical pattern collapses conditional+N-ends into ONE "+
+				"-- missing: %s. The canonical pattern is ONE "+
 				"end node fed directly by the rule-tree, where decision_key tracks the "+
 				"rule-tree's own output. BC's end_activity then auto-records the per-run "+
 				"decision (currentDecision.key) and renders the PDF, so you don't have to "+
@@ -1177,7 +1312,7 @@ func lintCanonicalEndNode(spec *composeSpec) {
 				"#   inputMappings: { ..., \"decision_key\": %q }\n"+
 				"#   endConfig.decisionConfig: { \"enabled\": true, \"decisionType\": \"final\" }\n"+
 				"#   endConfig.pdfConfig: { \"enabled\": true, ... }\n"+
-				"# (advisory; multiple ends + no-PDF + no-decision shapes are still legal).\n",
+				"# (advisory; no-PDF and no-decision shapes are still legal).\n",
 			endRef, strings.Join(missing, ", "), sourceHint,
 		)
 	}

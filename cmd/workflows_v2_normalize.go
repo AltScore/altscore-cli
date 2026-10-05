@@ -148,7 +148,7 @@ func validateTaskV2Body(body json.RawMessage, existingTypes map[string]bool) err
 func errAltdataMissingInputKeys(cause error) error {
 	return fmt.Errorf(
 		"altdata-enrichment task with non-empty sourcesConfig but empty inputKeys, and the CLI could not derive them (%w) -- "+
-			"the Hub UI will show an unwired source. Run 'altscore workflows-v2 sources-status --filter id=<SOURCE_ID>' "+
+			"the Hub UI will show an unwired source. Run 'altscore altdata describe <SOURCE_ID>' "+
 			"to see the source's required inputFields, then add an inputKeys entry per field, "+
 			`e.g. inputKeys: {"personId": "{{personId}}"}.`, cause)
 }
@@ -335,6 +335,8 @@ type composeNormalizeOpts struct {
 	AllowStealOwnership bool
 	// AutoDefaults fills only absent fields -- caller-supplied values always win.
 	AutoDefaults bool
+	// Defaults records every value a normalizer fills that the spec did not set; nil records nothing.
+	Defaults *appliedDefaults
 }
 
 // Dry-runs neither error nor warn: agents iterating on a spec are not expected
@@ -411,7 +413,7 @@ func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNorma
 	taskType, _ := task["type"].(string)
 	switch taskType {
 	case "altdata-enrichment":
-		return normalizeAltdataTask(c, task, dryRun)
+		return normalizeAltdataTask(c, task, opts, dryRun)
 	// compute-variables needs no case: BC derives its outputSchema server-side.
 	case "conditional":
 		return normalizeConditionalTask(task)
@@ -551,7 +553,7 @@ func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bo
 
 // dataAge is deliberately not defaulted (a test asserts it): an authored value
 // overrides the freshness the source publishes, which is right for almost no node.
-func applyAltdataSourceDefaults(sources []any) []any {
+func applyAltdataSourceDefaults(sources []any, ref string, applied *appliedDefaults) []any {
 	for i, s := range sources {
 		sm, ok := s.(map[string]any)
 		if !ok {
@@ -559,7 +561,9 @@ func applyAltdataSourceDefaults(sources []any) []any {
 		}
 		if _, has := sm["packageAlias"]; !has {
 			if sid, _ := sm["sourceId"].(string); sid != "" {
-				sm["packageAlias"] = strings.ToLower(strings.ReplaceAll(sid, "-", "_"))
+				alias := strings.ToLower(strings.ReplaceAll(sid, "-", "_"))
+				sm["packageAlias"] = alias
+				applied.add(ref, fmt.Sprintf("sourcesConfig[%s].packageAlias", sid), alias, "the source's results are stored under this package alias")
 			}
 		}
 		sources[i] = sm
@@ -567,7 +571,7 @@ func applyAltdataSourceDefaults(sources []any) []any {
 	return sources
 }
 
-func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) error {
+func normalizeAltdataTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	sources := asSlice(task["sourcesConfig"])
 	if len(sources) == 0 {
 		return nil
@@ -575,7 +579,7 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 
 	inputKeys := asMap(task["inputKeys"])
 
-	task["sourcesConfig"] = applyAltdataSourceDefaults(sources)
+	task["sourcesConfig"] = applyAltdataSourceDefaults(sources, defaultsRef(task), opts.Defaults)
 
 	// The runtime reads each source's required fields from inputKeys; omitting the
 	// map ships a source nobody wired.
@@ -683,10 +687,13 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 // Separates a genuinely bad reference from a transport blip, which callers tolerate.
 var errSourceNotFound = errors.New("source not found in any catalog")
 
+// One path, so apply and the altdata lookups share fetchSourceCatalog's cache entry.
+const altdataSourcesStatusPath = "/v2/workflows/sources-status?per-page=200"
+
 // The union of both catalogs is what a node may reference; the microservice is
 // first so its entry wins when an id exists in both.
 var sourceStatusCatalogs = []string{
-	"/v2/workflows/sources-status?per-page=200",
+	altdataSourcesStatusPath,
 	"/v2/workflows/external-sources-status",
 }
 
@@ -756,21 +763,32 @@ func fetchSourceCatalog(c *client.Client, path string) ([]map[string]any, error)
 	if cached, ok := sourceCatalogListCache[path]; ok {
 		return cached, nil
 	}
+	sources, err := fetchEveryPage(c, "borrower_central", path, sourceRowKey)
+	if err != nil {
+		return nil, err
+	}
+	sourceCatalogListCache[path] = sources
+	return sources, nil
+}
+
+// fetchEveryPage walks a paginated list endpoint for fetchSourceCatalog and the compact
+// listings. rowKey names a row stably across two reads (no volatile stats), so the
+// repeated-page check survives a field that changed between requests.
+func fetchEveryPage(c *client.Client, module, path string, rowKey func(map[string]any) string) ([]map[string]any, error) {
 	target, err := url.Parse(path)
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	perPage, _ := strconv.Atoi(target.Query().Get("per-page"))
-	var sources []map[string]any
+	rows := []map[string]any{}
 	previousPage := ""
-	complete := false
 	for page := 1; page <= maxCatalogPages; page++ {
 		if perPage > 0 {
 			q := target.Query()
 			q.Set("page", strconv.Itoa(page))
 			target.RawQuery = q.Encode()
 		}
-		data, _, err := c.Do("GET", "borrower_central", target.String(), nil)
+		data, _, err := c.Do("GET", module, target.String(), nil)
 		if err != nil {
 			return nil, err
 		}
@@ -779,31 +797,30 @@ func fetchSourceCatalog(c *client.Client, path string) ([]map[string]any, error)
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
 		// Compared on every row, so a page whose first row merely coincides is still kept.
-		key := catalogPageKey(batch)
+		key := pageKey(batch, rowKey)
 		if page > 1 && key == previousPage {
-			complete = true // the backend ignored `page` and answered the same page again
-			break
+			return rows, nil // the backend ignored `page` and answered the same page again
 		}
-		sources = append(sources, batch...)
+		rows = append(rows, batch...)
 		if perPage <= 0 || len(batch) < perPage {
-			complete = true
-			break
+			return rows, nil
 		}
 		previousPage = key
 	}
-	if !complete {
-		return nil, fmt.Errorf("fetch %s: catalog exceeds %d pages", path, maxCatalogPages)
-	}
-	sourceCatalogListCache[path] = sources
-	return sources, nil
+	return nil, fmt.Errorf("fetch %s: list exceeds %d pages", path, maxCatalogPages)
 }
 
-func catalogPageKey(batch []map[string]any) string {
+func pageKey(batch []map[string]any, rowKey func(map[string]any) string) string {
 	var b strings.Builder
 	for _, row := range batch {
-		fmt.Fprint(&b, row["sourceId"], "|", row["sourceVersion"], "\n")
+		b.WriteString(rowKey(row))
+		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+func sourceRowKey(row map[string]any) string {
+	return fmt.Sprint(row["sourceId"], "|", row["sourceVersion"])
 }
 
 func lookupAltdataSourceInputFields(c *client.Client, sourceID, version string, dryRun bool) ([]string, error) {
@@ -1504,6 +1521,7 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 		opts = &composeNormalizeOpts{}
 	}
 	taskType, _ := task["type"].(string)
+	ref := defaultsRef(task)
 
 	// The contact's borrower upsert keys on identity_key + identity_value, so a
 	// contact carrying only e.g. tax_id would resolve to a null identity.
@@ -1517,12 +1535,14 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 			if strings.TrimSpace(identityKey) == "" {
 				identityKey = "tax_id"
 				contact["identity_key"] = identityKey
+				opts.Defaults.add(ref, fmt.Sprintf("contacts[id=%v].identity_key", contact["id"]), identityKey, "the contact's borrower is matched on this identity")
 			}
 			if iv, _ := contact["identity_value"].(string); strings.TrimSpace(iv) != "" {
 				continue
 			}
 			if src, _ := contact[identityKey].(string); strings.TrimSpace(src) != "" {
 				contact["identity_value"] = src
+				opts.Defaults.add(ref, fmt.Sprintf("contacts[id=%v].identity_value", contact["id"]), src, "copied from the contact's "+identityKey)
 			} else {
 				fmt.Fprintf(os.Stderr,
 					"# warning: deal contact id=%v has no identity_value and no %q field to source it from; "+
@@ -1563,6 +1583,7 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 		} else if !hasPersonaMapping {
 			if v, ok := task["persona"].(string); !ok || strings.TrimSpace(v) == "" {
 				task["persona"] = "individual"
+				opts.Defaults.add(ref, "persona", "individual", "the borrower is written as an individual, not a business")
 			}
 		}
 		// (persona wired to a non-input source, e.g. custom.* -> leave as-is)

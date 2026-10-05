@@ -15,6 +15,7 @@ import (
 type composeCapture struct {
 	tasks       map[string]json.RawMessage
 	refByNodeID map[string]string
+	defaults    appliedDefaults
 }
 
 func newComposeCapture() *composeCapture {

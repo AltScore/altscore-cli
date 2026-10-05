@@ -44,8 +44,8 @@ Every one of these is cheaper to read than to ask, and it turns the intake from 
 | Whether v2 work already exists there | `altscore workflows-v2 list --filter is-latest=true` — an in-flight migration has DRAFTs |
 | What v1 is still running | `altscore workflows list`, and the v1 executions behind it (they are the parity corpus) |
 | Which workflows the legacy repo defines | the repo itself, once you know where it is: the v1 evaluator modules and their entry points |
-| Sources, decision keys, data models available in the target tenant | `sources-status --status active`, `decisions list`, `data-models list` |
-| The tenant's house style for output shape and write targets | `workflows-v2 export <closest sibling id> --format apply-spec` |
+| Sources, decision keys, data models available in the target tenant | `sources-status` (compact, every source version), `decisions list`, `data-models list` |
+| The tenant's house style for output shape and write targets | the closest sibling's skeleton, read with jq as in [workflows-v2](workflows-v2.md#discovery-before-authoring-a-guided-question-path-infer-first-then-ask-in-short-rounds), never the whole export |
 
 #### Step 2 — the intake round (AskUserQuestion)
 
@@ -65,7 +65,7 @@ Then restate what you got in one line — tenant, repo, workflows, scope — and
 
 **Do not ask** for anything in the Step 1 table, and do not ask the business-policy questions that belong to greenfield authoring. A migration has an answer for all of them already: the v1 repo is the source of truth for thresholds, messages, hard stops and output shape, and inventing a new policy mid-port destroys the parity proof you are about to build.
 
-**When AskUserQuestion is unavailable** (print mode `-p`, background jobs, some SDK hosts): do not guess and mutate. State the tenant, repo and workflow list you are assuming, do the offline work that does not depend on them, stop at `apply --dry-run`, and report the open questions. Apply only after the user answers.
+**When AskUserQuestion is unavailable** (print mode `-p`, background jobs, some SDK hosts): do not guess and mutate. Write the round's payload to `./questions.json` and end your turn before building; answers come back in `./answers.json` (same file protocol as [workflows-v2](workflows-v2.md#discovery-before-authoring-a-guided-question-path-infer-first-then-ask-in-short-rounds)). Only when the host states nobody will answer, state the tenant, repo and workflow list you are assuming, do the offline work that does not depend on them, stop at `apply --dry-run`, and report the open questions. Apply only after the user answers.
 
 #### Step 3 — the three rules that decide whether the port was worth doing
 
