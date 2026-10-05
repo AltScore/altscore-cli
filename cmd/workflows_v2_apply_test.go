@@ -345,6 +345,10 @@ func TestValidateStandardOutputShape(t *testing.T) {
 		{"score not object", map[string]any{"score": "x"}, "score must be an object"},
 		{"score unknown key", map[string]any{"score": map[string]any{"maximum": 1}}, `score has unknown field "maximum"`},
 		{"fields not object", map[string]any{"fields": []any{}}, "fields must be an object"},
+		{"output model alerts", map[string]any{"enabled": true, "outputModel": "alerts", "alerts": "{{task_outputs.s.a}}"}, ""},
+		{"output model null is unset", map[string]any{"enabled": true, "outputModel": nil}, ""},
+		{"output model unknown", map[string]any{"outputModel": "decisioning"}, "outputModel must be one of"},
+		{"output model not string", map[string]any{"outputModel": 1}, "outputModel must be one of"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -795,10 +795,17 @@ var standardOutputAllowedKeys = map[string]bool{
 	"enabled": true, "fields": true, "score": true,
 	"data": true, "scorecard": true, "metrics": true,
 	"rules": true, "alerts": true, "decision": true,
+	"outputModel": true,
 }
 
 var standardOutputScoreAllowedKeys = map[string]bool{
 	"key": true, "label": true, "value": true, "maxValue": true,
+}
+
+// The v1 output models the block can mirror (Borrower Central StandardOutputConfig.output_model);
+// absent keeps the white-box decisioning model.
+var standardOutputModels = map[string]bool{
+	"whiteBoxDecisioning": true, "alerts": true, "standard": true,
 }
 
 func validateStandardOutputShape(stdOut map[string]any) error {
@@ -806,7 +813,14 @@ func validateStandardOutputShape(stdOut map[string]any) error {
 		if !standardOutputAllowedKeys[k] {
 			return fmt.Errorf(
 				"endConfig.standardOutput has unknown field %q (allowed: enabled, fields, score, "+
-					"data, scorecard, metrics, rules, alerts, decision)", k)
+					"data, scorecard, metrics, rules, alerts, decision, outputModel)", k)
+		}
+	}
+	if v, ok := stdOut["outputModel"]; ok && v != nil {
+		if s, isStr := v.(string); !isStr || !standardOutputModels[s] {
+			return fmt.Errorf(
+				"endConfig.standardOutput.outputModel must be one of whiteBoxDecisioning, alerts, "+
+					"standard (the v1 output model to mirror), got %v", v)
 		}
 	}
 	if v, ok := stdOut["enabled"]; ok {
