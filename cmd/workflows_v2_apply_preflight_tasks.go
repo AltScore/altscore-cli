@@ -1272,19 +1272,14 @@ func lintCanonicalEndNode(spec *composeSpec) {
 
 		endCfg, _ := t["endConfig"].(map[string]any)
 		decisionEnabled := false
-		pdfEnabled := false
 		if endCfg != nil {
 			if dc, ok := endCfg["decisionConfig"].(map[string]any); ok {
 				if en, ok := dc["enabled"].(bool); ok && en {
 					decisionEnabled = true
 				}
 			}
-			if pc, ok := endCfg["pdfConfig"].(map[string]any); ok {
-				if en, ok := pc["enabled"].(bool); ok && en {
-					pdfEnabled = true
-				}
-			}
 		}
+		pdfEnabled, _ := endPdfSetting(t)
 
 		if hasDecisionKeyMapping && decisionEnabled && pdfEnabled {
 			continue

@@ -5,7 +5,7 @@ Four entity types power the credit-decisioning v2 task surface. They live at `/v
 > **`workflowAlias` is load-bearing — set it on every entity.**
 > The v2 builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias`. An entity created without one is invisible to that workflow, even though the entity itself is fine. Always pass `--workflow-alias <alias>` (matches the workflow's `alias`) on `create`, `update`, and `import`. The CLI prints a stderr warning on `create` if neither the flag nor a body field sets it.
 >
-> **Order: alias, entities, then the first dry-run.** Set `spec.alias` explicitly (without it the alias is slugified from the label, and a guess like `customer-onboarding-v1` misses a real `customer-onboarding-v-1`; `workflows-v2 create` drops a body `alias`, `apply` honors it). Create every entity the spec references with `--workflow-alias <spec.alias>` FIRST, then run the first `apply --dry-run`: the server checks each code on the tenant, so a dry-run before they exist fails with `*_NOT_FOUND`, each line naming the create command. `apply`'s auto-rescope re-stamps a wrong alias after a real apply; it cannot create a missing entity.
+> **Order: answers, alias, entities, then the first dry-run.** The question path's answers come first ([workflows-v2](workflows-v2.md#discovery-before-authoring-a-guided-question-path-infer-first-then-ask-in-short-rounds)): they decide the cutoffs, lanes and gates the entities hold. Set `spec.alias` explicitly (without it the alias is slugified from the label, and a guess like `customer-onboarding-v1` misses a real `customer-onboarding-v-1`; `workflows-v2 create` drops a body `alias`, `apply` honors it). Then create every entity the spec references with `--workflow-alias <spec.alias>`, and only then run the first `apply --dry-run`: the server checks each code on the tenant, so a dry-run before they exist fails with `*_NOT_FOUND`, each line naming the create command. `apply`'s auto-rescope re-stamps a wrong alias after a real apply; it cannot create a missing entity.
 
 #### Mapping tables — `mapping-tables`
 
@@ -124,7 +124,7 @@ References evaluation rules by id and/or code in a specific order with an `isDef
 
 #### Building a workflow that uses them (apply)
 
-The four matching v2 task types — `evaluate-rules`, `mapping-table`, `scorecard`, `rule-tree` — reference these entities by code. The server refuses a code the tenant does not have (`*_NOT_FOUND`), so create the entities first; `apply` also pre-fills `outputSchema` with the canonical runtime fields so downstream tasks see the right available outputs.
+The four matching v2 task types — `evaluate-rules`, `mapping-table`, `scorecard`, `rule-tree` — reference these entities by code. The server refuses a code the tenant does not have (`*_NOT_FOUND`), so create the entities after the answers and before the first dry-run; `apply` also pre-fills `outputSchema` with the canonical runtime fields so downstream tasks see the right available outputs.
 
 ```bash
 cat > /tmp/credit-spec.json <<'EOF'
@@ -166,7 +166,7 @@ cat > /tmp/credit-spec.json <<'EOF'
   ]
 }
 EOF
-# entities first, stamped with spec.alias (likewise scorecards, mapping-tables, evaluation-rules)
+# after the answers: entities first, stamped with spec.alias (likewise scorecards, mapping-tables, evaluation-rules)
 altscore rule-trees create --workflow-alias credit-pipeline --body @tree.json
 altscore workflows-v2 apply --body @/tmp/credit-spec.json --dry-run
 altscore workflows-v2 apply --body @/tmp/credit-spec.json --publish

@@ -4,7 +4,7 @@
 
 > **Create and update v2 workflows with `apply`.**
 >
-> To create or update a v2 workflow, run **`altscore workflows-v2 apply`** with a single spec file. Borrower Central reconciles the spec against the tenant in one request: a rejected spec writes nothing, a publish rejection leaves the tasks and a DRAFT in place (`APPLY_PUBLISH_REJECTED`), and a mid-write failure is rolled back, with the error saying when rollback was incomplete. It creates the workflow when no workflow has the spec's alias; otherwise it updates it in place (same id and alias; unchanged tasks are left alone, changed ones are version-bumped).
+> To create or update a v2 workflow, run the question path ([Discovery](#discovery-before-authoring-a-guided-question-path-infer-first-then-ask-in-short-rounds)) first, then **`altscore workflows-v2 apply`** with a single spec file. Borrower Central reconciles the spec against the tenant in one request: a rejected spec writes nothing, a publish rejection leaves the tasks and a DRAFT in place (`APPLY_PUBLISH_REJECTED`), and a mid-write failure is rolled back, with the error saying when rollback was incomplete. It creates the workflow when no workflow has the spec's alias; otherwise it updates it in place (same id and alias; unchanged tasks are left alone, changed ones are version-bumped).
 >
 > Do not call `workflows-v2 create` directly with hand-built nodes — that path produces orphan nodes (no `taskAlias`) that save successfully but break the Hub UI (`GET /v2/tasks/null` 404 for every node). The CLI rejects orphan-node bodies at write time with an error pointing at apply; if you see that error, you're on the wrong path — switch to apply.
 >
@@ -56,13 +56,15 @@ The whole guide is ~50k tokens; `--full` prints it, and nothing in this file nee
 
 #### Discovery before authoring: a guided question path (infer first, then ask in short rounds)
 
-"Create a workflow that does X" and "change workflow Y so that Z" leave decisions open. Most of them are already written down somewhere in the tenant; a few are business policy that only the user knows. Read the first group. Walk the user through the second as a **path of short rounds** with the **AskUserQuestion** tool, so they answer a few concrete choices at a time instead of reviewing a design:
+The path governs every spec you write or change: a new workflow, an update, a one-node edit. "Create a workflow that does X" and "change workflow Y so that Z" leave decisions open. Most of them are already written down somewhere in the tenant; some are business policy that only the user knows; and the brief has gaps of its own, even when it looks complete. Read the first group. Walk the user through the rest as a **path of short rounds** with the **AskUserQuestion** tool, so they answer a few concrete choices at a time instead of reviewing a design:
 
-1. **Frame.** Restate in one line what you inferred (who is evaluated, country, sources, decision keys, the closest sibling workflow). Then ask only the framing policy that survives the reads: what ends the application versus goes to a human, what happens when a gating source fails, where the cutoffs come from.
-2. **Details** (only when round 1 opened them). Questions that exist because of an answer: a review lane exists, so which findings go there; the user supplies the cutoffs, so what are they.
-3. **Confirm the plan.** Before writing the spec, one question: the node path in one line plus the two or three choices you made on the user's behalf, options `Build it (Recommended)` and `Change <choice>`. The engineer reacts to a proposal instead of holding the design in their head.
+1. **Frame.** Restate in one line what you inferred (who is evaluated, country, sources, decision keys, the closest sibling workflow). Then ask the framing policy and the brief-contract gaps that survive the reads: what ends the application versus goes to a human, what happens when a gating source fails, where the cutoffs come from, what the brief leaves undefined.
+2. **Details** (only when round 1 opened them or left questions over). Questions that exist because of an answer: a review lane exists, so which findings go there; the user supplies the cutoffs, so what are they.
+3. **Confirm the plan.** Before writing the spec, one question: the node path in one line plus **every choice made on the user's behalf**: each recommended option taken without asking, each question that did not fit a round, each `TODO` placeholder, and the [defaults `apply` fills](#canonical-end-node-pattern-one-end-fed-by-the-rule-tree) that the spec will not set. Options `Build it (Recommended)` and `Change <choice>`. The engineer reacts to a proposal instead of holding the design in their head.
 
-Every round: at most 4 questions, 2 to 4 options each, the option you would pick first and labelled `(Recommended)`; at most 8 questions across the whole path. Skip any round with nothing left to ask. Never ask what a read answers.
+Every round: at most 4 questions, 2 to 4 options each, the option you would pick first labelled `(Recommended)`; at most 8 across the whole path. When more than 4 survive, ask the 4 that change the graph's shape (a node, a branch, a source, an entity) first; the rest go to the next round or into the confirm round's list of choices. Never pack them into one round. Skip any round with nothing left to ask. Never ask what a read answers.
+
+**Order: questions, answers, then the entities the spec references, then the first `apply --dry-run`.** No entity, spec file or dry-run before the answers.
 
 **Infer first. Never ask these; read them.**
 
@@ -85,7 +87,7 @@ altscore workflows-v2 export <id> --format apply-spec | jq '.nodes[] | select(.r
 
 Anything the spec can default is yours as well: labels, positions, aliases and refs, branch ids, `inputKeys`, publish policy (DRAFT on create). Never ask which field a task type uses; read `schema-guide tasks <type>`.
 
-**Ask only what survives the reads.** These are business policy: nothing in the tenant states them, and guessing wrong costs money or a customer. Pick the ones the flow triggers, at most 4.
+**Ask only what survives the reads.** These are business policy and the brief's own contract: nothing in the tenant states them, and guessing wrong costs money or a customer. Pick the ones the flow triggers; the overflow rule above caps a round.
 
 | Question | Ask when | Options to offer |
 |---|---|---|
@@ -100,6 +102,11 @@ Anything the spec can default is yours as well: labels, positions, aliases and r
 | Update path: a rule got stricter. Does the past get re-evaluated? | the change tightens a gate or a cutoff | new applications only `(Recommended)`; batch re-run the active portfolio in test mode first; re-run and re-decide |
 | The brief and the tenant disagree | a field the brief names is missing on the test borrower, a sample value has the opposite shape, an alias the brief names is not in `workflows-v2 list` | the options ARE the disagreement: which side is right, or what the missing piece should be |
 | A rule you want to write has no line in the brief | you are about to copy a rule family from a sibling workflow, or add a "sanity" rule the brief never asked for | add it; add it as informative (no decision impact); leave it out `(Recommended)` |
+| **Brief contract.** Check these on every brief, create or update, however complete it looks | | |
+| An outcome the brief does not cover | it decides some cases but not all: an input that may be missing, a source that answers empty, a value between two stated bands, a party type it never mentions | the candidate outcomes; the conservative one `(Recommended)` when the brief asks for caution |
+| Units, currency and scale | a number or cutoff with no unit; an amount that could be local currency or USD, units or thousands; a rate that could be 0-1 or 0-100 | the readings; the one a sample value or the sibling supports `(Recommended)` |
+| Reference date and vague time words | "recent", "the last months", "current", an age or a window with no start date | measured from the application date `(Recommended)`, the run date, or the data's own date; for a vague word, a number of months |
+| An output or side effect the brief did not ask for | you are about to turn on recording a decision, a PDF, a notification or a write, or the dry-run's `# defaults applied` block lists one | what the closest sibling does `(Recommended)`; on; off. Ask before defaulting it on |
 
 Example path for "create a KYB workflow for Ecuadorian SMEs" in a tenant that already runs a KYC flow. Read: company, ECU and origination from the request; sources from `sources-status` (the ECU rows plus the INT ones a country filter hides); a `review` key from `decisions list`; write targets, output shape and `dataAge` from the KYC export. Round 1 asks three things: what happens when the registry or judicial source fails mid-run; which findings reject outright versus go to review; whether owners and legal representatives are screened, since the country has an ownership source. Round 2 is skipped: nothing new opened. Round 3 shows `start -> sources -> conditional (rejects / review) -> end` with the choices made for the user (30-day reuse of paid data, reason codes in the output) and asks to build. Do not ask who is evaluated, which country, which sources, where the decision lands, or whether to publish.
 
@@ -107,7 +114,7 @@ Example path for "create a KYB workflow for Ecuadorian SMEs" in a tenant that al
 
 **Mid-build unknowns get a second round, not an analogy.** The first round covers what the reads surfaced. New unknowns appear while building (an alias the brief spelled differently from the tenant, a package alias nobody stated, a subflow output the brief does not say whether to consume). Each is a question. Deriving an identifier from a sibling's pattern ("the other ten documents end in `_info`") is the single most expensive shortcut an agent takes: it looks right, publishes, and is wrong in a way only the client notices.
 
-**When AskUserQuestion is unavailable** (print mode `-p`, background jobs, some SDK hosts), the path still runs, through files. Write the exact payload the tool would have taken to `./questions.json`, `{"questions":[{"question","header","options":[{"label","description"}],"multiSelect"}]}`, and end your turn without building. The answers come back in `./answers.json` as `{"answers":{"<question text>":"<chosen label or free text>"}}`, the tool's own semantics; continue the path from there. An answer marked "no preference" means: take your recommended option and record it as an assumption. If no answers ever arrive, build under the recommended options, run `apply --dry-run` (or `--diff` for an update), list every assumption, and stop; apply only after the user answers.
+**When AskUserQuestion is unavailable** (print mode `-p`, background jobs, some SDK hosts), the path still runs, through files. Write the exact payload the tool would have taken to `./questions.json`, `{"questions":[{"question","header","options":[{"label","description"}],"multiSelect"}]}`, and **end the turn before building**: no entity, no spec, no dry-run. That is the delivery order, not a conflict with delivering: the spec comes in the turn after the answers, which arrive in `./answers.json` as `{"answers":{"<question text>":"<chosen label or free text>"}}`, the tool's own semantics; continue the path from there. An answer that leaves the choice to you means: take your recommended option and record it as an assumption. Ask this way whenever someone can answer (the user says they are available, or the host relays answers). Only when the host states that nobody will answer, build under the recommended options, run `apply --dry-run` (or `--diff` for an update), list every assumption, and stop; apply only after the user answers.
 
 #### Authoring loop (how to work a tenant without breaking the person next to you)
 
@@ -115,6 +122,7 @@ These rules exist because a correct workflow can still cost the engineer next to
 
 **Before the first write.**
 
+- The question path has run and its answers are in (or the host stated nobody will answer).
 - `altscore workflows-v2 list --filter is-latest=true` and read every alias and label. If the brief names an alias that is not in that list, STOP and ask which one it meant; a near miss (`validacion-...` vs `validaci-n-...`) is the tenant's real workflow spelled by a human. `apply` refuses this case itself (`APPLY_ALIAS_NEAR_MATCH`, override with `--create-new`); do not reach for the override to make the error go away.
 - Every identifier you will write (workflow alias, package alias, borrower-field key, decision key, source id) is either READ from the tenant (`packages list`, `packages content`, `borrower-fields list`, `decisions list`, `altdata describe`) or ASKED. Never derived by analogy.
 - Every rule you author cites the line of the brief, or the sibling workflow, it comes from. List the rules that have no source and the decision-key mapping in the question round; they are the ones the user will later call "invented".
@@ -154,6 +162,7 @@ This is the shape productive tenants run. Write it by default and deviate only f
 
    A custom variable that only re-exposes, renames, casts or `.get()`s one of these is never needed.
 2. **The decision lives in entities, not in Python.** `decision_key` comes from a rule-tree: hard gates first, then the band. Score bands and code-to-label maps are mapping tables; thresholds are evaluation rules or scorecards, versioned and editable without a republish. Rule-tree, scorecard and evaluate-rules inputs take deep paths directly, so gate on `isSuccess`, a status or a hit count with no variable in between. The usual chain is altdata -> indicator compute -> scorecard -> mapping-table (score to band) -> rule-tree -> End. Create the entities first ([credit-decisioning](credit-decisioning.md)), then reference them from the spec.
+   First means after the question path's answers and before the first dry-run.
 3. **Python computes indicators, one scalar each.** A variable earns its place when it combines two or more values (ratio, age, date delta, a multi-step formula), aggregates a list, builds a per-party list for a fan-out (filtering alone is `inputExpression: "inputs.<list>[<field>=<value>]"`), parses a raw payload once, normalises text, renders HTML for a PDF block, or is a scoped probe (below). Return a number, string or boolean, never an object; name it `snake_case` after the value; `onError: "null"` and let the rule handle "no data".
 4. **Limits productive tenants stay under:** at most 6 variables per compute node, compute nodes at most a third of the graph, no `self.` chain longer than 2, under about 1,000 code chars per variable unless it is HTML, parsing or iteration. Past those the Python is a rules engine; move it into entities.
 5. **Never in a variable:** a threshold, a band, a gate, a decision key, a label map, a constant, or a re-check of `isSuccess`.
@@ -173,6 +182,8 @@ This is the shape productive tenants run. Write it by default and deviate only f
 `apply` and `lint` print a `[structure]` advisory for each break of these rules, naming the fix.
 
 #### Recommended path: `apply` (declarative create-or-update)
+
+Before writing or changing a spec, run the question path ([Discovery](#discovery-before-authoring-a-guided-question-path-infer-first-then-ask-in-short-rounds)).
 
 For "Create a workflow that does X" — or "Update workflow Y to do Z" — use `workflows-v2 apply`. It takes a single spec and reconciles it against the tenant. Use `--dry-run` first to inspect what will be sent (the dry-run output also tells you which branch will fire: CREATE or UPDATE). It lists every blocking problem at once, each with its fix: fix all of them before the next dry-run.
 
@@ -300,12 +311,15 @@ A spec has exactly one end node (`apply` refuses more). When it contains a `rule
 | `deal_id` | `dealId` | upstream deal task output |
 | `decision_key` | `currentDecision.key` (when `decisionConfig.enabled=true`) | upstream rule-tree task output (`task_outputs.<rule-tree-ref>.decision_key`) |
 
-Wired this way, the rule-tree's per-run decision string flows through to BC's decision recorder, the PDF generates once, and there's no per-branch hand-maintained `outputJson` to drift. Apply ships a non-blocking lint (`lintCanonicalEndNode`) that warns when a spec has both a rule-tree and an end node but the end node is missing any of: `inputMappings.decision_key`, `endConfig.decisionConfig.enabled=true`, `endConfig.pdfConfig.enabled=true`.
+Wired this way, the rule-tree's per-run decision string flows through to BC's decision recorder, the PDF generates once, and there's no per-branch hand-maintained `outputJson` to drift. Apply ships a non-blocking lint (`lintCanonicalEndNode`) that warns when a spec has both a rule-tree and an end node but the end node lacks `inputMappings.decision_key` or `endConfig.decisionConfig.enabled=true`, or sets `pdfConfig.enabled` to false.
 
-> **Auto-defaults (on by default; `--no-auto-defaults` to skip).** apply injects three convenience defaults so common specs don't have to hand-wire them — each only fills an **absent** field, so caller-supplied values always win:
-> 1. **End-node `borrower_id` + `billable_id`** — wired to the single `customer` node's `borrower_id` output (`task_outputs.<customer-ref>.borrower_id`). Skipped with a stderr warning when the spec has 0 or >1 customer nodes (ambiguous — wire them yourself). `billable_id` defaults to `borrower_id` in `end_activity` anyway; both are set for clarity.
-> 2. **End-node PDF generation** — `endConfig.pdfConfig.enabled` defaults to `true` when the key is absent, and `pdfGenerationRequired` defaults to `true` when the report is on. Other pdfConfig fields are preserved, and an explicit `enabled: false` keeps the report off.
-> 3. **Deal-contact `identity_value`** — for each inline deal `contact`, if `identity_value` is absent it's copied from the field named by the contact's `identity_key` (default `tax_id`, which is also set when absent). The source value may itself be an `{{inputs.*}}` or `{{task_outputs.*}}` template. Without this, a contact carrying only `tax_id` resolves its borrower upsert to a null identity.
+> **Defaults (each fills only a field the spec leaves out).** Every mode prints the ones it used in one stderr block, `# defaults applied (confirm with the user or set them explicitly):`. List them in the confirm round before building, and set any the user decides in the spec:
+> 1. End `pdfConfig.enabled: true` (also the server's default; set `false` for no report) and `pdfGenerationRequired: true` (a failed render fails the run).
+> 2. End `borrower_id` and `billable_id` wired to the single `customer` node's `borrower_id`; with 0 or more than 1 customer nodes it warns and wires nothing.
+> 3. Decision recording stays off unless `endConfig.decisionConfig.enabled` is true; enabled without `decisionType` records `final` (server defaults).
+> 4. A write task without `persona` writes an `individual`; a deal contact without `identity_value` copies it from its `identity_key` field (default `tax_id`); a source without `packageAlias` stores under its lowercased id (`ECU-PUB-0002` -> `ecu_pub_0002`).
+>
+> `--no-auto-defaults` turns off 1, 2 and the contact fill; the server's PDF and decision defaults still apply.
 
 Canonical shape:
 
@@ -338,7 +352,7 @@ Canonical shape:
 
 > **Canvas auto-layout (on by default; `--no-layout` to skip).** apply positions nodes in left-to-right columns using the same algorithm as the Hub builder's **Align** button: longest-path leveling (every edge points forward, so a diamond's short arm never draws backwards into the join) plus barycenter row ordering to reduce crossings. Do NOT hand-write `position` on spec nodes — pinning it on *any* node disables auto-layout for the whole graph (apply says so on stderr) and you inherit responsibility for the entire canvas. Positions are recomputed on every apply, including the UPDATE path, so a re-applied spec always opens tidy.
 
-If the agent asks for help building or updating a workflow, default to apply. Other paths exist for special cases:
+If the agent asks for help building or updating a workflow, run the question path first, then default to apply. Other paths exist for special cases:
 
 - **Clone-and-modify** (highest success when a similar workflow exists): `export <similar-id> > wf.json` → edit JSON → `import --new-label "..."`. Import validates the bundle against the destination tenant before writing and refuses if it references a scorecard/rule-tree/mapping-table/evaluation-rule that is neither there nor in the bundle.
 - **Incremental edit on an existing workflow**: hold a lock + use `add-node`/`add-edge`/`set-mapping`/`set-variable` helpers (see Helpers section below)
@@ -577,7 +591,7 @@ altscore workflows-v2 ai suggest-mappings --body '{
 
 #### Ergonomic builder helpers (for INCREMENTAL EDIT path)
 
-These mutate an existing workflow in place. Each handles fetch + lock + autosave internally. **Prefer `apply` for any non-trivial change** — apply is declarative, re-runs the full validation pipeline, and reconciles entity scopes; these helpers are best used for one-off tweaks or interactive exploration where you don't want to maintain a spec file.
+Before changing a workflow this way, run the question path ([Discovery](#discovery-before-authoring-a-guided-question-path-infer-first-then-ask-in-short-rounds)). These mutate an existing workflow in place. Each handles fetch + lock + autosave internally. **Prefer `apply` for any non-trivial change** — apply is declarative, re-runs the full validation pipeline, and reconciles entity scopes; these helpers are best used for one-off tweaks or interactive exploration where you don't want to maintain a spec file.
 
 ```bash
 TOKEN=$(altscore workflows-v2 lock acquire my-wf --client-id "agent-$$" | jq -r .lockToken)
@@ -611,7 +625,7 @@ Both `--lock-token` (caller-managed) and `--client-id` (auto-acquire/release) ar
 
 #### Pre-flight checklist (before constructing or modifying)
 
-The workflow body is permissive — it'll save with bad refs and fail at execute time. Verify external references exist first:
+Before writing or changing a spec, run the question path ([Discovery](#discovery-before-authoring-a-guided-question-path-infer-first-then-ask-in-short-rounds)). The workflow body is permissive — it'll save with bad refs and fail at execute time. Verify external references exist first:
 
 ```bash
 altscore altdata describe <SOURCE_ID>                        # altdata-enrichment refs (canonical)

@@ -335,6 +335,8 @@ type composeNormalizeOpts struct {
 	AllowStealOwnership bool
 	// AutoDefaults fills only absent fields -- caller-supplied values always win.
 	AutoDefaults bool
+	// Defaults records every value a normalizer fills that the spec did not set; nil records nothing.
+	Defaults *appliedDefaults
 }
 
 // Dry-runs neither error nor warn: agents iterating on a spec are not expected
@@ -411,7 +413,7 @@ func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNorma
 	taskType, _ := task["type"].(string)
 	switch taskType {
 	case "altdata-enrichment":
-		return normalizeAltdataTask(c, task, dryRun)
+		return normalizeAltdataTask(c, task, opts, dryRun)
 	// compute-variables needs no case: BC derives its outputSchema server-side.
 	case "conditional":
 		return normalizeConditionalTask(task)
@@ -551,7 +553,7 @@ func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bo
 
 // dataAge is deliberately not defaulted (a test asserts it): an authored value
 // overrides the freshness the source publishes, which is right for almost no node.
-func applyAltdataSourceDefaults(sources []any) []any {
+func applyAltdataSourceDefaults(sources []any, ref string, applied *appliedDefaults) []any {
 	for i, s := range sources {
 		sm, ok := s.(map[string]any)
 		if !ok {
@@ -559,7 +561,9 @@ func applyAltdataSourceDefaults(sources []any) []any {
 		}
 		if _, has := sm["packageAlias"]; !has {
 			if sid, _ := sm["sourceId"].(string); sid != "" {
-				sm["packageAlias"] = strings.ToLower(strings.ReplaceAll(sid, "-", "_"))
+				alias := strings.ToLower(strings.ReplaceAll(sid, "-", "_"))
+				sm["packageAlias"] = alias
+				applied.add(ref, fmt.Sprintf("sourcesConfig[%s].packageAlias", sid), alias, "the source's results are stored under this package alias")
 			}
 		}
 		sources[i] = sm
@@ -567,7 +571,7 @@ func applyAltdataSourceDefaults(sources []any) []any {
 	return sources
 }
 
-func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) error {
+func normalizeAltdataTask(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {
 	sources := asSlice(task["sourcesConfig"])
 	if len(sources) == 0 {
 		return nil
@@ -575,7 +579,7 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, dryRun bool) er
 
 	inputKeys := asMap(task["inputKeys"])
 
-	task["sourcesConfig"] = applyAltdataSourceDefaults(sources)
+	task["sourcesConfig"] = applyAltdataSourceDefaults(sources, defaultsRef(task), opts.Defaults)
 
 	// The runtime reads each source's required fields from inputKeys; omitting the
 	// map ships a source nobody wired.
@@ -1517,6 +1521,7 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 		opts = &composeNormalizeOpts{}
 	}
 	taskType, _ := task["type"].(string)
+	ref := defaultsRef(task)
 
 	// The contact's borrower upsert keys on identity_key + identity_value, so a
 	// contact carrying only e.g. tax_id would resolve to a null identity.
@@ -1530,12 +1535,14 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 			if strings.TrimSpace(identityKey) == "" {
 				identityKey = "tax_id"
 				contact["identity_key"] = identityKey
+				opts.Defaults.add(ref, fmt.Sprintf("contacts[id=%v].identity_key", contact["id"]), identityKey, "the contact's borrower is matched on this identity")
 			}
 			if iv, _ := contact["identity_value"].(string); strings.TrimSpace(iv) != "" {
 				continue
 			}
 			if src, _ := contact[identityKey].(string); strings.TrimSpace(src) != "" {
 				contact["identity_value"] = src
+				opts.Defaults.add(ref, fmt.Sprintf("contacts[id=%v].identity_value", contact["id"]), src, "copied from the contact's "+identityKey)
 			} else {
 				fmt.Fprintf(os.Stderr,
 					"# warning: deal contact id=%v has no identity_value and no %q field to source it from; "+
@@ -1576,6 +1583,7 @@ func normalizeEntityWriteTask(task map[string]any, opts *composeNormalizeOpts) e
 		} else if !hasPersonaMapping {
 			if v, ok := task["persona"].(string); !ok || strings.TrimSpace(v) == "" {
 				task["persona"] = "individual"
+				opts.Defaults.add(ref, "persona", "individual", "the borrower is written as an individual, not a business")
 			}
 		}
 		// (persona wired to a non-input source, e.g. custom.* -> leave as-is)

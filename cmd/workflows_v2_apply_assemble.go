@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -93,9 +94,119 @@ func inferSchemaForVar(specValue any, name string) map[string]any {
 	return out
 }
 
+// A value the run will use that the spec never set. The author confirms these with the user,
+// so every fill is recorded where it happens and printed as one block.
+type appliedDefault struct {
+	Ref    string
+	Field  string
+	Value  any
+	Server bool
+	Effect string
+}
+
+type appliedDefaults []appliedDefault
+
+func (d *appliedDefaults) add(ref, field string, value any, effect string) {
+	if d == nil {
+		return
+	}
+	*d = append(*d, appliedDefault{Ref: ref, Field: field, Value: value, Effect: effect})
+}
+
+func (d *appliedDefaults) addAll(items appliedDefaults) {
+	if d == nil {
+		return
+	}
+	*d = append(*d, items...)
+}
+
+// The task-build loop moves `ref` to `specRef` before the normalizers run.
+func defaultsRef(task map[string]any) string {
+	if r, _ := task["specRef"].(string); r != "" {
+		return r
+	}
+	return localRef(task, fmt.Sprint(task["label"]))
+}
+
+func printAppliedDefaults(w io.Writer, items appliedDefaults) {
+	if len(items) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "# defaults applied (confirm with the user or set them explicitly):")
+	for _, d := range items {
+		value, err := json.Marshal(d.Value)
+		if err != nil {
+			value = []byte(fmt.Sprint(d.Value))
+		}
+		source := ""
+		if d.Server {
+			source = " (server default)"
+		}
+		fmt.Fprintf(w, "#   %s: %s = %s%s -- %s\n", d.Ref, d.Field, value, source, d.Effect)
+	}
+}
+
+// Mirrors the server: EndConfig and PdfConfig both default the report ON, so only an explicit
+// enabled=false, or an explicit null endConfig / pdfConfig, turns it off.
+func endPdfSetting(end map[string]any) (enabled bool, explicit bool) {
+	ec, present := end["endConfig"]
+	if !present {
+		return true, false
+	}
+	endCfg, _ := ec.(map[string]any)
+	if endCfg == nil {
+		return false, true
+	}
+	pc, present := endCfg["pdfConfig"]
+	if !present {
+		return true, false
+	}
+	pdf, _ := pc.(map[string]any)
+	if pdf == nil {
+		return false, true
+	}
+	en, present := pdf["enabled"]
+	if !present {
+		return true, false
+	}
+	on, _ := en.(bool)
+	return on, true
+}
+
+// What the server fills on an end node the spec (after apply's own defaults) leaves silent.
+// --no-auto-defaults does not turn these off.
+func serverEndDefaults(spec *composeSpec) appliedDefaults {
+	var applied appliedDefaults
+	for _, t := range spec.Tasks {
+		if tt, _ := t["type"].(string); tt != "end" {
+			continue
+		}
+		endRef := localRef(t, "end")
+		if _, explicit := endPdfSetting(t); !explicit {
+			applied = append(applied, appliedDefault{Ref: endRef, Field: "endConfig.pdfConfig.enabled", Value: true, Server: true,
+				Effect: "a PDF report is generated on every run"})
+		}
+		decision := asMap(asMap(t["endConfig"])["decisionConfig"])
+		enabled, has := decision["enabled"]
+		if !has {
+			applied = append(applied, appliedDefault{Ref: endRef, Field: "endConfig.decisionConfig.enabled", Value: false, Server: true,
+				Effect: "no decision is recorded on the execution"})
+			continue
+		}
+		if on, _ := enabled.(bool); on {
+			if _, has := decision["decisionType"]; !has {
+				applied = append(applied, appliedDefault{Ref: endRef, Field: "endConfig.decisionConfig.decisionType", Value: "final", Server: true,
+					Effect: "the recorded decision is final, not preliminary"})
+			}
+		}
+	}
+	return applied
+}
+
 // Every default fills an ABSENT key only, so a caller value always wins. The borrower_id
 // source is a SPEC-LOCAL ref, rewritten to the server alias by the task-build loop.
-func applyAutoEndDefaults(spec *composeSpec) {
+func applyAutoEndDefaults(spec *composeSpec) appliedDefaults {
+	var applied appliedDefaults
 	var customerRefs []string
 	for i, t := range spec.Tasks {
 		if tt, _ := t["type"].(string); tt == "customer" {
@@ -107,6 +218,7 @@ func applyAutoEndDefaults(spec *composeSpec) {
 		if tt, _ := t["type"].(string); tt != "end" {
 			continue
 		}
+		endRef := localRef(t, "end")
 
 		// Granularity is the KEY, not the pdfConfig object: an author who writes
 		// `pdfConfig: {"title": ...}` expressed no opinion on `enabled` and still wants a report.
@@ -120,12 +232,14 @@ func applyAutoEndDefaults(spec *composeSpec) {
 		}
 		if _, has := pdf["enabled"]; !has {
 			pdf["enabled"] = true
+			applied.add(endRef, "endConfig.pdfConfig.enabled", true, "a PDF report is generated on every run")
 		}
 		// "a failed render is fatal" is incoherent with a report that is switched off, so this
 		// defaults only when the report is actually on.
 		if enabled, _ := pdf["enabled"].(bool); enabled {
 			if _, has := pdf["pdfGenerationRequired"]; !has {
 				pdf["pdfGenerationRequired"] = true
+				applied.add(endRef, "endConfig.pdfConfig.pdfGenerationRequired", true, "a failed PDF render fails the run")
 			}
 		}
 		endCfg["pdfConfig"] = pdf
@@ -145,12 +259,15 @@ func applyAutoEndDefaults(spec *composeSpec) {
 		src := fmt.Sprintf("task_outputs.%s.borrower_id", customerRefs[0])
 		if _, has := im["borrower_id"]; !has {
 			im["borrower_id"] = src
+			applied.add(endRef, "inputMappings.borrower_id", src, "the execution is recorded on that customer")
 		}
 		if _, has := im["billable_id"]; !has {
 			im["billable_id"] = src
+			applied.add(endRef, "inputMappings.billable_id", src, "the run is billed to that customer")
 		}
 		t["inputMappings"] = im
 	}
+	return applied
 }
 
 // POSTs NOTHING: each task body is recorded on `capture` and the graph carries PLACEHOLDER
@@ -203,8 +320,6 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 	}
 
 	lintOutputJsonObjectRefs(spec)
-
-	lintCanonicalEndNode(spec)
 
 	if len(spec.CustomVariables) > 0 {
 		specNodes := make([]any, len(spec.Nodes))
@@ -263,9 +378,16 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 
 	// Runs before the task-build loop so the borrower_id mapping is a spec-local ref the loop
 	// validates like any other.
-	if autoDefaults {
-		applyAutoEndDefaults(spec)
+	var applied *appliedDefaults
+	if capture != nil {
+		applied = &capture.defaults
 	}
+	if autoDefaults {
+		applied.addAll(applyAutoEndDefaults(spec))
+	}
+	applied.addAll(serverEndDefaults(spec))
+	// After the defaults, so the advisory judges the end node the block reports.
+	lintCanonicalEndNode(spec)
 
 	// Sampled BEFORE the node loops: the extraNode loop back-fills `position` onto the spec's
 	// own maps, so asking afterwards always answers yes and auto-layout would never fire.
@@ -336,6 +458,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			AutoRescopeEntities: autoRescopeEntities,
 			AllowStealOwnership: allowStealOwnership,
 			AutoDefaults:        autoDefaults,
+			Defaults:            applied,
 		}, dryRun); err != nil {
 			return nil, fmt.Errorf("node ref=%q: %w", ref, err)
 		}

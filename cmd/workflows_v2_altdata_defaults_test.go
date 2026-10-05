@@ -7,7 +7,7 @@ func TestAltdataSourceDefaults_DoesNotStampDataAge(t *testing.T) {
 		map[string]any{"sourceId": "ECU-PUB-0063", "version": "v2"},
 	}
 
-	applyAltdataSourceDefaults(sources)
+	applyAltdataSourceDefaults(sources, "", nil)
 
 	sm := sources[0].(map[string]any)
 	if v, has := sm["dataAge"]; has {
@@ -21,7 +21,7 @@ func TestAltdataSourceDefaults_KeepsAnAuthoredDataAge(t *testing.T) {
 		map[string]any{"sourceId": "ECU-PUB-0089", "version": "v1", "dataAge": 60},
 	}
 
-	applyAltdataSourceDefaults(sources)
+	applyAltdataSourceDefaults(sources, "", nil)
 
 	if got := sources[0].(map[string]any)["dataAge"]; got != 60 {
 		t.Errorf("dataAge = %v, want 60 untouched", got)
@@ -34,7 +34,7 @@ func TestAltdataSourceDefaults_DerivesPackageAliasFromSourceId(t *testing.T) {
 		map[string]any{"sourceId": "ECU-PUB-0089", "version": "v1", "packageAlias": "mine"},
 	}
 
-	applyAltdataSourceDefaults(sources)
+	applyAltdataSourceDefaults(sources, "", nil)
 
 	if got := sources[0].(map[string]any)["packageAlias"]; got != "ecu_pub_0063" {
 		t.Errorf("packageAlias = %v, want ecu_pub_0063", got)
@@ -50,9 +50,26 @@ func TestAltdataSourceDefaults_SkipsEntriesWithNoSourceId(t *testing.T) {
 		"not-a-map",
 	}
 
-	applyAltdataSourceDefaults(sources)
+	applyAltdataSourceDefaults(sources, "", nil)
 
 	if _, has := sources[0].(map[string]any)["packageAlias"]; has {
 		t.Error("packageAlias derived from an empty sourceId")
+	}
+}
+
+func TestAltdataSourceDefaults_RecordsTheDerivedPackageAlias(t *testing.T) {
+	var applied appliedDefaults
+	sources := []any{
+		map[string]any{"sourceId": "ECU-PUB-0063", "version": "v2"},
+		map[string]any{"sourceId": "ECU-PUB-0089", "version": "v1", "packageAlias": "mine"},
+	}
+
+	applyAltdataSourceDefaults(sources, "bureau", &applied)
+
+	if len(applied) != 1 {
+		t.Fatalf("want one recorded default (the authored alias is not one), got %+v", applied)
+	}
+	if d := applied[0]; d.Ref != "bureau" || d.Field != "sourcesConfig[ECU-PUB-0063].packageAlias" || d.Value != "ecu_pub_0063" {
+		t.Errorf("recorded %+v", d)
 	}
 }
