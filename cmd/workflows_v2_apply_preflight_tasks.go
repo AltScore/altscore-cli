@@ -1271,17 +1271,17 @@ func lintCanonicalEndNode(spec *composeSpec) {
 		}
 
 		endCfg, _ := t["endConfig"].(map[string]any)
-		decisionEnabled := false
+		decisionEnabled, decisionDeclined := false, false
 		if endCfg != nil {
 			if dc, ok := endCfg["decisionConfig"].(map[string]any); ok {
-				if en, ok := dc["enabled"].(bool); ok && en {
-					decisionEnabled = true
+				if en, ok := dc["enabled"].(bool); ok {
+					decisionEnabled, decisionDeclined = en, !en
 				}
 			}
 		}
-		pdfEnabled, _ := endPdfSetting(t)
-
-		if hasDecisionKeyMapping && decisionEnabled && pdfEnabled {
+		// An explicit false (decision recording, or the PDF, which is not checked at all) is the
+		// user's answer to the question path, not a wiring gap.
+		if decisionDeclined || (hasDecisionKeyMapping && decisionEnabled) {
 			continue
 		}
 
@@ -1291,9 +1291,6 @@ func lintCanonicalEndNode(spec *composeSpec) {
 		}
 		if !decisionEnabled {
 			missing = append(missing, "endConfig.decisionConfig.enabled=true")
-		}
-		if !pdfEnabled {
-			missing = append(missing, "endConfig.pdfConfig.enabled=true")
 		}
 
 		sourceHint := fmt.Sprintf("task_outputs.%s.decision_key", ruleTreeRefs[0])
@@ -1311,8 +1308,7 @@ func lintCanonicalEndNode(spec *composeSpec) {
 				"Wire it like:\n"+
 				"#   inputMappings: { ..., \"decision_key\": %q }\n"+
 				"#   endConfig.decisionConfig: { \"enabled\": true, \"decisionType\": \"final\" }\n"+
-				"#   endConfig.pdfConfig: { \"enabled\": true, ... }\n"+
-				"# (advisory; no-PDF and no-decision shapes are still legal).\n",
+				"# (advisory; a no-decision shape is still legal).\n",
 			endRef, strings.Join(missing, ", "), sourceHint,
 		)
 	}

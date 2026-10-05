@@ -410,9 +410,11 @@ func TestCanonicalEndAdvisoryAgreesWithTheDefaultsBlock(t *testing.T) {
 		}
 	}
 
+	// The user answered "no PDF" in the question path: the canonical end-node advisory must not
+	// nag about their answer, and with the decision wired it has nothing else to say.
 	block, stderr := composeDefaultsBlock(t, spec(map[string]any{"enabled": false}), true)
-	if !strings.Contains(stderr, missingPdf) {
-		t.Errorf("an explicit enabled=false is a real gap the advisory must still name:\n%s", stderr)
+	if strings.Contains(stderr, missingPdf) || strings.Contains(stderr, "canonical single-end") {
+		t.Errorf("an explicit enabled=false is the user's choice, not a gap the advisory names:\n%s", stderr)
 	}
 	if strings.Contains(block, "pdfConfig.enabled") {
 		t.Errorf("an explicit enabled=false is not a default:\n%s", block)
@@ -437,5 +439,37 @@ func TestNormalizeEntityWriteTask_RecordsDealContactDefaults(t *testing.T) {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("block missing %q:\n%s", want, buf.String())
 		}
+	}
+}
+
+func TestCanonicalEndAdvisoryRespectsADeclinedDecision(t *testing.T) {
+	spec := func(decisionConfig map[string]any) *composeSpec {
+		endCfg := map[string]any{}
+		if decisionConfig != nil {
+			endCfg["decisionConfig"] = decisionConfig
+		}
+		return &composeSpec{
+			Alias:      "advisory-declined",
+			Label:      "Advisory declined",
+			Category:   "EVALUATION",
+			ExtraNodes: []map[string]any{{"ref": "start", "type": "start", "label": "Start"}},
+			Tasks: []map[string]any{
+				{"ref": "policy", "type": "rule-tree", "label": "Policy",
+					"ruleTreeConfig": map[string]any{"ruleTreeCode": "policy_tree", "outputVariable": "decision_key"}},
+				{"ref": "end", "type": "end", "label": "End",
+					"inputMappings": map[string]any{"decision_key": "task_outputs.policy.decision_key"},
+					"endConfig":     endCfg},
+			},
+			Edges: []map[string]any{{"from": "start", "to": "policy"}, {"from": "policy", "to": "end"}},
+		}
+	}
+	const advisory = "canonical single-end"
+
+	if _, stderr := composeDefaultsBlock(t, spec(map[string]any{"enabled": false}), true); strings.Contains(stderr, advisory) {
+		t.Errorf("decision recording explicitly off is the user's choice; the advisory must stay silent:\n%s", stderr)
+	}
+	_, stderr := composeDefaultsBlock(t, spec(nil), true)
+	if !strings.Contains(stderr, advisory) || !strings.Contains(stderr, "endConfig.decisionConfig.enabled=true") {
+		t.Errorf("a rule-tree with decision recording never configured is still a gap the advisory names:\n%s", stderr)
 	}
 }
