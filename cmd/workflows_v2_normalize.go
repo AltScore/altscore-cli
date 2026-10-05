@@ -107,17 +107,48 @@ func checkConditionOperator(op, path string) error {
 	}
 	if len(liveConditionOperators) > 0 {
 		return fmt.Errorf(
-			"%s.operator %q is not a known condition operator. "+
+			"%s.operator %q is not a known condition operator%s. "+
 				"The live backend was consulted and does not list it either (%d operators). valid: %v",
-			path, op, len(liveConditionOperators), sortedBoolMapKeys(liveConditionOperators),
+			path, op, didYouMeanOperator(op), len(liveConditionOperators), sortedBoolMapKeys(liveConditionOperators),
 		)
 	}
 	return fmt.Errorf(
-		"%s.operator %q is not a known condition operator "+
+		"%s.operator %q is not a known condition operator%s "+
 			"(the live backend could not be checked -- offline or an older backend; "+
 			"validated against this build's compiled-in list only). valid: %v",
-		path, op, sortedBoolMapKeys(conditionOperators),
+		path, op, didYouMeanOperator(op), sortedBoolMapKeys(conditionOperators),
 	)
+}
+
+// The closest snake_case operator. An operator holding every word of the input wins over a
+// nearer spelling: "notEmpty" means is_not_empty, not is_empty.
+func didYouMeanOperator(op string) string {
+	want := strings.ToLower(camelToSnake(op))
+	words := strings.FieldsFunc(want, func(r rune) bool { return r == '_' })
+	best, bestDist, bestCovers := "", 4, false
+	for _, known := range sortedBoolMapKeys(conditionOperators) {
+		if known != strings.ToLower(known) || !strings.Contains(known, "_") {
+			continue
+		}
+		covers := true
+		for _, w := range words {
+			if !strings.Contains("_"+known+"_", "_"+w+"_") {
+				covers = false
+				break
+			}
+		}
+		d := levenshtein(want, known)
+		if d >= 4 && !covers {
+			continue
+		}
+		if (covers && !bestCovers) || (covers == bestCovers && d < bestDist) {
+			best, bestDist, bestCovers = known, d, covers
+		}
+	}
+	if best == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (did you mean %q?)", best)
 }
 
 func sortedBoolMapKeys(m map[string]bool) []string {
@@ -1020,6 +1051,11 @@ func validateConditionGroup(v any, path string) error {
 	}
 	if op == "" {
 		return fmt.Errorf("%s.operator is required", path)
+	}
+	if snake := camelToSnake(op); !conditionOperators[op] && snake != op && conditionOperators[snake] {
+		fmt.Fprintf(os.Stderr, "# %s.operator %q rewritten to %q: the backend knows only that spelling and evaluates an unknown operator to False without an error\n", path, op, snake)
+		m["operator"] = snake
+		op = snake
 	}
 	if err := checkConditionOperator(op, path); err != nil {
 		return err

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -129,7 +130,7 @@ func TestAltdataDescribeNextDoesNotAdvertiseSample(t *testing.T) {
 
 func TestAltdataDictionaryFindsASourceOnCatalogPage2(t *testing.T) {
 	f := newFakeAltdataBackend(t)
-	data, err := fetchAltdataDictionary(newTestClient(t, f.URL), lateSourceID, "")
+	data, err := fetchAltdataDictionary(newTestClient(t, f.URL), lateSourceID, "", io.Discard)
 	if err != nil {
 		t.Fatalf("dictionary must resolve a source on catalog page 2, got %v", err)
 	}
@@ -153,7 +154,7 @@ func TestAltdataUnknownSourceErrorsWithClosestIDs(t *testing.T) {
 		t.Errorf("expected %s as the closest id, got %v", lateSourceID, err)
 	}
 
-	_, err = fetchAltdataDictionary(c, "NOPE", "")
+	_, err = fetchAltdataDictionary(c, "NOPE", "", io.Discard)
 	if err == nil || strings.Contains(err.Error(), "Did you mean") {
 		t.Errorf("an id unlike every catalog id must error with no suggestion, got %v", err)
 	}

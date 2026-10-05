@@ -581,6 +581,7 @@ score, scorecard breakdown, metrics, and rule hits.`,
 		Actions:  []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		WorkflowAlias: true,
+		CompactList:   decisioningCompactList,
 		Description: `Manage evaluation rules (individual business rules).
 
 An evaluation rule has a label, code, and a structured 'conditions' tree
@@ -640,6 +641,7 @@ deals, or other entities when certain criteria are met.`,
 		Actions:  []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		WorkflowAlias: true,
+		CompactList:   decisioningCompactList,
 		Description: `Manage rule trees (ordered evaluation rule sequences).
 
 A rule tree references evaluation rules by id/code in a specific order with
@@ -663,6 +665,7 @@ ruleTreeConfig.ruleTreeId / ruleTreeCode.`,
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "update", "delete"},
 		WorkflowAlias: true,
+		CompactList:   decisioningCompactList,
 		Description: `Manage mapping tables (numerical / categorical lookups).
 
 A mapping table converts an input value into an output value via
@@ -689,6 +692,7 @@ mappingTableConfig.entries[].mappingTableId.`,
 		Module:   "borrower_central",
 		Actions:  []string{"list", "get", "create", "update", "delete"},
 		WorkflowAlias: true,
+		CompactList:   decisioningCompactList,
 		Description: `Manage scorecards (weighted scoring tables).
 
 A scorecard maps multiple input fields to points via per-field rules and

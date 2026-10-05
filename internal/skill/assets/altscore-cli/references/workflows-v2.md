@@ -21,7 +21,7 @@
 >      {"id": "branch-else", "label": "Reject", "isElse": true, "order": 1, "conditions": null}
 >    ]
 >    ```
->    Operators: `eq, neq, gt, gte, lt, lte, contains, startsWith, endsWith, in, notIn, between, isNull, isNotNull, arrayContainsAny, arrayContainsAll, isAltdataEmpty, isAltdataNotCalculated, isAltdataError, isAltdataNull, isNotAltdataNull`. `valueType` is `"value"` (literal) or `"variable"` (reference to another inputSchema field). Field is `isElse` (camelCase), not `is_else`.
+>    Operators, written in snake_case (`apply` rewrites a camelCase spelling to it, because the backend evaluates an unknown operator to False with no error): `equals`/`eq`, `not_equals`/`neq`, `gt`, `gte`, `lt`, `lte`, `contains`, `not_contains`, `starts_with`, `ends_with`, `in`, `not_in`, `between`, `is_null`, `is_not_null`, `is_empty`, `is_not_empty`, `is_true`, `is_false`, `array_contains_any`/`_all`/`_none`, `is_altdata_empty`, `is_altdata_not_calculated`, `is_altdata_error`, `is_altdata_null`, `is_not_altdata_null`. `valueType` is `"value"` (literal) or `"variable"` (reference to another inputSchema field). Field is `isElse` (camelCase), not `is_else`.
 >
 > 2. **`altdata-enrichment` tasks need `inputKeys` to wire source-required fields.** Each source (e.g. `ECU-PUB-0002`) declares `inputFields` like `personId`, `taxId`. The task must include `inputKeys: {"personId": "{{personId}}", "taxId": "{{taxId}}"}` matched against an `inputSchema` that declares those keys, plus `packageAlias` (where to store results) on each `sourcesConfig` entry. Leave `dataAge` unset unless the user chose a freshness window, because an authored value overrides the freshness the source publishes. `apply` auto-derives `inputKeys` by querying `sources-status` for each source's `inputFields` — use it.
 >
@@ -48,11 +48,12 @@ altscore workflows-v2 schema-guide architecture   # the tasks-first explanation
 altscore workflows-v2 schema-guide nodes          # node shape (camelCase: nodeId, label, taskAlias, ...)
 altscore workflows-v2 schema-guide edges          # edge shape (sourceNodeId, targetNodeId)
 altscore workflows-v2 schema-guide tasks deal     # ONE task type: hand-written notes + introspected fields (1-4k tokens)
-altscore workflows-v2 schema-guide tasks          # every type at once (~24k tokens); only when comparing types
+altscore workflows-v2 schema-guide tasks          # every type, one row each; notes=false means fields only, no narrative
+altscore workflows-v2 schema-guide --search extraction   # every place the guide mentions a word, with the command that opens it
 altscore workflows-v2 schema-guide examples       # full scoring_pipeline template
 ```
 
-The whole guide is ~50k tokens; `--full` prints it, and nothing in this file needs it. Fetch the section that answers the question in front of you.
+The whole guide is ~50k tokens; `--full` prints it, and nothing in this file needs it. Fetch the section that answers the question in front of you, and look a word up with `--search`, never `--full | jq`.
 
 #### Discovery before authoring: a guided question path (infer first, then ask in short rounds)
 
@@ -71,18 +72,18 @@ Every round: at most 4 questions, 2 to 4 options each, the option you would pick
 | Decision | Where the answer is |
 |---|---|
 | Who is evaluated, which country, which stage of the customer's process | the request itself. "KYB for Ecuadorian SMEs" is a company, ECU, origination. |
-| Which sources, their required inputs, what they can detect | `altscore workflows-v2 sources-status`: every source version, one compact row with its `requiredInputs`. A `--country` filter hides INT (international) sources such as sanctions lists; stderr counts what a filter hid. Then `altdata describe <id>` and `altdata dictionary <id>` for ONE source's field paths |
+| Which sources, their required inputs, what they can detect | `altscore workflows-v2 sources-status --country <ISO3>` (or `--search <word>`): one compact row per source version with its `requiredInputs`; the unfiltered catalog is about 40 KB. A `--country` filter hides INT (international) sources such as sanctions lists; stderr counts what a filter hid. Then `altdata describe <id>` and `altdata dictionary <id>` for ONE source's field paths |
 | Decision vocabulary, whether a review lane exists | `altscore decisions list`: the registered keys are the only ones a run can write. A brief that says `approve/review/reject` while the tenant registers `passes/pending/fails` is mapped BY LABEL, and the mapping is restated to the user in one line |
 | Write targets, output shape, input payload, PDF or not, freshness of paid sources | the tenant's closest existing workflow: `workflows-v2 list --filter is-latest=true` (one compact row per workflow), its skeleton (below), then only its `inputSchema`, end node, `decisionConfig` and `sourcesConfig.dataAge`. Mirror it. |
 | Fields available on borrower and deal, and what a real value looks like | `altscore data-models list`, then `borrower-fields list --filter borrower-id=<test borrower>` and `packages content <id>` on the test case. A null sample is a question, not a guess |
 | Structure: orchestrator plus per-party child, fan-out, two-layer decisioning | [kyc-kyb-habits](kyc-kyb-habits.md) |
 | Whether a change is visible to others (update path) | `workflows-v2 schedule get <id>`, and other workflows whose `child-workflow` nodes carry this alias as `executorId` |
 
-Read a sibling a piece at a time; an unpiped export prints every task body:
+Read a sibling or a child with `--format outline` (inputs, graph, variable types, the end node's output keys: a few KB); the apply-spec inlines every task body:
 
 ```bash
-altscore workflows-v2 export <id> --format apply-spec | jq '{nodes: [.nodes[] | {ref, type, label}], edges}'
-altscore workflows-v2 export <id> --format apply-spec | jq '.nodes[] | select(.ref == "<ref>")'
+altscore workflows-v2 export <id> --format outline
+altscore workflows-v2 export <id> --format apply-spec | jq '.nodes[] | select(.ref == "<ref>")'   # one node's body
 ```
 
 Anything the spec can default is yours as well: labels, positions, aliases and refs, branch ids, `inputKeys`, publish policy (DRAFT on create). Never ask which field a task type uses; read `schema-guide tasks <type>`.
@@ -580,7 +581,7 @@ altscore workflows-v2 batch terminate <batch-id>
 #### Sources and AI helpers
 
 ```bash
-altscore workflows-v2 sources-status          # every source version, compact; --full adds outputSchema
+altscore workflows-v2 sources-status --country ECU   # source versions, compact; --full adds outputSchema
 altscore workflows-v2 external-sources-status
 
 altscore workflows-v2 ai suggest-mappings --body '{

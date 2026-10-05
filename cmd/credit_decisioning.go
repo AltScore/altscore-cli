@@ -337,3 +337,36 @@ func makeScUsageCmd() *cobra.Command {
 		},
 	}
 }
+
+// A raw decisioning entity carries its whole rule set (a rule-trees page ran to 205 KB); the
+// compact row says which entities exist, what they are called and which workflow owns them.
+var decisioningCompactList = &CompactList{
+	Fields: "id, code, label, workflowAlias, decisionKey (evaluation rules), rules or buckets (a count), isTest, updatedAt",
+	Row:    compactDecisioningRow,
+}
+
+type compactDecisioningEntity struct {
+	ID            any `json:"id"`
+	Code          any `json:"code"`
+	Label         any `json:"label"`
+	WorkflowAlias any `json:"workflowAlias"`
+	DecisionKey   any `json:"decisionKey,omitempty"`
+	Rules         int `json:"rules,omitempty"`
+	Buckets       int `json:"buckets,omitempty"`
+	IsTest        any `json:"isTest,omitempty"`
+	UpdatedAt     any `json:"updatedAt,omitempty"`
+}
+
+func compactDecisioningRow(item map[string]any) any {
+	return compactDecisioningEntity{
+		ID:            item["id"],
+		Code:          item["code"],
+		Label:         item["label"],
+		WorkflowAlias: item["workflowAlias"],
+		DecisionKey:   item["decisionKey"],
+		Rules:         len(asSlice(item["rules"])),
+		Buckets:       len(asSlice(item["buckets"])),
+		IsTest:        item["isTest"],
+		UpdatedAt:     item["updatedAt"],
+	}
+}

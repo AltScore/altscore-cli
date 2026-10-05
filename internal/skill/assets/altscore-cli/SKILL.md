@@ -71,6 +71,8 @@ altscore schema borrowers                    # create + update + response + filt
 altscore schema borrowers --action create    # just create body fields
 ```
 
+v2 workflow and task shapes are not in this registry: `altscore workflows-v2 schema-guide tasks <type>`.
+
 ### Test mode (UAT)
 
 Most entities support `isTest` for UAT data in production. Test records are **excluded from list results by default**.
