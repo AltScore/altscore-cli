@@ -89,5 +89,3 @@ altscore analytics terms                           # distinct debt durations + i
   per-tenant.
 - A fresh tenant renders empty until the ClickHouse migration has run over its
   data window — the metric/widget exist but have no rows yet.
-
-Full model: `borrower-central/docs/analytics-provisioning.md`.

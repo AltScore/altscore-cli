@@ -158,6 +158,7 @@ async def execute(input_data: InputData, context: dict) -> OutputData:
     report_url = await bc.report_generator.generate({
         "reportTitle": "Analysis Report",
         "byLine": f"Generated: {datetime.now().strftime('%Y-%m-%d')}",
+        "logoUrl": "",
         "sections": sections,
     })
 
