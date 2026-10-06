@@ -208,6 +208,12 @@ func preflightTasks(spec *composeSpec) error {
 					ref,
 				)
 			}
+		case "altdata-enrichment":
+			if f, _ := task["borrowerIdField"].(string); f != "" {
+				if problem := borrowerIdFieldProblem(f); problem != "" {
+					return fmt.Errorf("node ref=%q: %s", ref, problem)
+				}
+			}
 		case "notices":
 			cfg, ok := task["noticesConfig"].(map[string]any)
 			if !ok || cfg == nil {
@@ -716,6 +722,7 @@ func preflightSpecShape(spec *composeSpec) (map[string]bool, []error) {
 			add(checkInputSchemaType(t, fmt.Sprintf("workflow.inputVariables.%s.type", name)))
 		}
 	}
+	add(undeclaredObjectInputFieldsError(undeclaredObjectInputFields(spec.InputVariables, spec.Tasks, spec.ExtraNodes)))
 
 	// Collected upfront so forward references in inputMappings can be validated.
 	knownRefs := map[string]bool{}
@@ -817,6 +824,7 @@ func preflightSpecShape(spec *composeSpec) (map[string]bool, []error) {
 
 	problems = append(problems, edgeProblems(spec, knownRefs)...)
 	problems = append(problems, missingReturnValueProblems(spec.CustomVariables)...)
+	problems = append(problems, sandboxRefusalProblems(spec.CustomVariables)...)
 	return knownRefs, problems
 }
 

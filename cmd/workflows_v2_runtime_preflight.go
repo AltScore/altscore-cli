@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -152,4 +153,213 @@ func validateEvaluationRuleBody(body *json.RawMessage) error {
 		*body = out
 	}
 	return nil
+}
+
+// borrowerIdFieldProblem says why an altdata-enrichment borrowerIdField never resolves,
+// or returns "". The runtime looks the field up as a key of the node's context, where the
+// workflow inputs sit at the top level, so an `inputs.` path finds nothing and the node
+// silently falls back to the workflow's primary borrower.
+func borrowerIdFieldProblem(field string) string {
+	f := strings.TrimSpace(field)
+	if !strings.HasPrefix(f, "inputs.") && !strings.Contains(f, "{{") {
+		return ""
+	}
+	return fmt.Sprintf("borrowerIdField %q never resolves: it names a key of the node's own inputs, not a path, "+
+		"and the runtime then falls back to the workflow's primary borrower without a warning. Map the id instead, "+
+		`inputMappings {"borrower_id": "inputs.<name>"}, and drop borrowerIdField (it defaults to borrower_id)`, field)
+}
+
+var objectInputFieldRe = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])inputs\.([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)`)
+
+// undeclaredObjectInputFields lists every inputs.<object>.<field> the nodes read whose object
+// input declares no such property. A caller (the Hub's run form, an API client) knows only the
+// declared properties, so it never sends the field and the read comes back null. An object
+// marked "additionalProperties": true is open on purpose and is not checked.
+func undeclaredObjectInputFields(inputs map[string]any, nodes ...[]map[string]any) []string {
+	seen := map[string]bool{}
+	var out []string
+	var walk func(v any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case string:
+			for _, m := range objectInputFieldRe.FindAllStringSubmatch(t, -1) {
+				decl, _ := inputs[m[1]].(map[string]any)
+				if typ, _ := decl["type"].(string); typ != "object" || decl["additionalProperties"] == true {
+					continue
+				}
+				if _, declared := asMap(decl["properties"])[m[2]]; declared {
+					continue
+				}
+				if key := m[1] + "." + m[2]; !seen[key] {
+					seen[key] = true
+					out = append(out, key)
+				}
+			}
+		case map[string]any:
+			for _, x := range t {
+				walk(x)
+			}
+		case []any:
+			for _, x := range t {
+				walk(x)
+			}
+		}
+	}
+	for _, list := range nodes {
+		for _, n := range list {
+			walk(n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func undeclaredObjectInputFieldsError(fields []string) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	obj, field, _ := strings.Cut(fields[0], ".")
+	return fmt.Errorf("inputVariables: the nodes read %s, which the object inputs do not declare. A caller knows only "+
+		"the declared properties, so it never sends these and each read comes back null. Declare each under its "+
+		`object, e.g. "%s": {"type": "object", "properties": {"%s": {"type": "number"}}}, `+
+		`or mark the object "additionalProperties": true when its fields are open on purpose`,
+		strings.Join(fields, ", "), obj, field)
+}
+
+// The Python sandbox (python-eval-service, app/usecase/simple_eval.py) validates a custom
+// variable's code statically before running any of it, and in a compute node's shared mode
+// one refusal fails every variable of that node with a 500. These mirror its rules: imports
+// are allowed except the blocked modules, and a bare call to one of the blocked builtins is
+// refused wherever it appears. A method call such as re.compile(...) is fine.
+var sandboxBlockedModules = []string{
+	"subprocess", "os", "sys", "builtins", "importlib", "ctypes", "multiprocessing", "threading",
+	"socket", "requests", "urllib", "http", "ftp", "telnetlib", "smtplib", "ssl",
+}
+
+var sandboxBlockedCalls = map[string]string{
+	"__import__": "write the import as its own statement instead",
+	"eval":       "compute the value directly",
+	"exec":       "compute the value directly",
+	"compile":    "compute the value directly",
+	"open":       "files are not reachable from a variable",
+	"print":      "use logger.info(...) instead",
+}
+
+var (
+	pyImportStmtRe = regexp.MustCompile(`(?m)^[ \t]*import[ \t]+([^\n]+)`)
+	pyFromStmtRe   = regexp.MustCompile(`(?m)^[ \t]*from[ \t]+([A-Za-z_][A-Za-z0-9_]*)`)
+	pyBareCallRe   = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.])(__import__|eval|exec|compile|open|print)[ \t]*\(`)
+	pyNameAttrRe   = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)[ \t]*\.`)
+	pyDunderArgRe  = regexp.MustCompile(`^__import__[ \t]*\([ \t]*['"]([A-Za-z_][A-Za-z0-9_.]*)['"]`)
+)
+
+// pythonCodeOnly blanks comments and string literals, keeping every newline, so the scans
+// below see code only and their offsets still map to the author's line numbers.
+func pythonCodeOnly(src string) string {
+	b := []byte(src)
+	for i := 0; i < len(b); {
+		c := b[i]
+		switch {
+		case c == '#':
+			for i < len(b) && b[i] != '\n' {
+				b[i] = ' '
+				i++
+			}
+		case c == '\'' || c == '"':
+			delim := []byte{c}
+			if i+2 < len(b) && b[i+1] == c && b[i+2] == c {
+				delim = []byte{c, c, c}
+			}
+			i += len(delim)
+			for i < len(b) && !bytes.HasPrefix(b[i:], delim) {
+				if b[i] == '\\' && i+1 < len(b) && b[i+1] != '\n' {
+					b[i] = ' '
+					i++
+				}
+				if b[i] != '\n' {
+					b[i] = ' '
+				}
+				i++
+			}
+			i += len(delim)
+		default:
+			i++
+		}
+	}
+	return string(b)
+}
+
+// sandboxRefusals lists, in source order, what the sandbox would refuse in one expression.
+func sandboxRefusals(expression string) []string {
+	code := pythonCodeOnly(expression)
+	lineOf := func(offset int) int { return strings.Count(code[:offset], "\n") + 1 }
+	blocked := map[string]bool{}
+	for _, m := range sandboxBlockedModules {
+		blocked[m] = true
+	}
+	type refusal struct {
+		offset int
+		text   string
+	}
+	var found []refusal
+	for _, m := range pyImportStmtRe.FindAllStringSubmatchIndex(code, -1) {
+		for _, part := range strings.Split(code[m[2]:m[3]], ",") {
+			fields := strings.Fields(part)
+			if len(fields) == 0 {
+				continue
+			}
+			if module, _, _ := strings.Cut(fields[0], "."); blocked[module] {
+				found = append(found, refusal{m[2], fmt.Sprintf("line %d: import of '%s' is blocked", lineOf(m[2]), module)})
+			}
+		}
+	}
+	for _, m := range pyFromStmtRe.FindAllStringSubmatchIndex(code, -1) {
+		if module := code[m[2]:m[3]]; blocked[module] {
+			found = append(found, refusal{m[2], fmt.Sprintf("line %d: import from '%s' is blocked", lineOf(m[2]), module)})
+		}
+	}
+	for _, m := range pyBareCallRe.FindAllStringSubmatchIndex(code, -1) {
+		name := code[m[2]:m[3]]
+		fix := sandboxBlockedCalls[name]
+		if arg := pyDunderArgRe.FindStringSubmatch(expression[m[2]:]); name == "__import__" && arg != nil {
+			fix = fmt.Sprintf("write `import %s` on its own line instead", arg[1])
+		}
+		found = append(found, refusal{m[2], fmt.Sprintf("line %d: %s(...) is never allowed; %s", lineOf(m[2]), name, fix)})
+	}
+	for _, m := range pyNameAttrRe.FindAllStringSubmatchIndex(code, -1) {
+		if name := code[m[2]:m[3]]; blocked[name] {
+			found = append(found, refusal{m[2], fmt.Sprintf("line %d: access to the '%s' module is blocked", lineOf(m[2]), name)})
+		}
+	}
+	sort.SliceStable(found, func(i, j int) bool { return found[i].offset < found[j].offset })
+	var texts []string
+	seen := map[string]bool{}
+	for _, f := range found {
+		if !seen[f.text] {
+			seen[f.text] = true
+			texts = append(texts, f.text)
+		}
+	}
+	return texts
+}
+
+func sandboxRefusalProblems(customVars map[string]any) []error {
+	names := make([]string, 0, len(customVars))
+	for name := range customVars {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var problems []error
+	for _, name := range names {
+		v, _ := customVars[name].(map[string]any)
+		expression, _ := v["expression"].(string)
+		if refusals := sandboxRefusals(expression); len(refusals) > 0 {
+			problems = append(problems, fmt.Errorf(
+				"customVariables[%q]: the Python sandbox refuses this code before running it, and in a compute node "+
+					"one refusal fails every variable of the node: %s. Imports are allowed except %s; datetime and math "+
+					"are not pre-imported, so import them",
+				name, strings.Join(refusals, "; "), strings.Join(sandboxBlockedModules, ", ")))
+		}
+	}
+	return problems
 }

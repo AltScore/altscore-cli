@@ -486,17 +486,21 @@ For custom scope, the value is the raw default expression or value.
 			if scope != "input" && scope != "custom" {
 				return fmt.Errorf(`--scope must be "input" or "custom"`)
 			}
-			c, err := loadClient()
-			if err != nil {
-				return err
-			}
-
 			var defaultVal any
 			hasDefault := cmd.Flags().Changed("default")
 			if hasDefault {
 				if err := json.Unmarshal([]byte(defaultJSON), &defaultVal); err != nil {
 					return fmt.Errorf("invalid --default JSON: %w", err)
 				}
+			}
+			if scope == "custom" {
+				if problems := sandboxRefusalProblems(map[string]any{name: defaultVal}); len(problems) > 0 {
+					return problems[0]
+				}
+			}
+			c, err := loadClient()
+			if err != nil {
+				return err
 			}
 
 			mutate := func(wf map[string]any) error {
