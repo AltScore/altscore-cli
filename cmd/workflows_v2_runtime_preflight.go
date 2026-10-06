@@ -246,8 +246,10 @@ var sandboxBlockedCalls = map[string]string{
 }
 
 var (
-	pyImportStmtRe = regexp.MustCompile(`(?m)^[ \t]*import[ \t]+([^\n]+)`)
-	pyFromStmtRe   = regexp.MustCompile(`(?m)^[ \t]*from[ \t]+([A-Za-z_][A-Za-z0-9_]*)`)
+	// A statement starts a line or follows `;` or a one-line `if ...:`, and a backslash
+	// continues it onto the next line.
+	pyImportStmtRe = regexp.MustCompile(`(?m)(?:^|[;:])[ \t]*import[ \t]+((?:[^;\\\n]|\\\r?\n)*)`)
+	pyFromStmtRe   = regexp.MustCompile(`(?m)(?:^|[;:])[ \t]*from[ \t]+(?:\\\r?\n[ \t]*)?([A-Za-z_][A-Za-z0-9_]*)`)
 	pyBareCallRe   = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.])(__import__|eval|exec|compile|open|print)[ \t]*\(`)
 	pyNameAttrRe   = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)[ \t]*\.`)
 	pyDunderArgRe  = regexp.MustCompile(`^__import__[ \t]*\([ \t]*['"]([A-Za-z_][A-Za-z0-9_.]*)['"]`)
@@ -303,7 +305,8 @@ func sandboxRefusals(expression string) []string {
 	}
 	var found []refusal
 	for _, m := range pyImportStmtRe.FindAllStringSubmatchIndex(code, -1) {
-		for _, part := range strings.Split(code[m[2]:m[3]], ",") {
+		statement := strings.NewReplacer("\\\r\n", " ", "\\\n", " ").Replace(code[m[2]:m[3]])
+		for _, part := range strings.Split(statement, ",") {
 			fields := strings.Fields(part)
 			if len(fields) == 0 {
 				continue

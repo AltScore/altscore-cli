@@ -222,6 +222,11 @@ func TestPythonSandboxRefusalsMirrorTheEvalService(t *testing.T) {
 		"result = eval('1 + 1')":                        "line 1: eval(...) is never allowed",
 		"with open('f') as fh:\n    result = fh.read()": "line 1: open(...) is never allowed",
 		"result = os.getcwd()":                          "line 1: access to the 'os' module is blocked",
+		"import os; x = 1":                              "line 1: import of 'os' is blocked",
+		"import json; import os":                        "line 1: import of 'os' is blocked",
+		"x = 1\nimport json, \\\n    subprocess":        "line 2: import of 'subprocess' is blocked",
+		"if True: import ctypes":                        "line 1: import of 'ctypes' is blocked",
+		"x = 1; from socket import socket":              "line 1: import from 'socket' is blocked",
 	}
 	for code, want := range refused {
 		got := strings.Join(sandboxRefusals(code), "; ")
@@ -236,6 +241,8 @@ func TestPythonSandboxRefusalsMirrorTheEvalService(t *testing.T) {
 		"label = \"print(\" + 'os.path' + '''import sys'''",
 		"result = inputs.get('task_outputs.applicant.os.version')",
 		"my_os = {'path': 1}\nresult = my_os.get('path')",
+		"import json; import datetime\nweights = {'importance': 1}; result = weights['importance']",
+		"import json, \\\n    unicodedata",
 	}
 	for _, code := range allowed {
 		if got := sandboxRefusals(code); len(got) > 0 {
