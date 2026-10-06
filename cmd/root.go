@@ -581,6 +581,7 @@ score, scorecard breakdown, metrics, and rule hits.`,
 		Actions:  []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		WorkflowAlias: true,
+		BodyValidator: validateEvaluationRuleBody,
 		CompactList:   decisioningCompactList,
 		Description: `Manage evaluation rules (individual business rules).
 

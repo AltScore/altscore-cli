@@ -512,6 +512,9 @@ func normalizeChildWorkflowTask(c *client.Client, task map[string]any, dryRun bo
 	if executor == "" {
 		return nil
 	}
+	if err := checkChildWorkflowExecutor(c, executor); err != nil {
+		return err
+	}
 	runInBatch, _ := task["runInBatch"].(bool)
 	// Batch mode reads its inputs from the resolved inputExpression.
 	if runInBatch {
