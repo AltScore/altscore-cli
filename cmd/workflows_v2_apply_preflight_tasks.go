@@ -135,6 +135,8 @@ func preflightTasks(spec *composeSpec) error {
 					"requires a non-empty documentExtractionConfig.extractionSchema (a JSON Schema with type 'object' "+
 						"and at least one entry in 'properties') -- it is the contract the provider "+
 						"is asked to fill, and an empty one fails at run time, not on write")
+			} else if problem := extractionSchemaProblem(asMap(cfg["extractionSchema"])); problem != "" {
+				missing = append(missing, "has an invalid schema: "+problem)
 			}
 			// The source arrives either as a config value or an inputMappings entry (either
 			// spelling), so both have to count.
@@ -142,6 +144,14 @@ func preflightTasks(spec *composeSpec) error {
 			sources := []string{}
 			for _, field := range []string{"documentUrl", "documentBase64", "rawText"} {
 				if s, _ := cfg[field].(string); s != "" {
+					if token, bare := bareUnmappedToken(s, mappings); bare {
+						return fmt.Errorf(
+							"node ref=%q: document-extraction %s is the bare placeholder {{%s}}, which does not "+
+								"resolve: the runtime would read the braces as literal text. Write a path such as "+
+								"{{inputs.%s}}, or map %s in inputMappings and drop it from the config",
+							ref, field, token, token, field,
+						)
+					}
 					sources = append(sources, field)
 					continue
 				}
@@ -179,6 +189,41 @@ func preflightTasks(spec *composeSpec) error {
 						ref, field,
 					)
 				}
+			}
+		case "contact":
+			// Validated at RUN time only: both of these save and then fail the node.
+			cfg := asMap(task["contactConfig"])
+			if ch, _ := cfg["channel"].(string); ch != "" && ch != "email" {
+				return fmt.Errorf(
+					"node ref=%q: contact channel %q is not supported: the node sends email only, and any other "+
+						"channel fails it when it runs (CONTACT_CHANNEL_UNSUPPORTED)",
+					ref, ch,
+				)
+			}
+			if to, _ := cfg["to"].(string); strings.TrimSpace(to) == "" {
+				return fmt.Errorf(
+					"node ref=%q: contact task requires contactConfig.to. Nothing looks a recipient up: map the "+
+						"address in inputMappings (e.g. {\"cust_email\": \"entity.borrower.points_of_contact.email\"}) "+
+						"and write to: \"{cust_email}\"",
+					ref,
+				)
+			}
+		case "notices":
+			cfg, ok := task["noticesConfig"].(map[string]any)
+			if !ok || cfg == nil {
+				return fmt.Errorf(
+					"node ref=%q: notices task requires noticesConfig {message, severity}; without it the node "+
+						"saves and then fails when it runs",
+					ref,
+				)
+			}
+			switch sev, _ := cfg["severity"].(string); sev {
+			case "", "info", "warning", "error":
+			default:
+				return fmt.Errorf(
+					"node ref=%q: notices severity %q is not one of info, warning, error ('debug' is a v1 severity)",
+					ref, sev,
+				)
 			}
 		case "spreadsheet-extraction":
 			// Same as document-extraction: BC validates this config at RUN time only.
