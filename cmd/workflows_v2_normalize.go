@@ -671,15 +671,12 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, opts *composeNo
 			if sid == "" {
 				continue
 			}
-			reqFields, err := lookupAltdataSourceRequiredFields(c, sid, ver, dryRun)
+			reqs, err := lookupAltdataSourceRequirements(c, sid, ver, dryRun)
 			if err != nil {
 				continue // lookup failure already warned above; don't double-report
 			}
-			for _, f := range reqFields {
-				if seenReq[f] {
-					continue
-				}
-				if !altdataRequiredFieldSatisfied(f, inputKeys, inputMappings) {
+			for _, f := range unmetAltdataRequirements(reqs, inputKeys, inputMappings) {
+				if !seenReq[f] {
 					seenReq[f] = true
 					unmapped = append(unmapped, f)
 				}
@@ -693,11 +690,13 @@ func normalizeAltdataTask(c *client.Client, task map[string]any, opts *composeNo
 			if name == "" {
 				name = "altdata-enrichment"
 			}
+			example := strings.TrimPrefix(strings.SplitN(unmapped[0], " ", 2)[0], "one-of:")
+			example = strings.SplitN(example, ",", 2)[0]
 			fmt.Fprintf(os.Stderr,
 				"# warning: altdata task %q: required source input(s) %v have no inputMappings entry; "+
-					"they resolve to empty at runtime and the source returns 404 (the backend blocks publish on this). "+
+					"they resolve to empty at runtime and the source is queried without them. "+
 					"Add an inputMappings entry, e.g. {%q: \"inputs.%s\"}.\n",
-				name, unmapped, unmapped[0], unmapped[0])
+				name, unmapped, example, example)
 		}
 	}
 
@@ -878,22 +877,65 @@ func lookupAltdataSourceInputFields(c *client.Client, sourceID, version string, 
 	return fieldNames, nil
 }
 
-func lookupAltdataSourceRequiredFields(c *client.Client, sourceID, version string, dryRun bool) ([]string, error) {
+type altdataRequirement struct {
+	Field string
+	Kind  string // REQUIRED, AT_LEAST_ONE, EXCLUSIVE_ONE or REQUIRED_IF_PARENT
+}
+
+func lookupAltdataSourceRequirements(c *client.Client, sourceID, version string, dryRun bool) ([]altdataRequirement, error) {
 	s, err := lookupAltdataSourceStatus(c, sourceID, version, dryRun)
 	if err != nil {
 		return nil, err
 	}
-	var required []string
+	var reqs []altdataRequirement
 	for _, f := range asSlice(s["inputFields"]) {
 		fm, ok := f.(map[string]any)
 		if !ok {
 			continue
 		}
-		if name, _ := fm["field"].(string); name != "" && altdataFieldRequired(fm) {
-			required = append(required, name)
+		name, _ := fm["field"].(string)
+		if name == "" || !altdataFieldRequired(fm) {
+			continue
+		}
+		kind := "REQUIRED"
+		if s, ok := fm["required"].(string); ok && !strings.EqualFold(s, "true") {
+			kind = strings.ToUpper(s)
+		}
+		reqs = append(reqs, altdataRequirement{Field: name, Kind: kind})
+	}
+	return reqs, nil
+}
+
+// A REQUIRED input is needed on its own; AT_LEAST_ONE and EXCLUSIVE_ONE inputs are one group per
+// source, met when any member is fed ("one-of:a,b" names an unmet group); REQUIRED_IF_PARENT
+// depends on another input's value, which a spec cannot show, so it is never reported.
+func unmetAltdataRequirements(reqs []altdataRequirement, inputKeys, inputMappings map[string]any) []string {
+	var unmet []string
+	groups := map[string][]string{}
+	groupMet := map[string]bool{}
+	var groupOrder []string
+	for _, r := range reqs {
+		fed := altdataRequiredFieldSatisfied(r.Field, inputKeys, inputMappings)
+		switch r.Kind {
+		case "REQUIRED_IF_PARENT":
+		case "AT_LEAST_ONE", "EXCLUSIVE_ONE":
+			if _, seen := groups[r.Kind]; !seen {
+				groupOrder = append(groupOrder, r.Kind)
+			}
+			groups[r.Kind] = append(groups[r.Kind], r.Field)
+			groupMet[r.Kind] = groupMet[r.Kind] || fed
+		default:
+			if !fed {
+				unmet = append(unmet, r.Field)
+			}
 		}
 	}
-	return required, nil
+	for _, kind := range groupOrder {
+		if !groupMet[kind] {
+			unmet = append(unmet, "one-of:"+strings.Join(groups[kind], ","))
+		}
+	}
+	return unmet
 }
 
 // An absent flag counts as required, matching the backend source-status model.

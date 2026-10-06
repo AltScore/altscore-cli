@@ -314,7 +314,7 @@ A spec has exactly one end node (`apply` refuses more). When it contains a `rule
 | `deal_id` | `dealId` | upstream deal task output |
 | `decision_key` | `currentDecision.key` (when `decisionConfig.enabled=true`) | upstream rule-tree task output (`task_outputs.<rule-tree-ref>.decision_key`) |
 
-Wired this way, the rule-tree's per-run decision string flows through to BC's decision recorder, the PDF generates once, and there's no per-branch hand-maintained `outputJson` to drift. Apply ships a non-blocking lint (`lintCanonicalEndNode`) that warns when a spec has both a rule-tree and an end node but the end node lacks `inputMappings.decision_key` or `endConfig.decisionConfig.enabled=true`, or sets `pdfConfig.enabled` to false.
+Wired this way, the rule-tree's per-run decision string flows through to BC's decision recorder, the PDF generates once, and there's no per-branch hand-maintained `outputJson` to drift. Apply ships a non-blocking lint (`lintCanonicalEndNode`) that warns when a spec has both a rule-tree and an end node but the end node lacks `inputMappings.decision_key` or `endConfig.decisionConfig.enabled=true`. A PDF or decision recording explicitly turned off is the user's choice and is not flagged.
 
 > **Defaults (each fills only a field the spec leaves out).** Every mode prints the ones it used in one stderr block, `# defaults applied (confirm with the user or set them explicitly):`. List them in the confirm round before building, and set any the user decides in the spec:
 > 1. End `pdfConfig.enabled: true` (also the server's default; set `false` for no report) and `pdfGenerationRequired: true` (a failed render fails the run).
