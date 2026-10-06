@@ -12,7 +12,7 @@ To mail the outcome use `endConfig.emailReport` (the same fields plus `enabled`,
 
 ### `notices`
 
-Adds one `{message, severity}` to the execution's notices (Hub panel, live push) to say why a branch ran. `noticesConfig: {message, severity: info|warning|error}`; `{key}` and `{{task_outputs.<ref>.f}}` placeholders as above. It never stops the run and its output (`isSuccess` always true) is nothing to branch on: stop with an `exception` node, put text in the response with End `outputJson`. Use `warning` for business messages: `error` marks the execution as having a failed data source. A notice on a branch that did not run emits nothing; `debug` is v1-only.
+Adds one `{message, severity}` to the execution's notices (Hub panel, live push) to say why a branch ran. `noticesConfig: {message, severity: info|warning|error}`; `{key}` and `{{task_outputs.<ref>.f}}` placeholders as above. It never stops the run and its output (`isSuccess` always true) is nothing to branch on: stop with an `exception` node, put text in the response with End `outputJson`. Severity is how the notice displays; it never stops the run or marks a data source as failed. A notice on a branch that did not run emits nothing; `debug` is v1-only.
 
 ### `document-extraction`
 
@@ -27,4 +27,4 @@ The parent runs the child's ACTIVE version, never your draft, and gets back only
 - Fan-out (`inputExpression` resolving to a list; `runInBatch` is display only): `.items` is `[{index, output} | {index, error}]` in input order, `.summary.{total, success, failed}`; gate on `summary.failed` `eq` 0. Each element is the child's whole input (a scalar arrives as `{item: <v>}`).
 - `dispatchMode: "async-batch"` returns a dispatch receipt, no outputs.
 
-Pass `borrower_id` (`"borrower_id": "system.primary_borrower_id"`, or a field of every fan-out element): without it the child's sources skip the cache and save no packages. A child that ends on an `exception` node counts as a success with output `{}`.
+Pass `borrower_id` (`"borrower_id": "system.primary_borrower_id"`, or a field of every fan-out element): without it the child's sources skip the cache and save no packages. In a fan-out, a child that ends on an `exception` node, times out or hits a graph error lands in `items` as `{index, error}` and counts in `summary.failed`; a single run returns `{}` for any failed child.
