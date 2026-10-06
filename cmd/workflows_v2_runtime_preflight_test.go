@@ -164,3 +164,113 @@ func TestEvaluationRuleOperatorsAreChecked(t *testing.T) {
 		t.Errorf("a body without conditions passes unchanged, got %v %s", err, untouched)
 	}
 }
+
+func TestBorrowerIdFieldMustNameANodeInput(t *testing.T) {
+	task := map[string]any{"ref": "enrich", "type": "altdata-enrichment", "label": "Enrich", "borrowerIdField": "inputs.party_id"}
+	err := preflightTasks(docExtractionSpec(task))
+	if err == nil || !strings.Contains(err.Error(), `node ref="enrich"`) || !strings.Contains(err.Error(), `{"borrower_id": "inputs.<name>"}`) {
+		t.Fatalf("an inputs. path in borrowerIdField must be refused with the mapping to write, got %v", err)
+	}
+	for _, ok := range []string{"borrower_id", "party_id", "task_outputs.applicant.borrower_id"} {
+		if p := borrowerIdFieldProblem(ok); p != "" {
+			t.Errorf("borrowerIdField %q resolves at run time and must pass, got %q", ok, p)
+		}
+	}
+	if p := borrowerIdFieldProblem("{{inputs.party_id}}"); p == "" {
+		t.Error("a template in borrowerIdField never resolves and must be refused")
+	}
+}
+
+func TestFieldsReadFromAnObjectInputMustBeDeclared(t *testing.T) {
+	notice := func(message string) map[string]any {
+		return map[string]any{"ref": "note", "type": "notices", "label": "Note",
+			"noticesConfig": map[string]any{"message": message, "severity": "info"}}
+	}
+	spec := docExtractionSpec(notice("{{inputs.report.rating}} {{inputs.report.late_days}} {{inputs.open.anything}} " +
+		"{{inputs.applicant_id}} {{my_inputs.report.not_an_input_read}} {{inputs.bare.field}}"))
+	spec.InputVariables = map[string]any{
+		"report":       map[string]any{"type": "object", "properties": map[string]any{"rating": map[string]any{"type": "number"}}},
+		"open":         map[string]any{"type": "object", "additionalProperties": true},
+		"applicant_id": map[string]any{"type": "string"},
+		"bare":         map[string]any{"type": "object"},
+	}
+	err := preflightTasks(spec)
+	if err == nil || !strings.Contains(err.Error(), "the nodes read bare.field, report.late_days, which the object inputs do not declare") {
+		t.Fatalf("undeclared fields of object inputs must be listed together, got %v", err)
+	}
+	for _, never := range []string{"rating", "open.anything", "not_an_input_read", "applicant_id"} {
+		if strings.Contains(err.Error(), never) {
+			t.Errorf("%q is declared, open on purpose or not an input read, and must not be listed: %v", never, err)
+		}
+	}
+	spec.InputVariables["report"] = map[string]any{"type": "object", "properties": map[string]any{
+		"rating": map[string]any{"type": "number"}, "late_days": map[string]any{"type": "number"}}}
+	spec.InputVariables["bare"] = map[string]any{"type": "object", "properties": map[string]any{"field": map[string]any{"type": "string"}}}
+	if err := preflightTasks(spec); err != nil {
+		t.Errorf("a spec whose object inputs declare every field it reads must pass, got %v", err)
+	}
+}
+
+func TestPythonSandboxRefusalsMirrorTheEvalService(t *testing.T) {
+	refused := map[string]string{
+		"age = __import__('datetime').date.today().year - 2010": "line 1: __import__(...) is never allowed; write `import datetime` on its own line instead",
+		"import os":                                     "line 1: import of 'os' is blocked",
+		"import os.path":                                "line 1: import of 'os' is blocked",
+		"import json, subprocess as sp":                 "line 1: import of 'subprocess' is blocked",
+		"from urllib.parse import quote":                "line 1: import from 'urllib' is blocked",
+		"x = 1\ny = 2\nprint(x)":                        "line 3: print(...) is never allowed; use logger.info(...) instead",
+		"result = eval('1 + 1')":                        "line 1: eval(...) is never allowed",
+		"with open('f') as fh:\n    result = fh.read()": "line 1: open(...) is never allowed",
+		"result = os.getcwd()":                          "line 1: access to the 'os' module is blocked",
+		"import os; x = 1":                              "line 1: import of 'os' is blocked",
+		"import json; import os":                        "line 1: import of 'os' is blocked",
+		"x = 1\nimport json, \\\n    subprocess":        "line 2: import of 'subprocess' is blocked",
+		"if True: import ctypes":                        "line 1: import of 'ctypes' is blocked",
+		"x = 1; from socket import socket":              "line 1: import from 'socket' is blocked",
+	}
+	for code, want := range refused {
+		got := strings.Join(sandboxRefusals(code), "; ")
+		if !strings.Contains(got, want) {
+			t.Errorf("%q: want a refusal containing %q, got %q", code, want, got)
+		}
+	}
+	allowed := []string{
+		"import datetime\nimport math\nfrom dateutil import parser\nresult = math.floor(datetime.date.today().year)",
+		"pattern = re.compile(r'\\d+')\nlogger.info('ok')",
+		"# print(x) and import os would be refused if they were code\nresult = 1",
+		"label = \"print(\" + 'os.path' + '''import sys'''",
+		"result = inputs.get('task_outputs.applicant.os.version')",
+		"my_os = {'path': 1}\nresult = my_os.get('path')",
+		"import json; import datetime\nweights = {'importance': 1}; result = weights['importance']",
+		"import json, \\\n    unicodedata",
+	}
+	for _, code := range allowed {
+		if got := sandboxRefusals(code); len(got) > 0 {
+			t.Errorf("%q runs in the sandbox and must pass, got %q", code, got)
+		}
+	}
+	spec := docExtractionSpec(map[string]any{"ref": "note", "type": "notices", "label": "Note",
+		"noticesConfig": map[string]any{"message": "hi", "severity": "info"}})
+	spec.CustomVariables = map[string]any{
+		"age":  map[string]any{"expression": "result = __import__('datetime').date.today().year", "returnValue": "result"},
+		"band": map[string]any{"expression": "import math\nresult = math.floor(inputs['x'])", "returnValue": "result"},
+	}
+	err := preflightTasks(spec)
+	if err == nil || !strings.Contains(err.Error(), `customVariables["age"]: the Python sandbox refuses this code`) {
+		t.Fatalf("a variable the sandbox refuses must fail the dry-run before any request, got %v", err)
+	}
+	if strings.Contains(err.Error(), `customVariables["band"]`) {
+		t.Errorf("an allowed import must not be reported: %v", err)
+	}
+}
+
+func TestSetVariableRefusesSandboxedCodeBeforeAnyRequest(t *testing.T) {
+	cmd := makeWfv2SetVariableCmd()
+	cmd.SetArgs([]string{"wf-1", "--scope", "custom", "--name", "age",
+		"--default", `{"expression": "result = __import__('os').getcwd()", "returnValue": "result"}`})
+	cmd.SilenceUsage, cmd.SilenceErrors = true, true
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), `customVariables["age"]: the Python sandbox refuses this code`) {
+		t.Fatalf("set-variable must refuse code the sandbox refuses, before loading a client, got %v", err)
+	}
+}
