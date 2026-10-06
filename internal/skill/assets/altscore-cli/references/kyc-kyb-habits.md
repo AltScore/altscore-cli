@@ -18,7 +18,7 @@ Read this **before authoring** a KYC/KYB/onboarding workflow. For the mechanics 
 #### Enrichment
 
 - **Screen sanctions / PEP / adverse-media for *every* onboarded party** — KYC and KYB, primary and related. Beneficial owners and guarantors get screened too, not just the applicant.
-- **Distinguish "source failed" from "source said no."** Gate on an explicit success flag (`isSuccess`), not on data-presence — a timeout must not read as a clean result.
+- **Distinguish "source failed" from "source said no."** Gate on an explicit success flag (`isSuccess`), not on data-presence — a timeout must not read as a clean result. A source that succeeds can still answer a field with an empty-data code (`-999997`): guard every gate on that field with `is_not_altdata_null` and give absence its own outcome ([workflows-v2](workflows-v2.md), default structure point 6).
 - **Wire provider fields directly; compute only real indicators.** A rule, scorecard or mapping table reads a source field by its deep path (`task_outputs.<ref>.<SOURCE_ID>.data.<field>`, success gate `....isSuccess`); copying it into a variable first adds a node and a failure mode, nothing else. Compute a variable only when it derives something (a ratio, a date delta, a count across a list), one scalar each. Country portability lives in the versioned decision entities, not in an extraction layer.
 
 #### Decisioning
@@ -44,7 +44,7 @@ Read this **before authoring** a KYC/KYB/onboarding workflow. For the mechanics 
 - [ ] Parties fan out by persona/entity-type, best-effort.
 - [ ] Consistent identity key per subject type; all writes idempotent.
 - [ ] Sanctions/PEP screening on every party, primary and related.
-- [ ] Source failure distinguished from a clean negative (`isSuccess`).
+- [ ] Source failure distinguished from a clean negative (`isSuccess`), and no gate fires on an empty-data code.
 - [ ] Score and hard gates are separate layers.
 - [ ] Decision is structured (`decision_key` + reason) and written back; `final` only on the decider.
 - [ ] KYB: UBOs/legal-reps screened as relationships; entity-status gate present.
