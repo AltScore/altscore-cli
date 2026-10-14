@@ -415,6 +415,11 @@ func validateEntityWorkflowAliasMatch(opts *composeNormalizeOpts, entity map[str
 	if id == "" {
 		id = "<id>"
 	}
+	// ref is what the spec wrote, an id for an id-only reference.
+	entityCode, _ := entity["code"].(string)
+	if entityCode == "" {
+		entityCode = ref
+	}
 	skipRescope := opts != nil && opts.SkipRescope
 	if opts != nil && opts.AllowStealOwnership {
 		if skipRescope {
@@ -439,7 +444,7 @@ func validateEntityWorkflowAliasMatch(opts *composeNormalizeOpts, entity map[str
 				"\"workflowAlias\": %q, then altscore %s create --body @/tmp/clone.json, and reference the new code; or\n"+
 				"  - reference it as it is, without transferring it: re-run with --skip-rescope --allow-steal-ownership "+
 				"(nothing is re-stamped; it stays %q's).",
-			resourceKind, ref, ref, actual, predictedAlias,
+			resourceKind, ref, entityCode, actual, predictedAlias,
 			predictedAlias,
 			predictedAlias, resourceKind, id, predictedAlias, resourceKind,
 			actual)
@@ -454,14 +459,17 @@ func validateEntityWorkflowAliasMatch(opts *composeNormalizeOpts, entity map[str
 			"    # edit /tmp/clone.json: set \"code\" to a fresh value (e.g. %q) and \"workflowAlias\" to %q\n"+
 			"    altscore %s create --body @/tmp/clone.json\n"+
 			"If you really do want to transfer ownership of %q from %q to %q (rare: workflow rename, "+
-			"identity migration, decommissioning the old owner), re-run apply with --allow-steal-ownership.",
-		resourceKind, ref, ref, actual, predictedAlias,
+			"identity migration, decommissioning the old owner), re-run apply with --allow-steal-ownership. "+
+			"To reference it as it is WITHOUT a transfer, re-run with --skip-rescope --allow-steal-ownership "+
+			"(it stays %q's, and a revert of %q does not restore it).",
+		resourceKind, ref, entityCode, actual, predictedAlias,
 		actual,
 		predictedAlias,
 		resourceKind, id,
-		predictedAlias+"-"+ref, predictedAlias,
+		predictedAlias+"-"+entityCode, predictedAlias,
 		resourceKind,
-		ref, actual, predictedAlias)
+		ref, actual, predictedAlias,
+		actual, predictedAlias)
 }
 
 func normalizeTaskBody(c *client.Client, task map[string]any, opts *composeNormalizeOpts, dryRun bool) error {

@@ -101,6 +101,30 @@ func TestNormalizeTaskBody_PublishAcceptsAnIdReference(t *testing.T) {
 	}
 }
 
+// Once an id resolves, it is held to the rule a code is: another workflow's entity is
+// refused, and the refusal names the entity's code and every way forward.
+func TestAnIdReferenceToAnotherWorkflowsEntityFollowsTheOwnershipRule(t *testing.T) {
+	codes := map[string]string{"mapping-table": "MT", "scorecard": "SC", "rule-tree": "RT", "evaluate-rules": "DR_R001"}
+	for name, task := range idOnlyDecisioningTasks() {
+		t.Run(name, func(t *testing.T) {
+			c, _ := newFakeDecisioningBC(t, idOnlyEntities("other-wf"))
+			err := normalizeTaskBody(c, task(), &composeNormalizeOpts{PredictedAlias: "target-wf"}, false)
+			if err == nil {
+				t.Fatal("an id reference to another workflow's entity must be refused like a code reference")
+			}
+			for _, want := range []string{
+				`(code="` + codes[name] + `") is currently owned by workflow "other-wf"`,
+				"re-run apply with --allow-steal-ownership",
+				"--skip-rescope --allow-steal-ownership",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal is missing %q:\n%v", want, err)
+				}
+			}
+		})
+	}
+}
+
 func TestReconcileEntityScopes_StampsAnIdReference(t *testing.T) {
 	c, f := newFakeDecisioningBC(t, idOnlyEntities(""))
 	spec := &composeSpec{Tasks: []map[string]any{idOnlyDecisioningTasks()["mapping-table"]()}}
