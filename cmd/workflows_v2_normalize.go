@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"sort"
@@ -364,6 +365,9 @@ type composeNormalizeOpts struct {
 	// AllowStealOwnership transfers an entity another workflow owns; refusing by
 	// default keeps the 1:1 ownership its Hub elements panel depends on.
 	AllowStealOwnership bool
+	// SkipRescope is apply's --skip-rescope: nothing is re-stamped after the apply, so
+	// AllowStealOwnership then references a cross-owned entity without transferring it.
+	SkipRescope bool
 	// AutoDefaults fills only absent fields -- caller-supplied values always win.
 	AutoDefaults bool
 	// Defaults records every value a normalizer fills that the spec did not set; nil records nothing.
@@ -411,11 +415,34 @@ func validateEntityWorkflowAliasMatch(opts *composeNormalizeOpts, entity map[str
 	if id == "" {
 		id = "<id>"
 	}
+	skipRescope := opts != nil && opts.SkipRescope
 	if opts != nil && opts.AllowStealOwnership {
+		if skipRescope {
+			fmt.Fprintf(os.Stderr,
+				"# warning: %s %q is owned by workflowAlias=%q -- --allow-steal-ownership with --skip-rescope references it WITHOUT transferring it: "+
+					"it stays in %q's Hub elements panel, not %q's, and a revert of %q does not restore it (revert restores only entities scoped to the workflow's own alias)\n",
+				resourceKind, ref, actual, actual, predictedAlias, predictedAlias)
+			return nil
+		}
 		fmt.Fprintf(os.Stderr,
 			"# warning: %s %q is owned by workflowAlias=%q -- --allow-steal-ownership was set, apply will transfer ownership to %q after task creation\n",
 			resourceKind, ref, actual, predictedAlias)
 		return nil
+	}
+	if skipRescope {
+		return fmt.Errorf(
+			"%s %q (code=%q) is currently owned by workflow %q, but this apply targets workflow %q. "+
+				"--skip-rescope only skips the re-stamp after apply; the 1:1 ownership check still runs, because an entity "+
+				"another workflow owns is invisible in this workflow's Hub elements panel and a revert of %q does not restore it. "+
+				"To proceed, either:\n"+
+				"  - clone it for %q (recommended): altscore %s get %s > /tmp/clone.json, set a fresh \"code\" and "+
+				"\"workflowAlias\": %q, then altscore %s create --body @/tmp/clone.json, and reference the new code; or\n"+
+				"  - reference it as it is, without transferring it: re-run with --skip-rescope --allow-steal-ownership "+
+				"(nothing is re-stamped; it stays %q's).",
+			resourceKind, ref, ref, actual, predictedAlias,
+			predictedAlias,
+			predictedAlias, resourceKind, id, predictedAlias, resourceKind,
+			actual)
 	}
 	return fmt.Errorf(
 		"%s %q (code=%q) is currently owned by workflow %q, but this apply targets workflow %q. "+
@@ -1184,20 +1211,53 @@ func warnIfDecisionKeyUnknown(c *client.Client, decisionKey, ruleCode, context s
 	)
 }
 
-// Runs in dry-run too: skipping it would make the preview a different shape.
-// dryRun stays in the signature for symmetry with the sibling normalizers.
-// BC keys codes by (tenant, code, workflowAlias) and resolves them the same way: owner's copy first, tenant-wide after.
-func lookupEntity(c *client.Client, resource, codeOrID, workflowAlias string, dryRun bool) (map[string]any, error) {
-	_ = dryRun
-	if codeOrID == "" {
-		return nil, nil
-	}
-	if workflowAlias != "" {
-		if e := queryEntityByCode(c, resource, codeOrID, workflowAlias); e != nil {
-			return e, nil
+// The order BC's DecisioningEntityResolver resolves a reference in, so the preflight finds
+// what a run (and publish's pins) will: the code under the workflow's alias, then the code
+// tenant-wide, then the stored id. The list endpoints only filter by code, so an id is read
+// by id; a by-code query alone called every mappingTableId reference missing. Runs in
+// dry-run too: skipping it would make the preview a different shape.
+func lookupEntityRef(c *client.Client, resource, code, id, workflowAlias string) map[string]any {
+	if code != "" {
+		if workflowAlias != "" {
+			if e := queryEntityByCode(c, resource, code, workflowAlias); e != nil {
+				return e
+			}
+		}
+		if e := queryEntityByCode(c, resource, code, ""); e != nil {
+			return e
 		}
 	}
-	return queryEntityByCode(c, resource, codeOrID, ""), nil
+	if id != "" {
+		return fetchEntityByID(c, resource, id)
+	}
+	return nil
+}
+
+// A 404 is cached as a miss; any other failure is not, like queryEntityByCode.
+func fetchEntityByID(c *client.Client, resource, id string) map[string]any {
+	cacheKey := resource + "|id:" + id
+	if cached, ok := entityCache[cacheKey]; ok {
+		return cached
+	}
+	if c == nil {
+		return nil
+	}
+	data, status, err := c.Do("GET", "borrower_central", "/v1/"+resource+"/"+url.PathEscape(id), nil)
+	if err != nil {
+		if status == http.StatusNotFound {
+			entityCache[cacheKey] = nil
+		}
+		return nil
+	}
+	var e map[string]any
+	if err := json.Unmarshal(data, &e); err != nil || e == nil {
+		return nil
+	}
+	if got, _ := e["id"].(string); got != id {
+		return nil
+	}
+	entityCache[cacheKey] = e
+	return e
 }
 
 func queryEntityByCode(c *client.Client, resource, codeOrID, workflowAlias string) map[string]any {
@@ -1276,7 +1336,7 @@ func normalizeEvaluateRulesTask(c *client.Client, task map[string]any, opts *com
 		if ref == "" {
 			ref = id
 		}
-		entity, _ := lookupEntity(c, "evaluation-rules", ref, predictedAlias, dryRun)
+		entity := lookupEntityRef(c, "evaluation-rules", code, id, predictedAlias)
 		if entity == nil && c != nil {
 			if err := missingEntityHandler(opts, dryRun, "evaluation-rules", ref); err != nil {
 				return fmt.Errorf("rulesConfig[%d]: %w", i, err)
@@ -1387,7 +1447,7 @@ func normalizeMappingTableTask(c *client.Client, task map[string]any, opts *comp
 		if ref == "" {
 			ref = id
 		}
-		entity, _ := lookupEntity(c, "mapping-tables", ref, predictedAlias, dryRun)
+		entity := lookupEntityRef(c, "mapping-tables", code, id, predictedAlias)
 		if entity == nil && c != nil {
 			if err := missingEntityHandler(opts, dryRun, "mapping-tables", ref); err != nil {
 				return fmt.Errorf("entries[%d]: %w", i, err)
@@ -1449,7 +1509,7 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, opts *compose
 	if ref == "" {
 		ref = id
 	}
-	entity, _ := lookupEntity(c, "scorecards", ref, predictedAlias, dryRun)
+	entity := lookupEntityRef(c, "scorecards", code, id, predictedAlias)
 	if entity == nil && c != nil {
 		if err := missingEntityHandler(opts, dryRun, "scorecards", ref); err != nil {
 			return err
@@ -1476,7 +1536,7 @@ func normalizeScorecardTask(c *client.Client, task map[string]any, opts *compose
 				if mref == "" {
 					continue
 				}
-				mtEntity, _ := lookupEntity(c, "mapping-tables", mref, entityOwnerOr(entity, predictedAlias), dryRun)
+				mtEntity := lookupEntityRef(c, "mapping-tables", mcode, mid, entityOwnerOr(entity, predictedAlias))
 				if mtEntity == nil {
 					continue
 				}
@@ -1526,7 +1586,7 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeN
 	if ref == "" {
 		ref = id
 	}
-	entity, _ := lookupEntity(c, "rule-trees", ref, predictedAlias, dryRun)
+	entity := lookupEntityRef(c, "rule-trees", code, id, predictedAlias)
 	if entity == nil && c != nil {
 		if err := missingEntityHandler(opts, dryRun, "rule-trees", ref); err != nil {
 			return err
@@ -1551,7 +1611,7 @@ func normalizeRuleTreeTask(c *client.Client, task map[string]any, opts *composeN
 				if rref == "" {
 					continue
 				}
-				ruleEntity, _ := lookupEntity(c, "evaluation-rules", rref, entityOwnerOr(entity, predictedAlias), dryRun)
+				ruleEntity := lookupEntityRef(c, "evaluation-rules", rcode, rid, entityOwnerOr(entity, predictedAlias))
 				if ruleEntity == nil {
 					continue
 				}

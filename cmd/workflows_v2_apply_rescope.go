@@ -16,11 +16,15 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 	}
 	stamped := map[string]bool{}
 
-	stamp := func(resource, ref, scope string) {
+	stamp := func(resource, code, entityID, scope string) {
+		ref := code
+		if ref == "" {
+			ref = entityID
+		}
 		if ref == "" {
 			return
 		}
-		entity, _ := lookupEntity(c, resource, ref, scope, false)
+		entity := lookupEntityRef(c, resource, code, entityID, scope)
 		if entity == nil {
 			// Best-effort: missing entity already warned by normalize.
 			return
@@ -67,13 +71,10 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 				if cfg == nil {
 					continue
 				}
-				code, _ := cfg["scorecardCode"].(string)
-				if code == "" {
-					code, _ = cfg["scorecardId"].(string)
-				}
-				entity, _ := lookupEntity(c, "scorecards", code, targetAlias, false)
+				code, id := refCodeAndID(cfg, "scorecardCode", "scorecardId")
+				entity := lookupEntityRef(c, "scorecards", code, id, targetAlias)
 				nestedScope := entityOwnerOr(entity, targetAlias)
-				stamp("scorecards", code, targetAlias)
+				stamp("scorecards", code, id, targetAlias)
 				if entity != nil {
 					if rules, ok := entity["rules"].([]any); ok {
 						for _, rraw := range rules {
@@ -81,11 +82,8 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 							if !ok {
 								continue
 							}
-							mt, _ := rm["mappingTableCode"].(string)
-							if mt == "" {
-								mt, _ = rm["mappingTableId"].(string)
-							}
-							stamp("mapping-tables", mt, nestedScope)
+							mt, mtID := refCodeAndID(rm, "mappingTableCode", "mappingTableId")
+							stamp("mapping-tables", mt, mtID, nestedScope)
 						}
 					}
 				}
@@ -94,13 +92,10 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 				if cfg == nil {
 					continue
 				}
-				code, _ := cfg["ruleTreeCode"].(string)
-				if code == "" {
-					code, _ = cfg["ruleTreeId"].(string)
-				}
-				entity, _ := lookupEntity(c, "rule-trees", code, targetAlias, false)
+				code, id := refCodeAndID(cfg, "ruleTreeCode", "ruleTreeId")
+				entity := lookupEntityRef(c, "rule-trees", code, id, targetAlias)
 				nestedScope := entityOwnerOr(entity, targetAlias)
-				stamp("rule-trees", code, targetAlias)
+				stamp("rule-trees", code, id, targetAlias)
 				if entity != nil {
 					if rules, ok := entity["rules"].([]any); ok {
 						for _, rraw := range rules {
@@ -108,11 +103,8 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 							if !ok {
 								continue
 							}
-							rc, _ := rm["ruleCode"].(string)
-							if rc == "" {
-								rc, _ = rm["ruleId"].(string)
-							}
-							stamp("evaluation-rules", rc, nestedScope)
+							rc, rcID := refCodeAndID(rm, "ruleCode", "ruleId")
+							stamp("evaluation-rules", rc, rcID, nestedScope)
 						}
 					}
 				}
@@ -123,11 +115,8 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 					if !ok {
 						continue
 					}
-					rc, _ := rm["ruleCode"].(string)
-					if rc == "" {
-						rc, _ = rm["ruleId"].(string)
-					}
-					stamp("evaluation-rules", rc, targetAlias)
+					rc, rcID := refCodeAndID(rm, "ruleCode", "ruleId")
+					stamp("evaluation-rules", rc, rcID, targetAlias)
 				}
 			case "mapping-table":
 				cfg, _ := t["mappingTableConfig"].(map[string]any)
@@ -140,11 +129,8 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 					if !ok {
 						continue
 					}
-					mt, _ := em["mappingTableCode"].(string)
-					if mt == "" {
-						mt, _ = em["mappingTableId"].(string)
-					}
-					stamp("mapping-tables", mt, targetAlias)
+					mt, mtID := refCodeAndID(em, "mappingTableCode", "mappingTableId")
+					stamp("mapping-tables", mt, mtID, targetAlias)
 				}
 			}
 		}
@@ -152,4 +138,11 @@ func reconcileEntityScopes(c *client.Client, spec *composeSpec, targetAlias stri
 	walkTasks(spec.Tasks)
 	walkTasks(spec.ExtraNodes)
 	return nil
+}
+
+// A reference's code and id as written; BC tries the code first, then the id.
+func refCodeAndID(m map[string]any, codeKey, idKey string) (string, string) {
+	code, _ := m[codeKey].(string)
+	id, _ := m[idKey].(string)
+	return code, id
 }

@@ -405,16 +405,20 @@ func printScopeConflicts(out io.Writer, c *client.Client, spec *composeSpec, tar
 	touches := []touch{}
 	seen := map[string]bool{}
 
-	check := func(resource, ref string) {
+	check := func(resource, code, id string) {
+		ref := code
+		if ref == "" {
+			ref = id
+		}
 		if ref == "" {
 			return
 		}
-		key := resource + "|" + ref
+		key := resource + "|" + code + "|" + id
 		if seen[key] {
 			return
 		}
 		seen[key] = true
-		entity, _ := lookupEntity(c, resource, ref, targetAlias, false)
+		entity := lookupEntityRef(c, resource, code, id, targetAlias)
 		if entity == nil {
 			return
 		}
@@ -432,20 +436,14 @@ func printScopeConflicts(out io.Writer, c *client.Client, spec *composeSpec, tar
 			case "scorecard":
 				cfg, _ := t["scorecardConfig"].(map[string]any)
 				if cfg != nil {
-					code, _ := cfg["scorecardCode"].(string)
-					if code == "" {
-						code, _ = cfg["scorecardId"].(string)
-					}
-					check("scorecards", code)
+					code, id := refCodeAndID(cfg, "scorecardCode", "scorecardId")
+					check("scorecards", code, id)
 				}
 			case "rule-tree":
 				cfg, _ := t["ruleTreeConfig"].(map[string]any)
 				if cfg != nil {
-					code, _ := cfg["ruleTreeCode"].(string)
-					if code == "" {
-						code, _ = cfg["ruleTreeId"].(string)
-					}
-					check("rule-trees", code)
+					code, id := refCodeAndID(cfg, "ruleTreeCode", "ruleTreeId")
+					check("rule-trees", code, id)
 				}
 			case "evaluate-rules":
 				rules, _ := t["rulesConfig"].([]any)
@@ -454,11 +452,8 @@ func printScopeConflicts(out io.Writer, c *client.Client, spec *composeSpec, tar
 					if !ok {
 						continue
 					}
-					rc, _ := rm["ruleCode"].(string)
-					if rc == "" {
-						rc, _ = rm["ruleId"].(string)
-					}
-					check("evaluation-rules", rc)
+					rc, rcID := refCodeAndID(rm, "ruleCode", "ruleId")
+					check("evaluation-rules", rc, rcID)
 				}
 			case "mapping-table":
 				cfg, _ := t["mappingTableConfig"].(map[string]any)
@@ -471,11 +466,8 @@ func printScopeConflicts(out io.Writer, c *client.Client, spec *composeSpec, tar
 					if !ok {
 						continue
 					}
-					mt, _ := em["mappingTableCode"].(string)
-					if mt == "" {
-						mt, _ = em["mappingTableId"].(string)
-					}
-					check("mapping-tables", mt)
+					mt, mtID := refCodeAndID(em, "mappingTableCode", "mappingTableId")
+					check("mapping-tables", mt, mtID)
 				}
 			}
 		}
