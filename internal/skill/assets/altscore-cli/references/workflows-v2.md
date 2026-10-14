@@ -164,7 +164,7 @@ This is the shape productive tenants run. Write it by default and deviate only f
    | document extraction | `task_outputs.<ref>.fields.<name>`, `....missingFields`, `....isSuccess` |
 
    A custom variable that only re-exposes, renames, casts or `.get()`s one of these is never needed. Inputs and outputs of `contact`, `notices`, `document-extraction` and a child workflow: [node-contracts](node-contracts.md).
-2. **The decision lives in entities, not in Python.** `decision_key` comes from a rule-tree: hard gates first, then the band. Score bands and code-to-label maps are mapping tables; thresholds are evaluation rules or scorecards, versioned and editable without a republish. Rule-tree, scorecard and evaluate-rules inputs take deep paths directly, so gate on `isSuccess`, a status or a hit count with no variable in between. The usual chain is altdata -> indicator compute -> scorecard -> mapping-table (score to band) -> rule-tree -> End. Create the entities first ([credit-decisioning](credit-decisioning.md)), then reference them from the spec.
+2. **The decision lives in entities, not in Python.** `decision_key` comes from a rule-tree: hard gates first, then the band. Score bands and code-to-label maps are mapping tables; thresholds are evaluation rules or scorecards, which the client reads and edits as tables in the Hub. Every save of one is a new version, and a published workflow runs the versions pinned at its publish, so an edit goes live at the next publish (see [Entity versions and pins](#entity-versions-and-pins-what-an-entity-edit-changes)). Rule-tree, scorecard and evaluate-rules inputs take deep paths directly, so gate on `isSuccess`, a status or a hit count with no variable in between. The usual chain is altdata -> indicator compute -> scorecard -> mapping-table (score to band) -> rule-tree -> End. Create the entities first ([credit-decisioning](credit-decisioning.md)), then reference them from the spec.
    First means after the question path's answers and before the first dry-run.
 3. **Python computes indicators, one scalar each.** A variable earns its place when it combines two or more values (ratio, age, date delta, a multi-step formula), aggregates a list, builds a per-party list for a fan-out over several parties (filtering alone is `inputExpression: "inputs.<list>[<field>=<value>]"`; one party is a plain child call, not a one-element batch), parses a raw payload once, normalises text, renders HTML for a PDF block, or is a scoped probe (below). Return a number, string or boolean, never an object; name it `snake_case` after the value; `onError: "null"` and let the rule handle "no data". The sandbox runs the code inside `def execute(input, context)`: `json`, `re` and a `logger` are already there, but `datetime` and `math` are not, so write `import datetime` (or `math`, `unicodedata`) as a statement. It refuses `os`, `sys`, `subprocess`, network and threading modules, and any bare `__import__`, `eval`, `exec`, `compile`, `open` or `print` call, before running anything; one refusal fails every variable of its compute node, and `apply --dry-run` reports it.
 4. **Limits productive tenants stay under:** at most 6 variables per compute node, compute nodes at most a third of the graph, no `self.` chain longer than 2, under about 1,000 code chars per variable unless it is HTML, parsing or iteration. Past those the Python is a rules engine; move it into entities.
@@ -218,7 +218,7 @@ Both paths share the same validation + normalize pipeline (`preflightTasks`, per
 - `evaluate-rules` task → each `rulesConfig[*].ruleCode` evaluation rule.
 - `mapping-table` task → each `mappingTableConfig.entries[*].mappingTableCode` mapping table.
 
-Each successful stamp logs to stderr (`# scoped <resource> <code> to <alias>`). Pass `--skip-rescope` to opt out (then a stale scope shows as a hard error in normalize and the agent has to fix it manually).
+Each successful stamp logs to stderr (`# scoped <resource> <code> to <alias>`). Pass `--skip-rescope` to opt out (then a stale scope shows as a hard error in normalize and the agent has to fix it manually). `--skip-rescope` does NOT lift the ownership rule below: add `--allow-steal-ownership` to reference another workflow's entity without transferring it (nothing is re-stamped; it stays in its owner's Hub panel, and a revert of this workflow does not restore it). A reference resolves as the runtime resolves it: the code under the workflow's alias, then the code tenant-wide, then the id (`mappingTableId`, `scorecardId`, `ruleTreeId`, `ruleId`), so an id reference passes `--publish` too.
 
 **Entity ownership rule.** Each v2 workflow owns its credit-decisioning entities 1:1. A workflow's spec must NOT reference an entity whose `workflowAlias` is currently another workflow's alias. If you want the same logic in two workflows, **clone the entity** with a new code (e.g. `kyc-sc` and `kyb-sc` instead of one shared `scoring-sc`). Apply now refuses to silently steal ownership; pass `--allow-steal-ownership` if you really do want to transfer. Codes are unique per workflow, not per tenant: apply resolves a code under the target workflow's alias first (a tree's rules and a scorecard's tables under the parent's alias), exactly as the runtime does, so each workflow may own its own `DR_R001`; only a code no entity under that alias carries falls back to the tenant-wide match and its ownership check.
 
@@ -358,7 +358,7 @@ Canonical shape:
 
 > **Values render as JSON, quoted or not.** Each placeholder becomes `json.dumps` of its value, and a placeholder that fills a whole quoted string drops those quotes. So `"{{task_outputs.<ref>.score}}"` gives the number `720`, a dict gives an object, and `None` (or a path that resolves to nothing) gives a real `null`. To emit null, leave the value `None`: the text `'null'` comes out as the string `"null"`, and `''` stays an empty string. A placeholder inside a longer string (`"Score: {{...}}"`) breaks the JSON when its value is a string, and the output silently falls back to the scope dump.
 
-> **DRAFT vs publish (test before you publish).** apply's CREATE path saves workflows in `status: "DRAFT"` by default — mirrors the Hub's "save-then-publish" editor flow. A DRAFT executes its **full graph faithfully** — node execution is never gated by status (the engine reads nodes straight from the workflow doc), so a DRAFT run is a real, complete test run. Publishing only changes which version the **alias** serves (the alias resolves to the latest `ACTIVE` version). So to validate before going live, execute the DRAFT **by its workflow id** (or by alias in test mode) — you do **not** have to publish untested work to run it. Pass `--publish` on apply when you *do* want it live immediately; the UPDATE path always publishes (apply treats the spec as desired state). `workflows-v2 execute` prints an informational stderr note when the targeted version isn't `ACTIVE`; pass `--skip-status-check` to silence it.
+> **DRAFT vs publish (test before you publish).** apply's CREATE path saves workflows in `status: "DRAFT"` by default — mirrors the Hub's "save-then-publish" editor flow. A DRAFT executes its **full graph faithfully** — node execution is never gated by status (the engine reads nodes straight from the workflow doc), so a DRAFT run is a real, complete test run. Publishing changes which version the **alias** serves (the alias resolves to the latest `ACTIVE` version), and it pins the entity version every mapping-table / scorecard / rule-tree / evaluate-rules reference reads ([Entity versions and pins](#entity-versions-and-pins-what-an-entity-edit-changes)). So to validate before going live, execute the DRAFT **by its workflow id** (or by alias in test mode) — you do **not** have to publish untested work to run it. Pass `--publish` on apply when you *do* want it live immediately; the UPDATE path always publishes (apply treats the spec as desired state). `workflows-v2 execute` prints an informational stderr note when the targeted version isn't `ACTIVE`; pass `--skip-status-check` to silence it.
 
 > **Canvas auto-layout (on by default; `--no-layout` to skip).** apply positions nodes in left-to-right columns using the same algorithm as the Hub builder's **Align** button: longest-path leveling (every edge points forward, so a diamond's short arm never draws backwards into the join) plus barycenter row ordering to reduce crossings. Do NOT hand-write `position` on spec nodes — pinning it on *any* node disables auto-layout for the whole graph (apply says so on stderr) and you inherit responsibility for the entire canvas. Positions are recomputed on every apply, including the UPDATE path, so a re-applied spec always opens tidy.
 
@@ -506,8 +506,7 @@ All lock subcommands accept an alias **or** an id; an id is resolved to its alia
 altscore workflows-v2 create-draft <active-id>                   # branch off ACTIVE
 altscore workflows-v2 publish <draft-id>                         # DRAFT -> ACTIVE (no lock held)
 altscore workflows-v2 publish <draft-id> --lock-token "$TOKEN"    # when you hold the edit lock
-altscore workflows-v2 revert my-wf <version-id>                  # restore prior version into a draft
-altscore workflows-v2 revert my-wf <version-id> --mode publish   # replace ACTIVE directly
+altscore workflows-v2 revert my-wf <version-id>                  # restore prior version into a draft (+ its tasks and own pinned entities); publish to go live
 altscore workflows-v2 archive <id>                               # archive all versions
 altscore workflows-v2 restore <id>                               # un-archive
 altscore workflows-v2 duplicate <id> --new-label "Copy of X"
@@ -519,13 +518,32 @@ altscore workflows-v2 set-visibility my-wf --hidden=true          # every versio
 
 ```bash
 altscore workflows-v2 versions my-wf --include-changes
-altscore workflows-v2 get-version my-wf latest
+altscore workflows-v2 get-version my-wf 3                        # "latest" = highest version of ANY status (the open DRAFT), not the ACTIVE
+altscore workflows-v2 pins my-wf                                 # the entity versions the ACTIVE version runs on
+altscore workflows-v2 diff <v3-id> <v4-id>                       # graph AND entity-pin changes between two versions
 altscore workflows-v2 executions <id> --per-page 20 --sort-by createdAt --sort-direction desc
 
 altscore workflows-v2 update-mapping <id> --node-id score --previous old --new new
 altscore workflows-v2 update-mapping <id> --node-id score --previous old --new ""    # clear
 altscore workflows-v2 resolve-mappings <id>                                          # auto-wire unresolved
 ```
+
+#### Entity versions and pins (what an entity edit changes)
+
+Since 2026-10-14 (borrower-central #2402) every save of a mapping table, rule tree, scorecard or evaluation rule mints an immutable version (`version` on the entity), and **publishing** a workflow writes `config.entityPins`: the exact entity version each reference reads. A non-test run of that published version reads exactly those versions.
+
+- **Editing an entity does not change production.** It reaches a workflow at that workflow's next publish (`publish`, or `apply` over the ACTIVE). Drafts and test runs (`--test`) read the latest versions, so test the edit there, then publish.
+- A version published before 2026-10-14 has no pins and reads the latest entities until it is republished. A DRAFT never carries pins; `create-draft`, `import` and `duplicate` drop them.
+- `revert` writes the reverted version's pinned content back as each entity's new latest version (source `revert`), only for entities scoped to this workflow's alias and only when the ACTIVE version carries pins; the draft then publishes them.
+
+```bash
+altscore workflows-v2 pins my-wf                        # pins of the ACTIVE version (stderr says what they mean)
+altscore workflows-v2 diff <prev-id> <active-id>        # which entity versions changed between two publishes
+altscore mapping-tables versions <id>                   # [{version, createdAt, createdBy, source}], newest first
+altscore mapping-tables get-version <id> 3              # the body a pin names (also after a delete)
+```
+
+Calibration loop: edit the entity; open a draft (`create-draft <active-id>`, or use the open one) and run it by id, or the alias with `--test`, on sample inputs; `publish` the draft; then `diff <previous-active-id> <new-active-id>`: an entity-only change shows no node changes and lists the pin moves (`v3 -> v4`).
 
 #### Schedules
 
@@ -557,7 +575,7 @@ altscore workflows-v2 import --body @my-wf.json --new-label "Light" --skip-evalu
 ```bash
 altscore workflows-v2 execute <id> --body '{"borrower_id":"abc"}'                          # sync, flat keys
 altscore workflows-v2 execute <id> --body '{...}' --execution-mode async --tags smoke      # async returns executionId
-altscore workflows-v2 execute-by-alias my-wf latest --body '{...}'
+altscore workflows-v2 execute-by-alias my-wf latest --body '{...}'                        # live: the ACTIVE version; with --test: the highest (the open DRAFT)
 
 # A sync run blocks until the graph finishes; the CLI waits up to 10 minutes for
 # the server to answer. If it still reports "timeout awaiting response headers",

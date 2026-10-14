@@ -59,7 +59,15 @@ makes it disappear from the previous owner's Hub element panel. Pass
 --allow-steal-ownership to override (rare: workflow rename / identity
 migration / decommissioning the old owner). Pass --skip-rescope to disable
 the entire rescope step (then a stale scope shows as a hard error in
-normalize and the agent has to fix it manually).
+normalize and the agent has to fix it manually). --skip-rescope does not
+lift the ownership check: --skip-rescope --allow-steal-ownership references
+another workflow's entity WITHOUT transferring it.
+
+A reference resolves as the runtime resolves it: the code under this
+workflow's alias, then the code tenant-wide, then the id (mappingTableId,
+scorecardId, ruleTreeId, ruleId). Publishing pins the entity version each
+reference reads ('workflows-v2 pins'); an entity edited later reaches this
+workflow's production runs only at its next publish.
 
 DRAFT vs publish: the create path saves the workflow in DRAFT by default,
 mirror of the Hub editor's save-then-publish flow. A DRAFT executes its full

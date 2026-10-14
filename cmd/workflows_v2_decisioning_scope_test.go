@@ -17,7 +17,8 @@ type fakeDecisioningBC struct {
 	patched  []string
 }
 
-// Honours the list endpoints' code and workflow-alias filters the way BC's CRUD.query does.
+// Honours the list endpoints' code and workflow-alias filters the way BC's CRUD.query does,
+// and answers GET /v1/{resource}/{id} for a stored id.
 func newFakeDecisioningBC(t *testing.T, entities map[string][]map[string]any) (*client.Client, *fakeDecisioningBC) {
 	t.Helper()
 	seedEntities(t, map[string]map[string]any{})
@@ -40,6 +41,14 @@ func newFakeDecisioningBC(t *testing.T, entities map[string][]map[string]any) (*
 				out = append(out, e)
 			}
 			_ = json.NewEncoder(w).Encode(out)
+		case r.Method == http.MethodGet && len(parts) == 2:
+			for _, e := range f.entities[resource] {
+				if e["id"] == parts[1] {
+					_ = json.NewEncoder(w).Encode(e)
+					return
+				}
+			}
+			w.WriteHeader(http.StatusNotFound)
 		case r.Method == http.MethodPatch && len(parts) == 2:
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -226,7 +235,7 @@ func TestLookupEntity_ResolvesWithinTheWorkflowAliasFirst(t *testing.T) {
 					rows = append(rows, decisioningEntity(id, "CODE", owner, nil))
 				}
 				c, _ := newFakeDecisioningBC(t, map[string][]map[string]any{resource: rows})
-				got, _ := lookupEntity(c, resource, "CODE", "target-wf", false)
+				got := lookupEntityRef(c, resource, "CODE", "", "target-wf")
 				if id, _ := got["id"].(string); id != tc.wantID {
 					t.Fatalf("resolved %v, want id=%s", got, tc.wantID)
 				}

@@ -457,6 +457,7 @@ func composeWorkflowBody(c *client.Client, spec *composeSpec, dryRun bool, publi
 			Publish:             publish,
 			AutoRescopeEntities: autoRescopeEntities,
 			AllowStealOwnership: allowStealOwnership,
+			SkipRescope:         !autoRescopeEntities,
 			AutoDefaults:        autoDefaults,
 			Defaults:            applied,
 		}, dryRun); err != nil {

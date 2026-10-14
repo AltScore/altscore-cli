@@ -1,6 +1,8 @@
 ### Credit Decisioning
 
-Four entity types power the credit-decisioning v2 task surface. They live at `/v1/{evaluation-rules, mapping-tables, scorecards, rule-trees}` and are referenced by alias from v2 tasks. All four have full CRUD + `import` extras; scorecards add `usage`; evaluation-rules add `history`.
+Four entity types power the credit-decisioning v2 task surface. They live at `/v1/{evaluation-rules, mapping-tables, scorecards, rule-trees}` and are referenced by alias from v2 tasks. All four have full CRUD + `import` extras plus `versions` / `get-version`; scorecards add `usage`; evaluation-rules add `history` (the field-level edit log).
+
+> **Every save is a version; production runs pinned versions.** Each save mints an immutable version (`version` on the entity; `<resource> versions <id>` lists them, `<resource> get-version <id> <n>` prints one). Publishing a workflow pins the version each of its references reads, so **an edit reaches a published workflow only at that workflow's next publish**. Drafts and `--test` runs read the latest version: test there, then publish. Workflow versions published before 2026-10-14 carry no pins and read live until republished. See [workflows-v2](workflows-v2.md#entity-versions-and-pins-what-an-entity-edit-changes).
 
 > **`workflowAlias` is load-bearing — set it on every entity.**
 > The v2 builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias`. An entity created without one is invisible to that workflow, even though the entity itself is fine. Always pass `--workflow-alias <alias>` (matches the workflow's `alias`) on `create`, `update`, and `import`. The CLI prints a stderr warning on `create` if neither the flag nor a body field sets it.
@@ -56,7 +58,8 @@ The Hub auto-slugs `code` from `label` (`label.toLowerCase().replace(/[^a-z0-9]/
 #### Evaluation rules — `evaluation-rules`
 
 ```bash
-altscore evaluation-rules history <id>            # version history
+altscore evaluation-rules history <id>            # field-level edit log
+altscore evaluation-rules versions <id>           # immutable versions (what workflows pin)
 altscore evaluation-rules import --body @rules.json --workflow-alias underwriting-v1
 altscore evaluation-rules create --workflow-alias underwriting-v1 --body '{
   "label": "Active SRI taxpayer required",
@@ -179,6 +182,8 @@ altscore workflows-v2 apply --body @/tmp/credit-spec.json --publish
 - `rule-tree`: `outputSchema = {<outputVariable>: <outputType>}`
 
 #### Common pitfalls (credit-decisioning specific)
+
+- **An entity edit is not live until the workflow is republished.** A published workflow version runs the entity versions pinned at its publish (`workflows-v2 pins <alias>`). After `update`, run the DRAFT or a `--test` run, then publish; `workflows-v2 diff` of the two ACTIVE versions shows the pin moves.
 
 - **`workflowAlias` decides picker visibility.** The Hub builder filters its rule / rule-tree / mapping-table / scorecard pickers by `workflowAlias` matching the workflow. Entities created without it exist on the tenant but are invisible to that workflow. **`apply` handles this automatically** via the entity-scope reconciler — after a successful apply, every referenced entity (and the rules/mapping-tables nested under scorecards and rule-trees) is stamped to the workflow's alias. If you're scripting outside apply, pass `--workflow-alias <alias>` to `create`, `update`, and `import`. To re-scope an existing entity manually: `altscore <resource> update <id> --workflow-alias <alias>`.
 - **All four task types are reference-only.** `evaluate-rules` → `rulesConfig: [{ruleCode}]`, `mapping-table` → `mappingTableConfig.entries[].mappingTableCode`, `scorecard` → `scorecardConfig.scorecardCode`, `rule-tree` → `ruleTreeConfig.ruleTreeCode`. Inline rule/scorecard/table definitions on the task body are silently ignored at runtime; create the entity via the matching CRUD command first, then reference by code in apply.

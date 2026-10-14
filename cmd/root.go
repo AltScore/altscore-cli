@@ -69,11 +69,11 @@ func registerResources() {
 	// --- Core business entities ---
 
 	registerResource(ResourceDef{
-		Name:     "borrowers",
-		Singular: "borrower",
-		BasePath: "/v1/borrowers",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:        "borrowers",
+		Singular:    "borrower",
+		BasePath:    "/v1/borrowers",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		Description: `Manage borrowers in the AltScore Borrower Central API.
 
@@ -100,11 +100,11 @@ prospect. Borrowers have identities, documents, and can participate in deals.`,
 	})
 
 	registerResource(ResourceDef{
-		Name:     "identities",
-		Singular: "identity",
-		BasePath: "/v1/identities",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "create", "delete"},
+		Name:        "identities",
+		Singular:    "identity",
+		BasePath:    "/v1/identities",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "create", "delete"},
 		HasTestMode: true,
 		Description: `Manage identities attached to borrowers.
 
@@ -125,11 +125,11 @@ uniquely identify and deduplicate borrowers.`,
 	})
 
 	docGroup := registerResource(ResourceDef{
-		Name:     "documents",
-		Singular: "document",
-		BasePath: "/v1/documents",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "create", "delete"},
+		Name:        "documents",
+		Singular:    "document",
+		BasePath:    "/v1/documents",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "create", "delete"},
 		HasTestMode: true,
 		Description: `Manage documents attached to borrowers.
 
@@ -155,11 +155,11 @@ to attach a file.`,
 	docGroup.AddCommand(makeDocUploadCmd())
 
 	registerResource(ResourceDef{
-		Name:     "deals",
-		Singular: "deal",
-		BasePath: "/v1/deals",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update"},
+		Name:        "deals",
+		Singular:    "deal",
+		BasePath:    "/v1/deals",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update"},
 		HasTestMode: true,
 		Description: `Manage deals (loan applications, credit lines, etc.).
 
@@ -187,11 +187,11 @@ associated with a borrower.`,
 	})
 
 	registerResource(ResourceDef{
-		Name:     "assets",
-		Singular: "asset",
-		BasePath: "/v1/assets",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:        "assets",
+		Singular:    "asset",
+		BasePath:    "/v1/assets",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		Description: `Manage assets attached to deals.
 
@@ -213,11 +213,11 @@ such as a vehicle, property, or piece of equipment.`,
 	})
 
 	registerResource(ResourceDef{
-		Name:     "borrower-fields",
-		Singular: "borrower-field",
-		BasePath: "/v1/borrower-fields",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:        "borrower-fields",
+		Singular:    "borrower-field",
+		BasePath:    "/v1/borrower-fields",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		Description: `Manage borrower fields (key-value data attached to borrowers).
 
@@ -225,7 +225,7 @@ A borrower field stores a typed value under a data-model key for a borrower.`,
 		CreateSchema: `  borrowerId: string    [required] Parent borrower ID
   key: string           [required] Field key (must match a data-model)
   value: any            Field value`,
-		UpdateSchema: `  value: any            Updated field value`,
+		UpdateSchema:   `  value: any            Updated field value`,
 		ResponseSchema: `  id, borrowerId, key, label, value, isTest, createdAt, updatedAt`,
 		FilterHelp: `  borrower-id           Parent borrower ID
   key                   Field key
@@ -234,11 +234,11 @@ A borrower field stores a typed value under a data-model key for a borrower.`,
 	})
 
 	registerResource(ResourceDef{
-		Name:     "deal-fields",
-		Singular: "deal-field",
-		BasePath: "/v1/deal-fields",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:        "deal-fields",
+		Singular:    "deal-field",
+		BasePath:    "/v1/deal-fields",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		Description: `Manage deal fields (key-value data attached to deals).
 
@@ -246,7 +246,7 @@ A deal field stores a typed value under a data-model key for a deal.`,
 		CreateSchema: `  dealId: string        [required] Parent deal ID
   key: string           [required] Field key (must match a data-model)
   value: any            Field value`,
-		UpdateSchema: `  value: any            Updated field value`,
+		UpdateSchema:   `  value: any            Updated field value`,
 		ResponseSchema: `  id, dealId, key, label, value, isTest, createdAt, updatedAt`,
 		FilterHelp: `  deal-id               Parent deal ID
   key                   Field key
@@ -255,11 +255,11 @@ A deal field stores a typed value under a data-model key for a deal.`,
 	})
 
 	registerResource(ResourceDef{
-		Name:     "asset-fields",
-		Singular: "asset-field",
-		BasePath: "/v1/asset-fields",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:        "asset-fields",
+		Singular:    "asset-field",
+		BasePath:    "/v1/asset-fields",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		Description: `Manage asset fields (key-value data attached to assets).
 
@@ -267,7 +267,7 @@ An asset field stores a typed value under a data-model key for an asset.`,
 		CreateSchema: `  assetId: string       [required] Parent asset ID
   key: string           [required] Field key (must match a data-model)
   value: any            Field value`,
-		UpdateSchema: `  value: any            Updated field value`,
+		UpdateSchema:   `  value: any            Updated field value`,
 		ResponseSchema: `  id, assetId, key, label, value, isTest, createdAt, updatedAt`,
 		FilterHelp: `  asset-id              Parent asset ID
   key                   Field key
@@ -276,11 +276,11 @@ An asset field stores a typed value under a data-model key for an asset.`,
 	})
 
 	registerResource(ResourceDef{
-		Name:     "points-of-contact",
-		Singular: "point-of-contact",
-		BasePath: "/v1/points-of-contact",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:        "points-of-contact",
+		Singular:    "point-of-contact",
+		BasePath:    "/v1/points-of-contact",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		Description: `Manage points of contact for borrowers.
 
@@ -302,11 +302,11 @@ associated with a borrower.`,
 	})
 
 	registerResource(ResourceDef{
-		Name:     "deal-contacts",
-		Singular: "deal-contact",
-		BasePath: "/v1/deal-contacts",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:        "deal-contacts",
+		Singular:    "deal-contact",
+		BasePath:    "/v1/deal-contacts",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		Description: `Manage deal contacts (borrowers linked to deals with a role).
 
@@ -315,7 +315,7 @@ A deal contact associates a borrower with a deal in a specific role
 		CreateSchema: `  dealId: string        [required] Parent deal ID
   borrowerId: string    [required] Linked borrower ID
   role: string          Contact role`,
-		UpdateSchema: `  role: string          Updated role`,
+		UpdateSchema:   `  role: string          Updated role`,
 		ResponseSchema: `  id, dealId, borrowerId, role, isTest, createdAt, updatedAt`,
 		FilterHelp: `  deal-id               Parent deal ID
   borrower-id           Linked borrower ID
@@ -324,11 +324,11 @@ A deal contact associates a borrower with a deal in a specific role
 	})
 
 	registerResource(ResourceDef{
-		Name:     "authorizations",
-		Singular: "authorization",
-		BasePath: "/v1/authorizations",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "delete"},
+		Name:        "authorizations",
+		Singular:    "authorization",
+		BasePath:    "/v1/authorizations",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "delete"},
 		HasTestMode: true,
 		Description: `Manage authorizations (consent records for borrowers).
 
@@ -362,7 +362,7 @@ for a borrower, such as scores, ratios, or aggregated values.`,
 		CreateSchema: `  borrowerId: string    [required] Parent borrower ID
   key: string           [required] Metric key
   value: any            Metric value`,
-		UpdateSchema: `  value: any            Updated metric value`,
+		UpdateSchema:   `  value: any            Updated metric value`,
 		ResponseSchema: `  id, borrowerId, key, label, value, isTest, createdAt, updatedAt`,
 		FilterHelp: `  borrower-id           Parent borrower ID
   key                   Metric key
@@ -371,11 +371,11 @@ for a borrower, such as scores, ratios, or aggregated values.`,
 	})
 
 	registerResource(ResourceDef{
-		Name:     "artifacts",
-		Singular: "artifact",
-		BasePath: "/v1/artifacts",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:        "artifacts",
+		Singular:    "artifact",
+		BasePath:    "/v1/artifacts",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		Description: `Manage artifacts (versioned document templates and generated content).
 
@@ -400,11 +400,11 @@ version history.`,
 	// --- Workflow execution resources (filter-only, no set-test) ---
 
 	exGroup := registerResource(ResourceDef{
-		Name:     "executions",
-		Singular: "execution",
-		BasePath: "/v1/executions",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get"},
+		Name:          "executions",
+		Singular:      "execution",
+		BasePath:      "/v1/executions",
+		Module:        "borrower_central",
+		Actions:       []string{"list", "get"},
 		HasTestFilter: true,
 		Description: `View workflow executions.
 
@@ -438,11 +438,11 @@ such as a scoring model run or data retrieval.`,
 	exGroup.AddCommand(makeExDeleteDecisionCmd())
 
 	registerResource(ResourceDef{
-		Name:     "execution-batches",
-		Singular: "execution-batch",
-		BasePath: "/v1/execution-batches",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update"},
+		Name:          "execution-batches",
+		Singular:      "execution-batch",
+		BasePath:      "/v1/execution-batches",
+		Module:        "borrower_central",
+		Actions:       []string{"list", "get", "create", "update"},
 		HasTestFilter: true,
 		Description: `Manage execution batches (bulk workflow runs).
 
@@ -489,11 +489,11 @@ returns the stored payload a package-io node reads at run time.`,
 	// --- Config/rules entities ---
 
 	dmGroup := registerResource(ResourceDef{
-		Name:     "data-models",
-		Singular: "data-model",
-		BasePath: "/v1/data-models",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:        "data-models",
+		Singular:    "data-model",
+		BasePath:    "/v1/data-models",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		Description: `Manage data-models (schema definitions for all AltScore entities).
 
@@ -545,11 +545,11 @@ required fields, validation rules, and create examples.`,
 	dmGroup.AddCommand(makeDmGuideCmd())
 
 	evGroup := registerResource(ResourceDef{
-		Name:     "evaluators",
-		Singular: "evaluator",
-		BasePath: "/v1/evaluators",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:        "evaluators",
+		Singular:    "evaluator",
+		BasePath:    "/v1/evaluators",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		Description: `Manage evaluators (code-based rule engines).
 
@@ -574,15 +574,16 @@ score, scorecard breakdown, metrics, and rule hits.`,
 	evGroup.AddCommand(makeEvEvaluateByAliasCmd())
 
 	erGroup := registerResource(ResourceDef{
-		Name:     "evaluation-rules",
-		Singular: "evaluation-rule",
-		BasePath: "/v1/evaluation-rules",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
-		HasTestMode: true,
+		Name:          "evaluation-rules",
+		Singular:      "evaluation-rule",
+		BasePath:      "/v1/evaluation-rules",
+		Module:        "borrower_central",
+		Actions:       []string{"list", "get", "create", "update", "delete"},
+		HasTestMode:   true,
 		WorkflowAlias: true,
 		BodyValidator: validateEvaluationRuleBody,
 		CompactList:   decisioningCompactList,
+		Versioned:     true,
 		Description: `Manage evaluation rules (individual business rules).
 
 An evaluation rule has a label, code, and a structured 'conditions' tree
@@ -607,16 +608,16 @@ Referenced by alias from v2 evaluate-rules tasks via {ruleCode: "<code>"}.`,
                                 --workflow-alias <alias> is the canonical way to set this)`,
 		UpdateSchema: `  label, code, description, conditions, alertLevel, alertMessage, decisionKey, workflowAlias`,
 		ResponseSchema: `  id, label, code, description, conditions, alertLevel, alertMessage,
-  decisionKey, workflowAlias, isTest, createdAt, updatedAt`,
+  decisionKey, workflowAlias, isTest, version, createdAt, updatedAt`,
 		FilterHelp: `  code, workflow-alias, sort-by, sort-direction`,
 	})
 
 	registerResource(ResourceDef{
-		Name:     "policy-rules",
-		Singular: "policy-rule",
-		BasePath: "/v1/rules",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:        "policy-rules",
+		Singular:    "policy-rule",
+		BasePath:    "/v1/rules",
+		Module:      "borrower_central",
+		Actions:     []string{"list", "get", "create", "update", "delete"},
 		HasTestMode: true,
 		Description: `Manage policy rules (automated policy enforcement rules).
 
@@ -635,14 +636,15 @@ deals, or other entities when certain criteria are met.`,
 	})
 
 	rtGroup := registerResource(ResourceDef{
-		Name:     "rule-trees",
-		Singular: "rule-tree",
-		BasePath: "/v1/rule-trees",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
-		HasTestMode: true,
+		Name:          "rule-trees",
+		Singular:      "rule-tree",
+		BasePath:      "/v1/rule-trees",
+		Module:        "borrower_central",
+		Actions:       []string{"list", "get", "create", "update", "delete"},
+		HasTestMode:   true,
 		WorkflowAlias: true,
 		CompactList:   decisioningCompactList,
+		Versioned:     true,
 		Description: `Manage rule trees (ordered evaluation rule sequences).
 
 A rule tree references evaluation rules by id/code in a specific order with
@@ -654,19 +656,20 @@ ruleTreeConfig.ruleTreeId / ruleTreeCode.`,
   rules: array          [{ruleId, ruleCode, order, isDefault}]
   workflowAlias: string Workflow scope -- REQUIRED for the rule tree to appear in
                         that workflow's rule-tree task picker (use --workflow-alias)`,
-		UpdateSchema: `  label, code, description, rules, workflowAlias`,
-		ResponseSchema: `  id, label, code, description, rules, workflowAlias, isTest, createdAt, updatedAt`,
-		FilterHelp: `  code, workflow-alias, sort-by, sort-direction`,
+		UpdateSchema:   `  label, code, description, rules, workflowAlias`,
+		ResponseSchema: `  id, label, code, description, rules, workflowAlias, isTest, version, createdAt, updatedAt`,
+		FilterHelp:     `  code, workflow-alias, sort-by, sort-direction`,
 	})
 
 	mtGroup := registerResource(ResourceDef{
-		Name:     "mapping-tables",
-		Singular: "mapping-table",
-		BasePath: "/v1/mapping-tables",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:          "mapping-tables",
+		Singular:      "mapping-table",
+		BasePath:      "/v1/mapping-tables",
+		Module:        "borrower_central",
+		Actions:       []string{"list", "get", "create", "update", "delete"},
 		WorkflowAlias: true,
 		CompactList:   decisioningCompactList,
+		Versioned:     true,
 		Description: `Manage mapping tables (numerical / categorical lookups).
 
 A mapping table converts an input value into an output value via
@@ -682,18 +685,19 @@ mappingTableConfig.entries[].mappingTableId.`,
                              that workflow's mapping-table picker (use --workflow-alias)`,
 		UpdateSchema: `  label, code, mappingType, outputType, buckets, defaultValue, workflowAlias`,
 		ResponseSchema: `  id, label, code, mappingType, outputType, buckets, defaultValue,
-  workflowAlias, createdAt, updatedAt`,
+  workflowAlias, version, createdAt, updatedAt`,
 		FilterHelp: `  code, workflow-alias, mapping-type, output-type, sort-by, sort-direction`,
 	})
 
 	scGroup := registerResource(ResourceDef{
-		Name:     "scorecards",
-		Singular: "scorecard",
-		BasePath: "/v1/scorecards",
-		Module:   "borrower_central",
-		Actions:  []string{"list", "get", "create", "update", "delete"},
+		Name:          "scorecards",
+		Singular:      "scorecard",
+		BasePath:      "/v1/scorecards",
+		Module:        "borrower_central",
+		Actions:       []string{"list", "get", "create", "update", "delete"},
 		WorkflowAlias: true,
 		CompactList:   decisioningCompactList,
+		Versioned:     true,
 		Description: `Manage scorecards (weighted scoring tables).
 
 A scorecard maps multiple input fields to points via per-field rules and
@@ -707,9 +711,9 @@ tasks via scorecardConfig (inline rules + totalScoreVariable).`,
                                          values, includeNa, isDefault}]}]
   workflowAlias: string     Workflow scope -- REQUIRED for the scorecard to appear in
                              that workflow's scorecard task picker (use --workflow-alias)`,
-		UpdateSchema: `  label, code, rules, workflowAlias`,
-		ResponseSchema: `  id, label, code, rules, workflowAlias, createdAt, updatedAt`,
-		FilterHelp: `  code, workflow-alias, sort-by, sort-direction`,
+		UpdateSchema:   `  label, code, rules, workflowAlias`,
+		ResponseSchema: `  id, label, code, rules, workflowAlias, version, createdAt, updatedAt`,
+		FilterHelp:     `  code, workflow-alias, sort-by, sort-direction`,
 	})
 
 	// Credit-decisioning extras (declared in cmd/credit_decisioning.go).
@@ -905,6 +909,7 @@ already have a hand-assembled body and know exactly what you are sending.`
 	wfv2Group.AddCommand(makeWfv2ResolveMappingsCmd())
 	wfv2Group.AddCommand(makeWfv2VersionsCmd())
 	wfv2Group.AddCommand(makeWfv2GetVersionCmd())
+	wfv2Group.AddCommand(makeWfv2PinsCmd())
 	wfv2Group.AddCommand(makeWfv2ExecutionsCmd())
 	wfv2Group.AddCommand(makeWfv2ScheduleGroupCmd())
 	wfv2Group.AddCommand(makeWfv2ExportCmd())
