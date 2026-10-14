@@ -197,9 +197,17 @@ func loadSideForDiff(c clientDoer, id string) (map[string]any, sideSummary, erro
 	}
 	side.Label, _ = spec["label"].(string)
 	side.Version = bundle.SourceVersion
-	side.pins = entityPinsOf(bundle.Workflow)
+	// Pins come from the workflow GET: the export bundle stopped carrying
+	// config.entityPins (BC #2407, they are tenant-local ids). The bundle is read only
+	// when the GET does not answer, for a backend that still exports them.
+	status, live := fetchWorkflowForDiff(c, id)
+	side.Status = status
+	if live != nil {
+		side.pins = entityPinsOf(live)
+	} else {
+		side.pins = entityPinsOf(bundle.Workflow)
+	}
 	side.EntityPins = len(side.pins)
-	side.Status = fetchWorkflowStatus(c, id)
 	for _, t := range bundle.Tasks {
 		if ref, _ := t["specRef"].(string); ref == "" {
 			alias, _ := t["alias"].(string)
@@ -218,20 +226,20 @@ type clientDoer interface {
 	Do(method, module, path string, body any) (json.RawMessage, int, error)
 }
 
-// Best-effort: the export bundle carries no status, and failing a whole diff over a
-// decoration would be the wrong trade.
-func fetchWorkflowStatus(c clientDoer, id string) string {
+// The version's status and the version itself, which carries config.entityPins. Best
+// effort: the export bundle carries neither, and failing a whole diff over them would be
+// the wrong trade; a nil workflow means the GET did not answer.
+func fetchWorkflowForDiff(c clientDoer, id string) (string, map[string]any) {
 	raw, _, err := c.Do("GET", "borrower_central", "/v2/workflows/"+id, nil)
 	if err != nil {
-		return ""
+		return "", nil
 	}
-	var wf struct {
-		Status string `json:"status"`
-	}
+	var wf map[string]any
 	if err := json.Unmarshal(raw, &wf); err != nil {
-		return ""
+		return "", nil
 	}
-	return wf.Status
+	status, _ := wf["status"].(string)
+	return status, wf
 }
 
 func indexSpecNodesByRef(spec map[string]any) map[string]map[string]any {
