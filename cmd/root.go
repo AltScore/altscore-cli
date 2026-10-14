@@ -909,6 +909,7 @@ already have a hand-assembled body and know exactly what you are sending.`
 	wfv2Group.AddCommand(makeWfv2ResolveMappingsCmd())
 	wfv2Group.AddCommand(makeWfv2VersionsCmd())
 	wfv2Group.AddCommand(makeWfv2GetVersionCmd())
+	wfv2Group.AddCommand(makeWfv2PinsCmd())
 	wfv2Group.AddCommand(makeWfv2ExecutionsCmd())
 	wfv2Group.AddCommand(makeWfv2ScheduleGroupCmd())
 	wfv2Group.AddCommand(makeWfv2ExportCmd())

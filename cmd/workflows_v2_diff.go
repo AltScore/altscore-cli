@@ -24,6 +24,9 @@ type sideSummary struct {
 	InputVariables  int      `json:"inputVariables"`
 	Tasks           int      `json:"tasks"`
 	TasksMissingRef []string `json:"tasksMissingSpecRef"`
+	EntityPins      int      `json:"entityPins"`
+
+	pins []entityPin
 }
 
 type fieldDelta struct {
@@ -71,6 +74,12 @@ type diffReport struct {
 	InputVarsOnlyInA []string   `json:"inputVariablesOnlyInA"`
 	InputVarsOnlyInB []string   `json:"inputVariablesOnlyInB"`
 	InputVarsChanged []varDelta `json:"inputVariablesChanged"`
+
+	// Compared only when both sides carry pins (diffEntityPins).
+	EntityPinsOnlyInA   []entityPin `json:"entityPinsOnlyInA"`
+	EntityPinsOnlyInB   []entityPin `json:"entityPinsOnlyInB"`
+	EntityPinsChanged   []pinDelta  `json:"entityPinsChanged"`
+	EntityPinsUnchanged int         `json:"entityPinsUnchanged"`
 }
 
 // Per-node keys that differ between any two versions as bookkeeping, never as an authored
@@ -110,7 +119,15 @@ Nodes are matched by 'ref' (the server task alias, stable across versions of the
 same workflow). A ref present on one side only is reported as added or removed,
 except when a node with the same type and label exists on the other side under a
 different ref -- that is an alias rotation, reported as a rename, and it is the
-symptom of the specRef loss above.`,
+symptom of the specRef loss above.
+
+Also compares the entity pins (config.entityPins) of two published versions:
+which mapping table, rule, tree and scorecard version each reference read, and
+which changed between them (v3 -> v4), the calibration answer a node diff
+cannot give, since an entity edit changes no node. A DRAFT, or a version
+published before 2026-10-14, carries no pins and reads the latest entities, so
+pins are compared only when both sides carry them. 'workflows-v2 pins' lists
+one version's.`,
 		Args: cobra.ExactArgs(2),
 		Example: `  altscore workflows-v2 diff <active-id> <draft-id>
   altscore workflows-v2 diff <id-a> <id-b> --json | jq '.nodesChanged'
@@ -180,6 +197,8 @@ func loadSideForDiff(c clientDoer, id string) (map[string]any, sideSummary, erro
 	}
 	side.Label, _ = spec["label"].(string)
 	side.Version = bundle.SourceVersion
+	side.pins = entityPinsOf(bundle.Workflow)
+	side.EntityPins = len(side.pins)
 	side.Status = fetchWorkflowStatus(c, id)
 	for _, t := range bundle.Tasks {
 		if ref, _ := t["specRef"].(string); ref == "" {
@@ -336,6 +355,7 @@ func buildDiffReport(specA map[string]any, sideA sideSummary, specB map[string]a
 		toMap(specA["customVariables"]), toMap(specB["customVariables"]))
 	r.InputVarsOnlyInA, r.InputVarsOnlyInB, r.InputVarsChanged = diffVarMaps(
 		toMap(specA["inputVariables"]), toMap(specB["inputVariables"]))
+	r.EntityPinsOnlyInA, r.EntityPinsOnlyInB, r.EntityPinsChanged, r.EntityPinsUnchanged = diffEntityPins(sideA.pins, sideB.pins)
 	return r
 }
 
@@ -488,6 +508,7 @@ func renderDiffReport(r diffReport) string {
 	renderVars(&buf, "customVariables", r.CustomVarsOnlyInA, r.CustomVarsOnlyInB, r.CustomVarsChanged)
 	renderVars(&buf, "inputVariables", r.InputVarsOnlyInA, r.InputVarsOnlyInB, r.InputVarsChanged)
 
+	renderEntityPins(&buf, r)
 	renderSpecRefCensus(&buf, r)
 	return buf.String()
 }

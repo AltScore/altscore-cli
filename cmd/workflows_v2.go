@@ -74,7 +74,12 @@ lock you acquired yourself. Pass --lock-token whenever you hold one:
     altscore workflows-v2 publish <draft-id> --lock-token "$TOKEN"
 
 A successful publish releases that lock server-side, so no separate release is
-needed afterwards.`,
+needed afterwards.
+
+Publishing also pins every mapping table, rule tree, scorecard and evaluation
+rule the graph references to its current version (config.entityPins; see
+'pins'). The new ACTIVE version runs on exactly those versions until it is
+published again, so an entity edited after this publish does not reach it.`,
 		Example: `  altscore workflows-v2 publish <id>
   altscore workflows-v2 publish <id> --lock-token $TOKEN`,
 		Args: cobra.ExactArgs(1),
@@ -122,7 +127,9 @@ func makeWfv2CreateDraftCmd() *cobra.Command {
 		Use:   "create-draft <id>",
 		Short: "Create or fetch a draft from an ACTIVE v2 workflow",
 		Long: `Create a new DRAFT version of an ACTIVE workflow. If a draft already
-exists, the existing draft is returned unless --force-recreate is set.`,
+exists, the existing draft is returned unless --force-recreate is set.
+The draft carries no entity pins: it reads the latest mapping tables, rules,
+trees and scorecards until it is published.`,
 		Example: `  altscore workflows-v2 create-draft <id>
   altscore workflows-v2 create-draft <id> --message "Adding scoring step"
   altscore workflows-v2 create-draft <id> --force-recreate`,
@@ -165,8 +172,28 @@ func makeWfv2RevertCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "revert <alias-or-id> <version-id>",
 		Short: "Revert a v2 workflow draft to a prior version",
-		Long: `Revert a draft to the contents of a prior version. Mode controls whether
-the revert produces a new draft (default) or replaces the active version.`,
+		Long: `Write the contents of a prior version (<version-id> is that version's id, from
+'versions') into the alias's DRAFT: the open draft is overwritten, or a new one
+is created. The ACTIVE version is untouched, so production keeps running as it
+is until the draft is published. --mode is sent but the API ignores it: revert
+always produces a DRAFT.
+
+What else comes back:
+  - every task body, from the reverted version's snapshot, as the task's new
+    latest version;
+  - every decisioning entity the reverted version pinned (mapping tables, rule
+    trees, scorecards, evaluation rules): its pinned content is written back
+    as the entity's new latest version (source "revert"), so the draft runs
+    what that version ran. Only entities scoped to this workflow's own alias
+    (in the pin and live), only their content (never code, workflowAlias or
+    isTest), and only while the alias's ACTIVE version itself carries pins.
+    An ACTIVE published before 2026-10-14 reads the live entities, so
+    restoring them would change production at once: then no entity is
+    restored. An entity another workflow owns is never restored.
+
+The draft carries no pins; publishing it pins the restored versions. Check
+with '<resource> versions <entity-id>' (the "revert" rows) and, after the
+publish, 'workflows-v2 pins <alias>'.`,
 		Example: `  altscore workflows-v2 revert my-wf <version-id>
   altscore workflows-v2 revert my-wf <version-id> --mode publish --message "Rollback bad change"`,
 		Args: cobra.ExactArgs(2),
@@ -200,7 +227,7 @@ the revert produces a new draft (default) or replaces the active version.`,
 	}
 
 	cmd.Flags().StringVar(&message, "message", "", "revert message")
-	cmd.Flags().StringVar(&mode, "mode", "", `"draft" (default) or "publish"`)
+	cmd.Flags().StringVar(&mode, "mode", "", `sent as "mode", but the API ignores it: revert always produces a DRAFT; publish it to go live`)
 	return cmd
 }
 
