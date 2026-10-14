@@ -101,12 +101,24 @@ func bundleWithPins(t *testing.T, version int, pins ...map[string]any) json.RawM
 	return raw
 }
 
+func workflowJSON(t *testing.T, wf map[string]any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// What BC serves since #2407: the export bundle carries no pins, the workflow GET does.
 func TestDiffComparesTheEntityPinsOfTwoPublishedVersions(t *testing.T) {
 	f := fakeDoer{byPath: map[string]json.RawMessage{
-		"/v2/workflows/v3/export": bundleWithPins(t, 3, pin("mapping_table", "band", 3, "mt-1"), pin("scorecard", "s1", 2, "sc-1")),
-		"/v2/workflows/v4/export": bundleWithPins(t, 4, pin("mapping_table", "band", 4, "mt-1"), pin("scorecard", "s1", 2, "sc-1")),
-		"/v2/workflows/v3":        json.RawMessage(`{"status":"ARCHIVED"}`),
-		"/v2/workflows/v4":        json.RawMessage(`{"status":"ACTIVE"}`),
+		"/v2/workflows/v3/export": bundleWithPins(t, 3),
+		"/v2/workflows/v4/export": bundleWithPins(t, 4),
+		"/v2/workflows/v3": workflowJSON(t, workflowWithPins("v3", "ARCHIVED", 3,
+			pin("mapping_table", "band", 3, "mt-1"), pin("scorecard", "s1", 2, "sc-1"))),
+		"/v2/workflows/v4": workflowJSON(t, workflowWithPins("v4", "ACTIVE", 4,
+			pin("mapping_table", "band", 4, "mt-1"), pin("scorecard", "s1", 2, "sc-1"))),
 	}}
 	specA, sideA, err := loadSideForDiff(f, "v3")
 	if err != nil {
@@ -140,19 +152,52 @@ func TestDiffComparesTheEntityPinsOfTwoPublishedVersions(t *testing.T) {
 
 func TestDiffAgainstADraftSaysItHasNoPinsInsteadOfListingRemovals(t *testing.T) {
 	f := fakeDoer{byPath: map[string]json.RawMessage{
-		"/v2/workflows/v3/export":    bundleWithPins(t, 3, pin("mapping_table", "band", 3, "mt-1")),
+		"/v2/workflows/v3/export":    bundleWithPins(t, 3),
 		"/v2/workflows/draft/export": bundleWithPins(t, 4),
-		"/v2/workflows/v3":           json.RawMessage(`{"status":"ACTIVE"}`),
-		"/v2/workflows/draft":        json.RawMessage(`{"status":"DRAFT"}`),
+		"/v2/workflows/v3":           workflowJSON(t, workflowWithPins("v3", "ACTIVE", 3, pin("mapping_table", "band", 3, "mt-1"))),
+		"/v2/workflows/draft":        workflowJSON(t, workflowWithPins("draft", "DRAFT", 4)),
 	}}
 	specA, sideA, _ := loadSideForDiff(f, "v3")
 	specB, sideB, _ := loadSideForDiff(f, "draft")
+	if sideA.EntityPins != 1 {
+		t.Fatalf("A's pins come from its GET, got %d", sideA.EntityPins)
+	}
 	text := renderDiffReport(buildDiffReport(specA, sideA, specB, sideB))
 	if !strings.Contains(text, "B carries none and reads the latest entities") {
 		t.Errorf("expected the no-pins note for B:\n%s", text)
 	}
 	if strings.Contains(text, "- mapping_table") {
 		t.Errorf("a draft's missing pins are not removals:\n%s", text)
+	}
+}
+
+// v0.46.0 read pins from the export bundle and found none once BC stopped exporting them.
+// The GET is the source whenever it answers, even over pins an older export still carries.
+func TestDiffReadsPinsFromTheWorkflowGetNotTheExport(t *testing.T) {
+	f := fakeDoer{byPath: map[string]json.RawMessage{
+		"/v2/workflows/v3/export": bundleWithPins(t, 3, pin("mapping_table", "band", 1, "mt-old")),
+		"/v2/workflows/v3":        workflowJSON(t, workflowWithPins("v3", "ACTIVE", 3, pin("mapping_table", "band", 3, "mt-1"))),
+	}}
+	_, side, err := loadSideForDiff(f, "v3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if side.Status != "ACTIVE" || len(side.pins) != 1 || side.pins[0].EntityID != "mt-1" || side.pins[0].Version != 3 {
+		t.Fatalf("pins must come from the GET (mt-1 v3), never the export (mt-old v1): status=%q pins=%+v", side.Status, side.pins)
+	}
+}
+
+// A backend whose workflow GET does not answer still diffs, on the pins its export carries.
+func TestDiffFallsBackToExportPinsWhenTheGetFails(t *testing.T) {
+	f := fakeDoer{byPath: map[string]json.RawMessage{
+		"/v2/workflows/v3/export": bundleWithPins(t, 3, pin("mapping_table", "band", 3, "mt-1")),
+	}}
+	_, side, err := loadSideForDiff(f, "v3")
+	if err != nil {
+		t.Fatalf("a failed GET is a decoration loss, not a diff failure: %v", err)
+	}
+	if side.Status != "" || side.EntityPins != 1 {
+		t.Fatalf("expected no status and the export's 1 pin, got status=%q pins=%d", side.Status, side.EntityPins)
 	}
 }
 
