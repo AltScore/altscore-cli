@@ -796,8 +796,12 @@ func makeWfv2GetVersionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "get-version <alias-or-id> <version>",
 		Short: "Fetch a specific v2 workflow version",
-		Long:  `Pass "latest" as <version> to get the most recent published version.`,
-		Args:  cobra.ExactArgs(2),
+		Long: `<version> is a version number, or "latest" for the HIGHEST version of any
+status: the open DRAFT when there is one, which is what the builder shows but
+not what a live run of the alias executes (that is the ACTIVE version; see
+'versions' for each version's status). A published version carries
+config.entityPins, the entity versions its runs read; 'pins' prints them.`,
+		Args: cobra.ExactArgs(2),
 		Example: `  altscore workflows-v2 get-version my-wf latest
   altscore workflows-v2 get-version my-wf 3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1456,6 +1460,43 @@ func extractFailureDetail(data json.RawMessage) (failedNodeID, reason string) {
 	return failedNodeID, reason
 }
 
+// The workflow version an execution actually ran, which is the only id its record answers
+// under (GET /v2/workflows/{workflowId}/executions/{id} 404s for any other). An alias is
+// resolved server-side -- `latest` is the ACTIVE version for a live run and the highest
+// version, the open DRAFT, for a test run -- and the async response names only the
+// executionId, so the run's own record says: the sync response's workflowId, else the v1
+// mirror every v2 run writes before the response (GET /v1/executions/{id}). "" when
+// neither answers.
+func executionWorkflowID(c clientDoer, submitResp json.RawMessage, executionID string) string {
+	if id := jsonStringField(submitResp, "workflowId"); id != "" {
+		return id
+	}
+	data, _, err := c.Do("GET", "borrower_central", "/v1/executions/"+url.PathEscape(executionID), nil)
+	if err != nil {
+		return ""
+	}
+	return jsonStringField(data, "workflowId")
+}
+
+// A top-level string field, or the same field under a "data" wrapper.
+func jsonStringField(data json.RawMessage, key string) string {
+	var env map[string]any
+	if err := json.Unmarshal(data, &env); err != nil {
+		return ""
+	}
+	if s, ok := env[key].(string); ok && s != "" {
+		return s
+	}
+	if inner, ok := env["data"].(map[string]any); ok {
+		if s, ok := inner[key].(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// workflowID is the caller's guess, used only when the run's record names none: the
+// exact id for 'execute <uuid>', "" whenever the server resolved an alias.
 func runExecuteWithOptionalWait(
 	c *client.Client,
 	stdout, stderr io.Writer,
@@ -1472,6 +1513,19 @@ func runExecuteWithOptionalWait(
 	if executionID == "" {
 		return fmt.Errorf("--wait: could not find executionId in submit response (got %d bytes)", len(submitResp))
 	}
+
+	ran := executionWorkflowID(c, submitResp, executionID)
+	if ran == "" {
+		ran = workflowID
+	}
+	if ran == "" {
+		return fmt.Errorf("--wait: execution %s was submitted, but neither the response nor GET /v1/executions/%s names the workflow version it ran, so it cannot be polled; follow it with 'altscore executions get %s'",
+			executionID, executionID, executionID)
+	}
+	if verbose && workflowID != "" && ran != workflowID {
+		fmt.Fprintf(stderr, "# the server ran workflow version %s, not %s\n", ran, workflowID)
+	}
+	workflowID = ran
 
 	if verbose {
 		fmt.Fprintf(stderr, "# polling /v2/workflows/%s/executions/%s every %s (timeout %s)\n",
@@ -1583,7 +1637,12 @@ from 'altscore executions get-output <executionId>'.`,
 			if err != nil {
 				return explainExecuteTimeout(err, args[0])
 			}
-			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, args[0], wait, flagVerbose)
+			// BC runs a non-UUID argument as alias@latest, whose version it picks itself.
+			ranID := ""
+			if uuidPattern.MatchString(args[0]) {
+				ranID = args[0]
+			}
+			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, ranID, wait, flagVerbose)
 		},
 	}
 
@@ -1627,12 +1686,16 @@ func makeWfv2ExecuteByAliasCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "execute-by-alias <alias> [version]",
 		Short: "Execute a v2 workflow by alias (version defaults to latest)",
-		Long: `The <version> argument is optional and defaults to "latest" (the most
-recent published version), consistent with how 'altdata describe' and
-'dictionary' auto-resolve. Pass an explicit version to pin one.
+		Long: `The <version> argument is optional and defaults to "latest". The server
+resolves it: a live run executes the ACTIVE (published) version, and fails
+when the alias has none; a test run (--test) executes the highest version,
+which is the open DRAFT when there is one. Pass a version number to run that
+exact version.
 
 Pass --wait to submit async and poll until the execution reaches a terminal
-state. Honors --timeout (default 5m) and --poll-interval (default 2s). On
+state. It polls the workflow version the server actually ran, read from the
+run's own record, so a DRAFT open over the ACTIVE version does not matter.
+Honors --timeout (default 5m) and --poll-interval (default 2s). On
 --verbose prints per-node status transitions to stderr. Exits 0 on completed,
 1 on failed/cancelled/timed_out, 2 on the local --timeout firing. --wait prints
 the internal v2 execution record (End results under output.standard_output and
@@ -1640,8 +1703,8 @@ output.custom_output); integrations read the same run as output and customOutput
 from 'altscore executions get-output <executionId>'.`,
 		Args: cobra.RangeArgs(1, 2),
 		Example: `  altscore workflows-v2 execute-by-alias my-wf --body '{...}'
-  altscore workflows-v2 execute-by-alias my-wf latest --body '{...}'
-  altscore workflows-v2 execute-by-alias my-wf v3 --body '{...}' --wait`,
+  altscore workflows-v2 execute-by-alias my-wf latest --body '{...}' --wait
+  altscore workflows-v2 execute-by-alias my-wf 3 --body '{...}' --wait`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadClient()
 			if err != nil {
@@ -1662,27 +1725,15 @@ from 'altscore executions get-output <executionId>'.`,
 			if err != nil {
 				return err
 			}
-			workflowID := ""
-			if wait.wait {
-				if wf, _, gerr := c.Do("GET", "borrower_central", fmt.Sprintf("/v2/workflows/%s/%s", alias, version), nil); gerr == nil {
-					var parsed map[string]any
-					if json.Unmarshal(wf, &parsed) == nil {
-						if id, ok := parsed["id"].(string); ok {
-							workflowID = id
-						}
-					}
-				}
-				if workflowID == "" {
-					return fmt.Errorf("--wait: could not resolve workflow id for alias=%s version=%s", alias, version)
-				}
-			}
 			path := fmt.Sprintf("/v2/workflows/%s/%s/execute", alias, version)
 			useSyncExecuteTimeout(c, headers.executionMode)
 			data, _, err := c.DoWithHeaders("POST", "borrower_central", path, body, headers.asMap())
 			if err != nil {
 				return explainExecuteTimeout(err, alias)
 			}
-			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, workflowID, wait, flagVerbose)
+			// No guess: GET /{alias}/latest is the highest version (the DRAFT), while a
+			// live run of latest executes the ACTIVE one. The run's record says which.
+			return runExecuteWithOptionalWait(c, cmd.OutOrStdout(), cmd.OutOrStderr(), data, "", wait, flagVerbose)
 		},
 	}
 
