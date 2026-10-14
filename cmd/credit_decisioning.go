@@ -83,6 +83,12 @@ func normalizeImportBody(body json.RawMessage, wrapperKey, alias, entityKind str
 		}
 	}
 
+	// "version" is the source tenant's save counter (HQ-2013): a bundle built from list or
+	// get output carries it, and the import mints its own.
+	for i := range items {
+		delete(items[i], "version")
+	}
+
 	encodedItems, err := json.Marshal(items)
 	if err != nil {
 		return nil, err
@@ -137,9 +143,12 @@ evaluate-rules picker.`,
 
 func makeErHistoryCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "history <id>",
-		Short:   "Show the version history for an evaluation rule",
-		Long:    `GET /v1/evaluation-rules/{id}/history. Returns chronological revisions.`,
+		Use:   "history <id>",
+		Short: "Show the field-level edit log of an evaluation rule",
+		Long: `GET /v1/evaluation-rules/{id}/history. The rule's edit log, newest first
+(at most 50): who changed which field, with old and new values for the
+scalar ones. It is not the versions published workflows pin: 'versions <id>'
+lists those, and 'get-version <id> <n>' prints the full rule at one.`,
 		Example: `  altscore evaluation-rules history <id>`,
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -341,7 +350,7 @@ func makeScUsageCmd() *cobra.Command {
 // A raw decisioning entity carries its whole rule set (a rule-trees page ran to 205 KB); the
 // compact row says which entities exist, what they are called and which workflow owns them.
 var decisioningCompactList = &CompactList{
-	Fields: "id, code, label, workflowAlias, decisionKey (evaluation rules), rules or buckets (a count), isTest, updatedAt",
+	Fields: "id, code, label, workflowAlias, version, decisionKey (evaluation rules), rules or buckets (a count), isTest, updatedAt",
 	Row:    compactDecisioningRow,
 }
 
@@ -350,6 +359,7 @@ type compactDecisioningEntity struct {
 	Code          any `json:"code"`
 	Label         any `json:"label"`
 	WorkflowAlias any `json:"workflowAlias"`
+	Version       any `json:"version,omitempty"`
 	DecisionKey   any `json:"decisionKey,omitempty"`
 	Rules         int `json:"rules,omitempty"`
 	Buckets       int `json:"buckets,omitempty"`
@@ -363,6 +373,7 @@ func compactDecisioningRow(item map[string]any) any {
 		Code:          item["code"],
 		Label:         item["label"],
 		WorkflowAlias: item["workflowAlias"],
+		Version:       item["version"],
 		DecisionKey:   item["decisionKey"],
 		Rules:         len(asSlice(item["rules"])),
 		Buckets:       len(asSlice(item["buckets"])),

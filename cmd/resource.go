@@ -45,6 +45,7 @@ type ResourceDef struct {
 	WorkflowAlias  bool                              // adds --workflow-alias <alias> on create/update; injects "workflowAlias" into the body. Without it the entity will not appear in the workflow builder's pickers.
 	BodyValidator  func(body *json.RawMessage) error // optional hook called before POST/PATCH; may normalize the body in place; aborts the request if it returns an error
 	CompactList    *CompactList                      // when set, list reads every page and prints one compact row per item; --full prints the raw items
+	Versioned      bool                              // a decisioning entity versioned on every save (HQ-2013): adds versions + get-version, says on update/delete what an edit does to published workflows, drops "version" from update bodies
 }
 
 // CompactList is a list's default discovery shape: an item reduced to the fields that say
@@ -57,10 +58,14 @@ type CompactList struct {
 // registerResource creates a Cobra command group for the resource and adds
 // subcommands for each action.
 func registerResource(def ResourceDef) *cobra.Command {
+	long := def.Description
+	if def.Versioned {
+		long += "\n\n" + versionedEntityNote
+	}
 	groupCmd := &cobra.Command{
 		Use:   def.Name,
 		Short: fmt.Sprintf("Manage %s", def.Name),
-		Long:  def.Description,
+		Long:  long,
 	}
 
 	for _, action := range def.Actions {
@@ -80,6 +85,10 @@ func registerResource(def ResourceDef) *cobra.Command {
 
 	if def.HasTestMode {
 		groupCmd.AddCommand(makeSetTestCmd(def))
+	}
+	if def.Versioned {
+		groupCmd.AddCommand(makeEntityVersionsCmd(def))
+		groupCmd.AddCommand(makeEntityGetVersionCmd(def))
 	}
 
 	rootCmd.AddCommand(groupCmd)
@@ -429,6 +438,9 @@ When --body is omitted and stdin is not a terminal, the body is read from stdin.
 	if def.WorkflowAlias {
 		long += "\n\nUse --workflow-alias <alias> to (re)scope this entity to a workflow.\nThe value is merged into the JSON body as workflowAlias."
 	}
+	if def.Versioned {
+		long += "\n\n" + versionedUpdateNote(def.Singular)
+	}
 	if def.UpdateSchema != "" {
 		long += "\n\nRequest body fields:\n" + def.UpdateSchema
 	}
@@ -460,6 +472,9 @@ When --body is omitted and stdin is not a terminal, the body is read from stdin.
 					return err
 				}
 			}
+			if def.Versioned {
+				body = dropServerVersion(body, cmd.ErrOrStderr())
+			}
 
 			if def.BodyValidator != nil {
 				if err := def.BodyValidator(&body); err != nil {
@@ -483,10 +498,14 @@ When --body is omitted and stdin is not a terminal, the body is read from stdin.
 }
 
 func makeDeleteCmd(def ResourceDef) *cobra.Command {
+	long := fmt.Sprintf("Delete %s %s by ID. Returns empty on success (HTTP 204).", article(def.Singular), def.Singular)
+	if def.Versioned {
+		long += "\n\n" + versionedDeleteNote(def.Singular)
+	}
 	return &cobra.Command{
 		Use:     "delete <id>",
 		Short:   fmt.Sprintf("Delete %s %s", article(def.Singular), def.Singular),
-		Long:    fmt.Sprintf("Delete %s %s by ID. Returns empty on success (HTTP 204).", article(def.Singular), def.Singular),
+		Long:    long,
 		Example: fmt.Sprintf(`  altscore %s delete <id>`, def.Name),
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

@@ -583,6 +583,7 @@ score, scorecard breakdown, metrics, and rule hits.`,
 		WorkflowAlias: true,
 		BodyValidator: validateEvaluationRuleBody,
 		CompactList:   decisioningCompactList,
+		Versioned:     true,
 		Description: `Manage evaluation rules (individual business rules).
 
 An evaluation rule has a label, code, and a structured 'conditions' tree
@@ -607,7 +608,7 @@ Referenced by alias from v2 evaluate-rules tasks via {ruleCode: "<code>"}.`,
                                 --workflow-alias <alias> is the canonical way to set this)`,
 		UpdateSchema: `  label, code, description, conditions, alertLevel, alertMessage, decisionKey, workflowAlias`,
 		ResponseSchema: `  id, label, code, description, conditions, alertLevel, alertMessage,
-  decisionKey, workflowAlias, isTest, createdAt, updatedAt`,
+  decisionKey, workflowAlias, isTest, version, createdAt, updatedAt`,
 		FilterHelp: `  code, workflow-alias, sort-by, sort-direction`,
 	})
 
@@ -643,6 +644,7 @@ deals, or other entities when certain criteria are met.`,
 		HasTestMode:   true,
 		WorkflowAlias: true,
 		CompactList:   decisioningCompactList,
+		Versioned:     true,
 		Description: `Manage rule trees (ordered evaluation rule sequences).
 
 A rule tree references evaluation rules by id/code in a specific order with
@@ -655,7 +657,7 @@ ruleTreeConfig.ruleTreeId / ruleTreeCode.`,
   workflowAlias: string Workflow scope -- REQUIRED for the rule tree to appear in
                         that workflow's rule-tree task picker (use --workflow-alias)`,
 		UpdateSchema:   `  label, code, description, rules, workflowAlias`,
-		ResponseSchema: `  id, label, code, description, rules, workflowAlias, isTest, createdAt, updatedAt`,
+		ResponseSchema: `  id, label, code, description, rules, workflowAlias, isTest, version, createdAt, updatedAt`,
 		FilterHelp:     `  code, workflow-alias, sort-by, sort-direction`,
 	})
 
@@ -667,6 +669,7 @@ ruleTreeConfig.ruleTreeId / ruleTreeCode.`,
 		Actions:       []string{"list", "get", "create", "update", "delete"},
 		WorkflowAlias: true,
 		CompactList:   decisioningCompactList,
+		Versioned:     true,
 		Description: `Manage mapping tables (numerical / categorical lookups).
 
 A mapping table converts an input value into an output value via
@@ -682,7 +685,7 @@ mappingTableConfig.entries[].mappingTableId.`,
                              that workflow's mapping-table picker (use --workflow-alias)`,
 		UpdateSchema: `  label, code, mappingType, outputType, buckets, defaultValue, workflowAlias`,
 		ResponseSchema: `  id, label, code, mappingType, outputType, buckets, defaultValue,
-  workflowAlias, createdAt, updatedAt`,
+  workflowAlias, version, createdAt, updatedAt`,
 		FilterHelp: `  code, workflow-alias, mapping-type, output-type, sort-by, sort-direction`,
 	})
 
@@ -694,6 +697,7 @@ mappingTableConfig.entries[].mappingTableId.`,
 		Actions:       []string{"list", "get", "create", "update", "delete"},
 		WorkflowAlias: true,
 		CompactList:   decisioningCompactList,
+		Versioned:     true,
 		Description: `Manage scorecards (weighted scoring tables).
 
 A scorecard maps multiple input fields to points via per-field rules and
@@ -708,7 +712,7 @@ tasks via scorecardConfig (inline rules + totalScoreVariable).`,
   workflowAlias: string     Workflow scope -- REQUIRED for the scorecard to appear in
                              that workflow's scorecard task picker (use --workflow-alias)`,
 		UpdateSchema:   `  label, code, rules, workflowAlias`,
-		ResponseSchema: `  id, label, code, rules, workflowAlias, createdAt, updatedAt`,
+		ResponseSchema: `  id, label, code, rules, workflowAlias, version, createdAt, updatedAt`,
 		FilterHelp:     `  code, workflow-alias, sort-by, sort-direction`,
 	})
 
