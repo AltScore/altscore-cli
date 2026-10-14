@@ -32,7 +32,8 @@ altscore-cli/
 │   ├── workflows_v2_apply_server.go       # POST /v2/workflows/apply: flat-spec builder, request, result rendering
 │   ├── workflows_v2_apply_diff.go         # --diff renderer
 │   ├── workflows_v2_apply_enforce_type.go # enforceType stamping on new custom variables, carry-forward on live ones
-│   ├── workflows_v2_diff.go               # `diff <a> <b>`: two EXISTING versions (task bodies + specRef census); not `apply --diff`
+│   ├── workflows_v2_diff.go               # `diff <a> <b>`: two EXISTING versions (task bodies, entity pins, specRef census); not `apply --diff`
+│   ├── workflows_v2_pins.go               # `pins`: config.entityPins of one version, and the pin comparison `diff` uses
 │   ├── workflows_v2_import.go             # makeWfv2ImportCmd + the findings it reports
 │   ├── workflows_v2_findings.go           # shared finding partition/render (apply + import)
 │   ├── workflows_v2_validation.go         # composeCapture + validation finding types shared by apply, lint and import
@@ -47,6 +48,7 @@ altscore-cli/
 │   ├── tasks_v2.go                        # tasks-v2 group (/v2/tasks)
 │   ├── executions.go  altdata.go  analytics.go  decisions.go
 │   ├── credit_decisioning.go  credit_accounts.go  payment_orders.go  dpas.go
+│   ├── entity_versions.go                 # ResourceDef.Versioned: versions / get-version + help for the 4 decisioning entities
 │   ├── evaluators.go  external_source_configs.go  data_models.go  schemas.go
 │   ├── workflow_tasks.go  task_tests.go  tools.go
 │   ├── login.go  refresh_token.go  profiles.go  config.go  env.go
@@ -75,7 +77,7 @@ A ResourceDef group (`cmd/root.go`, `Name: "workflows-v2"`, `BasePath: /v2/workf
 | Authoring | `apply` (alias `compose`), `diff`, `lint`, `import`, `export`, `duplicate` |
 | Graph edits (the 7 helpers) | `add-node`, `remove-node`, `add-edge`, `remove-edge`, `set-variable`, `unset-variable`, `set-mapping` |
 | Mapping endpoints | `update-mapping`, `resolve-mappings` |
-| Lifecycle | `publish`, `create-draft`, `revert`, `archive`, `restore`, `set-visibility`, `versions`, `get-version` |
+| Lifecycle | `publish`, `create-draft`, `revert`, `archive`, `restore`, `set-visibility`, `versions`, `get-version`, `pins` |
 | Locking | `lock` (group), `autosave` |
 | Execution | `execute`, `execute-by-alias`, `execute-batch`, `execute-batch-by-alias`, `batch`, `executions`, `download`, `schedule` |
 | Introspection | `schema-guide`, `sources-status`, `external-sources-status`, `ai` |
@@ -132,7 +134,7 @@ Mechanism 2, invisible from root.go. 10 files self-register their command from t
 
 1. Add a `registerResource(ResourceDef{...})` call inside `registerResources()` in `cmd/root.go`
 2. Fill in `CreateSchema`, `UpdateSchema`, `ResponseSchema`, `FilterHelp` from the API docs
-3. Set the behavioral fields: `HasTestMode`, `HasTestFilter`, `WorkflowAlias`, `BodyValidator`
+3. Set the behavioral fields: `HasTestMode`, `HasTestFilter`, `WorkflowAlias`, `BodyValidator`, `Versioned` (only an entity BC versions on every save and serves at `{id}/versions`)
 4. Build and test with `--help`
 
 `WorkflowAlias` is load-bearing. Its declaration comment in `cmd/resource.go` says it plainly: without it "the entity will not appear in the workflow builder's pickers".

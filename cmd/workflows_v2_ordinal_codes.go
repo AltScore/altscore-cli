@@ -123,7 +123,7 @@ func adviseOrdinalCodeVars(customVariables map[string]any) (readabilityFinding, 
 		Advice: "custom variable(s) return nothing but a small integer code. The variable has " +
 			"already made the decision, in a vocabulary only its author can read: the client " +
 			"cannot tell whether 2 outranks 1, cannot see which finding produced it, and cannot " +
-			"change the coding without a republish. Emit the underlying VALUE (the amount, the " +
+			"change the coding without editing code. Emit the underlying VALUE (the amount, the " +
 			"count, the category as the source spells it) and move the coding onto an " +
 			"evaluation-rule (yes/no) or a mapping-table (named levels, which is also where a " +
 			"scorecard's points belong). A `-1` for missing is an includeNa bucket, not a value. " +
