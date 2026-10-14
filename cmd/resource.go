@@ -30,21 +30,21 @@ func article(word string) string {
 
 // ResourceDef defines a REST resource that can be registered as a set of Cobra subcommands.
 type ResourceDef struct {
-	Name           string                                // plural: "borrowers"
-	Singular       string                                // "borrower"
-	BasePath       string                                // "/v1/borrowers"
-	Module         string                                // "borrower_central"
-	Actions        []string                              // subset of: "list", "get", "create", "update", "delete"
-	Description    string                                // long description of the resource
-	CreateSchema   string                                // documents the JSON body for create
-	UpdateSchema   string                                // documents the JSON body for update
-	ResponseSchema string                                // documents the fields in GET responses
-	FilterHelp     string                                // documents query parameters for list
-	HasTestMode    bool                                  // adds set-test command + --include-tests/--test-only on list + --is-test on create
-	HasTestFilter  bool                                  // adds only --include-tests/--test-only on list (no set-test, no create flag)
-	WorkflowAlias  bool                                  // adds --workflow-alias <alias> on create/update; injects "workflowAlias" into the body. Without it the entity will not appear in the workflow builder's pickers.
-	BodyValidator  func(body *json.RawMessage) error     // optional hook called before POST/PATCH; may normalize the body in place; aborts the request if it returns an error
-	CompactList    *CompactList                          // when set, list reads every page and prints one compact row per item; --full prints the raw items
+	Name           string                            // plural: "borrowers"
+	Singular       string                            // "borrower"
+	BasePath       string                            // "/v1/borrowers"
+	Module         string                            // "borrower_central"
+	Actions        []string                          // subset of: "list", "get", "create", "update", "delete"
+	Description    string                            // long description of the resource
+	CreateSchema   string                            // documents the JSON body for create
+	UpdateSchema   string                            // documents the JSON body for update
+	ResponseSchema string                            // documents the fields in GET responses
+	FilterHelp     string                            // documents query parameters for list
+	HasTestMode    bool                              // adds set-test command + --include-tests/--test-only on list + --is-test on create
+	HasTestFilter  bool                              // adds only --include-tests/--test-only on list (no set-test, no create flag)
+	WorkflowAlias  bool                              // adds --workflow-alias <alias> on create/update; injects "workflowAlias" into the body. Without it the entity will not appear in the workflow builder's pickers.
+	BodyValidator  func(body *json.RawMessage) error // optional hook called before POST/PATCH; may normalize the body in place; aborts the request if it returns an error
+	CompactList    *CompactList                      // when set, list reads every page and prints one compact row per item; --full prints the raw items
 }
 
 // CompactList is a list's default discovery shape: an item reduced to the fields that say
@@ -484,9 +484,9 @@ When --body is omitted and stdin is not a terminal, the body is read from stdin.
 
 func makeDeleteCmd(def ResourceDef) *cobra.Command {
 	return &cobra.Command{
-		Use:   "delete <id>",
-		Short: fmt.Sprintf("Delete %s %s", article(def.Singular), def.Singular),
-		Long:  fmt.Sprintf("Delete %s %s by ID. Returns empty on success (HTTP 204).", article(def.Singular), def.Singular),
+		Use:     "delete <id>",
+		Short:   fmt.Sprintf("Delete %s %s", article(def.Singular), def.Singular),
+		Long:    fmt.Sprintf("Delete %s %s by ID. Returns empty on success (HTTP 204).", article(def.Singular), def.Singular),
 		Example: fmt.Sprintf(`  altscore %s delete <id>`, def.Name),
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
