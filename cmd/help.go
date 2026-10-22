@@ -13,12 +13,15 @@ altscore uses OAuth2 client credentials for authentication.
 
 ## Login
 
-  altscore login --profile <name> --environment <env>
+  altscore login                                  # asks for the alias too
+  altscore login --profile <alias>
+  altscore login --profile <alias> --environment staging
 
-This prompts for client_id and client_secret (or reads them from
-ALTSCORE_CLIENT_ID and ALTSCORE_CLIENT_SECRET environment variables),
-exchanges them for an access token, and stores everything in the
-named profile.
+This prompts for client_id and client_secret, exchanges them for an
+access token, reads the tenant those credentials belong to from the
+API, and stores everything in the named profile. The environment is
+production unless --environment names staging or sandbox; logging in
+again to an existing profile keeps its environment.
 
 ## Token Refresh
 
@@ -78,8 +81,8 @@ environments or tenants, similar to AWS CLI profiles.
 
 ## Managing Profiles
 
+  altscore login --profile prod
   altscore login --profile staging --environment staging
-  altscore login --profile prod --environment production
   altscore profiles list
   altscore profiles show staging
   altscore profiles set-default prod
