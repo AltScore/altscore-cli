@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -14,21 +16,31 @@ import (
 	"golang.org/x/term"
 )
 
+const defaultLoginEnvironment = "production"
+
 var loginCmd = &cobra.Command{
 	Use:   "login",
 	Short: "Authenticate and create or update a profile",
-	Long: `Authenticate with the AltScore API using OAuth2 client credentials.
+	Long: `Authenticate with the AltScore API using OAuth2 client credentials and
+save the result as a named profile.
 
-Walks you through each field with existing values shown as defaults in
-brackets. Press Enter to accept a default.
+Asks for three things: the profile alias (skipped when --profile is given),
+the client id and the client secret. The tenant is read from the API after
+authenticating: the credentials belong to exactly one tenant, so there is
+nothing to choose and --tenant is refused here.
 
-The tenant ID is auto-detected from the API after authentication. You can
-confirm or override the detected value when prompted.`,
-	Example: `  # Interactive login
+The environment is production. Pass --environment staging or
+--environment sandbox to log in somewhere else. Logging in again to an
+existing profile keeps its environment unless the flag says otherwise, and
+offers the stored client id and secret as defaults: press Enter to keep them.`,
+	Example: `  # Production; asks for the alias, client id and secret
   altscore login
 
-  # Login with a named profile
-  altscore login --profile prod`,
+  # Named profile; asks only for the client id and secret
+  altscore login --profile la-fabril
+
+  # Another environment
+  altscore login --profile la-fabril-stg --environment staging`,
 	RunE: runLogin,
 }
 
@@ -40,34 +52,38 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return fmt.Errorf("login requires an interactive terminal")
 	}
+	if flagTenant != "" {
+		return fmt.Errorf("--tenant does not apply to login: the tenant comes from the credentials and is read from the API after authenticating")
+	}
+	// Checked before any prompt, so a typo fails before the secret is typed.
+	if flagEnvironment != "" {
+		if _, err := client.GetBaseURLs(flagEnvironment); err != nil {
+			return err
+		}
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 
-	// Prompt profile
-	defaultProfile := config.ResolveProfile(cfg, flagProfile)
-	profileName, err := promptWithDefault("profile", defaultProfile)
-	if err != nil {
-		return err
+	profileName := flagProfile
+	if profileName == "" {
+		profileName, err = promptProfileAlias()
+		if err != nil {
+			return err
+		}
 	}
 
-	// Load existing profile for defaults
-	existing := cfg.Profiles[profileName]
-
-	// Prompt environment
-	envDefault := existing.Environment
-	if envDefault == "" {
-		envDefault = "production"
-	}
-	environment, err := promptEnvironment(envDefault)
-	if err != nil {
-		return err
+	existing, updating := cfg.Profiles[profileName]
+	environment := loginEnvironment(flagEnvironment, existing.Environment)
+	if updating {
+		fmt.Fprintf(os.Stderr, "Updating profile %q (%s). Press Enter to keep a stored value.\n", profileName, describeProfileTarget(existing))
 	}
 
-	// Prompt client id
-	clientID, err := promptSecretWithDefault("client id", existing.ClientID)
+	// The client id is an identifier, not a secret (profiles show prints it),
+	// so it echoes: a pasted value can be checked before it is sent.
+	clientID, err := promptWithDefault("client id", existing.ClientID)
 	if err != nil {
 		return err
 	}
@@ -75,8 +91,12 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("client id is required")
 	}
 
-	// Prompt client secret
-	secret, err := promptSecretWithDefault("client secret", existing.ClientSecret)
+	// A stored secret only belongs to the stored client id.
+	secretDefault := ""
+	if clientID == existing.ClientID {
+		secretDefault = existing.ClientSecret
+	}
+	secret, err := promptSecretWithDefault("client secret", secretDefault)
 	if err != nil {
 		return err
 	}
@@ -84,7 +104,6 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("client secret is required")
 	}
 
-	// Authenticate
 	authURL, err := client.ModuleURL(environment, "auth")
 	if err != nil {
 		return err
@@ -96,18 +115,20 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Auto-detect tenant
-	tenantDefault := existing.TenantID
-	if detected, detErr := detectTenant(environment, token); detErr == nil && detected != "" {
-		tenantDefault = detected
+	detected, detErr := detectTenant(environment, token)
+	if detErr != nil || detected == "" {
+		if claim := tenantFromToken(token); claim != "" {
+			detected, detErr = claim, nil
+		}
+	}
+	tenantID, warning := resolveLoginTenant(detected, detErr, clientID, existing)
+	if warning != "" {
+		fmt.Fprintln(os.Stderr, "warning: "+warning)
+	}
+	if updating && existing.TenantID != "" && tenantID != "" && tenantID != existing.TenantID {
+		fmt.Fprintf(os.Stderr, "Profile %q now points at tenant %q (was %q).\n", profileName, tenantID, existing.TenantID)
 	}
 
-	tenantID, err := promptWithDefault("tenant", tenantDefault)
-	if err != nil {
-		return err
-	}
-
-	// Save profile
 	cfg.Profiles[profileName] = config.Profile{
 		Environment:  environment,
 		ClientID:     clientID,
@@ -124,8 +145,76 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Logged in. Profile %q saved.\n", profileName)
+	target := environment
+	if tenantID != "" {
+		target = fmt.Sprintf("tenant %q on %s", tenantID, environment)
+	}
+	fmt.Fprintf(os.Stderr, "Logged in to %s. Profile %q saved.\n", target, profileName)
+	if cfg.DefaultProfile != profileName {
+		arg := profileName
+		if strings.ContainsAny(arg, " \t") {
+			arg = fmt.Sprintf("%q", arg)
+		}
+		fmt.Fprintf(os.Stderr, "Use it with --profile %s, or make it the default: altscore profiles set-default %s\n", arg, arg)
+	}
 	return nil
+}
+
+// loginEnvironment picks the environment a login authenticates against: the
+// --environment flag, else the profile's current one (so re-logging a staging
+// profile stays on staging), else production.
+func loginEnvironment(flagValue, existing string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	if existing != "" {
+		return existing
+	}
+	return defaultLoginEnvironment
+}
+
+// resolveLoginTenant returns the tenant to store after a successful
+// authentication, plus a warning when it could not be read from the API. A
+// failed read keeps the stored tenant only when the client id is unchanged,
+// since a tenant belongs to the credentials and not to the alias.
+func resolveLoginTenant(detected string, detErr error, clientID string, existing config.Profile) (string, string) {
+	if detErr == nil && detected != "" {
+		return detected, ""
+	}
+	reason := "the API returned no tenant"
+	if detErr != nil {
+		reason = detErr.Error()
+	}
+	if clientID == existing.ClientID && existing.TenantID != "" {
+		return existing.TenantID, fmt.Sprintf("could not read the tenant from the API (%s); keeping %q", reason, existing.TenantID)
+	}
+	return "", fmt.Sprintf("could not read the tenant from the API (%s); the profile is saved without one", reason)
+}
+
+// promptProfileAlias has no default on purpose: offering the default profile
+// made Enter overwrite its credentials with another tenant's.
+func promptProfileAlias() (string, error) {
+	for {
+		alias, err := promptWithDefault("profile alias", "")
+		if err != nil {
+			return "", err
+		}
+		if alias != "" {
+			return alias, nil
+		}
+		fmt.Fprintln(os.Stderr, "a profile alias is required (e.g. the tenant's short name)")
+	}
+}
+
+func describeProfileTarget(p config.Profile) string {
+	env := p.Environment
+	if env == "" {
+		env = defaultLoginEnvironment
+	}
+	if p.TenantID == "" {
+		return env
+	}
+	return fmt.Sprintf("tenant %s on %s", p.TenantID, env)
 }
 
 // detectTenant calls GET /v1/application/tenant on Borrower Central to
@@ -153,14 +242,58 @@ func detectTenant(environment, token string) (string, error) {
 		return "", fmt.Errorf("tenant detection returned HTTP %d", resp.StatusCode)
 	}
 
-	var result struct {
-		TenantID string `json:"tenantId"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return "", err
 	}
+	return parseTenantResponse(body)
+}
 
-	return result.TenantID, nil
+// tenantFromToken reads the tenantId claim of the access token, the same claim
+// the Python SDK reads. It is the fallback when the API read fails. The
+// signature is not checked: the token came straight from the auth server and
+// the tenant is only stored on the profile.
+func tenantFromToken(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		TenantID string `json:"tenantId"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.TenantID
+}
+
+// parseTenantResponse reads the tenant id out of GET /v1/application/tenant.
+// Borrower Central passes Frontegg's tenant record through unchanged, which is
+// an ARRAY of tenants (one for client credentials); decoding it as an object
+// failed on every login, so the tenant was never detected. A bare object is
+// still accepted in case the endpoint starts unwrapping it.
+func parseTenantResponse(body []byte) (string, error) {
+	type tenant struct {
+		TenantID string `json:"tenantId"`
+	}
+	var list []tenant
+	if err := json.Unmarshal(body, &list); err == nil {
+		for _, t := range list {
+			if t.TenantID != "" {
+				return t.TenantID, nil
+			}
+		}
+		return "", nil
+	}
+	var single tenant
+	if err := json.Unmarshal(body, &single); err != nil {
+		return "", fmt.Errorf("cannot parse tenant response: %w", err)
+	}
+	return single.TenantID, nil
 }
 
 func promptWithDefault(label, defaultVal string) (string, error) {
@@ -197,17 +330,4 @@ func promptSecretWithDefault(label, existing string) (string, error) {
 		return existing, nil
 	}
 	return val, nil
-}
-
-func promptEnvironment(defaultVal string) (string, error) {
-	for {
-		val, err := promptWithDefault("environment", defaultVal)
-		if err != nil {
-			return "", err
-		}
-		if _, err := client.GetBaseURLs(val); err == nil {
-			return val, nil
-		}
-		fmt.Fprintln(os.Stderr, "invalid environment. choose: production, staging, sandbox")
-	}
 }

@@ -16,7 +16,7 @@ var profilesCmd = &cobra.Command{
 	Long: `Manage named profiles stored in ~/.config/altscore/config.toml.
 
 Each profile contains credentials and settings for a specific AltScore
-environment and tenant. Use 'altscore login --profile <name>' to create
+environment and tenant. Use 'altscore login --profile <alias>' to create
 profiles, then switch between them with --profile or set-default.`,
 }
 

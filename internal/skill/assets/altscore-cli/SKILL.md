@@ -32,7 +32,7 @@ This skill ships inside the binary. `altscore skill status` says whether the cop
 
 ## Authentication
 
-The CLI must be logged in before use. Check with `altscore config`. If no profile exists, log in interactively (requires a terminal) with `altscore login`. Tokens auto-refresh on 401 — no manual refresh needed.
+The CLI must be logged in before use. Check with `altscore config`. If no profile exists, log in interactively (requires a terminal) with `altscore login --profile <alias>`: it asks only for the client id and secret, reads the tenant from the API, and targets production unless `--environment staging|sandbox` is passed. Tokens auto-refresh on 401 — no manual refresh needed.
 
 **Exporting credentials for the Python SDK** — `altscore env` prints raw secrets (client_secret, access token) to stdout. NEVER run it bare; ALWAYS pipe to a file:
 

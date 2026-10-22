@@ -41,10 +41,12 @@ check or notify.
 ## Login
 
 ```bash
-altscore login
+altscore login                                     # asks for the profile alias, client id and secret
+altscore login --profile la-fabril                 # asks only for the client id and secret
+altscore login --profile la-fabril-stg --environment staging
 ```
 
-Walks you through profile, environment, credentials, and tenant. Tenant is auto-detected after authentication.
+The tenant is read from the API after authenticating, since the credentials belong to one tenant. The environment is production unless `--environment` names `staging` or `sandbox`.
 
 ## Usage
 

@@ -29,7 +29,7 @@ It supports multiple named profiles for different environments and tenants,
 automatic token refresh, and JSON output for scripting and LLM tool use.
 
 Authentication uses OAuth2 client credentials. Configure profiles with:
-  altscore login --profile <name> --environment <env>
+  altscore login --profile <alias>    (add --environment staging|sandbox off production)
 
 All commands output JSON to stdout. Status messages go to stderr.
 Use --help on any command to see available flags and examples.
