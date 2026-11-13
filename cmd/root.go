@@ -794,6 +794,52 @@ executes the task code and compares actual vs expected using DeepDiff.`,
 	ttGroup.AddCommand(makeTtRunAllCmd())
 	ttGroup.AddCommand(makeTtByTaskCmd())
 
+	wftGroup := registerResource(ResourceDef{
+		Name:          "workflow-test-cases",
+		Singular:      "workflow-test-case",
+		BasePath:      "/v1/workflow-test-cases",
+		Module:        "borrower_central",
+		Actions:       []string{"list", "get", "create", "update", "delete"},
+		WorkflowAlias: true,
+		Description: `Manage UAT test cases for workflows-v2 flows (feature builder-uat).
+
+A test case mocks the flow's data sources with canned example responses, runs the flow
+in test mode, and asserts what it should decide. "run" returns the decision the flow
+reached together with the verdict, so the same result shows in the builder and here.`,
+		CreateSchema: `  name: string          [required] Test case name
+  sourceBindings: array One per source: {taskAlias, sourceId, version,
+                        mode: "example"|"live", exampleRef}
+  inputs: object        Flow input variables (leave identity ids empty)
+  codeExpectation: string  Python boolean over the result, e.g.
+                        decision.key == "APPROVED" and isSuccess == True
+  expectations: array   (legacy) structured {path, operator, value} rows
+  seed: object          Optional pre-existing borrower/deal state`,
+		UpdateSchema: `  name, expectedBehavior, sourceBindings, inputs,
+  codeExpectation, expectations, seed  (any subset)`,
+		ResponseSchema: `  id, workflowAlias, workflowVersion, name, expectedBehavior,
+  sourceBindings, inputs, expectations, codeExpectation, seed,
+  createdAt, updatedAt`,
+		FilterHelp: `  workflow-alias        [required on list] the workflow whose cases to return`,
+	})
+	wftGroup.AddCommand(makeWftRunCmd())
+	wftGroup.AddCommand(makeWftRunAllCmd())
+	wftGroup.AddCommand(makeWftStalenessCmd())
+
+	registerResource(ResourceDef{
+		Name:          "workflow-test-suites",
+		Singular:      "workflow-test-suite",
+		BasePath:      "/v1/workflow-test-suites",
+		Module:        "borrower_central",
+		Actions:       []string{"list", "create", "update", "delete"},
+		WorkflowAlias: true,
+		Description: `Manage suites that group workflow test cases (feature builder-uat).`,
+		CreateSchema: `  name: string          [required] Suite name
+  description: string   Description`,
+		UpdateSchema:   `  name, description  (any subset)`,
+		ResponseSchema: `  id, workflowAlias, name, description, createdAt, updatedAt`,
+		FilterHelp:     `  workflow-alias        [required on list] the workflow whose suites to return`,
+	})
+
 	wfGroup := registerResource(ResourceDef{
 		Name:     "workflows",
 		Singular: "workflow",
