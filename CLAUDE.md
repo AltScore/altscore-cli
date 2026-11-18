@@ -53,6 +53,7 @@ altscore-cli/
 │   ├── workflow_tasks.go  task_tests.go  tools.go
 │   ├── login.go  refresh_token.go  profiles.go  config.go  env.go
 │   ├── packages.go  skill.go  source_test_cases.go
+│   ├── feedback.go                        # `feedback`: files an HQ triage ticket via BC POST /v1/support/tickets (the Hub bug widget's route; staff tokens only)
 │   └── api.go  help.go  update.go  update_check.go  version.go
 ├── internal/
 │   ├── client/{client,auth,urls}.go       # HTTP client, OAuth2, env base URLs
@@ -124,7 +125,7 @@ The CLI uses a generic resource builder pattern. `ResourceDef` in `cmd/resource.
 
 There are TWO registration mechanisms and `cmd/root.go` shows only one of them, so grepping root.go for a command name can come up empty even though the command exists.
 
-Mechanism 1, via root.go. `func init()` in `cmd/root.go` sets rootCmd's persistent flags, adds `schema` / `tools` / `skill` / `version` directly, then calls `registerResources()`, which holds every ResourceDef plus:
+Mechanism 1, via root.go. `func init()` in `cmd/root.go` sets rootCmd's persistent flags, adds `schema` / `tools` / `skill` / `version` / `feedback` directly, then calls `registerResources()`, which holds every ResourceDef plus:
 - ResourceDefs that live in their own file: `cmd/external_source_configs.go:17`, wired via `registerExternalSourceConfigs()`.
 - Non-CRUD groups built in their own file and only added from root: `registerTasksV2(rootCmd)`, `makeCreditAccountsGroupCmd()`, `makePaymentOrdersGroupCmd("payment-orders")` / `("disbursements")`, `makeDpasGroupCmd()`, `makeAnalyticsGroupCmd()`, `makeDecisionsGroupCmd()`. `registerSourceTestCases()` also lives in its own file but is a `registerResource` group with extra content commands.
 

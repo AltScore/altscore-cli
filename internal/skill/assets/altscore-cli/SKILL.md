@@ -114,6 +114,22 @@ A delivery engineer asking to move a workflow off the legacy v1 engine has not t
 
 Full intake, including the fallback when AskUserQuestion is unavailable: [v1-migration](references/v1-migration.md).
 
+## Reporting a problem (`altscore feedback`)
+
+When the CLI or the platform gets in your way, report it: `altscore feedback` files a ticket in HQ's triage queue, like the Hub's bug widget does, and the team routes it from there.
+
+- **Report:** a command that crashes, returns something wrong or contradicts its `--help` (`--kind bug`); the skill, a reference or `schema-guide` saying something the API does not do (`--kind docs`); a missing command or capability that blocked the task (`--kind suggestion`); a platform failure your spec and data did not cause (`--area workflow-runtime`, `workflow-builder`, `altdata`, ...; the default `cli` is the CLI itself).
+- **Don't report:** your own spec or data mistakes, a tenant's configuration, or a question. Check `--help` and `schema-guide` first; if you still cannot tell whether it is a bug or misuse, ask the user before filing.
+- **Write it for a stranger.** The title names the defect. The body says what you ran, what you expected, what happened (the exact error) and the smallest repro. Put identifiers in `--context` (`command=`, `execution_id=`, `workflow_alias=`, `workflow_version=`) and long output in `--attach file`. Leave out customer data (names, ID numbers); tokens and secrets are scrubbed for you, PII is not.
+- One report per problem. The CLI refuses the same title for 7 days and names the earlier ticket; add new findings to that ticket instead of passing `--force`.
+- File it yourself, and give the user the `HQ-NNNN` and URL it prints. `--dry-run` shows the request without sending it. A 403 means this profile is not an AltScore staff credential: tell the user, don't retry.
+
+```bash
+altscore feedback --kind docs --title "workflows-v2.md says X, apply rejects it" \
+  --body @report.md --context command="altscore workflows-v2 apply --body @spec.json --dry-run" \
+  --attach apply-output.txt
+```
+
 ## Reference index
 
 Load the file that matches the task:

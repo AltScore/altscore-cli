@@ -62,6 +62,7 @@ func init() {
 	rootCmd.AddCommand(makeToolsCmd())
 	rootCmd.AddCommand(makeSkillCmd())
 	rootCmd.AddCommand(makeVersionCmd())
+	rootCmd.AddCommand(makeFeedbackCmd())
 	registerResources()
 }
 
