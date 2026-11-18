@@ -129,6 +129,74 @@ func TestRenderFeedbackDescription(t *testing.T) {
 	}
 }
 
+func TestRenderFeedbackDescription_NoContextIsDropped(t *testing.T) {
+	in := sampleFeedbackInput()
+	in.Context = map[string]string{"workflow_version": "3"}
+	d := renderFeedbackDescription(in, in.mergedContext())
+	if strings.Contains(d, "**Workflow:**") || !strings.Contains(d, "| workflow_version | 3 |") {
+		t.Errorf("a version with no workflow to hang on belongs in the table:\n%s", d)
+	}
+
+	in.Context = map[string]string{"workflow_alias": "kyc", "workflow_id": "wf-9", "workflow_version": "3"}
+	d = renderFeedbackDescription(in, in.mergedContext())
+	if !strings.Contains(d, "- **Workflow:** kyc v3") || !strings.Contains(d, "| workflow_id | wf-9 |") {
+		t.Errorf("the id next to the alias that took the line belongs in the table:\n%s", d)
+	}
+	if strings.Contains(d, "| workflow_version |") || strings.Contains(d, "| workflow_alias |") {
+		t.Errorf("keys on the Workflow line must not repeat in the table:\n%s", d)
+	}
+}
+
+func TestRedactFeedbackContext(t *testing.T) {
+	ctx := map[string]string{
+		"api_key":      "short1",
+		"client_token": "abc",
+		"db_password":  "hunter2",
+		"execution_id": "exec-1",
+		"note":         "Bearer abcdefghijklmnopqrstuvwxyz",
+		"token_empty":  "",
+	}
+	n := redactFeedbackContext(ctx, nil)
+	for _, k := range []string{"api_key", "client_token", "db_password"} {
+		if ctx[k] != "[REDACTED]" {
+			t.Errorf("%s = %q, a credential-named key must lose its value", k, ctx[k])
+		}
+	}
+	if ctx["execution_id"] != "exec-1" || ctx["token_empty"] != "" {
+		t.Errorf("ordinary or empty values changed: %v", ctx)
+	}
+	if ctx["note"] != "Bearer [REDACTED]" {
+		t.Errorf("note = %q", ctx["note"])
+	}
+	if n != 4 {
+		t.Errorf("redacted %d, want 4", n)
+	}
+}
+
+func TestReadLimited(t *testing.T) {
+	if got, err := readLimited(strings.NewReader("12345"), 5); err != nil || string(got) != "12345" {
+		t.Errorf("at the limit: %q %v", got, err)
+	}
+	if _, err := readLimited(strings.NewReader("123456"), 5); err == nil {
+		t.Error("one byte over the limit must be refused")
+	}
+}
+
+func TestLoadFeedbackAttachments_SecretInFileName(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "dump-profile-secret-123.log")
+	if err := os.WriteFile(p, []byte("clean"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadFeedbackAttachments([]string{p}, []string{"profile-secret-123"})
+	if err == nil {
+		t.Fatal("a file name holding the profile secret should be refused")
+	}
+	if strings.Contains(err.Error(), "profile-secret-123") {
+		t.Errorf("the error must not repeat the leaked name: %v", err)
+	}
+}
+
 func TestRenderFeedbackDescription_ReporterFallbacks(t *testing.T) {
 	in := sampleFeedbackInput()
 	in.Reporter = feedbackReporter{Email: "ana@altscore.ai"}
@@ -316,6 +384,30 @@ func TestFeedbackLedger(t *testing.T) {
 	}
 	if err := loadFeedbackLedger("").record("x", feedbackSent{}, now); err != nil {
 		t.Error("a ledger without a path is a no-op")
+	}
+}
+
+func TestFeedbackLedger_KeepsAnotherProcessesEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), feedbackStateFile)
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	first := loadFeedbackLedger(path)  // loaded before the other process writes
+	second := loadFeedbackLedger(path) // the other process
+	if err := second.record("theirs", feedbackSent{Ticket: "HQ-7", At: now}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.record("mine", feedbackSent{Ticket: "HQ-8", At: now}, now); err != nil {
+		t.Fatal(err)
+	}
+	got := loadFeedbackLedger(path)
+	if _, ok := got.recent("theirs", now); !ok {
+		t.Error("a write from a stale snapshot dropped another process's report")
+	}
+	if _, ok := got.recent("mine", now); !ok {
+		t.Error("own report missing")
+	}
+	leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".feedback-sent-*"))
+	if len(leftovers) != 0 {
+		t.Errorf("temporary files left behind: %v", leftovers)
 	}
 }
 

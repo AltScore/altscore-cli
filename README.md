@@ -64,8 +64,9 @@ All commands output JSON to stdout. Use `--help` on any command to see fields, f
 `altscore feedback` files a bug, suggestion or docs problem as a ticket in HQ's triage queue, the way the Hub's bug widget does. It is meant for agents as much as people: it records the reporter, tenant, environment, CLI version and the agent that filed it, scrubs tokens and secrets, and refuses the same report twice in 7 days. It needs AltScore staff credentials.
 
 ```bash
+# substitute your own execution id for exec-123
 altscore feedback --title "executions state 404s for a v2 execution" \
-  --body @report.md --context execution_id=<id> --attach output.txt
+  --body @report.md --context execution_id=exec-123 --attach output.txt
 altscore feedback --kind suggestion --title "..." --body "..." --dry-run   # print the request, send nothing
 ```
 

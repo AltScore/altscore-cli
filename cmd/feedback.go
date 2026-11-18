@@ -48,6 +48,7 @@ const (
 
 	feedbackMaxTitle        = 200
 	feedbackMaxBody         = 20000
+	feedbackMaxBodyBytes    = 1 << 20  // read ceiling for stdin and @file, checked before the rune limit
 	feedbackMaxAttachment   = 25 << 20 // what HQ accepts; the Hub caps it the same way
 	feedbackMaxContextValue = 500
 
@@ -99,23 +100,12 @@ var feedbackReservedContextKeys = map[string]bool{
 	"agent":          true,
 }
 
-// feedbackMetaKeys are context keys rendered as their own line at the top of the
-// description, so they are left out of the Context table.
-var feedbackMetaKeys = map[string]bool{
-	"reported_via":     true,
-	"cli_version":      true,
-	"agent":            true,
-	"kind":             true,
-	"workflow_alias":   true,
-	"workflow_id":      true,
-	"workflow_version": true,
-	"execution_id":     true,
-	"command":          true,
-}
-
 var (
 	feedbackContextKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
-	feedbackAgentPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$`)
+	// A --context key that names a credential has its value replaced whatever
+	// the value looks like: a short opaque secret matches no pattern.
+	feedbackSecretKeyPattern = regexp.MustCompile(`secret|token|passw|api_?key|authorization|credential|private_key`)
+	feedbackAgentPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$`)
 
 	// Credentials an agent might paste from a debug session. The literal
 	// client secret and access token of the active profile are scrubbed too.
@@ -241,26 +231,34 @@ func renderFeedbackDescription(in feedbackInput, ctx map[string]string) string {
 		"- **Area:** " + in.Area,
 		"- **Kind:** " + in.Kind,
 	}
-	workflow := ctx["workflow_alias"]
-	if workflow == "" {
-		workflow = ctx["workflow_id"]
+	// Keys shown on a meta line are left out of the Context table. Only the
+	// ones actually rendered: a workflow_version with no workflow to hang on,
+	// or a workflow_id next to the alias that took the line, stay in the table.
+	rendered := map[string]bool{"reported_via": true, "cli_version": true, "agent": true, "kind": true}
+	workflowKey := "workflow_alias"
+	if ctx[workflowKey] == "" {
+		workflowKey = "workflow_id"
 	}
-	if workflow != "" {
+	if workflow := ctx[workflowKey]; workflow != "" {
+		rendered[workflowKey] = true
 		if v := ctx["workflow_version"]; v != "" {
 			workflow += " v" + v
+			rendered["workflow_version"] = true
 		}
 		meta = append(meta, "- **Workflow:** "+workflow)
 	}
 	if id := ctx["execution_id"]; id != "" {
 		meta = append(meta, "- **Execution:** "+id)
+		rendered["execution_id"] = true
 	}
 	if command := ctx["command"]; command != "" {
 		meta = append(meta, "- **Command:** "+markdownCodeSpan(command))
+		rendered["command"] = true
 	}
 
 	var keys []string
 	for k, v := range ctx {
-		if !feedbackMetaKeys[k] && v != "" {
+		if !rendered[k] && v != "" {
 			keys = append(keys, k)
 		}
 	}
@@ -356,6 +354,23 @@ func redactSecrets(s string, literals []string) (string, int) {
 	return s, n
 }
 
+// redactFeedbackContext scrubs the --context values in place and says how many
+// it replaced. A key that names a credential loses its value outright.
+func redactFeedbackContext(ctx map[string]string, literals []string) int {
+	n := 0
+	for k, v := range ctx {
+		if v != "" && feedbackSecretKeyPattern.MatchString(k) {
+			ctx[k] = "[REDACTED]"
+			n++
+			continue
+		}
+		var m int
+		ctx[k], m = redactSecrets(v, literals)
+		n += m
+	}
+	return n
+}
+
 // containsSecret is redactSecrets' check for attachments, which are sent as
 // they are: a file that holds a credential is refused rather than altered.
 func containsSecret(data []byte, literals []string) bool {
@@ -377,28 +392,57 @@ func loadFeedbackAttachments(paths []string, literals []string) ([]feedbackAttac
 		if info.IsDir() {
 			return nil, fmt.Errorf("--attach %s is a directory; attach files", p)
 		}
+		name := filepath.Base(p)
+		if containsSecret([]byte(name), literals) {
+			// The name itself is the leak, so it is not repeated here.
+			return nil, fmt.Errorf("an --attach file name looks like it holds a credential; rename the file and retry")
+		}
 		if info.Size() > feedbackMaxAttachment {
 			return nil, fmt.Errorf("--attach %s is %d MB; the limit is 25 MB", p, info.Size()>>20)
 		}
-		data, err := os.ReadFile(p)
+		data, err := readAtMost(p, feedbackMaxAttachment)
 		if err != nil {
 			return nil, fmt.Errorf("--attach %s: %w", p, err)
 		}
 		if containsSecret(data, literals) {
 			return nil, fmt.Errorf("--attach %s looks like it holds a credential (a token, client secret or API key); remove it from the file and retry", p)
 		}
-		out = append(out, feedbackAttachment{Name: filepath.Base(p), Data: data})
+		out = append(out, feedbackAttachment{Name: name, Data: data})
 	}
 	return out, nil
 }
 
+// readAtMost reads a file, failing once it passes max bytes: a log can grow
+// between the size check and the read.
+func readAtMost(path string, max int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return readLimited(f, max)
+}
+
+func readLimited(r io.Reader, max int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("over the %d MB limit", max>>20)
+	}
+	return data, nil
+}
+
 // readFeedbackBody takes --body text, --body @file, or stdin when it is piped.
+// File and stdin reads stop at feedbackMaxBodyBytes instead of buffering a
+// whole piped log before the length check refuses it.
 func readFeedbackBody(flag string, stdin io.Reader, stdinIsTerminal bool) (string, error) {
 	if strings.HasPrefix(flag, "@") {
 		path := strings.TrimPrefix(flag, "@")
-		data, err := os.ReadFile(path)
+		data, err := readAtMost(path, feedbackMaxBodyBytes)
 		if err != nil {
-			return "", fmt.Errorf("cannot read --body file %q: %w", path, err)
+			return "", fmt.Errorf("cannot read --body file %q: %w; put logs in --attach", path, err)
 		}
 		return string(data), nil
 	}
@@ -408,9 +452,9 @@ func readFeedbackBody(flag string, stdin io.Reader, stdinIsTerminal bool) (strin
 	if stdinIsTerminal {
 		return "", nil
 	}
-	data, err := io.ReadAll(stdin)
+	data, err := readLimited(stdin, feedbackMaxBodyBytes)
 	if err != nil {
-		return "", fmt.Errorf("cannot read the report from stdin: %w", err)
+		return "", fmt.Errorf("cannot read the report from stdin: %w; put logs in --attach", err)
 	}
 	return string(data), nil
 }
@@ -464,7 +508,9 @@ type feedbackSent struct {
 
 // feedbackLedger remembers recent reports so an agent stuck in a loop files one
 // ticket, not twenty. A missing or unreadable file is an empty ledger, and a
-// ledger with no path remembers nothing.
+// ledger with no path remembers nothing. It is a best-effort guard against
+// repeats, not a lock: two processes that check at the same instant can both
+// file the same report.
 type feedbackLedger struct {
 	path    string
 	entries map[string]feedbackSent
@@ -494,21 +540,38 @@ func (l *feedbackLedger) recent(fingerprint string, now time.Time) (feedbackSent
 	return s, true
 }
 
+// record adds one report. It re-reads the file first, so a report another
+// process recorded since this one loaded is kept, and replaces the file
+// atomically, so a failed write leaves the previous ledger intact.
 func (l *feedbackLedger) record(fingerprint string, s feedbackSent, now time.Time) error {
 	if l.path == "" {
 		return nil
 	}
-	for k, v := range l.entries {
+	entries := loadFeedbackLedger(l.path).entries
+	entries[fingerprint] = s
+	for k, v := range entries {
 		if now.Sub(v.At) > feedbackDedupRetention {
-			delete(l.entries, k)
+			delete(entries, k)
 		}
 	}
-	l.entries[fingerprint] = s
-	data, err := json.MarshalIndent(l.entries, "", "  ")
+	l.entries = entries
+	data, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(l.path, data, 0o600)
+	tmp, err := os.CreateTemp(filepath.Dir(l.path), ".feedback-sent-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // a no-op once the rename has moved it
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), l.path)
 }
 
 type feedbackRun struct {
@@ -566,7 +629,7 @@ func fileFeedback(c *client.Client, r feedbackRun) error {
 
 	raw, status, err := c.DoKeepBody("POST", "borrower_central", feedbackTicketsPath, payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot file the report: %w", err)
 	}
 	if status >= 400 {
 		return describeFeedbackError(status, raw, in.Reporter.Email)
@@ -595,7 +658,7 @@ func fileFeedback(c *client.Client, r feedbackRun) error {
 	failed := []string{}
 	for _, a := range in.Attachments {
 		if err := uploadFeedbackAttachment(c, ticket.ID, a); err != nil {
-			fmt.Fprintf(r.Stderr, "warning: attachment %s was not uploaded: %v\n", a.Name, err)
+			fmt.Fprintf(r.Stderr, "warning: attachment %s was not uploaded (%v). The ticket exists: add the file from its page in HQ, %s, instead of filing again\n", a.Name, err, url)
 			failed = append(failed, a.Name)
 			continue
 		}
@@ -654,10 +717,17 @@ func uploadFeedbackAttachment(c *client.Client, ticketID string, a feedbackAttac
 	body := buf.Bytes()
 	// Buffered, so every replay (401 refresh, connect-phase retry) sends the
 	// same bytes under the boundary already named in the Content-Type.
-	_, _, err = c.DoRaw("POST", "borrower_central", feedbackAttachmentsPath, func() (io.Reader, error) {
+	_, status, err := c.DoRaw("POST", "borrower_central", feedbackAttachmentsPath, func() (io.Reader, error) {
 		return bytes.NewReader(body), nil
 	}, w.FormDataContentType())
-	return err
+	if err != nil {
+		return err
+	}
+	// DoRaw hands back a 401 that survived the token refresh with no error.
+	if status < 200 || status > 299 {
+		return fmt.Errorf("HTTP %d", status)
+	}
+	return nil
 }
 
 func quoteFormValue(s string) string {
@@ -769,10 +839,7 @@ Output: {"ticket": "HQ-1234", "id", "url", "status", "labels",
 			redacted += n
 			text, n = redactSecrets(text, literals)
 			redacted += n
-			for k, v := range context {
-				context[k], n = redactSecrets(v, literals)
-				redacted += n
-			}
+			redacted += redactFeedbackContext(context, literals)
 			if redacted > 0 {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Replaced %d credential-looking value(s) with [REDACTED] before sending.\n", redacted)
 			}
