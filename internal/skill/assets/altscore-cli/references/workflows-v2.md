@@ -794,6 +794,8 @@ Needs a Borrower Central that has these (a route that is not deployed answers 40
 | `artifact` | `artifactAlias`, `columns` | the published rows of a table artifact |
 | `code` | `code` (xlsxwriter API; `wb`, `ws`, `row`, `inputs`) | whatever it draws |
 
+`source: "template"` fills an `.xlsx` you upload with `altscore workflows-v2 spreadsheet upload-template <path.xlsx>` (prints `template.objectName` and `template.fileLabel`; example below).
+
 - **Rows never go in the config.** `rowsFrom` / `valueFrom` / `template.fileFrom` name an **inputMappings KEY** of the node (`"rowsFrom": "ventas"` with `inputMappings: {"ventas": "task_outputs.<ref>.rows"}`); a list inside `{{...}}` would arrive as text. `batchFrom` may also be a workflow input, so it needs no mapping.
 - `columns` is `"auto"` or `[{header, field, type?, format?, width?, total?} | {header, formula}]`. `field` is a dotted path INSIDE the row (`persona.nombre`), not a `{{...}}` template; `formula` starts with `=` (`"=B{row}*2"`).
 - Sheet names: at most 31 characters, none of `[ ] : * ? / \`, unique ignoring case; every sheet needs at least one block.
@@ -857,7 +859,12 @@ for field, values in (inputs['counts'] or {}).items():
 
 Code-mode rules: the code runs against a recorder the worker replays, so calls return nothing except `wb.add_worksheet` / `add_format` / `add_chart`, which return the object to use, a method outside xlsxwriter's allowlist fails with `SPREADSHEET_CODE_METHOD_NOT_ALLOWED`, `ws.write` of a string is always text (formulas go through `ws.write_formula`). To add EVERY row next to the counts, map a `rows`-mode node (`"filas": "task_outputs.<rows-ref>.rows"`) and call `ws.table_from(0, 0, 'filas')` on a sheet of its own (or `ws.table_from(0, 0, {'rowsFrom': 'filas', 'columns': [...]})`); nothing may be written below a `table_from` / `batch_table` on the same sheet. The output's `preview` shows the first rows of every sheet in code mode too.
 
-**Counts into an Excel file, template mode** (an `.xlsx` uploaded once with its look; the node fills cells and tables). Each counted field with a plain name is already a list of `{value, count}` rows, so a template table reads it directly:
+**Counts into an Excel file, template mode** (an `.xlsx` uploaded once with its look; the node fills cells and tables). Each counted field with a plain name is already a list of `{value, count}` rows, so a template table reads it directly. Upload the template first and paste its output into `template`:
+
+```bash
+altscore workflows-v2 spreadsheet upload-template ./Plantilla.xlsx
+# {"objectName": "attachments/<tenant>/<uuid>.xlsx", "fileLabel": "Plantilla.xlsx"}
+```
 
 ```json
 {"ref": "planilla", "type": "spreadsheet-builder", "label": "Armar planilla",
@@ -877,7 +884,7 @@ Code-mode rules: the code runs against a recorder the worker replays, so calls r
 ```
 
 - `todas` here is a second batch-results node in `rows` mode; `filas` streams every row into the `Detalle` sheet. Any of these tables works the same as a `table` block in `source: "blocks"` (`{"type": "table", "rowsFrom": "por_decision", "columns": [...]}`).
-- `objectName` comes from uploading the `.xlsx` (`POST /v1/stores/packages/commands/attachments/upload`, multipart `file`; the response's `fileName` is `attachments/<tenant>/<uuid>.xlsx`); the worker refuses any other prefix. `cell` is a defined name, `Sheet!B4` or `B4`.
+- `objectName` / `fileLabel` come from uploading the `.xlsx` once: `altscore workflows-v2 spreadsheet upload-template ./Plantilla.xlsx` prints `{"objectName": "attachments/<tenant>/<uuid>.xlsx", "fileLabel": "Plantilla.xlsx"}`, exactly the two fields of `template`. It refuses anything but `.xlsx` and files over 25 MB before uploading; the worker refuses an `objectName` outside `attachments/<tenant>/`. Re-upload only when the template changes (each run makes a new object). `cell` is a defined name, `Sheet!B4` or `B4`.
 
 **Post-processing** = another PUBLISHED flow of the tenant, named in a workflow's batch policy, that Borrower Central starts once a batch has finished (rows and automatic retries). It is an ordinary workflow that receives ONE input, `batch`: `{id, label, description, status, workflowAlias, workflowVersion, isTest, createdBy, createdByEmail, createdAt, finishedAt, total, successful, failed, pending, unsuccessfulSources, decisions}`. It qualifies when it is published, is not the batch's own workflow, and requires no input other than `batch`.
 
