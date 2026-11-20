@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
-	"unicode/utf8"
+	"unicode/utf16"
 )
 
 // Offline mirror of borrower-central's app/model/workflows_v2/spreadsheet_builder.py
@@ -22,6 +23,7 @@ const (
 
 var (
 	spreadsheetSheetNameForbidden = regexp.MustCompile(`[\[\]:*?/\\]`)
+	spreadsheetA1Cell             = regexp.MustCompile(`^\$?([A-Za-z]{1,3})\$?(\d{1,7})$`)
 
 	spreadsheetBlockTypes   = []string{"fields", "table", "batch-results", "artifact", "code"}
 	spreadsheetSources      = []string{"blocks", "code", "template"}
@@ -55,11 +57,34 @@ func sbString(m map[string]any, camel string) string {
 	return s
 }
 
+// spreadsheetA1Problem says why an A1 reference (B4, Hoja!B4) is outside a sheet; a
+// reference that is not A1 (a defined name) is not its to judge.
+func spreadsheetA1Problem(reference string) string {
+	cell := strings.TrimSpace(reference)
+	if i := strings.LastIndex(cell, "!"); i >= 0 {
+		cell = strings.TrimSpace(cell[i+1:])
+	}
+	match := spreadsheetA1Cell.FindStringSubmatch(cell)
+	if match == nil {
+		return ""
+	}
+	column := 0
+	for _, letter := range strings.ToUpper(match[1]) {
+		column = column*26 + int(letter-'A'+1)
+	}
+	row, _ := strconv.Atoi(match[2])
+	if row < 1 || row > 1048576 || column > spreadsheetMaxColumns {
+		return fmt.Sprintf("'%s' is outside a sheet (columns A to XFD, rows 1 to 1,048,576)", reference)
+	}
+	return ""
+}
+
 func spreadsheetSheetNameProblem(name string) string {
 	if strings.TrimSpace(name) == "" {
 		return "a sheet needs a name"
 	}
-	if utf8.RuneCountInString(name) > spreadsheetMaxSheetNameLength {
+	// Excel counts UTF-16 units: an emoji takes two of the 31.
+	if len(utf16.Encode([]rune(name))) > spreadsheetMaxSheetNameLength {
 		return fmt.Sprintf("sheet name '%s' is longer than %d characters", name, spreadsheetMaxSheetNameLength)
 	}
 	if spreadsheetSheetNameForbidden.MatchString(name) {
@@ -243,6 +268,8 @@ func spreadsheetBuilderProblems(task map[string]any) []string {
 			cell, _ := rawCell.(map[string]any)
 			if name, _ := cell["cell"].(string); strings.TrimSpace(name) == "" {
 				problems = append(problems, fmt.Sprintf("template cell %d: name the cell to fill", i+1))
+			} else if problem := spreadsheetA1Problem(name); problem != "" {
+				problems = append(problems, fmt.Sprintf("template cell %d: %s", i+1, problem))
 			}
 			if key := sbString(cell, "valueFrom"); key != "" {
 				keys = append(keys, key)
@@ -253,6 +280,13 @@ func spreadsheetBuilderProblems(task map[string]any) []string {
 			where := fmt.Sprintf("template table %d", i+1)
 			if sheet, _ := table["sheet"].(string); strings.TrimSpace(sheet) == "" {
 				problems = append(problems, fmt.Sprintf("%s: name the sheet it is written on", where))
+			}
+			if anchor := strings.TrimSpace(sbString(table, "anchor")); anchor != "" {
+				if !spreadsheetA1Cell.MatchString(anchor) {
+					problems = append(problems, fmt.Sprintf("%s: the anchor '%s' is not a cell like A2", where, anchor))
+				} else if problem := spreadsheetA1Problem(anchor); problem != "" {
+					problems = append(problems, fmt.Sprintf("%s: %s", where, problem))
+				}
 			}
 			rowsFrom := sbString(table, "rowsFrom")
 			if (rowsFrom != "") == (sbString(table, "batchFrom") != "") {

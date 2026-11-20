@@ -165,6 +165,16 @@ func TestSpreadsheetBuilderProblems(t *testing.T) {
 		{"empty sheet name", sbSheets(sbSheet("", table)), ventas, []string{"a sheet needs a name"}},
 		{"long sheet name", sbSheets(sbSheet(strings.Repeat("a", 32), table)), ventas, []string{"longer than 31 characters"}},
 		{"31 accented characters fit", sbSheets(sbSheet(strings.Repeat("ñ", 31), table)), ventas, nil},
+		{"16 emoji are 32 UTF-16 units", sbSheets(sbSheet(strings.Repeat("\U0001F600", 16), table)), ventas,
+			[]string{"longer than 31 characters"}},
+		{"template cell and anchor outside the sheet", map[string]any{"source": "template", "template": map[string]any{
+			"objectName": "attachments/tenant-demo/00000000-0000-0000-0000-000000000000.xlsx",
+			"cells":      []any{map[string]any{"cell": "Hoja!B0", "value": "x"}, map[string]any{"cell": "cliente", "value": "x"}},
+			"tables": []any{
+				map[string]any{"sheet": "Ventas", "anchor": "XFE2", "rowsFrom": "ventas"},
+				map[string]any{"sheet": "Ventas", "anchor": "nada", "rowsFrom": "ventas"}},
+		}}, ventas, []string{"template cell 1: 'Hoja!B0' is outside a sheet", "template table 1: 'XFE2' is outside a sheet",
+			"template table 2: the anchor 'nada' is not a cell like A2"}},
 		{"forbidden character", sbSheets(sbSheet("Ventas/2026", table)), ventas, []string{"contains one of"}},
 		{"reserved name", sbSheets(sbSheet("History", table)), ventas, []string{"Excel reserves"}},
 		{"duplicate ignoring case", sbSheets(sbSheet("Ventas", table), sbSheet("VENTAS", table)), ventas,
