@@ -454,13 +454,26 @@ such as a scoring model run or data retrieval.`,
 		Description: `Manage execution batches (bulk workflow runs).
 
 An execution batch runs a workflow across multiple borrowers or deals.
-Supports pause, resume, cancel, and retry operations.`,
+Supports pause, resume, cancel, and retry operations.
+
+Post-processing (v2 workflows): a batch launched while its workflow's batch
+policy names a flow (batchPolicy.postProcessing) carries a 'postProcessing'
+object and goes processing -> post_processing -> complete |
+post_processing_failed. It is not 'complete' until that flow has run. The flow's
+files are the attachments of its run, which is NOT a row of the batch:
+
+    altscore execution-batches get <id> | jq '{status, postProcessing}'
+    altscore executions get-output-attachments <postProcessing.executionId>
+
+Re-run only the flow: 'altscore workflows-v2 batch post-process <id>'.`,
 		CreateSchema: `  workflowId: string    [required] Workflow to execute
   borrowerIds: [string] Borrower IDs to process
   tags: [string]        Tags (default: [])`,
 		UpdateSchema: `  tags: [string]        Tags`,
 		ResponseSchema: `  id, workflowId, status, totalItems, processedItems, tags, isTest,
-  createdAt, updatedAt`,
+  createdAt, updatedAt,
+  postProcessing: null | {workflowAlias, status: pending|running|complete|failed,
+    executionId, startedAt, finishedAt, error, attempts}`,
 		FilterHelp: `  workflow-id           Workflow ID
   parent-execution-id   Batches an async-batch subflow node dispatched from one
                         workflow execution
@@ -928,6 +941,8 @@ already have a hand-assembled body and know exactly what you are sending.`
 	wfv2Group.AddCommand(makeWfv2ExecuteBatchByAliasCmd())
 	wfv2Group.AddCommand(makeWfv2DownloadCmd())
 	wfv2Group.AddCommand(makeWfv2BatchGroupCmd())
+	wfv2Group.AddCommand(makeWfv2BatchPolicyGroupCmd())
+	wfv2Group.AddCommand(makeWfv2PostProcessingGroupCmd())
 	wfv2Group.AddCommand(makeWfv2SourcesStatusCmd())
 	wfv2Group.AddCommand(makeWfv2ExternalSourcesStatusCmd())
 	wfv2Group.AddCommand(makeWfv2AIGroupCmd())

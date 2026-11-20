@@ -525,7 +525,13 @@ Response fields (per attachment):
   id, url, label, fileExtension, metadata, createdAt
 
 Only the execution's own files. The files of its sub-flows stay on the sub-flow
-runs: list them with get-subflow-attachments.`,
+runs: list them with get-subflow-attachments.
+
+A file a spreadsheet-builder node generated is listed here with label = its
+file name, fileExtension = "xlsx" and metadata {kind: "generated-file", nodeId,
+workflowAttempt}. The files of a batch's post-processing flow are the
+attachments of THAT flow's run: pass the batch's postProcessing.executionId
+('altscore execution-batches get <batch-id> | jq -r .postProcessing.executionId').`,
 		Example: `  altscore executions get-output-attachments <execution-id>
   altscore executions get-output-attachments <execution-id> | jq '.[].url'`,
 		Args: cobra.ExactArgs(1),

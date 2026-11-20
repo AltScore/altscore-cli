@@ -24,7 +24,8 @@ var validTaskTypes = map[string]bool{
 	"package-io": true, "sftp": true, "notices": true,
 	"contact": true, "document-extraction": true,
 	"spreadsheet-extraction": true, "category": true,
-	"artifact": true,
+	"artifact":            true,
+	"spreadsheet-builder": true, "batch-results": true,
 }
 
 // Compiled in so the refusal also holds offline. fetchServerTaskTypes UNIONS the backend's

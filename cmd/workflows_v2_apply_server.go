@@ -55,6 +55,8 @@ type serverApplyResult struct {
 		Requested bool     `json:"requested"`
 		Published bool     `json:"published"`
 		Errors    []string `json:"errors"`
+		// Not sent by the apply endpoint today; rendered if a backend starts to.
+		Warnings json.RawMessage `json:"warnings"`
 	} `json:"publish"`
 	Lock struct {
 		Acquired bool `json:"acquired"`
@@ -419,6 +421,7 @@ func printServerApplySummary(w io.Writer, res *serverApplyResult) {
 	switch {
 	case res.Publish.Requested && res.Publish.Published:
 		fmt.Fprintln(w, "# published")
+		printPublishWarnings(w, res.Publish.Warnings)
 	case res.Publish.Requested:
 		fmt.Fprintf(w, "# publish requested but not published: %s\n", strings.Join(res.Publish.Errors, "; "))
 	default:

@@ -659,6 +659,16 @@ var refBearingTaskBodies = map[string]map[string]any{
 	"contact":                {},
 	"document-extraction":    {},
 	"spreadsheet-extraction": {},
+	"spreadsheet-builder": {
+		"spreadsheetBuilderConfig": map[string]any{
+			"fileName": "reporte-{{task_outputs.a.periodo}}.xlsx",
+			"sheets": []any{map[string]any{
+				"name":   "Resumen",
+				"blocks": []any{map[string]any{"type": "table", "rowsFrom": "upstream", "columns": "auto"}},
+			}},
+		},
+	},
+	"batch-results": {},
 }
 
 func TestRefBearingTaskBodies_CoversEveryTaskType(t *testing.T) {

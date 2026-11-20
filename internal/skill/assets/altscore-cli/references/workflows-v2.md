@@ -506,6 +506,7 @@ All lock subcommands accept an alias **or** an id; an id is resolved to its alia
 altscore workflows-v2 create-draft <active-id>                   # branch off ACTIVE
 altscore workflows-v2 publish <draft-id>                         # DRAFT -> ACTIVE (no lock held)
 altscore workflows-v2 publish <draft-id> --lock-token "$TOKEN"    # when you hold the edit lock
+# publish prints any `warnings` of the response on stderr as "# WARNING [CODE]: ..." (exit code unchanged)
 altscore workflows-v2 revert my-wf <version-id>                  # restore prior version into a draft (+ its tasks and own pinned entities); publish to go live
 altscore workflows-v2 archive <id>                               # archive all versions
 altscore workflows-v2 restore <id>                               # un-archive
@@ -603,6 +604,11 @@ altscore workflows-v2 execute-batch <id> --body '{
 altscore workflows-v2 batch pause     <batch-id>
 altscore workflows-v2 batch continue  <batch-id>
 altscore workflows-v2 batch terminate <batch-id>
+altscore workflows-v2 batch post-process <batch-id>   # re-run only the batch's post-processing flow (see "run a flow when a batch finishes")
+
+# What happens when a batch finishes (auto-retry, results email, post-processing flow): the batch policy
+altscore workflows-v2 batch-policy get <alias-or-id>
+altscore workflows-v2 batch-policy set <alias-or-id> --body @policy.json   # replaces the WHOLE policy; '{}' clears it
 ```
 
 #### Sources and AI helpers
@@ -773,6 +779,112 @@ altscore execution-batches get <executionBatchId>
 altscore executions list --filter execution-batch-id=<executionBatchId>
 altscore execution-batches list --filter parent-execution-id=<parentExecutionId>
 ```
+
+#### Build an Excel file, and run a flow when a batch finishes (`spreadsheet-builder`, `batch-results`, `batchPolicy.postProcessing`)
+
+Needs a Borrower Central that has these (a route that is not deployed answers 404/405 and the CLI says so). Field reference, always live: `altscore workflows-v2 schema-guide tasks spreadsheet-builder`, `... tasks batch-results`, `... schema-guide batchPolicy`.
+
+**`spreadsheet-builder`** builds ONE `.xlsx` and keeps it as an attachment of the execution. `spreadsheetBuilderConfig: {fileName, source: "blocks" (default) | "code" | "template", sheets: [{name, blocks: [...]}]}`. A sheet is a list of blocks written one under the other:
+
+| Block `type` | Takes | Writes |
+|---|---|---|
+| `fields` | `rows: [{label, value \| valueFrom, type?, format?}]` | two columns, one row per field |
+| `table` | `rowsFrom`, `columns`, `explodeField?`, `maxRows?` | a list of rows |
+| `batch-results` | `batchFrom?` (default: the `batch` input), `columns`, `rowsFilter: all\|successful\|failed`, `includeInput?`, `includeStatus?` | EVERY row of a batch, streamed (200k rows cost what 200 do) |
+| `artifact` | `artifactAlias`, `columns` | the published rows of a table artifact |
+| `code` | `code` (xlsxwriter API; `wb`, `ws`, `row`, `inputs`) | whatever it draws |
+
+- **Rows never go in the config.** `rowsFrom` / `valueFrom` / `template.fileFrom` name an **inputMappings KEY** of the node (`"rowsFrom": "ventas"` with `inputMappings: {"ventas": "task_outputs.<ref>.rows"}`); a list inside `{{...}}` would arrive as text. `batchFrom` may also be a workflow input, so it needs no mapping.
+- `columns` is `"auto"` or `[{header, field, type?, format?, width?, total?} | {header, formula}]`. `field` is a dotted path INSIDE the row (`persona.nombre`), not a `{{...}}` template; `formula` starts with `=` (`"=B{row}*2"`).
+- Sheet names: at most 31 characters, none of `[ ] : * ? / \`, unique ignoring case; every sheet needs at least one block.
+- The backend SAVES this config unvalidated and refuses it at publish (`SPREADSHEET_BUILDER_INVALID`). `apply` checks the same rules locally and reports every problem of the node in one error, `--dry-run` included.
+- Output: `task_outputs.<ref>.{attachmentId, fileName, fileUrl, fileSizeBytes, sheets, rowCount, preview}`. `fileUrl` is a signed link valid 24 h: map it into a `contact` node's attachment token to mail the file. The file is also listed by `altscore executions get-output-attachments <execution-id>` (`label` = file name, `metadata.kind = "generated-file"`).
+
+**`batch-results`** (the NODE, not the block) reads a batch into the flow to decide and to word a message: `batchResultsConfig: {batchFrom?, mode: "summary" (default) | "rows", rowsFilter, fields?, includeInput?, maxRows?}`. Output: `id, label, status, workflowAlias, createdByEmail, total, successful, failed, pending, decisions[...]` (the same under `.batch`), and in `rows` mode `.rows, .rowCount, .truncated`. Rows ride in the run's context, so at most 5,000 and 1 MB: for a sheet with every row use the spreadsheet block above.
+
+**Post-processing** = another PUBLISHED flow of the tenant, named in a workflow's batch policy, that Borrower Central starts once a batch has finished (rows and automatic retries). It is an ordinary workflow that receives ONE input, `batch`: `{id, label, description, status, workflowAlias, workflowVersion, isTest, createdBy, createdByEmail, createdAt, finishedAt, total, successful, failed, pending, unsuccessfulSources, decisions}`. It qualifies when it is published, is not the batch's own workflow, and requires no input other than `batch`.
+
+The usual flow as an apply spec (Start with a `batch` input -> build the sheet -> mail it to whoever launched the batch, or leave a notice):
+
+```jsonc
+{
+  "alias": "post-scoring", "label": "Post-procesamiento Scoring", "category": "ACTION",
+  // additionalProperties: apply refuses a read of inputs.batch.<field> the declaration does not cover.
+  // required:false -- a required input other than `batch` would make the flow incompatible.
+  "inputVariables": {"batch": {"type": "object", "required": false, "additionalProperties": true}},
+  "nodes": [
+    {"ref": "start", "type": "start", "label": "Start"},
+    {"ref": "planilla", "type": "spreadsheet-builder", "label": "Armar planilla",
+     "inputMappings": {"batch": "inputs.batch"},
+     "spreadsheetBuilderConfig": {"fileName": "resultados.xlsx", "sheets": [
+       {"name": "Resultados", "blocks": [
+         {"type": "batch-results", "batchFrom": "batch", "columns": "auto", "rowsFilter": "all", "includeStatus": true}]}]}},
+    // createdByEmail is null when the batch was launched with an API key: branch before mailing.
+    {"ref": "tiene-correo", "type": "conditional", "label": "Launcher has an email?",
+     "inputSchema": {"launcher_email": {"type": "string"}},
+     "inputMappings": {"launcher_email": "inputs.batch.createdByEmail"},
+     "branches": [
+       {"label": "Yes", "conditions": {"operator": "AND", "items": [
+         {"field": "launcher_email", "operator": "is_not_empty", "value": "", "valueType": "value"}]}},
+       {"label": "No", "isElse": true}]},
+    {"ref": "correo", "type": "contact", "label": "Mail the results",
+     "inputMappings": {"launcher_email": "inputs.batch.createdByEmail", "batch_label": "inputs.batch.label",
+                       "results_file": "task_outputs.planilla.fileUrl"},
+     "contactConfig": {"channel": "email", "to": "{launcher_email}",
+                       "subject": "Resultados del batch {batch_label}", "body": "El archivo va adjunto.",
+                       "attachments": [{"token": "results_file", "filename": "resultados.xlsx"}]}},
+    {"ref": "sin-correo", "type": "notices", "label": "No email sent",
+     "noticesConfig": {"severity": "warning", "message": "No email: the batch was not launched by a person. The file is attached to this run."}},
+    {"ref": "end", "type": "end", "label": "End"}
+  ],
+  "edges": [
+    {"from": "start", "to": "planilla"}, {"from": "planilla", "to": "tiene-correo"},
+    {"from": "tiene-correo", "to": "correo", "sourceHandle": "branch_0"},
+    {"from": "tiene-correo", "to": "sin-correo", "sourceHandle": "branch-else"},
+    {"from": "correo", "to": "end"}, {"from": "sin-correo", "to": "end"}
+  ]
+}
+```
+
+End to end (`scoring` = the workflow whose batches get the flow):
+
+```bash
+# 1a. the usual flow in one call: creates 'post-<alias>', PUBLISHES it, selects it (and turns the results email off)
+altscore workflows-v2 post-processing create-template scoring
+# 1b. ...or author your own and publish it (it must be ACTIVE to be selectable)
+altscore workflows-v2 apply --body @post-scoring.json --dry-run
+altscore workflows-v2 apply --body @post-scoring.json --publish
+
+# 2. which published flows qualify, and why the others do not
+altscore workflows-v2 post-processing candidates scoring                    # table: ALIAS LABEL VERSION COMPATIBLE REASON
+altscore workflows-v2 post-processing candidates scoring --compatible-only
+
+# 3. select it. batch-policy set REPLACES THE WHOLE policy: read, edit, write back
+altscore workflows-v2 batch-policy get scoring | jq '.batchPolicy // {}
+  | .postProcessing = {enabled: true, workflowAlias: "post-scoring"}
+  | if .delivery then .delivery.enabled = false else . end' > policy.json
+altscore workflows-v2 batch-policy set scoring --body @policy.json
+
+# 4. launch a batch, then follow it. It is NOT `complete` until the flow has run.
+altscore workflows-v2 execute-batch <scoring-id> --body '{"inputs":[...]}' --test
+altscore execution-batches get <batch-id> | jq '{status, postProcessing}'
+#   status: processing -> post_processing -> complete | post_processing_failed
+#   postProcessing: {workflowAlias, status: pending|running|complete|failed, executionId, startedAt, finishedAt, error, attempts}
+
+# 5. the flow's files = the attachments of ITS run (not a row of the batch)
+altscore executions get-output-attachments <postProcessing.executionId> | jq '.[] | {label, url}'
+
+# 6. the flow failed (post_processing_failed)? fix it, publish, and re-run ONLY the flow -- no row is re-run
+altscore workflows-v2 batch post-process <batch-id>
+```
+
+- `batch-policy get|set`, `post-processing candidates|create-template` take an alias or an id. The policy belongs to ONE workflow version: an alias resolves to the ACTIVE version, else the latest DRAFT (stderr says which).
+- **`delivery.enabled` and `postProcessing.enabled` are mutually exclusive** (`BATCH_POST_PROCESSING_EXCLUDES_DELIVERY`): the flow decides what is sent. `enabled` without `workflowAlias` is `BATCH_POST_PROCESSING_WORKFLOW_REQUIRED`; a flow that does not qualify is `BATCH_POST_PROCESSING_WORKFLOW_INCOMPATIBLE` with the reason. The CLI checks the first two before the request.
+- **A batch runs the flow named when it was LAUNCHED**, at that flow's published version. Changing the policy does not touch batches already launched; a batch launched without one has `postProcessing: null` and `batch post-process` answers 400 `BATCH_HAS_NO_POST_PROCESSING`.
+- `batch post-process` answers 409 `BATCH_POST_PROCESSING_NOT_RETRYABLE` until the batch is `complete` or `post_processing_failed`, and 409 `BATCH_POST_PROCESSING_ALREADY_RUNNING` while the flow runs. Retrying ROWS of a batch in `post_processing` is refused too (409 `BATCH_POST_PROCESSING_RUNNING`).
+- A failed flow never touches the rows: their results and the default results file (`workflows-v2 download`) stay as they are, and `postProcessing.error` says why.
+- **Publishing a flow that other workflows use as post-processing** can break them: when the new version requires an input a finished batch cannot give, `publish` still succeeds and prints `# WARNING [POST_PROCESSING_FLOW_INCOMPATIBLE]` on stderr (also in the response's `warnings`) naming the workflows that use it. Their next batch ends `post_processing_failed` until you fix it.
+- The flow's run is an execution of its own: tagged `batch-post-processing`, carrying `postProcessingBatchId`, billed like any other, and absent from `executions list --filter execution-batch-id=<batch>`. Test it by hand like any workflow: `altscore workflows-v2 execute-by-alias post-scoring latest --body '{"batch": {"id": "<a-finished-batch-id>"}}' --test`.
 
 #### Gotchas (v2 specific)
 
