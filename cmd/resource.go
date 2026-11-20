@@ -547,47 +547,7 @@ The file is sent as a multipart form upload to the document's attachment endpoin
 
 			filename := filepath.Base(filePath)
 
-			// The boundary is fixed up front because Content-Type names it and
-			// DoRaw may replay the body (401 refresh, connect-phase retry): a
-			// fresh multipart.Writer per attempt would otherwise pick a new
-			// boundary that no longer matches the header already sent.
-			boundaryWriter := multipart.NewWriter(io.Discard)
-			boundary := boundaryWriter.Boundary()
-			contentType := boundaryWriter.FormDataContentType()
-
-			// A factory, not a reader: the pipe below is drained by the first
-			// attempt, so each attempt needs its own pipe and its own open file.
-			newBody := func() (io.Reader, error) {
-				f, err := os.Open(filePath)
-				if err != nil {
-					return nil, fmt.Errorf("cannot open file: %w", err)
-				}
-
-				pr, pw := io.Pipe()
-				w := multipart.NewWriter(pw)
-				if err := w.SetBoundary(boundary); err != nil {
-					f.Close()
-					pr.Close()
-					pw.Close()
-					return nil, fmt.Errorf("cannot set multipart boundary: %w", err)
-				}
-
-				go func() {
-					defer f.Close()
-					part, err := w.CreateFormFile("file", filename)
-					if err != nil {
-						pw.CloseWithError(err)
-						return
-					}
-					if _, err := io.Copy(part, f); err != nil {
-						pw.CloseWithError(err)
-						return
-					}
-					pw.CloseWithError(w.Close())
-				}()
-
-				return pr, nil
-			}
+			newBody, contentType := multipartFileBody(filePath, "file", filename)
 
 			// POST .../attachments/upload -- the singular PUT .../attachment this
 			// used to send has never existed in borrower-central, so the command
@@ -610,6 +570,53 @@ The file is sent as a multipart form upload to the document's attachment endpoin
 
 	cmd.Flags().StringVar(&filePath, "file", "", "path to the file to upload [required]")
 	return cmd
+}
+
+// multipartFileBody streams one file as a multipart form upload under field. It returns
+// a body FACTORY plus the Content-Type to send with it.
+//
+// The boundary is fixed up front because Content-Type names it and DoRaw may replay the
+// body (401 refresh, connect-phase retry): a fresh multipart.Writer per attempt would
+// otherwise pick a new boundary that no longer matches the header already sent. A
+// factory, not a reader: the pipe is drained by the first attempt, so each attempt
+// needs its own pipe and its own open file.
+func multipartFileBody(filePath, field, filename string) (func() (io.Reader, error), string) {
+	boundaryWriter := multipart.NewWriter(io.Discard)
+	boundary := boundaryWriter.Boundary()
+	contentType := boundaryWriter.FormDataContentType()
+
+	newBody := func() (io.Reader, error) {
+		f, err := os.Open(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("cannot open file: %w", err)
+		}
+
+		pr, pw := io.Pipe()
+		w := multipart.NewWriter(pw)
+		if err := w.SetBoundary(boundary); err != nil {
+			f.Close()
+			pr.Close()
+			pw.Close()
+			return nil, fmt.Errorf("cannot set multipart boundary: %w", err)
+		}
+
+		go func() {
+			defer f.Close()
+			part, err := w.CreateFormFile(field, filename)
+			if err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+			if _, err := io.Copy(part, f); err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+			pw.CloseWithError(w.Close())
+		}()
+
+		return pr, nil
+	}
+	return newBody, contentType
 }
 
 // readBody reads JSON from --body flag or stdin.

@@ -943,6 +943,7 @@ already have a hand-assembled body and know exactly what you are sending.`
 	wfv2Group.AddCommand(makeWfv2BatchGroupCmd())
 	wfv2Group.AddCommand(makeWfv2BatchPolicyGroupCmd())
 	wfv2Group.AddCommand(makeWfv2PostProcessingGroupCmd())
+	wfv2Group.AddCommand(makeWfv2SpreadsheetGroupCmd())
 	wfv2Group.AddCommand(makeWfv2SourcesStatusCmd())
 	wfv2Group.AddCommand(makeWfv2ExternalSourcesStatusCmd())
 	wfv2Group.AddCommand(makeWfv2AIGroupCmd())

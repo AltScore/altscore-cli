@@ -281,7 +281,7 @@ func preflightTasks(spec *composeSpec) error {
 			if found := batchResultsProblems(task); len(found) > 0 {
 				return fmt.Errorf("node ref=%q: batch-results task: %s", ref, strings.Join(found, "; "))
 			}
-			if advisory := batchResultsRowCapAdvisory(task); advisory != "" {
+			if advisory := batchResultsMaxRowsAdvisory(task); advisory != "" {
 				fmt.Fprintf(os.Stderr, "# warning: node ref=%q: %s.\n", ref, advisory)
 			}
 		case "exception":
