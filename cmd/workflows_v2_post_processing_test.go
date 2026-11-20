@@ -434,6 +434,7 @@ func TestPostProcessingCommandsAreRegistered(t *testing.T) {
 		{"workflows-v2", "batch-policy", "set"},
 		{"workflows-v2", "post-processing", "candidates"},
 		{"workflows-v2", "post-processing", "create-template"},
+		{"workflows-v2", "post-processing", "row-fields"},
 		{"workflows-v2", "batch", "post-process"},
 		{"workflows-v2", "batch", "pause"},
 		{"workflows-v2", "batch", "continue"},
@@ -449,5 +450,86 @@ func TestPostProcessingCommandsAreRegistered(t *testing.T) {
 		if cand.Flags().Lookup(flag) == nil {
 			t.Errorf("candidates lacks --%s", flag)
 		}
+	}
+	rowFields, _, _ := rootCmd.Find([]string{"workflows-v2", "post-processing", "row-fields"})
+	if rowFields.Flags().Lookup("table") == nil {
+		t.Error("row-fields lacks --table")
+	}
+}
+
+const ppRowFieldsBody = `{"sources":[
+ {"alias":"scoring","label":"Scoring","fields":["person_id","decision"]},
+ {"alias":"onboarding","label":"Onboarding","fields":["person_id","segment"]}],
+ "fields":["person_id","decision","segment"],
+ "standardFields":["execution_id","item_index","is_success","error_message"]}`
+
+func TestBatchRowFields_RequestPathJSONAndTable(t *testing.T) {
+	srv, seen := ppServer(t, map[string]func(http.ResponseWriter){
+		"GET /v2/workflows/" + ppWorkflowID + "/batch-row-fields": ppJSON(200, ppRowFieldsBody),
+	})
+	res, err := fetchBatchRowFields(newTestClient(t, srv.URL), ppWorkflowID)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(*seen) != 1 || (*seen)[0].Method != "GET" || (*seen)[0].Path != "/v2/workflows/"+ppWorkflowID+"/batch-row-fields" {
+		t.Fatalf("requests %+v", *seen)
+	}
+	if len(res.Sources) != 2 || len(res.Fields) != 3 || len(res.StandardFields) != 4 {
+		t.Fatalf("parsed %+v", res)
+	}
+	encoded, _ := json.Marshal(res)
+	for _, key := range []string{`"sources"`, `"alias"`, `"label"`, `"fields"`, `"standardFields"`} {
+		if !strings.Contains(string(encoded), key) {
+			t.Errorf("JSON output lacks %s: %s", key, encoded)
+		}
+	}
+
+	var table bytes.Buffer
+	if err := renderBatchRowFields(&table, res); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(table.String(), "\n"), "\n")
+	if len(lines) != 1+3+4 {
+		t.Fatalf("want a header, 3 fields and 4 standard fields, got:\n%s", table.String())
+	}
+	for i, want := range [][]string{
+		{"FIELD", "FROM"},
+		{"person_id", "scoring, onboarding"},
+		{"decision", "scoring"},
+		{"segment", "onboarding"},
+		{"execution_id", "(standard)"},
+	} {
+		for _, cell := range want {
+			if !strings.Contains(lines[i], cell) {
+				t.Errorf("line %d %q lacks %q", i, lines[i], cell)
+			}
+		}
+	}
+}
+
+func TestBatchRowFields_EmptyAndBackendWithoutTheRoute(t *testing.T) {
+	srv, _ := ppServer(t, map[string]func(http.ResponseWriter){
+		"GET /v2/workflows/" + ppWorkflowID + "/batch-row-fields": ppJSON(200, `{"sources":[],"fields":[],"standardFields":["execution_id"]}`),
+	})
+	res, err := fetchBatchRowFields(newTestClient(t, srv.URL), ppWorkflowID)
+	if err != nil || len(res.Sources) != 0 || len(res.Fields) != 0 {
+		t.Fatalf("no sources is a valid answer, got %+v, %v", res, err)
+	}
+	encoded, _ := json.Marshal(res)
+	if !strings.Contains(string(encoded), `"sources":[]`) || !strings.Contains(string(encoded), `"fields":[]`) {
+		t.Errorf("empty lists must print as [], not null: %s", encoded)
+	}
+
+	srv404, _ := ppServer(t, nil)
+	_, err = fetchBatchRowFields(newTestClient(t, srv404.URL), ppWorkflowID)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 404") || !strings.Contains(err.Error(), "batch-row-fields") {
+		t.Fatalf("want the 404 naming the route, got: %v", err)
+	}
+	srvOld, _ := ppServer(t, map[string]func(http.ResponseWriter){
+		"GET /v2/workflows/" + ppWorkflowID + "/batch-row-fields": ppJSON(200, `{"id":"x"}`),
+	})
+	_, err = fetchBatchRowFields(newTestClient(t, srvOld.URL), ppWorkflowID)
+	if err == nil || !strings.Contains(err.Error(), "no 'fields' list") {
+		t.Fatalf("a response without fields must be an error, got: %v", err)
 	}
 }

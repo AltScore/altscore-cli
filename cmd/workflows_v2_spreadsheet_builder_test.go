@@ -248,21 +248,27 @@ func TestSpreadsheetBuilderPreflightIsAnErrorNamingTheNodeAndThePublishCode(t *t
 	}
 }
 
-func TestBatchResultsPreflight(t *testing.T) {
-	task := func(cfg map[string]any) *composeSpec {
-		body := map[string]any{"ref": "xls", "label": "Read batch", "type": "batch-results"}
-		if cfg != nil {
-			body["batchResultsConfig"] = cfg
-		}
-		return sbSpec(body)
+func batchResultsSpec(cfg map[string]any) *composeSpec {
+	body := map[string]any{"ref": "xls", "label": "Read batch", "type": "batch-results"}
+	if cfg != nil {
+		body["batchResultsConfig"] = cfg
 	}
+	return sbSpec(body)
+}
+
+func TestBatchResultsPreflight(t *testing.T) {
 	for name, cfg := range map[string]map[string]any{
-		"no config":    nil,
-		"summary":      {"batchFrom": "batch", "mode": "summary"},
-		"rows":         {"mode": "rows", "rowsFilter": "failed", "fields": []any{"score"}, "maxRows": float64(50)},
-		"over the cap": {"mode": "rows", "maxRows": float64(9000)}, // advisory only: the backend caps
+		"no config":      nil,
+		"summary":        {"batchFrom": "batch", "mode": "summary"},
+		"rows":           {"mode": "rows", "rowsFilter": "failed", "fields": []any{"score"}},
+		"rows no fields": {"mode": "rows"},
+		"counts":         {"mode": "counts", "rowsFilter": "successful", "fields": []any{"decision", "persona.provincia"}},
+		"legacy maxRows": {"mode": "rows", "maxRows": float64(9000)}, // advisory only: obsolete and ignored
+		"maxRows zero":   {"maxRows": float64(0)},                    // ignored by the backend, so never an error
 	} {
-		if err := preflightTasks(task(cfg)); err != nil {
+		var err error
+		captureStderr(t, func() { err = preflightTasks(batchResultsSpec(cfg)) })
+		if err != nil {
 			t.Errorf("%s: preflight should accept it, got: %v", name, err)
 		}
 	}
@@ -270,15 +276,47 @@ func TestBatchResultsPreflight(t *testing.T) {
 		cfg  map[string]any
 		want string
 	}{
-		"bad mode":       {map[string]any{"mode": "all"}, "mode"},
-		"bad rowsFilter": {map[string]any{"rowsFilter": "ok"}, "rowsFilter"},
-		"maxRows zero":   {map[string]any{"maxRows": float64(0)}, "maxRows must be at least 1"},
-		"fields string":  {map[string]any{"fields": "score"}, "fields is a list"},
+		"bad mode":            {map[string]any{"mode": "all"}, "summary, counts, rows"},
+		"bad rowsFilter":      {map[string]any{"rowsFilter": "ok"}, "rowsFilter"},
+		"fields string":       {map[string]any{"fields": "score"}, "fields is a list"},
+		"counts no fields":    {map[string]any{"mode": "counts"}, "mode 'counts' needs batchResultsConfig.fields"},
+		"counts null fields":  {map[string]any{"mode": "counts", "fields": nil}, "mode 'counts' needs"},
+		"counts empty fields": {map[string]any{"mode": "counts", "fields": []any{}}, "mode 'counts' needs"},
+		"counts blank fields": {map[string]any{"mode": "counts", "fields": []any{" ", ""}}, "mode 'counts' needs"},
 	} {
-		err := preflightTasks(task(tc.cfg))
-		if err == nil || !strings.Contains(err.Error(), tc.want) {
-			t.Errorf("%s: want an error mentioning %q, got: %v", name, tc.want, err)
+		var err error
+		captureStderr(t, func() { err = preflightTasks(batchResultsSpec(tc.cfg)) })
+		if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), `ref="xls"`) {
+			t.Errorf("%s: want an error naming the node and mentioning %q, got: %v", name, tc.want, err)
 		}
+	}
+}
+
+func TestBatchResultsMaxRowsIsAnAdvisoryNeverAnError(t *testing.T) {
+	var err error
+	stderr := captureStderr(t, func() {
+		err = preflightTasks(batchResultsSpec(map[string]any{"mode": "counts", "fields": []any{"decision"}, "maxRows": float64(100)}))
+	})
+	if err != nil {
+		t.Fatalf("maxRows must never fail the preflight, got: %v", err)
+	}
+	for _, want := range []string{"# warning:", `ref="xls"`, "maxRows=100", "obsolete and ignored"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr lacks %q: %q", want, stderr)
+		}
+	}
+	stderr = captureStderr(t, func() {
+		err = preflightTasks(batchResultsSpec(map[string]any{"mode": "rows"}))
+	})
+	if err != nil || strings.Contains(stderr, "maxRows") {
+		t.Errorf("a config without maxRows must print no advisory (err %v, stderr %q)", err, stderr)
+	}
+	snake := map[string]any{"batch_results_config": map[string]any{"mode": "rows", "max_rows": float64(50)}}
+	if batchResultsMaxRowsAdvisory(snake) == "" {
+		t.Error("the advisory must read the snake_case spelling too")
+	}
+	if batchResultsMaxRowsAdvisory(map[string]any{"batchResultsConfig": map[string]any{"maxRows": nil}}) != "" {
+		t.Error("an explicit null maxRows sets nothing: no advisory")
 	}
 }
 
@@ -329,9 +367,5 @@ func TestSpreadsheetPreflight_ReviewFindings(t *testing.T) {
 	got := spreadsheetBlockProblems("b", map[string]any{"type": "fields", "rows": []any{false, map[string]any{"label": "x", "value": "y"}}}, &keys)
 	if len(got) != 1 || !strings.Contains(got[0], "field 1") {
 		t.Errorf("a non-object field row must be reported, got %v", got)
-	}
-	snake := map[string]any{"batch_results_config": map[string]any{"mode": "rows", "max_rows": float64(9000)}}
-	if batchResultsRowCapAdvisory(snake) == "" {
-		t.Error("the row-cap advisory must read the snake_case spelling too")
 	}
 }

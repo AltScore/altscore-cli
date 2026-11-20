@@ -33,7 +33,7 @@ altscore-cli/
 │   ├── workflows_v2_apply_diff.go         # --diff renderer
 │   ├── workflows_v2_apply_enforce_type.go # enforceType stamping on new custom variables, carry-forward on live ones
 │   ├── workflows_v2_diff.go               # `diff <a> <b>`: two EXISTING versions (task bodies, entity pins, specRef census); not `apply --diff`
-│   ├── workflows_v2_post_processing.go    # `batch-policy get|set`, `post-processing candidates|create-template`, `batch post-process`, publish `warnings` on stderr
+│   ├── workflows_v2_post_processing.go    # `batch-policy get|set`, `post-processing candidates|create-template|row-fields`, `batch post-process`, publish `warnings` on stderr
 │   ├── workflows_v2_spreadsheet_builder.go # offline mirror of BC's spreadsheet-builder publish rules (SPREADSHEET_BUILDER_INVALID) + batch-results checks, called by preflightTasks
 │   ├── workflows_v2_pins.go               # `pins`: config.entityPins of one version, and the pin comparison `diff` uses
 │   ├── workflows_v2_import.go             # makeWfv2ImportCmd + the findings it reports

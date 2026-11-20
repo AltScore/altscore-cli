@@ -18,7 +18,6 @@ const (
 	spreadsheetMaxSheetNameLength = 31
 	spreadsheetMaxSheets          = 100
 	spreadsheetMaxColumns         = 16384
-	batchResultsMaxRowsCap        = 5000
 )
 
 var (
@@ -29,7 +28,7 @@ var (
 	spreadsheetColumnTypes  = []string{"auto", "text", "number", "currency", "percent", "date", "boolean"}
 	spreadsheetColumnTotals = []string{"sum", "average", "count", "min", "max"}
 	batchRowsFilters        = []string{"all", "successful", "failed"}
-	batchResultsModes       = []string{"summary", "rows"}
+	batchResultsModes       = []string{"summary", "counts", "rows"}
 )
 
 func stringIn(list []string, s string) bool {
@@ -338,33 +337,51 @@ func batchResultsProblems(task map[string]any) []string {
 	}
 	config, ok := rawConfig.(map[string]any)
 	if !ok {
-		return []string{"batchResultsConfig must be an object {batchFrom?, mode, rowsFilter, fields?, includeInput?, maxRows?}"}
+		return []string{"batchResultsConfig must be an object {batchFrom?, mode: summary|counts|rows, rowsFilter, fields?, includeInput?}"}
 	}
 	var problems []string
+	mode := "summary"
 	if raw, has := config["mode"]; has && raw != nil {
-		if s, _ := raw.(string); !stringIn(batchResultsModes, s) {
+		s, _ := raw.(string)
+		if !stringIn(batchResultsModes, s) {
 			problems = append(problems, fmt.Sprintf("batchResultsConfig.mode %v is not one of %s", raw, strings.Join(batchResultsModes, ", ")))
 		}
+		mode = s
 	}
 	problems = append(problems, spreadsheetRowsFilterProblem("batchResultsConfig", config)...)
-	problems = append(problems, spreadsheetMaxRowsProblem("batchResultsConfig", config)...)
-	if raw, has := config["fields"]; has && raw != nil {
-		if _, isList := raw.([]any); !isList {
-			problems = append(problems, "batchResultsConfig.fields is a list of dotted paths inside each row, or null")
-		}
+	rawFields, hasFields := config["fields"]
+	fields, isList := rawFields.([]any)
+	if hasFields && rawFields != nil && !isList {
+		problems = append(problems, "batchResultsConfig.fields is a list of dotted paths inside each row, or null")
+	} else if mode == "counts" && countNonBlankStrings(fields) == 0 {
+		problems = append(problems, "mode 'counts' needs batchResultsConfig.fields: at least one dotted path inside "+
+			"each row whose values are counted, e.g. \"fields\": [\"decision\"]. "+
+			"'altscore workflows-v2 post-processing row-fields <this-flow>' lists the fields the batches carry")
 	}
 	return problems
 }
 
-// Advisory only: the backend caps silently instead of refusing.
-func batchResultsRowCapAdvisory(task map[string]any) string {
+func countNonBlankStrings(list []any) int {
+	n := 0
+	for _, v := range list {
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// Advisory only: maxRows is obsolete. The backend accepts it (tasks saved when the node
+// capped its rows still carry it) and ignores it: no mode carries rows in the run's
+// context any more, so none has a row limit.
+func batchResultsMaxRowsAdvisory(task map[string]any) string {
 	rawConfig, _ := sbValue(task, "batchResultsConfig")
 	config := asMap(rawConfig)
-	raw, _ := sbValue(config, "maxRows")
-	if n, ok := raw.(float64); ok && n > batchResultsMaxRowsCap {
-		return fmt.Sprintf("batchResultsConfig.maxRows=%v is above the %d-row cap: the node returns at most %d rows "+
-			"(and at most 1 MB) with truncated=true. A sheet with EVERY row is a spreadsheet-builder node's "+
-			"'batch-results' block, which streams them into the file", raw, batchResultsMaxRowsCap, batchResultsMaxRowsCap)
+	raw, present := sbValue(config, "maxRows")
+	if !present || raw == nil {
+		return ""
 	}
-	return ""
+	return fmt.Sprintf("batchResultsConfig.maxRows=%v is obsolete and ignored: no mode has a row limit "+
+		"('rows' returns a reference the spreadsheet-builder node streams, 'counts' a few numbers per field). "+
+		"Drop the field", raw)
 }

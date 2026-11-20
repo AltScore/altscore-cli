@@ -329,6 +329,7 @@ contact node mailing the file.
 
   candidates        which published flows can be one, and why the others cannot
   create-template   create the usual one, publish it and select it
+  row-fields        the fields the rows of the batches it receives carry
   (select your own) altscore workflows-v2 batch-policy set <workflow> --body ...
   (re-run it)       altscore workflows-v2 batch post-process <batch-id>
 
@@ -336,6 +337,7 @@ Reference: 'altscore workflows-v2 schema-guide batchPolicy'.`,
 	}
 	group.AddCommand(makeWfv2PostProcessingCandidatesCmd())
 	group.AddCommand(makeWfv2PostProcessingCreateTemplateCmd())
+	group.AddCommand(makeWfv2PostProcessingRowFieldsCmd())
 	return group
 }
 
@@ -389,6 +391,121 @@ version, compatible, reason}]}); --table prints an aligned table for a person.
 		},
 	}
 	cmd.Flags().BoolVar(&compatibleOnly, "compatible-only", false, "show only the flows that can run as post-processing")
+	cmd.Flags().BoolVar(&asTable, "table", false, "print an aligned table for a person instead of JSON")
+	return cmd
+}
+
+type batchRowFieldsSource struct {
+	Alias  string   `json:"alias"`
+	Label  string   `json:"label"`
+	Fields []string `json:"fields"`
+}
+
+type batchRowFields struct {
+	Sources        []batchRowFieldsSource `json:"sources"`
+	Fields         []string               `json:"fields"`
+	StandardFields []string               `json:"standardFields"`
+}
+
+func fetchBatchRowFields(c *client.Client, workflowID string) (*batchRowFields, error) {
+	path := fmt.Sprintf("/v2/workflows/%s/batch-row-fields", workflowID)
+	data, status, err := c.Do("GET", "borrower_central", path, nil)
+	if err != nil {
+		return nil, postProcessingRouteError(err, status, "GET /v2/workflows/{id}/batch-row-fields")
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil || probe["fields"] == nil {
+		return nil, fmt.Errorf("unexpected response from GET %s (no 'fields' list): this Borrower Central "+
+			"does not serve the route yet", path)
+	}
+	var res batchRowFields
+	if err := json.Unmarshal(data, &res); err != nil {
+		return nil, fmt.Errorf("could not parse the batch-row-fields response: %w", err)
+	}
+	if res.Sources == nil {
+		res.Sources = []batchRowFieldsSource{}
+	}
+	if res.Fields == nil {
+		res.Fields = []string{}
+	}
+	if res.StandardFields == nil {
+		res.StandardFields = []string{}
+	}
+	return &res, nil
+}
+
+// One line per field: the union first, in the backend's order, with the source flows
+// that produce it; then the standard fields every row has.
+func renderBatchRowFields(w io.Writer, res *batchRowFields) error {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "FIELD\tFROM")
+	for _, field := range res.Fields {
+		var from []string
+		for _, src := range res.Sources {
+			for _, f := range src.Fields {
+				if f == field {
+					from = append(from, src.Alias)
+					break
+				}
+			}
+		}
+		if len(from) == 0 {
+			from = []string{"-"}
+		}
+		fmt.Fprintf(tw, "%s\t%s\n", field, strings.Join(from, ", "))
+	}
+	for _, field := range res.StandardFields {
+		fmt.Fprintf(tw, "%s\t(standard)\n", field)
+	}
+	return tw.Flush()
+}
+
+func makeWfv2PostProcessingRowFieldsCmd() *cobra.Command {
+	var asTable bool
+	cmd := &cobra.Command{
+		Use:   "row-fields <alias-or-id>",
+		Short: "List the fields the batch rows a post-processing flow receives carry",
+		Long: `GET /v2/workflows/{id}/batch-row-fields. <alias-or-id> is the POST-PROCESSING flow
+(the one being authored), not the workflow whose batches it receives.
+
+The sources are the workflows whose batchPolicy.postProcessing names this flow's alias;
+each one's fields are what its End node outputs (outputJson / inputMappings), i.e. the
+columns of every row of its batches. 'fields' is their union, in order;
+'standardFields' are on every row whatever the workflow (execution_id, item_index,
+is_success, error_message).
+
+Use them as the dotted paths of a batch-results node (batchResultsConfig.fields, for
+mode 'counts' or 'rows') or of a spreadsheet column's 'field'. No source yet (no
+workflow names this flow) answers empty lists: a path you know is still accepted.
+
+Prints the response as JSON ({sources: [{alias, label, fields}], fields,
+standardFields}); --table prints one line per field with the flows it comes from.`,
+		Example: `  altscore workflows-v2 post-processing row-fields post-scoring | jq -r '.fields[]'
+  altscore workflows-v2 post-processing row-fields post-scoring --table`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := loadClient()
+			if err != nil {
+				return err
+			}
+			id, err := resolveWorkflowIDForBatchPolicy(c, args[0], cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			res, err := fetchBatchRowFields(c, id)
+			if err != nil {
+				return err
+			}
+			if !asTable {
+				return output.JSON(res)
+			}
+			if len(res.Sources) == 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(), "# no workflow names %s as its batch post-processing yet: only the "+
+					"standard fields are known. Select it with 'altscore workflows-v2 batch-policy set <workflow>'.\n", args[0])
+			}
+			return renderBatchRowFields(cmd.OutOrStdout(), res)
+		},
+	}
 	cmd.Flags().BoolVar(&asTable, "table", false, "print an aligned table for a person instead of JSON")
 	return cmd
 }
