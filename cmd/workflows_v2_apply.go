@@ -125,7 +125,12 @@ End-node output (endConfig on the 'end' node):
         "fields":   {"tax_id":"{{inputs.tax_id}}","note":"approved"}
       }
     score.value/scorecard/metrics/rules/alerts/decision/data each take a single
-    variable; score.key/label/maxValue and fields values may be literals.`,
+    variable; score.key/label/maxValue and fields values may be literals.
+  - includeSubflowAttachments: true lists the files of the run's sub-flows
+    (at any depth) with its own, read where they are: no copy, no fixed
+    attachments slot per child report. Absent means off; set it on a parent
+    whose children produce reports. Read with
+    'altscore executions get-subflow-attachments <id>'.`,
 		Example: `  altscore workflows-v2 apply --body @scoring-pipeline.json
   altscore workflows-v2 apply --body @spec.json --publish          # create+publish OR update+publish
   altscore workflows-v2 apply --body @spec.json --dry-run

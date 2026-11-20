@@ -398,6 +398,121 @@ decision but does NOT replay the workflow.`,
 	}
 }
 
+// subflowAttachmentsPage is the answer of GET /v1/executions/{id}/output/subflow-attachments.
+type subflowAttachmentsPage struct {
+	Enabled   bool              `json:"enabled"`
+	Count     int               `json:"count"`
+	Truncated bool              `json:"truncated"`
+	Data      []json.RawMessage `json:"data"`
+}
+
+func subflowAttachmentsPath(executionID string, page, perPage int, onlyIfEnabled bool) string {
+	path := fmt.Sprintf("/v1/executions/%s/output/subflow-attachments?page=%d&per-page=%d", executionID, page, perPage)
+	if onlyIfEnabled {
+		path += "&only-if-enabled=true"
+	}
+	return path
+}
+
+// collectSubflowAttachments walks every page into one answer. It stops at the count the
+// first page reports, or at an empty page, so a count that moves while it walks cannot
+// loop forever.
+func collectSubflowAttachments(fetch func(page int) (subflowAttachmentsPage, error)) (subflowAttachmentsPage, error) {
+	all := subflowAttachmentsPage{Data: []json.RawMessage{}}
+	for page := 1; ; page++ {
+		current, err := fetch(page)
+		if err != nil {
+			return all, err
+		}
+		if page == 1 {
+			all.Enabled, all.Count, all.Truncated = current.Enabled, current.Count, current.Truncated
+		}
+		all.Data = append(all.Data, current.Data...)
+		if len(current.Data) == 0 || len(all.Data) >= all.Count {
+			return all, nil
+		}
+	}
+}
+
+func makeExGetSubflowAttachmentsCmd() *cobra.Command {
+	var page, perPage int
+	var all, onlyIfEnabled bool
+
+	cmd := &cobra.Command{
+		Use:   "get-subflow-attachments <execution-id>",
+		Short: "Get the attachments of an execution's sub-flows, at any depth",
+		Long: `List the files the execution's sub-flows produced (child-workflow nodes run
+inline, at any depth), read where they are: nothing is copied onto the parent, so
+get-output-attachments still returns only the execution's own files.
+
+Each parent counts only its current attempt's children, and each sub-flow run only
+its latest attempt's files. Children of an async-batch node are not linked to the
+parent and are not listed.
+
+The answer is paged:
+  {"enabled": bool, "count": int, "truncated": bool, "data": [...]}
+
+  enabled     the run's End node had endConfig.includeSubflowAttachments on. The
+              list is served either way unless --only-if-enabled is set.
+  truncated   the run has more than 5,000 sub-flow executions; only those are walked.
+
+Per attachment, the fields of get-output-attachments plus:
+  executionId         the sub-flow run that owns the file
+  parentExecutionId   its parent
+  workflowAlias, borrowerId, borrowerLabel
+  depth               1 = a direct child
+
+URLs are signed and expire; fetch them again rather than storing them.`,
+		Example: `  altscore executions get-subflow-attachments <execution-id>
+  altscore executions get-subflow-attachments <execution-id> --page 2 --per-page 100
+  altscore executions get-subflow-attachments <execution-id> --all | jq -r '.data[].url'`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if perPage < 1 || perPage > 200 {
+				return fmt.Errorf("--per-page must be between 1 and 200")
+			}
+			if page < 1 {
+				return fmt.Errorf("--page must be 1 or more")
+			}
+			c, err := loadClient()
+			if err != nil {
+				return err
+			}
+			fetch := func(p int) (json.RawMessage, error) {
+				data, _, err := c.Do("GET", "borrower_central", subflowAttachmentsPath(args[0], p, perPage, onlyIfEnabled), nil)
+				return data, err
+			}
+			if !all {
+				data, err := fetch(page)
+				if err != nil {
+					return err
+				}
+				return output.RawJSON(data)
+			}
+			collected, err := collectSubflowAttachments(func(p int) (subflowAttachmentsPage, error) {
+				var current subflowAttachmentsPage
+				data, err := fetch(p)
+				if err != nil {
+					return current, err
+				}
+				if err := json.Unmarshal(data, &current); err != nil {
+					return current, fmt.Errorf("reading page %d: %w", p, err)
+				}
+				return current, nil
+			})
+			if err != nil {
+				return err
+			}
+			return output.JSON(collected)
+		},
+	}
+	cmd.Flags().IntVar(&page, "page", 1, "page to fetch (ignored with --all)")
+	cmd.Flags().IntVar(&perPage, "per-page", 50, "attachments per page, 1-200")
+	cmd.Flags().BoolVar(&all, "all", false, "fetch every page and print one combined answer")
+	cmd.Flags().BoolVar(&onlyIfEnabled, "only-if-enabled", false, "answer an empty list when the run's End node did not turn the listing on")
+	return cmd
+}
+
 func makeExGetOutputAttachmentsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "get-output-attachments <execution-id>",
@@ -407,7 +522,10 @@ func makeExGetOutputAttachmentsCmd() *cobra.Command {
 Returns a JSON array of attachment records, each containing a download URL.
 
 Response fields (per attachment):
-  id, url, label, fileExtension, metadata, createdAt`,
+  id, url, label, fileExtension, metadata, createdAt
+
+Only the execution's own files. The files of its sub-flows stay on the sub-flow
+runs: list them with get-subflow-attachments.`,
 		Example: `  altscore executions get-output-attachments <execution-id>
   altscore executions get-output-attachments <execution-id> | jq '.[].url'`,
 		Args: cobra.ExactArgs(1),

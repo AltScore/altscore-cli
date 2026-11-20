@@ -97,6 +97,10 @@ altscore executions state <execution-id> | jq '.state.data_flow.task_states | to
 # Get attachments from an execution output (returns download URLs)
 altscore executions get-output-attachments <execution-id>
 altscore executions get-output-attachments <execution-id> | jq '.[].url'
+
+# The files of its sub-flows, at any depth (paged; --all walks every page)
+altscore executions get-subflow-attachments <execution-id>
+altscore executions get-subflow-attachments <execution-id> --all | jq -r '.data[] | "\(.borrowerLabel // .workflowAlias)\t\(.label)\t\(.url)"'
 ```
 
 > **Per-task vs envelope outputs.** v2 declarative tasks (altdata-enrichment, scorecard, rule-tree, mapping-table, evaluate-rules, conditional, http) do NOT write into the top-level `output` envelope; only the End node does. For a v2 run, `executions get-output | jq '.output'` is the white-box standard output (score, scorecard, rules, decision, ...) when the End node has `endConfig.standardOutput.enabled: true`, and the stub `{"is_success": true}` otherwise. `.customOutput` is `endConfig.outputJson`, or the type-keyed dump below when that is unset.
