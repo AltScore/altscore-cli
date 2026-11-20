@@ -266,6 +266,24 @@ func preflightTasks(spec *composeSpec) error {
 					ref, len(sources), strings.Join(sources, ", "),
 				)
 			}
+		case "spreadsheet-builder":
+			// BC saves this config unvalidated and refuses it at PUBLISH
+			// (SPREADSHEET_BUILDER_INVALID), so every problem is reported here in one pass.
+			if found := spreadsheetBuilderProblems(task); len(found) > 0 {
+				return fmt.Errorf(
+					"node ref=%q: spreadsheet-builder task cannot be published (the backend refuses it with "+
+						"SPREADSHEET_BUILDER_INVALID): %s. Run 'altscore workflows-v2 schema-guide tasks "+
+						"spreadsheet-builder' for the config shape",
+					ref, strings.Join(found, "; "),
+				)
+			}
+		case "batch-results":
+			if found := batchResultsProblems(task); len(found) > 0 {
+				return fmt.Errorf("node ref=%q: batch-results task: %s", ref, strings.Join(found, "; "))
+			}
+			if advisory := batchResultsRowCapAdvisory(task); advisory != "" {
+				fmt.Fprintf(os.Stderr, "# warning: node ref=%q: %s.\n", ref, advisory)
+			}
 		case "exception":
 			// Both the BC schema and the runtime read `errorMessage`. Strip the legacy
 			// `message` key so the persisted body is unambiguous.

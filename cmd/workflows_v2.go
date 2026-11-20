@@ -79,7 +79,12 @@ needed afterwards.
 Publishing also pins every mapping table, rule tree, scorecard and evaluation
 rule the graph references to its current version (config.entityPins; see
 'pins'). The new ACTIVE version runs on exactly those versions until it is
-published again, so an entity edited after this publish does not reach it.`,
+published again, so an entity edited after this publish does not reach it.
+
+The response may carry a 'warnings' list; each entry is also printed on stderr
+and never changes the exit code. POST_PROCESSING_FLOW_INCOMPATIBLE means this
+flow is named as the batch post-processing of other workflows and the version
+just published can no longer run that way (see 'post-processing candidates').`,
 		Example: `  altscore workflows-v2 publish <id>
   altscore workflows-v2 publish <id> --lock-token $TOKEN`,
 		Args: cobra.ExactArgs(1),
@@ -92,6 +97,7 @@ published again, so an entity edited after this publish does not reach it.`,
 			if err != nil {
 				return err
 			}
+			printPublishResponseWarnings(cmd.ErrOrStderr(), data)
 			return output.RawJSON(data)
 		},
 	}
@@ -1928,11 +1934,12 @@ func makeWfv2DownloadCmd() *cobra.Command {
 func makeWfv2BatchGroupCmd() *cobra.Command {
 	group := &cobra.Command{
 		Use:   "batch",
-		Short: "Control a running v2 execution batch",
+		Short: "Control a v2 execution batch (pause, continue, terminate, re-run its post-processing)",
 	}
 	group.AddCommand(makeWfv2BatchSignalCmd("pause", "Send a pause signal to a batch"))
 	group.AddCommand(makeWfv2BatchSignalCmd("continue", "Resume a paused batch"))
 	group.AddCommand(makeWfv2BatchSignalCmd("terminate", "Cancel a batch"))
+	group.AddCommand(makeWfv2BatchPostProcessCmd())
 	return group
 }
 

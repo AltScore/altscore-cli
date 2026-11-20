@@ -689,6 +689,28 @@ var residualSpecRefExcludedPaths = map[string]bool{
 	"artifactConfig.artifactAlias":  true,
 	"artifactConfig.artifact_alias": true,
 	"artifactConfig.columns":        true,
+	// spreadsheet-builder / batch-results: inputMappings KEYS, row paths and tenant
+	// literals. A key is naturally named after the node it reads ("ventas"), and none
+	// of these is ever resolved as a node reference.
+	"blocks.rowsFrom":              true,
+	"blocks.batchFrom":             true,
+	"blocks.artifactAlias":         true,
+	"blocks.explodeField":          true,
+	"blocks.id":                    true,
+	"rows.valueFrom":               true,
+	"columns.field":                true,
+	"columns.header":               true,
+	"sheets.id":                    true,
+	"cells.valueFrom":              true,
+	"cells.cell":                   true,
+	"tables.rowsFrom":              true,
+	"tables.batchFrom":             true,
+	"tables.sheet":                 true,
+	"tables.explodeField":          true,
+	"template.fileFrom":            true,
+	"template.fileLabel":           true,
+	"batchResultsConfig.batchFrom": true,
+	"batchResultsConfig.fields":    true,
 }
 
 func parentSegment(path string) string {
