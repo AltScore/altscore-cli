@@ -806,11 +806,14 @@ Needs a Borrower Central that has these (a route that is not deployed answers 40
 
 The usual flow as an apply spec (Start with a `batch` input -> build the sheet -> mail it to whoever launched the batch, or leave a notice):
 
-```jsonc
+Notes on the spec below (kept out of it, since `apply` reads plain JSON):
+- additionalProperties: apply refuses a read of inputs.batch.<field> the declaration does not cover.
+- required:false -- a required input other than `batch` would make the flow incompatible.
+- createdByEmail is null when the batch was launched with an API key: branch before mailing.
+
+```json
 {
   "alias": "post-scoring", "label": "Post-procesamiento Scoring", "category": "ACTION",
-  // additionalProperties: apply refuses a read of inputs.batch.<field> the declaration does not cover.
-  // required:false -- a required input other than `batch` would make the flow incompatible.
   "inputVariables": {"batch": {"type": "object", "required": false, "additionalProperties": true}},
   "nodes": [
     {"ref": "start", "type": "start", "label": "Start"},
@@ -819,7 +822,6 @@ The usual flow as an apply spec (Start with a `batch` input -> build the sheet -
      "spreadsheetBuilderConfig": {"fileName": "resultados.xlsx", "sheets": [
        {"name": "Resultados", "blocks": [
          {"type": "batch-results", "batchFrom": "batch", "columns": "auto", "rowsFilter": "all", "includeStatus": true}]}]}},
-    // createdByEmail is null when the batch was launched with an API key: branch before mailing.
     {"ref": "tiene-correo", "type": "conditional", "label": "Launcher has an email?",
      "inputSchema": {"launcher_email": {"type": "string"}},
      "inputMappings": {"launcher_email": "inputs.batch.createdByEmail"},
@@ -843,8 +845,7 @@ The usual flow as an apply spec (Start with a `batch` input -> build the sheet -
     {"from": "tiene-correo", "to": "sin-correo", "sourceHandle": "branch-else"},
     {"from": "correo", "to": "end"}, {"from": "sin-correo", "to": "end"}
   ]
-}
-```
+}```
 
 End to end (`scoring` = the workflow whose batches get the flow):
 
@@ -874,13 +875,14 @@ altscore execution-batches get <batch-id> | jq '{status, postProcessing}'
 # 5. the flow's files = the attachments of ITS run (not a row of the batch)
 altscore executions get-output-attachments <postProcessing.executionId> | jq '.[] | {label, url}'
 
-# 6. the flow failed (post_processing_failed)? fix it, publish, and re-run ONLY the flow -- no row is re-run
+# 6. the flow failed (post_processing_failed)? fix it, PUBLISH it, and re-run ONLY the flow -- no row is re-run.
+#    The re-run uses the flow's version published at that moment, so the fix applies.
 altscore workflows-v2 batch post-process <batch-id>
 ```
 
 - `batch-policy get|set`, `post-processing candidates|create-template` take an alias or an id. The policy belongs to ONE workflow version: an alias resolves to the ACTIVE version, else the latest DRAFT (stderr says which).
 - **`delivery.enabled` and `postProcessing.enabled` are mutually exclusive** (`BATCH_POST_PROCESSING_EXCLUDES_DELIVERY`): the flow decides what is sent. `enabled` without `workflowAlias` is `BATCH_POST_PROCESSING_WORKFLOW_REQUIRED`; a flow that does not qualify is `BATCH_POST_PROCESSING_WORKFLOW_INCOMPATIBLE` with the reason. The CLI checks the first two before the request.
-- **A batch runs the flow named when it was LAUNCHED**, at that flow's published version. Changing the policy does not touch batches already launched; a batch launched without one has `postProcessing: null` and `batch post-process` answers 400 `BATCH_HAS_NO_POST_PROCESSING`.
+- **A batch runs the flow (alias) named when it was LAUNCHED.** The version is resolved each time the flow runs: the one published at that moment, so a fix published before `batch post-process` is what the re-run executes. Changing the policy does not touch batches already launched; a batch launched without one has `postProcessing: null` and `batch post-process` answers 400 `BATCH_HAS_NO_POST_PROCESSING`.
 - `batch post-process` answers 409 `BATCH_POST_PROCESSING_NOT_RETRYABLE` until the batch is `complete` or `post_processing_failed`, and 409 `BATCH_POST_PROCESSING_ALREADY_RUNNING` while the flow runs. Retrying ROWS of a batch in `post_processing` is refused too (409 `BATCH_POST_PROCESSING_RUNNING`).
 - A failed flow never touches the rows: their results and the default results file (`workflows-v2 download`) stay as they are, and `postProcessing.error` says why.
 - **Publishing a flow that other workflows use as post-processing** can break them: when the new version requires an input a finished batch cannot give, `publish` still succeeds and prints `# WARNING [POST_PROCESSING_FLOW_INCOMPATIBLE]` on stderr (also in the response's `warnings`) naming the workflows that use it. Their next batch ends `post_processing_failed` until you fix it.

@@ -145,7 +145,11 @@ func spreadsheetMaxRowsProblem(where string, m map[string]any) []string {
 	if !present || raw == nil {
 		return nil
 	}
-	if n, ok := raw.(float64); ok && n < 1 {
+	n, ok := raw.(float64)
+	if !ok || n != float64(int64(n)) {
+		return []string{fmt.Sprintf("%s: maxRows must be a whole number (got %v)", where, raw)}
+	}
+	if n < 1 {
 		return []string{fmt.Sprintf("%s: maxRows must be at least 1", where)}
 	}
 	return nil
@@ -167,11 +171,14 @@ func spreadsheetBlockProblems(where string, block map[string]any, keys *[]string
 		if len(rows) == 0 {
 			problems = append(problems, fmt.Sprintf("%s: add at least one field (rows: [{label, value | valueFrom}])", where))
 		}
-		for _, rawRow := range rows {
-			if row, ok := rawRow.(map[string]any); ok {
-				if key := sbString(row, "valueFrom"); key != "" {
-					*keys = append(*keys, key)
-				}
+		for i, rawRow := range rows {
+			row, ok := rawRow.(map[string]any)
+			if !ok {
+				problems = append(problems, fmt.Sprintf("%s, field %d: must be an object {label, value | valueFrom}", where, i+1))
+				continue
+			}
+			if key := sbString(row, "valueFrom"); key != "" {
+				*keys = append(*keys, key)
 			}
 		}
 	case "table":
@@ -351,7 +358,8 @@ func batchResultsProblems(task map[string]any) []string {
 
 // Advisory only: the backend caps silently instead of refusing.
 func batchResultsRowCapAdvisory(task map[string]any) string {
-	config := asMap(task["batchResultsConfig"])
+	rawConfig, _ := sbValue(task, "batchResultsConfig")
+	config := asMap(rawConfig)
 	raw, _ := sbValue(config, "maxRows")
 	if n, ok := raw.(float64); ok && n > batchResultsMaxRowsCap {
 		return fmt.Sprintf("batchResultsConfig.maxRows=%v is above the %d-row cap: the node returns at most %d rows "+

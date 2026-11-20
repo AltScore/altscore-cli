@@ -314,3 +314,24 @@ func TestSpreadsheetBuilder_MappingKeysAreNotTreatedAsResidualRefs(t *testing.T)
 		t.Fatalf("batchResultsConfig literals must not abort apply, got: %v", err)
 	}
 }
+
+func TestSpreadsheetPreflight_ReviewFindings(t *testing.T) {
+	if got := spreadsheetMaxRowsProblem("b", map[string]any{"maxRows": "0"}); len(got) != 1 || !strings.Contains(got[0], "whole number") {
+		t.Errorf("a string maxRows must be reported, got %v", got)
+	}
+	if got := spreadsheetMaxRowsProblem("b", map[string]any{"maxRows": 2.5}); len(got) != 1 {
+		t.Errorf("a fractional maxRows must be reported, got %v", got)
+	}
+	if got := spreadsheetMaxRowsProblem("b", map[string]any{"maxRows": float64(10)}); len(got) != 0 {
+		t.Errorf("a whole maxRows is fine, got %v", got)
+	}
+	var keys []string
+	got := spreadsheetBlockProblems("b", map[string]any{"type": "fields", "rows": []any{false, map[string]any{"label": "x", "value": "y"}}}, &keys)
+	if len(got) != 1 || !strings.Contains(got[0], "field 1") {
+		t.Errorf("a non-object field row must be reported, got %v", got)
+	}
+	snake := map[string]any{"batch_results_config": map[string]any{"mode": "rows", "max_rows": float64(9000)}}
+	if batchResultsRowCapAdvisory(snake) == "" {
+		t.Error("the row-cap advisory must read the snake_case spelling too")
+	}
+}
