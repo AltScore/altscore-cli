@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -50,7 +51,19 @@ func checkSpreadsheetTemplateFile(filePath string) error {
 	if info.Size() == 0 {
 		return fmt.Errorf("%s is empty", filePath)
 	}
-	return nil
+	// An .xlsx is a zip holding xl/workbook.xml. A file renamed to .xlsx would upload
+	// fine and only fail when the flow runs.
+	archive, err := zip.OpenReader(filePath)
+	if err != nil {
+		return fmt.Errorf("%s is not a readable .xlsx file (an .xlsx is a zip archive): save it again from Excel", filePath)
+	}
+	defer archive.Close()
+	for _, part := range archive.File {
+		if part.Name == "xl/workbook.xml" {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s is a zip but not an Excel workbook (no xl/workbook.xml): save it again from Excel", filePath)
 }
 
 func uploadSpreadsheetTemplate(c *client.Client, filePath string) (*spreadsheetTemplateRef, error) {

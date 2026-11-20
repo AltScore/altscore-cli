@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"archive/zip"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -60,9 +61,33 @@ func writeTempFile(t *testing.T, name string, size int64) string {
 	return path
 }
 
+// writeZip writes a zip holding the named parts: an .xlsx when one is xl/workbook.xml.
+func writeZip(t *testing.T, name string, parts ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := zip.NewWriter(f)
+	for _, part := range parts {
+		w, err := archive.Create(part)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte("<x/>"))
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	return path
+}
+
 func TestUploadSpreadsheetTemplate_PostsTheFileAsMultipart(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "Plantilla Ventas.xlsx")
-	if err := os.WriteFile(path, []byte("PK fake xlsx bytes"), 0o600); err != nil {
+	path := writeZip(t, "Plantilla Ventas.xlsx", "[Content_Types].xml", "xl/workbook.xml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatal(err)
 	}
 	srv, seen := sbUploadServer(t, 200,
@@ -74,7 +99,7 @@ func TestUploadSpreadsheetTemplate_PostsTheFileAsMultipart(t *testing.T) {
 	if seen.method != "POST" || seen.path != "/v1/stores/packages/commands/attachments/upload" {
 		t.Errorf("request %s %s", seen.method, seen.path)
 	}
-	if seen.field != "file" || seen.filename != "Plantilla Ventas.xlsx" || seen.content != "PK fake xlsx bytes" {
+	if seen.field != "file" || seen.filename != "Plantilla Ventas.xlsx" || seen.content != string(raw) {
 		t.Errorf("multipart part: field %q, filename %q, content %q", seen.field, seen.filename, seen.content)
 	}
 	if ref.ObjectName != "attachments/tenant/abc.xlsx" || ref.FileLabel != "Plantilla Ventas.xlsx" {
@@ -93,6 +118,8 @@ func TestUploadSpreadsheetTemplate_RefusesBeforeUploading(t *testing.T) {
 		"over 25 MB": {writeTempFile(t, "big.xlsx", spreadsheetTemplateMaxBytes+1), "at most 25 MB"},
 		"missing":    {filepath.Join(t.TempDir(), "nope.xlsx"), "cannot read"},
 		"empty":      {writeTempFile(t, "empty.xlsx", 0), "is empty"},
+		"not a zip":  {writeTempFile(t, "renamed.xlsx", 10), "not a readable .xlsx"},
+		"other zip":  {writeZip(t, "docs.xlsx", "word/document.xml"), "not an Excel workbook"},
 	} {
 		_, err := uploadSpreadsheetTemplate(c, tc.path)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -102,19 +129,23 @@ func TestUploadSpreadsheetTemplate_RefusesBeforeUploading(t *testing.T) {
 	if seen.requests != 0 {
 		t.Errorf("a refused file must send no request, sent %d", seen.requests)
 	}
-	if err := checkSpreadsheetTemplateFile(writeTempFile(t, "exact.XLSX", spreadsheetTemplateMaxBytes)); err != nil {
-		t.Errorf("exactly 25 MB with an upper-case extension is fine, got: %v", err)
+	if err := checkSpreadsheetTemplateFile(writeTempFile(t, "exact.XLSX", spreadsheetTemplateMaxBytes)); err == nil ||
+		strings.Contains(err.Error(), "25 MB") {
+		t.Errorf("exactly 25 MB passes the size check (then fails as no zip), got: %v", err)
+	}
+	if err := checkSpreadsheetTemplateFile(writeZip(t, "ok.XLSX", "xl/workbook.xml")); err != nil {
+		t.Errorf("a workbook with an upper-case extension is fine, got: %v", err)
 	}
 }
 
 func TestUploadSpreadsheetTemplate_RefusesAnObjectOutsideTheAttachmentsPrefix(t *testing.T) {
 	srv, _ := sbUploadServer(t, 200, `{"attachmentId":"abc","fileName":"abc.xlsx"}`)
-	_, err := uploadSpreadsheetTemplate(newTestClient(t, srv.URL), writeTempFile(t, "t.xlsx", 10))
+	_, err := uploadSpreadsheetTemplate(newTestClient(t, srv.URL), writeZip(t, "t.xlsx", "xl/workbook.xml"))
 	if err == nil || !strings.Contains(err.Error(), "would refuse it") {
 		t.Fatalf("want the prefix refusal, got: %v", err)
 	}
 	srvErr, _ := sbUploadServer(t, 400, `{"message":"Unsupported file extension"}`)
-	if _, err := uploadSpreadsheetTemplate(newTestClient(t, srvErr.URL), writeTempFile(t, "t.xlsx", 10)); err == nil {
+	if _, err := uploadSpreadsheetTemplate(newTestClient(t, srvErr.URL), writeZip(t, "t.xlsx", "xl/workbook.xml")); err == nil {
 		t.Fatal("a 400 must be an error")
 	}
 }
