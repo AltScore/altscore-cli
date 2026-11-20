@@ -423,9 +423,14 @@ such as a scoring model run or data retrieval.`,
                         response field, which is 'batchId' -- '--filter batch-id'
                         is not a real filter and is silently ignored, so it
                         returns the whole unfiltered list.
-  parent-execution-id   Children of one run (inline subflow fan-out only; an
-                        async-batch subflow creates its rows through the batch
-                        engine, so use execution-batch-id for those)
+  parent-execution-id   Children of one run's CURRENT attempt (inline subflow
+                        fan-out only; an async-batch subflow creates its rows
+                        through the batch engine, so use execution-batch-id for
+                        those). A retry re-runs the parent's own record and
+                        starts its subflows again as new executions.
+  include-previous-attempts
+                        With parent-execution-id: true also lists the children
+                        of the parent's earlier attempts
   status                Execution status
   sort-by               Field to sort by
   sort-direction        "asc" or "desc"`,
@@ -433,6 +438,7 @@ such as a scoring model run or data retrieval.`,
 	exGroup.AddCommand(makeExQueryOutputsCmd())
 	exGroup.AddCommand(makeExGetOutputCmd())
 	exGroup.AddCommand(makeExGetOutputAttachmentsCmd())
+	exGroup.AddCommand(makeExGetSubflowAttachmentsCmd())
 	exGroup.AddCommand(makeExStateCmd())
 	exGroup.AddCommand(makeExGetDecisionCmd())
 	exGroup.AddCommand(makeExSetDecisionCmd())
