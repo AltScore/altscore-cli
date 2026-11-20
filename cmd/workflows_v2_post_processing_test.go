@@ -533,3 +533,37 @@ func TestBatchRowFields_EmptyAndBackendWithoutTheRoute(t *testing.T) {
 		t.Fatalf("a response without fields must be an error, got: %v", err)
 	}
 }
+
+func TestBatchRowFields_InputFieldsAreListedUnderInput(t *testing.T) {
+	body := `{"sources":[{"alias":"scoring","label":"Scoring","fields":["decision"],"inputFields":["person_id"]}],
+ "fields":["decision"],"inputFields":["person_id"],"standardFields":["error_message"]}`
+	srv, _ := ppServer(t, map[string]func(http.ResponseWriter){
+		"GET /v2/workflows/" + ppWorkflowID + "/batch-row-fields": ppJSON(200, body),
+	})
+	res, err := fetchBatchRowFields(newTestClient(t, srv.URL), ppWorkflowID)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	var table bytes.Buffer
+	if err := renderBatchRowFields(&table, res); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(table.String(), "\n"), "\n")
+	if len(lines) != 4 || !strings.Contains(lines[2], "input.person_id") || !strings.Contains(lines[2], "includeInput") {
+		t.Fatalf("want the input field listed as input.<name>, got:\n%s", table.String())
+	}
+}
+
+func TestBatchRowFields_OlderBackendWithoutInputFields(t *testing.T) {
+	srv, _ := ppServer(t, map[string]func(http.ResponseWriter){
+		"GET /v2/workflows/" + ppWorkflowID + "/batch-row-fields": ppJSON(200, ppRowFieldsBody),
+	})
+	res, err := fetchBatchRowFields(newTestClient(t, srv.URL), ppWorkflowID)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	encoded, _ := json.Marshal(res)
+	if !strings.Contains(string(encoded), `"inputFields":[]`) {
+		t.Errorf("an absent inputFields is printed as an empty list: %s", encoded)
+	}
+}

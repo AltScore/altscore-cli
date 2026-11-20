@@ -396,14 +396,16 @@ version, compatible, reason}]}); --table prints an aligned table for a person.
 }
 
 type batchRowFieldsSource struct {
-	Alias  string   `json:"alias"`
-	Label  string   `json:"label"`
-	Fields []string `json:"fields"`
+	Alias       string   `json:"alias"`
+	Label       string   `json:"label"`
+	Fields      []string `json:"fields"`
+	InputFields []string `json:"inputFields,omitempty"`
 }
 
 type batchRowFields struct {
 	Sources        []batchRowFieldsSource `json:"sources"`
 	Fields         []string               `json:"fields"`
+	InputFields    []string               `json:"inputFields"`
 	StandardFields []string               `json:"standardFields"`
 }
 
@@ -427,6 +429,9 @@ func fetchBatchRowFields(c *client.Client, workflowID string) (*batchRowFields, 
 	}
 	if res.Fields == nil {
 		res.Fields = []string{}
+	}
+	if res.InputFields == nil {
+		res.InputFields = []string{}
 	}
 	if res.StandardFields == nil {
 		res.StandardFields = []string{}
@@ -454,6 +459,9 @@ func renderBatchRowFields(w io.Writer, res *batchRowFields) error {
 		}
 		fmt.Fprintf(tw, "%s\t%s\n", field, strings.Join(from, ", "))
 	}
+	for _, field := range res.InputFields {
+		fmt.Fprintf(tw, "input.%s\t(input, with includeInput)\n", field)
+	}
 	for _, field := range res.StandardFields {
 		fmt.Fprintf(tw, "%s\t(standard)\n", field)
 	}
@@ -471,6 +479,8 @@ func makeWfv2PostProcessingRowFieldsCmd() *cobra.Command {
 The sources are the workflows whose batchPolicy.postProcessing names this flow's alias;
 each one's fields are what its End node outputs (outputJson / inputMappings), i.e. the
 columns of every row of its batches. 'fields' is their union, in order;
+'inputFields' are those workflows' input variables, which a row carries under
+'input.<name>' when the node reads it with includeInput (a failed row's only data);
 'standardFields' are on every row whatever the workflow (execution_id, item_index,
 is_success, error_message).
 
@@ -478,8 +488,8 @@ Use them as the dotted paths of a batch-results node (batchResultsConfig.fields,
 mode 'counts' or 'rows') or of a spreadsheet column's 'field'. No source yet (no
 workflow names this flow) answers empty lists: a path you know is still accepted.
 
-Prints the response as JSON ({sources: [{alias, label, fields}], fields,
-standardFields}); --table prints one line per field with the flows it comes from.`,
+Prints the response as JSON ({sources: [{alias, label, fields, inputFields}], fields,
+inputFields, standardFields}); --table prints one line per field with the flows it comes from.`,
 		Example: `  altscore workflows-v2 post-processing row-fields post-scoring | jq -r '.fields[]'
   altscore workflows-v2 post-processing row-fields post-scoring --table`,
 		Args: cobra.ExactArgs(1),
