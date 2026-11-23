@@ -115,6 +115,19 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 		specNodes = append(specNodes, entry)
 	}
 
+	// A node exported under its specRef keeps, inside every body, the references the
+	// builder wrote: task_outputs.<server alias>. Apply resolves only the refs the spec
+	// names, so applied as a NEW workflow those stayed pointed at the original
+	// workflow's tasks and resolved to null at run time, with no error anywhere.
+	if aliasToRef := exportedAliasRefs(rawNodes, refByNodeID); len(aliasToRef) > 0 {
+		for _, entry := range specNodes {
+			rewriteAliasRefsForExport(entry, aliasToRef)
+		}
+		if cv, ok := b.Workflow["customVariables"]; ok && cv != nil {
+			rewriteAliasRefsForExport(cv, aliasToRef)
+		}
+	}
+
 	// Only for an apply-spec: nobody re-applies a diff comparison.
 	if mode == refFromSpecRef && len(deprecatedNodes) > 0 {
 		fmt.Fprintf(os.Stderr,
@@ -168,4 +181,51 @@ func bundleToApplySpec(bundle json.RawMessage, mode exportRefMode) (map[string]a
 		}
 	}
 	return spec, nil
+}
+
+// exportedAliasRefs maps each server alias to the ref the spec gives its node, only
+// where they differ.
+func exportedAliasRefs(rawNodes []any, refByAlias map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, rn := range rawNodes {
+		node, _ := rn.(map[string]any)
+		alias, _ := node["taskAlias"].(string)
+		if ref := refByAlias[alias]; alias != "" && ref != "" && ref != alias {
+			out[alias] = ref
+		}
+	}
+	return out
+}
+
+// rewriteAliasRefsForExport re-points the three reference forms a body can hold:
+// task_outputs.<alias> anywhere (the generic pass apply also uses), entity.<alias>:
+// in a scoped reference, and a bare alias under taskAlias.
+func rewriteAliasRefsForExport(o any, aliasToRef map[string]string) any {
+	rewriteTaskOutputsRefsDeep(o, aliasToRef, nil)
+	var walk func(any, string) any
+	walk = func(v any, key string) any {
+		switch t := v.(type) {
+		case string:
+			if key == "taskAlias" || key == "task_alias" {
+				if ref, ok := aliasToRef[t]; ok {
+					return ref
+				}
+				return t
+			}
+			for alias, ref := range aliasToRef {
+				t = strings.ReplaceAll(t, "entity."+alias+":", "entity."+ref+":")
+			}
+			return t
+		case []any:
+			for i, e := range t {
+				t[i] = walk(e, key)
+			}
+		case map[string]any:
+			for k, e := range t {
+				t[k] = walk(e, k)
+			}
+		}
+		return v
+	}
+	return walk(o, "")
 }

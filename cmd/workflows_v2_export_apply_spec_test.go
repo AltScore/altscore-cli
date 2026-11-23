@@ -283,3 +283,38 @@ func TestBundleToApplySpec_WarnsOnDeprecatedNodeType(t *testing.T) {
 		t.Errorf("diff's flatten must not warn, got: %q", quiet)
 	}
 }
+
+// A node exported under its specRef must be referenced by that ref inside every body,
+// or applying the spec as a NEW workflow leaves the reference on the original
+// workflow's task and it resolves to null at run time.
+func TestBundleToApplySpec_ReferencesFollowTheSpecRef(t *testing.T) {
+	bundle := strings.Replace(sampleExportBundle,
+		`"endConfig": {"pdfConfig": {"enabled": true, "sourcesConfig": []}}}`,
+		`"endConfig": {"outputJson": "{\"s\": {{task_outputs.score-222222.total}}}", "pdfConfig": {"enabled": true, "sourcesConfig": []}},
+     "branches": [{"conditions": [{"field": "entity.fetch-ecu-111111:item.x"}]}],
+     "lookup": {"taskAlias": "score-222222"}}`, 1)
+	bundle = strings.Replace(bundle, `"customVariables": {}`,
+		`"customVariables": {"tot": {"expression": "task_outputs.score-222222.total * 2"}}`, 1)
+	spec, err := bundleToApplySpec(json.RawMessage(bundle), refFromSpecRef)
+	if err != nil {
+		t.Fatalf("bundleToApplySpec: %v", err)
+	}
+	raw, _ := json.Marshal(spec)
+	text := string(raw)
+	for _, want := range []string{
+		`task_outputs.fetch-ecu.score`,
+		`task_outputs.score.total`,
+		`entity.fetch-ecu:item.x`,
+		`"taskAlias":"score"`,
+		`task_outputs.score.total * 2`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("exported spec lacks %q", want)
+		}
+	}
+	for _, alias := range []string{"fetch-ecu-111111", "score-222222", "end-333333"} {
+		if strings.Contains(text, alias) {
+			t.Errorf("exported spec still names the server alias %q", alias)
+		}
+	}
+}
