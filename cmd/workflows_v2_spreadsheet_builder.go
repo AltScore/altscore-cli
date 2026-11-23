@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
-	"unicode/utf8"
+	"unicode/utf16"
 )
 
 // Offline mirror of borrower-central's app/model/workflows_v2/spreadsheet_builder.py
@@ -18,18 +19,18 @@ const (
 	spreadsheetMaxSheetNameLength = 31
 	spreadsheetMaxSheets          = 100
 	spreadsheetMaxColumns         = 16384
-	batchResultsMaxRowsCap        = 5000
 )
 
 var (
 	spreadsheetSheetNameForbidden = regexp.MustCompile(`[\[\]:*?/\\]`)
+	spreadsheetA1Cell             = regexp.MustCompile(`^\$?([A-Za-z]{1,3})\$?(\d{1,7})$`)
 
 	spreadsheetBlockTypes   = []string{"fields", "table", "batch-results", "artifact", "code"}
 	spreadsheetSources      = []string{"blocks", "code", "template"}
 	spreadsheetColumnTypes  = []string{"auto", "text", "number", "currency", "percent", "date", "boolean"}
 	spreadsheetColumnTotals = []string{"sum", "average", "count", "min", "max"}
 	batchRowsFilters        = []string{"all", "successful", "failed"}
-	batchResultsModes       = []string{"summary", "rows"}
+	batchResultsModes       = []string{"summary", "counts", "rows"}
 )
 
 func stringIn(list []string, s string) bool {
@@ -56,11 +57,34 @@ func sbString(m map[string]any, camel string) string {
 	return s
 }
 
+// spreadsheetA1Problem says why an A1 reference (B4, Hoja!B4) is outside a sheet; a
+// reference that is not A1 (a defined name) is not its to judge.
+func spreadsheetA1Problem(reference string) string {
+	cell := strings.TrimSpace(reference)
+	if i := strings.LastIndex(cell, "!"); i >= 0 {
+		cell = strings.TrimSpace(cell[i+1:])
+	}
+	match := spreadsheetA1Cell.FindStringSubmatch(cell)
+	if match == nil {
+		return ""
+	}
+	column := 0
+	for _, letter := range strings.ToUpper(match[1]) {
+		column = column*26 + int(letter-'A'+1)
+	}
+	row, _ := strconv.Atoi(match[2])
+	if row < 1 || row > 1048576 || column > spreadsheetMaxColumns {
+		return fmt.Sprintf("'%s' is outside a sheet (columns A to XFD, rows 1 to 1,048,576)", reference)
+	}
+	return ""
+}
+
 func spreadsheetSheetNameProblem(name string) string {
 	if strings.TrimSpace(name) == "" {
 		return "a sheet needs a name"
 	}
-	if utf8.RuneCountInString(name) > spreadsheetMaxSheetNameLength {
+	// Excel counts UTF-16 units: an emoji takes two of the 31.
+	if len(utf16.Encode([]rune(name))) > spreadsheetMaxSheetNameLength {
 		return fmt.Sprintf("sheet name '%s' is longer than %d characters", name, spreadsheetMaxSheetNameLength)
 	}
 	if spreadsheetSheetNameForbidden.MatchString(name) {
@@ -244,6 +268,8 @@ func spreadsheetBuilderProblems(task map[string]any) []string {
 			cell, _ := rawCell.(map[string]any)
 			if name, _ := cell["cell"].(string); strings.TrimSpace(name) == "" {
 				problems = append(problems, fmt.Sprintf("template cell %d: name the cell to fill", i+1))
+			} else if problem := spreadsheetA1Problem(name); problem != "" {
+				problems = append(problems, fmt.Sprintf("template cell %d: %s", i+1, problem))
 			}
 			if key := sbString(cell, "valueFrom"); key != "" {
 				keys = append(keys, key)
@@ -254,6 +280,13 @@ func spreadsheetBuilderProblems(task map[string]any) []string {
 			where := fmt.Sprintf("template table %d", i+1)
 			if sheet, _ := table["sheet"].(string); strings.TrimSpace(sheet) == "" {
 				problems = append(problems, fmt.Sprintf("%s: name the sheet it is written on", where))
+			}
+			if anchor := strings.TrimSpace(sbString(table, "anchor")); anchor != "" {
+				if !spreadsheetA1Cell.MatchString(anchor) {
+					problems = append(problems, fmt.Sprintf("%s: the anchor '%s' is not a cell like A2", where, anchor))
+				} else if problem := spreadsheetA1Problem(anchor); problem != "" {
+					problems = append(problems, fmt.Sprintf("%s: %s", where, problem))
+				}
 			}
 			rowsFrom := sbString(table, "rowsFrom")
 			if (rowsFrom != "") == (sbString(table, "batchFrom") != "") {
@@ -338,33 +371,51 @@ func batchResultsProblems(task map[string]any) []string {
 	}
 	config, ok := rawConfig.(map[string]any)
 	if !ok {
-		return []string{"batchResultsConfig must be an object {batchFrom?, mode, rowsFilter, fields?, includeInput?, maxRows?}"}
+		return []string{"batchResultsConfig must be an object {batchFrom?, mode: summary|counts|rows, rowsFilter, fields?, includeInput?}"}
 	}
 	var problems []string
+	mode := "summary"
 	if raw, has := config["mode"]; has && raw != nil {
-		if s, _ := raw.(string); !stringIn(batchResultsModes, s) {
+		s, _ := raw.(string)
+		if !stringIn(batchResultsModes, s) {
 			problems = append(problems, fmt.Sprintf("batchResultsConfig.mode %v is not one of %s", raw, strings.Join(batchResultsModes, ", ")))
 		}
+		mode = s
 	}
 	problems = append(problems, spreadsheetRowsFilterProblem("batchResultsConfig", config)...)
-	problems = append(problems, spreadsheetMaxRowsProblem("batchResultsConfig", config)...)
-	if raw, has := config["fields"]; has && raw != nil {
-		if _, isList := raw.([]any); !isList {
-			problems = append(problems, "batchResultsConfig.fields is a list of dotted paths inside each row, or null")
-		}
+	rawFields, hasFields := config["fields"]
+	fields, isList := rawFields.([]any)
+	if hasFields && rawFields != nil && !isList {
+		problems = append(problems, "batchResultsConfig.fields is a list of dotted paths inside each row, or null")
+	} else if mode == "counts" && countNonBlankStrings(fields) == 0 {
+		problems = append(problems, "mode 'counts' needs batchResultsConfig.fields: at least one dotted path inside "+
+			"each row whose values are counted, e.g. \"fields\": [\"decision\"]. "+
+			"'altscore workflows-v2 post-processing row-fields <this-flow>' lists the fields the batches carry")
 	}
 	return problems
 }
 
-// Advisory only: the backend caps silently instead of refusing.
-func batchResultsRowCapAdvisory(task map[string]any) string {
+func countNonBlankStrings(list []any) int {
+	n := 0
+	for _, v := range list {
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// Advisory only: maxRows is obsolete. The backend accepts it (tasks saved when the node
+// capped its rows still carry it) and ignores it: no mode carries rows in the run's
+// context any more, so none has a row limit.
+func batchResultsMaxRowsAdvisory(task map[string]any) string {
 	rawConfig, _ := sbValue(task, "batchResultsConfig")
 	config := asMap(rawConfig)
-	raw, _ := sbValue(config, "maxRows")
-	if n, ok := raw.(float64); ok && n > batchResultsMaxRowsCap {
-		return fmt.Sprintf("batchResultsConfig.maxRows=%v is above the %d-row cap: the node returns at most %d rows "+
-			"(and at most 1 MB) with truncated=true. A sheet with EVERY row is a spreadsheet-builder node's "+
-			"'batch-results' block, which streams them into the file", raw, batchResultsMaxRowsCap, batchResultsMaxRowsCap)
+	raw, present := sbValue(config, "maxRows")
+	if !present || raw == nil {
+		return ""
 	}
-	return ""
+	return fmt.Sprintf("batchResultsConfig.maxRows=%v is obsolete and ignored: no mode has a row limit "+
+		"('rows' returns a reference the spreadsheet-builder node streams, 'counts' a few numbers per field). "+
+		"Drop the field", raw)
 }

@@ -33,7 +33,8 @@ altscore-cli/
 │   ├── workflows_v2_apply_diff.go         # --diff renderer
 │   ├── workflows_v2_apply_enforce_type.go # enforceType stamping on new custom variables, carry-forward on live ones
 │   ├── workflows_v2_diff.go               # `diff <a> <b>`: two EXISTING versions (task bodies, entity pins, specRef census); not `apply --diff`
-│   ├── workflows_v2_post_processing.go    # `batch-policy get|set`, `post-processing candidates|create-template`, `batch post-process`, publish `warnings` on stderr
+│   ├── workflows_v2_post_processing.go    # `batch-policy get|set`, `post-processing candidates|create-template|row-fields`, `batch post-process`, publish `warnings` on stderr
+│   ├── workflows_v2_spreadsheet_template.go # `spreadsheet upload-template`: .xlsx -> {objectName, fileLabel} for template mode
 │   ├── workflows_v2_spreadsheet_builder.go # offline mirror of BC's spreadsheet-builder publish rules (SPREADSHEET_BUILDER_INVALID) + batch-results checks, called by preflightTasks
 │   ├── workflows_v2_pins.go               # `pins`: config.entityPins of one version, and the pin comparison `diff` uses
 │   ├── workflows_v2_import.go             # makeWfv2ImportCmd + the findings it reports
@@ -83,6 +84,7 @@ A ResourceDef group (`cmd/root.go`, `Name: "workflows-v2"`, `BasePath: /v2/workf
 | Lifecycle | `publish`, `create-draft`, `revert`, `archive`, `restore`, `set-visibility`, `versions`, `get-version`, `pins` |
 | Locking | `lock` (group), `autosave` |
 | Execution | `execute`, `execute-by-alias`, `execute-batch`, `execute-batch-by-alias`, `batch` (incl. `post-process`), `batch-policy`, `post-processing`, `executions`, `download`, `schedule` |
+| Spreadsheet-builder | `spreadsheet upload-template` |
 | Introspection | `schema-guide`, `sources-status`, `external-sources-status`, `ai` |
 
 Each of the 7 graph-edit helpers wraps lock + fetch + mutate + autosave + release, via `mutateAndAutosaveV2` in `cmd/workflows_v2_helpers.go`. The two mapping endpoints do not: `makeWfv2UpdateMappingCmd` and `makeWfv2ResolveMappingsCmd` live in `cmd/workflows_v2.go` and are single bare calls (PUT `/v2/workflows/{id}/update_mapping_workflow`, GET `/v2/workflows/{id}/resolve-mappings`) with no lock and no autosave.

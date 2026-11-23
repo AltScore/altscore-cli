@@ -789,10 +789,12 @@ Needs a Borrower Central that has these (a route that is not deployed answers 40
 | Block `type` | Takes | Writes |
 |---|---|---|
 | `fields` | `rows: [{label, value \| valueFrom, type?, format?}]` | two columns, one row per field |
-| `table` | `rowsFrom`, `columns`, `explodeField?`, `maxRows?` | a list of rows |
+| `table` | `rowsFrom`, `columns`, `explodeField?`, `maxRows?` | a list of rows, or the `rows` reference of a `batch-results` node in `rows` mode (streamed, no limit) |
 | `batch-results` | `batchFrom?` (default: the `batch` input), `columns`, `rowsFilter: all\|successful\|failed`, `includeInput?`, `includeStatus?` | EVERY row of a batch, streamed (200k rows cost what 200 do) |
 | `artifact` | `artifactAlias`, `columns` | the published rows of a table artifact |
 | `code` | `code` (xlsxwriter API; `wb`, `ws`, `row`, `inputs`) | whatever it draws |
+
+`source: "template"` fills an `.xlsx` you upload with `altscore workflows-v2 spreadsheet upload-template <path.xlsx>` (prints `template.objectName` and `template.fileLabel`; example below).
 
 - **Rows never go in the config.** `rowsFrom` / `valueFrom` / `template.fileFrom` name an **inputMappings KEY** of the node (`"rowsFrom": "ventas"` with `inputMappings: {"ventas": "task_outputs.<ref>.rows"}`); a list inside `{{...}}` would arrive as text. `batchFrom` may also be a workflow input, so it needs no mapping.
 - `columns` is `"auto"` or `[{header, field, type?, format?, width?, total?} | {header, formula}]`. `field` is a dotted path INSIDE the row (`persona.nombre`), not a `{{...}}` template; `formula` starts with `=` (`"=B{row}*2"`).
@@ -800,7 +802,89 @@ Needs a Borrower Central that has these (a route that is not deployed answers 40
 - The backend SAVES this config unvalidated and refuses it at publish (`SPREADSHEET_BUILDER_INVALID`). `apply` checks the same rules locally and reports every problem of the node in one error, `--dry-run` included.
 - Output: `task_outputs.<ref>.{attachmentId, fileName, fileUrl, fileSizeBytes, sheets, rowCount, preview}`. `fileUrl` is a signed link valid 24 h: map it into a `contact` node's attachment token to mail the file. The file is also listed by `altscore executions get-output-attachments <execution-id>` (`label` = file name, `metadata.kind = "generated-file"`).
 
-**`batch-results`** (the NODE, not the block) reads a batch into the flow to decide and to word a message: `batchResultsConfig: {batchFrom?, mode: "summary" (default) | "rows", rowsFilter, fields?, includeInput?, maxRows?}`. Output: `id, label, status, workflowAlias, createdByEmail, total, successful, failed, pending, decisions[...]` (the same under `.batch`), and in `rows` mode `.rows, .rowCount, .truncated`. Rows ride in the run's context, so at most 5,000 and 1 MB: for a sheet with every row use the spreadsheet block above.
+**`batch-results`** (the NODE, not the block) reads a batch into the flow: `batchResultsConfig: {batchFrom?, mode: "summary" (default) | "counts" | "rows", rowsFilter: all|successful|failed, fields?, includeInput?}`. No mode has a row limit and none puts rows in the run's context. Every mode outputs the summary: `id, label, status, workflowAlias, createdByEmail, total, successful, failed, pending, decisions[{key,label,count}]` (the same under `.batch`).
+
+| `mode` | `fields` | Adds to the output | Use it to |
+|---|---|---|---|
+| `summary` | ignored | nothing | decide and word a message (`total`, `failed`, `decisions`) |
+| `counts` | **required, at least one** dotted path of the row (apply refuses an empty list); `input.<name>` counts what each row was sent | `counts: {<field>: [{value, count}]}` exactly the fields asked, each sorted by count desc (at most 200 values per field), `countsByPath` the dotted fields again at their path (`countsByPath.persona.provincia`), `countsOther: {<field>: {distinct, count}}` only when a field has more values than that, `countedRows` | how many rows hold each value: a breakdown table, a chart, a branch |
+| `rows` | columns to bring (empty = all); `includeInput` adds the row's input | `rows` = a REFERENCE `{type: "batch-rows", batchId, rowsFilter, fields, includeInput}` (not a list), `rowCount` | hand EVERY row to a `spreadsheet-builder`: a `table` block's `rowsFrom`, `ws.table_from(row, col, '<key>')` in code, or a template table's `rowsFrom` -- all read it in streaming |
+
+- `rows` is not a list: do not loop over it in `compute-variables` or a template. Map it into a spreadsheet-builder (`inputMappings: {"filas": "task_outputs.<ref>.rows"}`, then `rowsFrom: "filas"`).
+- Which fields do the rows have? `altscore workflows-v2 post-processing row-fields <this-post-processing-flow>` lists them (the End outputs of every workflow whose batch policy names this flow, with the inner paths of an object output such as `detalle.flag`, plus `execution_id, item_index, is_success, error_message`). `inputFields` are those workflows' input variables: a node with `includeInput: true` reads them as `input.<name>`, the only data a failed row carries. It answers empty lists until a workflow selects the flow; any path you know is still accepted.
+- `maxRows` is obsolete: the backend reads and ignores it (tasks saved when the node capped its rows still carry it). Do not write it; `apply` prints a `# warning:` when a spec does, never an error.
+- A counted field named with a dot (`persona.provincia`) is a KEY of `counts` (`inputs['counts']['persona.provincia']` in code); a mapping cannot name that key, so map its path under `countsByPath`: `task_outputs.<ref>.countsByPath.persona.provincia`. Plain names (`decision`) map directly from `counts`. Every value of `counts` is a list, so iterating it as below is safe. An object value is counted by its JSON text.
+
+**Counts into an Excel file, code mode** (`source: "code"` draws the whole file with xlsxwriter's API; `inputs` holds the node's inputMappings values). One sheet per counted field:
+
+```json
+{"ref": "conteos", "type": "batch-results", "label": "Contar resultados",
+ "inputMappings": {"batch": "inputs.batch"},
+ "batchResultsConfig": {"batchFrom": "batch", "mode": "counts", "rowsFilter": "all", "fields": ["decision", "segment"]}}
+```
+
+```json
+{"ref": "planilla", "type": "spreadsheet-builder", "label": "Armar planilla",
+ "inputMappings": {"counts": "task_outputs.conteos.counts", "other": "task_outputs.conteos.countsOther",
+                   "total": "task_outputs.conteos.countedRows", "batch_label": "task_outputs.conteos.label"},
+ "spreadsheetBuilderConfig": {"fileName": "conteos.xlsx", "source": "code",
+   "code": "bold = wb.add_format({'bold': True})\npct = wb.add_format({'num_format': '0.0%'})\ntotal = inputs['total'] or 0\nfor field, values in (inputs['counts'] or {}).items():\n    ws = wb.add_worksheet(field[:31].replace('.', '_'))\n    ws.write(0, 0, inputs['batch_label'] or '', bold)\n    ws.write_row(2, 0, ['Valor', 'Filas', '%'], bold)\n    r = 3\n    for item in values:\n        ws.write(r, 0, '(vacio)' if item['value'] is None else str(item['value']))\n        ws.write(r, 1, item['count'])\n        ws.write(r, 2, item['count'] / total if total else 0, pct)\n        r += 1\n    rest = (inputs['other'] or {}).get(field)\n    if rest:\n        ws.write(r, 0, 'Otros (%d valores)' % rest['distinct'])\n        ws.write(r, 1, rest['count'])\n        r += 1\n    ws.write(r, 0, 'Total', bold)\n    ws.write_formula(r, 1, '=SUM(B4:B%d)' % r, bold)\n    ws.set_column(0, 0, 28)"}}
+```
+
+The code is the readable script below, JSON-escaped into `code` (`apply` reads plain JSON):
+
+```python
+bold = wb.add_format({'bold': True})
+pct = wb.add_format({'num_format': '0.0%'})
+total = inputs['total'] or 0
+for field, values in (inputs['counts'] or {}).items():
+    ws = wb.add_worksheet(field[:31].replace('.', '_'))   # sheet names: <=31 chars, no [ ] : * ? / \
+    ws.write(0, 0, inputs['batch_label'] or '', bold)
+    ws.write_row(2, 0, ['Valor', 'Filas', '%'], bold)
+    r = 3
+    for item in values:                                    # already sorted by count, desc
+        ws.write(r, 0, '(vacio)' if item['value'] is None else str(item['value']))
+        ws.write(r, 1, item['count'])
+        ws.write(r, 2, item['count'] / total if total else 0, pct)
+        r += 1
+    rest = (inputs['other'] or {}).get(field)              # only when the field had > 200 values
+    if rest:
+        ws.write(r, 0, 'Otros (%d valores)' % rest['distinct'])
+        ws.write(r, 1, rest['count'])
+        r += 1
+    ws.write(r, 0, 'Total', bold)
+    ws.write_formula(r, 1, '=SUM(B4:B%d)' % r, bold)
+    ws.set_column(0, 0, 28)
+```
+
+Code-mode rules: the code runs against a recorder the worker replays, so calls return nothing except `wb.add_worksheet` / `add_format` / `add_chart`, which return the object to use, a method outside xlsxwriter's allowlist fails with `SPREADSHEET_CODE_METHOD_NOT_ALLOWED`, `ws.write` of a string is always text (formulas go through `ws.write_formula`). To add EVERY row next to the counts, map a `rows`-mode node (`"filas": "task_outputs.<rows-ref>.rows"`) and call `ws.table_from(0, 0, 'filas')` on a sheet of its own (or `ws.table_from(0, 0, {'rowsFrom': 'filas', 'columns': [...]})`); nothing may be written below a `table_from` / `batch_table` on the same sheet. The output's `preview` shows the first rows of every sheet in code mode too.
+
+**Counts into an Excel file, template mode** (an `.xlsx` uploaded once with its look; the node fills cells and tables). Each counted field with a plain name is already a list of `{value, count}` rows, so a template table reads it directly. Upload the template first and paste its output into `template`:
+
+```bash
+altscore workflows-v2 spreadsheet upload-template ./Plantilla.xlsx
+# {"objectName": "attachments/<tenant>/<uuid>.xlsx", "fileLabel": "Plantilla.xlsx"}
+```
+
+```json
+{"ref": "planilla", "type": "spreadsheet-builder", "label": "Armar planilla",
+ "inputMappings": {"por_decision": "task_outputs.conteos.counts.decision",
+                   "por_segmento": "task_outputs.conteos.counts.segment",
+                   "total": "task_outputs.conteos.countedRows", "batch_label": "task_outputs.conteos.label",
+                   "filas": "task_outputs.todas.rows"},
+ "spreadsheetBuilderConfig": {"fileName": "reporte.xlsx", "source": "template",
+   "template": {"objectName": "attachments/<tenant>/<uuid>.xlsx", "fileLabel": "Plantilla.xlsx",
+     "cells": [{"cell": "Resumen!B2", "valueFrom": "batch_label"}, {"cell": "Resumen!B3", "valueFrom": "total"}],
+     "tables": [
+       {"sheet": "Resumen", "anchor": "A6", "rowsFrom": "por_decision",
+        "columns": [{"header": "Decision", "field": "value"}, {"header": "Filas", "field": "count", "type": "number"}]},
+       {"sheet": "Resumen", "anchor": "D6", "rowsFrom": "por_segmento",
+        "columns": [{"header": "Segmento", "field": "value"}, {"header": "Filas", "field": "count", "type": "number"}]},
+       {"sheet": "Detalle", "anchor": "A1", "rowsFrom": "filas", "columns": "auto"}]}}}
+```
+
+- `todas` here is a second batch-results node in `rows` mode; `filas` streams every row into the `Detalle` sheet. Any of these tables works the same as a `table` block in `source: "blocks"` (`{"type": "table", "rowsFrom": "por_decision", "columns": [...]}`).
+- `objectName` / `fileLabel` come from uploading the `.xlsx` once: `altscore workflows-v2 spreadsheet upload-template ./Plantilla.xlsx` prints `{"objectName": "attachments/<tenant>/<uuid>.xlsx", "fileLabel": "Plantilla.xlsx"}`, exactly the two fields of `template`. It refuses anything but `.xlsx` and files over 25 MB before uploading; the worker refuses an `objectName` outside `attachments/<tenant>/`. Re-upload only when the template changes (each run makes a new object). `cell` is a defined name, `Sheet!B4` or `B4`.
 
 **Post-processing** = another PUBLISHED flow of the tenant, named in a workflow's batch policy, that Borrower Central starts once a batch has finished (rows and automatic retries). It is an ordinary workflow that receives ONE input, `batch`: `{id, label, description, status, workflowAlias, workflowVersion, isTest, createdBy, createdByEmail, createdAt, finishedAt, total, successful, failed, pending, unsuccessfulSources, decisions}`. It qualifies when it is published, is not the batch's own workflow, and requires no input other than `batch`.
 
@@ -859,6 +943,8 @@ altscore workflows-v2 apply --body @post-scoring.json --publish
 # 2. which published flows qualify, and why the others do not
 altscore workflows-v2 post-processing candidates scoring                    # table: ALIAS LABEL VERSION COMPATIBLE REASON
 altscore workflows-v2 post-processing candidates scoring --compatible-only
+#    ...and, while authoring the flow, which fields the batch rows carry (for batch-results `fields`, column `field`)
+altscore workflows-v2 post-processing row-fields post-scoring --table          # FIELD FROM
 
 # 3. select it. batch-policy set REPLACES THE WHOLE policy: read, edit, write back
 altscore workflows-v2 batch-policy get scoring | jq '.batchPolicy // {}
@@ -880,7 +966,7 @@ altscore executions get-output-attachments <postProcessing.executionId> | jq '.[
 altscore workflows-v2 batch post-process <batch-id>
 ```
 
-- `batch-policy get|set`, `post-processing candidates|create-template` take an alias or an id. The policy belongs to ONE workflow version: an alias resolves to the ACTIVE version, else the latest DRAFT (stderr says which).
+- `batch-policy get|set`, `post-processing candidates|create-template|row-fields` take an alias or an id. The policy belongs to ONE workflow version: an alias resolves to the ACTIVE version, else the latest DRAFT (stderr says which).
 - **`delivery.enabled` and `postProcessing.enabled` are mutually exclusive** (`BATCH_POST_PROCESSING_EXCLUDES_DELIVERY`): the flow decides what is sent. `enabled` without `workflowAlias` is `BATCH_POST_PROCESSING_WORKFLOW_REQUIRED`; a flow that does not qualify is `BATCH_POST_PROCESSING_WORKFLOW_INCOMPATIBLE` with the reason. The CLI checks the first two before the request.
 - **A batch runs the flow (alias) named when it was LAUNCHED.** The version is resolved each time the flow runs: the one published at that moment, so a fix published before `batch post-process` is what the re-run executes. Changing the policy does not touch batches already launched; a batch launched without one has `postProcessing: null` and `batch post-process` answers 400 `BATCH_HAS_NO_POST_PROCESSING`.
 - `batch post-process` answers 409 `BATCH_POST_PROCESSING_NOT_RETRYABLE` until the batch is `complete` or `post_processing_failed`, and 409 `BATCH_POST_PROCESSING_ALREADY_RUNNING` while the flow runs. Retrying ROWS of a batch in `post_processing` is refused too (409 `BATCH_POST_PROCESSING_RUNNING`).
