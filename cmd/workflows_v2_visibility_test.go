@@ -29,6 +29,20 @@ func TestBuildVisibilityBody_AllThree(t *testing.T) {
 	}
 }
 
+func TestBuildVisibilityBody_BatchPostProcessing(t *testing.T) {
+	body, err := buildVisibilityBody(wfv2VisibilityFlags{BatchPostProcessing: "true"})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got := string(body); got != `{"batchPostProcessing":true}` {
+		t.Errorf("body = %s, want {\"batchPostProcessing\":true}", got)
+	}
+	if _, err := buildVisibilityBody(wfv2VisibilityFlags{BatchPostProcessing: "yes"}); err == nil ||
+		!strings.Contains(err.Error(), "--batch-post-processing") {
+		t.Errorf("error = %v, want it to name --batch-post-processing", err)
+	}
+}
+
 func TestBuildVisibilityBody_FalseIsSentNotOmitted(t *testing.T) {
 	body, err := buildVisibilityBody(wfv2VisibilityFlags{Hidden: "false"})
 	if err != nil {
