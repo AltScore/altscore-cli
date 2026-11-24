@@ -878,7 +878,8 @@ reference.`,
   inputVariables, customVariables, config (any subset).
   'status' is NOT patchable -- lifecycle transitions belong to the
   publish/archive/restore endpoints, and BC ignores it silently.
-  Visibility flags (hidden, showInCustomer, showInDeal) are alias-level:
+  Visibility flags (hidden, showInCustomer, showInDeal, batchPostProcessing)
+  are alias-level:
   use 'set-visibility'.
   Note: prefer 'autosave' with --lock-token for conflict-safe edits.`,
 		ResponseSchema: `  id, tenant, alias, label, description, category, status, version,

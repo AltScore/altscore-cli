@@ -317,15 +317,17 @@ from the new label; if it collides with an existing alias the API returns 409.`,
 
 // Each flag is tri-state: "" means unset, so its key stays out of the body.
 type wfv2VisibilityFlags struct {
-	Hidden         string
-	ShowInCustomer string
-	ShowInDeal     string
+	Hidden              string
+	ShowInCustomer      string
+	ShowInDeal          string
+	BatchPostProcessing string
 }
 
 type wfv2VisibilityBody struct {
-	Hidden         *bool `json:"hidden,omitempty"`
-	ShowInCustomer *bool `json:"showInCustomer,omitempty"`
-	ShowInDeal     *bool `json:"showInDeal,omitempty"`
+	Hidden              *bool `json:"hidden,omitempty"`
+	ShowInCustomer      *bool `json:"showInCustomer,omitempty"`
+	ShowInDeal          *bool `json:"showInDeal,omitempty"`
+	BatchPostProcessing *bool `json:"batchPostProcessing,omitempty"`
 }
 
 func parseTriStateBool(flag, raw string) (*bool, error) {
@@ -352,8 +354,11 @@ func buildVisibilityBody(f wfv2VisibilityFlags) (json.RawMessage, error) {
 	if body.ShowInDeal, err = parseTriStateBool("--show-in-deal", f.ShowInDeal); err != nil {
 		return nil, err
 	}
-	if body.Hidden == nil && body.ShowInCustomer == nil && body.ShowInDeal == nil {
-		return nil, fmt.Errorf("pass at least one of --hidden, --show-in-customer, --show-in-deal")
+	if body.BatchPostProcessing, err = parseTriStateBool("--batch-post-processing", f.BatchPostProcessing); err != nil {
+		return nil, err
+	}
+	if body.Hidden == nil && body.ShowInCustomer == nil && body.ShowInDeal == nil && body.BatchPostProcessing == nil {
+		return nil, fmt.Errorf("pass at least one of --hidden, --show-in-customer, --show-in-deal, --batch-post-processing")
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -387,11 +392,17 @@ applies to EVERY version of the alias and survives publish and revert.
                       (default true: opt-out)
   --show-in-deal      list the workflow in the Deal actions menu
                       (default false: opt-in)
+  --batch-post-processing
+                      mark the workflow as a batch's post-processing: it reads
+                      one finished batch, so it runs by hand or when a batch
+                      ends, and execute-batch refuses it (default false; set
+                      automatically when a batch policy names it)
 
 At least one flag is required. Returns alias, modifiedCount and the flags sent.`,
 		Example: `  altscore workflows-v2 set-visibility my-wf --show-in-deal=true
   altscore workflows-v2 set-visibility my-wf --hidden=true
-  altscore workflows-v2 set-visibility my-wf --show-in-customer=false --show-in-deal=true`,
+  altscore workflows-v2 set-visibility my-wf --show-in-customer=false --show-in-deal=true
+  altscore workflows-v2 set-visibility post-kyc --batch-post-processing=true`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			body, err := buildVisibilityBody(flags)
@@ -417,6 +428,7 @@ At least one flag is required. Returns alias, modifiedCount and the flags sent.`
 	cmd.Flags().StringVar(&flags.Hidden, "hidden", "", "true|false: hide from the runner page and entity launchers")
 	cmd.Flags().StringVar(&flags.ShowInCustomer, "show-in-customer", "", "true|false: list in the Customer profile actions menu (unset = true)")
 	cmd.Flags().StringVar(&flags.ShowInDeal, "show-in-deal", "", "true|false: list in the Deal actions menu (unset = false)")
+	cmd.Flags().StringVar(&flags.BatchPostProcessing, "batch-post-processing", "", "true|false: mark as a batch's post-processing, never run as a batch (unset = false)")
 	return cmd
 }
 

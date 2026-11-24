@@ -513,6 +513,7 @@ altscore workflows-v2 restore <id>                               # un-archive
 altscore workflows-v2 duplicate <id> --new-label "Copy of X"
 altscore workflows-v2 set-visibility my-wf --show-in-deal=true    # per-surface flags: --hidden, --show-in-customer (default true), --show-in-deal (default false)
 altscore workflows-v2 set-visibility my-wf --hidden=true          # every version of the alias; survives publish/revert
+altscore workflows-v2 set-visibility post-kyc --batch-post-processing=true  # a batch's post-processing flow: runs by hand or when a batch ends; execute-batch refuses it (400 WORKFLOW_IS_BATCH_POST_PROCESSING). Set automatically when a batch policy names it
 ```
 
 #### Versions, executions, mappings
