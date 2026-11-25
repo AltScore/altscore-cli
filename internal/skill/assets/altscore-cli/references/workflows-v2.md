@@ -785,15 +785,25 @@ altscore execution-batches list --filter parent-execution-id=<parentExecutionId>
 
 Needs a Borrower Central that has these (a route that is not deployed answers 404/405 and the CLI says so). Field reference, always live: `altscore workflows-v2 schema-guide tasks spreadsheet-builder`, `... tasks batch-results`, `... schema-guide batchPolicy`.
 
-**`spreadsheet-builder`** builds ONE `.xlsx` and keeps it as an attachment of the execution. `spreadsheetBuilderConfig: {fileName, source: "blocks" (default) | "code" | "template", sheets: [{name, blocks: [...]}]}`. A sheet is a list of blocks written one under the other:
+**`spreadsheet-builder`** builds ONE `.xlsx` and keeps it as an attachment of the execution. `spreadsheetBuilderConfig: {fileName, source: "blocks" (default) | "template" | "code", sheets: [{name, blocks: [...]}]}`.
+
+**Build the file natively; code is the exception.** The support team reads and edits blocks and templates in the Hub, and they cannot do that with Python. Pick the first that fits:
+
+1. **`blocks`** (the default, no `source`): fields, tables, batch rows, artifacts. A column takes `type`, `format`, `width`, `total` (sum / average / count / min / max) or a per-row `formula`, so headers, number formats, totals and derived columns need no code.
+2. **`template`**: the client has its own layout (logos, colours, merged headers, charts already drawn). Upload their `.xlsx` once and fill cells and tables.
+3. **`code`** (`source: "code"` or a `code` block): only for what neither of the above can draw, such as a chart built from the run's data or conditional formatting, or when the user explicitly asks for code. Say which one it is when you choose it.
+
+"One sheet per counted field", "a summary on top and the detail below", "a percentage column" and "a total row" are all done with blocks. `apply` and `lint` print a `[structure] spreadsheet-code` advisory on every node drawn with code. The advisory never blocks anything, and nodes that already use code keep working.
+
+A sheet is a list of blocks written one under the other:
 
 | Block `type` | Takes | Writes |
 |---|---|---|
-| `fields` | `rows: [{label, value \| valueFrom, type?, format?}]` | two columns, one row per field |
-| `table` | `rowsFrom`, `columns`, `explodeField?`, `maxRows?` | a list of rows, or the `rows` reference of a `batch-results` node in `rows` mode (streamed, no limit) |
+| `fields` | `title?`, `rows: [{label, value \| valueFrom, type?, format?}]` | two columns, one row per field |
+| `table` | `title?`, `rowsFrom`, `columns`, `explodeField?`, `maxRows?` | a list of rows, or the `rows` reference of a `batch-results` node in `rows` mode (streamed, no limit) |
 | `batch-results` | `batchFrom?` (default: the `batch` input), `columns`, `rowsFilter: all\|successful\|failed`, `includeInput?`, `includeStatus?` | EVERY row of a batch, streamed (200k rows cost what 200 do) |
 | `artifact` | `artifactAlias`, `columns` | the published rows of a table artifact |
-| `code` | `code` (xlsxwriter API; `wb`, `ws`, `row`, `inputs`) | whatever it draws |
+| `code` | `code` (xlsxwriter API; `wb`, `ws`, `row`, `inputs`) | whatever it draws. Last resort, see above |
 
 `source: "template"` fills an `.xlsx` you upload with `altscore workflows-v2 spreadsheet upload-template <path.xlsx>` (prints `template.objectName` and `template.fileLabel`; example below).
 
@@ -814,9 +824,9 @@ Needs a Borrower Central that has these (a route that is not deployed answers 40
 - `rows` is not a list: do not loop over it in `compute-variables` or a template. Map it into a spreadsheet-builder (`inputMappings: {"filas": "task_outputs.<ref>.rows"}`, then `rowsFrom: "filas"`).
 - Which fields do the rows have? `altscore workflows-v2 post-processing row-fields <this-post-processing-flow>` lists them (the End outputs of every workflow whose batch policy names this flow, with the inner paths of an object output such as `detalle.flag`, plus `execution_id, item_index, is_success, error_message`). `inputFields` are those workflows' input variables: a node with `includeInput: true` reads them as `input.<name>`, the only data a failed row carries. It answers empty lists until a workflow selects the flow; any path you know is still accepted.
 - `maxRows` is obsolete: the backend reads and ignores it (tasks saved when the node capped its rows still carry it). Do not write it; `apply` prints a `# warning:` when a spec does, never an error.
-- A counted field named with a dot (`persona.provincia`) is a KEY of `counts` (`inputs['counts']['persona.provincia']` in code); a mapping cannot name that key, so map its path under `countsByPath`: `task_outputs.<ref>.countsByPath.persona.provincia`. Plain names (`decision`) map directly from `counts`. Every value of `counts` is a list, so iterating it as below is safe. An object value is counted by its JSON text.
+- A counted field named with a dot (`persona.provincia`) is a KEY of `counts`, and a mapping cannot name that key, so map its path under `countsByPath`: `task_outputs.<ref>.countsByPath.persona.provincia`. Plain names (`decision`) map directly from `counts`. Every value of `counts` is a list of `{value, count}`, which is exactly what a `table` block reads. An object value is counted by its JSON text.
 
-**Counts into an Excel file, code mode** (`source: "code"` draws the whole file with xlsxwriter's API; `inputs` holds the node's inputMappings values). One sheet per counted field:
+**Counts into an Excel file, blocks (the native default).** This gives one sheet per counted field, with the batch on top, a percentage column and a total row, and has no code:
 
 ```json
 {"ref": "conteos", "type": "batch-results", "label": "Contar resultados",
@@ -826,39 +836,30 @@ Needs a Borrower Central that has these (a route that is not deployed answers 40
 
 ```json
 {"ref": "planilla", "type": "spreadsheet-builder", "label": "Armar planilla",
- "inputMappings": {"counts": "task_outputs.conteos.counts", "other": "task_outputs.conteos.countsOther",
+ "inputMappings": {"por_decision": "task_outputs.conteos.counts.decision",
+                   "por_segmento": "task_outputs.conteos.counts.segment",
                    "total": "task_outputs.conteos.countedRows", "batch_label": "task_outputs.conteos.label"},
- "spreadsheetBuilderConfig": {"fileName": "conteos.xlsx", "source": "code",
-   "code": "bold = wb.add_format({'bold': True})\npct = wb.add_format({'num_format': '0.0%'})\ntotal = inputs['total'] or 0\nfor field, values in (inputs['counts'] or {}).items():\n    ws = wb.add_worksheet(field[:31].replace('.', '_'))\n    ws.write(0, 0, inputs['batch_label'] or '', bold)\n    ws.write_row(2, 0, ['Valor', 'Filas', '%'], bold)\n    r = 3\n    for item in values:\n        ws.write(r, 0, '(vacio)' if item['value'] is None else str(item['value']))\n        ws.write(r, 1, item['count'])\n        ws.write(r, 2, item['count'] / total if total else 0, pct)\n        r += 1\n    rest = (inputs['other'] or {}).get(field)\n    if rest:\n        ws.write(r, 0, 'Otros (%d valores)' % rest['distinct'])\n        ws.write(r, 1, rest['count'])\n        r += 1\n    ws.write(r, 0, 'Total', bold)\n    ws.write_formula(r, 1, '=SUM(B4:B%d)' % r, bold)\n    ws.set_column(0, 0, 28)"}}
+ "spreadsheetBuilderConfig": {"fileName": "conteos.xlsx", "sheets": [
+   {"name": "Decision", "blocks": [
+     {"type": "fields", "rows": [{"label": "Batch", "valueFrom": "batch_label"},
+                                 {"label": "Filas contadas", "valueFrom": "total", "type": "number"}]},
+     {"type": "table", "rowsFrom": "por_decision", "columns": [
+       {"header": "Valor", "field": "value", "width": 28},
+       {"header": "Filas", "field": "count", "type": "number", "total": "sum"},
+       {"header": "%", "formula": "=B{row}/$B$2", "type": "percent", "format": "0.0%"}]}]},
+   {"name": "Segmento", "blocks": [
+     {"type": "fields", "rows": [{"label": "Batch", "valueFrom": "batch_label"},
+                                 {"label": "Filas contadas", "valueFrom": "total", "type": "number"}]},
+     {"type": "table", "rowsFrom": "por_segmento", "columns": [
+       {"header": "Valor", "field": "value", "width": 28},
+       {"header": "Filas", "field": "count", "type": "number", "total": "sum"},
+       {"header": "%", "formula": "=B{row}/$B$2", "type": "percent", "format": "0.0%"}]}]}]}}
 ```
 
-The code is the readable script below, JSON-escaped into `code` (`apply` reads plain JSON):
-
-```python
-bold = wb.add_format({'bold': True})
-pct = wb.add_format({'num_format': '0.0%'})
-total = inputs['total'] or 0
-for field, values in (inputs['counts'] or {}).items():
-    ws = wb.add_worksheet(field[:31].replace('.', '_'))   # sheet names: <=31 chars, no [ ] : * ? / \
-    ws.write(0, 0, inputs['batch_label'] or '', bold)
-    ws.write_row(2, 0, ['Valor', 'Filas', '%'], bold)
-    r = 3
-    for item in values:                                    # already sorted by count, desc
-        ws.write(r, 0, '(vacio)' if item['value'] is None else str(item['value']))
-        ws.write(r, 1, item['count'])
-        ws.write(r, 2, item['count'] / total if total else 0, pct)
-        r += 1
-    rest = (inputs['other'] or {}).get(field)              # only when the field had > 200 values
-    if rest:
-        ws.write(r, 0, 'Otros (%d valores)' % rest['distinct'])
-        ws.write(r, 1, rest['count'])
-        r += 1
-    ws.write(r, 0, 'Total', bold)
-    ws.write_formula(r, 1, '=SUM(B4:B%d)' % r, bold)
-    ws.set_column(0, 0, 28)
-```
-
-Code-mode rules: the code runs against a recorder the worker replays, so calls return nothing except `wb.add_worksheet` / `add_format` / `add_chart`, which return the object to use, a method outside xlsxwriter's allowlist fails with `SPREADSHEET_CODE_METHOD_NOT_ALLOWED`, `ws.write` of a string is always text (formulas go through `ws.write_formula`). To add EVERY row next to the counts, map a `rows`-mode node (`"filas": "task_outputs.<rows-ref>.rows"`) and call `ws.table_from(0, 0, 'filas')` on a sheet of its own (or `ws.table_from(0, 0, {'rowsFrom': 'filas', 'columns': [...]})`); nothing may be written below a `table_from` / `batch_table` on the same sheet. The output's `preview` shows the first rows of every sheet in code mode too.
+- The cells are predictable because blocks are written one under the other with a blank row between them. Here the `fields` block takes rows 1-2 (so `Filas contadas` sits in `B2`), and the table header lands on row 4. That is how the `%` formula can point at `$B$2`. A `title` adds one row above its block.
+- `{row}` in a column `formula` is that row's Excel number (`{row-1}` and `{row+1}` also work). `total` writes a `SUBTOTAL` row under the table, so the total follows the reader's filter.
+- A field with more than 200 values also has `countsOther.<field>.{distinct, count}`. Map `task_outputs.conteos.countsOther.decision.count` into a `fields` row ("Otros") when it matters; when there are fewer values it is null and the cell stays blank.
+- To add EVERY row, add a sheet with one `table` block whose `rowsFrom` maps a `rows`-mode node (`"filas": "task_outputs.<rows-ref>.rows"`, `"columns": "auto"`), or a `batch-results` block.
 
 **Counts into an Excel file, template mode** (an `.xlsx` uploaded once with its look; the node fills cells and tables). Each counted field with a plain name is already a list of `{value, count}` rows, so a template table reads it directly. Upload the template first and paste its output into `template`:
 
@@ -886,6 +887,20 @@ altscore workflows-v2 spreadsheet upload-template ./Plantilla.xlsx
 
 - `todas` here is a second batch-results node in `rows` mode; `filas` streams every row into the `Detalle` sheet. Any of these tables works the same as a `table` block in `source: "blocks"` (`{"type": "table", "rowsFrom": "por_decision", "columns": [...]}`).
 - `objectName` / `fileLabel` come from uploading the `.xlsx` once: `altscore workflows-v2 spreadsheet upload-template ./Plantilla.xlsx` prints `{"objectName": "attachments/<tenant>/<uuid>.xlsx", "fileLabel": "Plantilla.xlsx"}`, exactly the two fields of `template`. It refuses anything but `.xlsx` and files over 25 MB before uploading; the worker refuses an `objectName` outside `attachments/<tenant>/`. Re-upload only when the template changes (each run makes a new object). `cell` is a defined name, `Sheet!B4` or `B4`.
+
+**Code mode: only when blocks and templates cannot do it, or the user asks for code.** `source: "code"` draws the whole file with xlsxwriter's API (`wb`, plus `inputs` = the node's inputMappings values), and a `code` block draws inside one sheet (`ws`, `row` = its first free row). Typical legitimate case: a chart built from the run's data. Tell the user why it is code, and keep everything else in blocks:
+
+```json
+{"ref": "grafico", "type": "spreadsheet-builder", "label": "Grafico de decisiones",
+ "inputMappings": {"por_decision": "task_outputs.conteos.counts.decision"},
+ "spreadsheetBuilderConfig": {"fileName": "decisiones.xlsx", "sheets": [
+   {"name": "Decision", "blocks": [
+     {"type": "table", "rowsFrom": "por_decision", "columns": [
+       {"header": "Valor", "field": "value"}, {"header": "Filas", "field": "count", "type": "number"}]},
+     {"type": "code", "code": "n = len(inputs['por_decision'] or [])\nchart = wb.add_chart({'type': 'pie'})\nchart.add_series({'categories': ['Decision', 1, 0, n, 0], 'values': ['Decision', 1, 1, n, 1]})\nws.insert_chart(row, 0, chart)"}]}]}}
+```
+
+Code-mode rules: the code runs against a recorder the worker replays, so calls return nothing except `wb.add_worksheet` / `add_format` / `add_chart`, which return the object to use. A method outside xlsxwriter's allowlist fails with `SPREADSHEET_CODE_METHOD_NOT_ALLOWED`, and `ws.write` of a string is always text (formulas go through `ws.write_formula`). In `source: "code"`, `ws.table_from(0, 0, 'filas')` (or `ws.table_from(0, 0, {'rowsFrom': 'filas', 'columns': [...]})`) streams a `rows` reference onto a sheet of its own; nothing may be written below a `table_from` / `batch_table` on the same sheet. The output's `preview` shows the first rows of every sheet in code mode too. `apply` / `lint` print a `[structure] spreadsheet-code` advisory for every such node, as a reminder, never as an error.
 
 **Post-processing** = another PUBLISHED flow of the tenant, named in a workflow's batch policy, that Borrower Central starts once a batch has finished (rows and automatic retries). It is an ordinary workflow that receives ONE input, `batch`: `{id, label, description, status, workflowAlias, workflowVersion, isTest, createdBy, createdByEmail, createdAt, finishedAt, total, successful, failed, pending, unsuccessfulSources, decisions}`. It qualifies when it is published, is not the batch's own workflow, and requires no input other than `batch`.
 
@@ -930,7 +945,8 @@ Notes on the spec below (kept out of it, since `apply` reads plain JSON):
     {"from": "tiene-correo", "to": "sin-correo", "sourceHandle": "branch-else"},
     {"from": "correo", "to": "end"}, {"from": "sin-correo", "to": "end"}
   ]
-}```
+}
+```
 
 End to end (`scoring` = the workflow whose batches get the flow):
 

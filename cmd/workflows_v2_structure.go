@@ -35,6 +35,7 @@ var structurePractices = []string{
 	"self-chain",
 	"large-policy-variable",
 	"object-return",
+	"spreadsheet-code",
 }
 
 type structureNode struct {
@@ -329,6 +330,7 @@ func (g *structureGraph) findings() []structureFinding {
 	out = append(out, g.adviseComputeNodes()...)
 	out = append(out, g.adviseLargePolicyVariables()...)
 	out = append(out, g.adviseObjectReturns()...)
+	out = append(out, g.adviseSpreadsheetCode()...)
 	return out
 }
 
@@ -645,6 +647,54 @@ func (g *structureGraph) adviseObjectReturns() []structureFinding {
 	return out
 }
 
+// A file drawn with xlsxwriter calls is Python the next engineer has to read and the Hub
+// cannot edit; blocks and templates cover tables, totals, formulas and formats natively.
+func (g *structureGraph) adviseSpreadsheetCode() []structureFinding {
+	var out []structureFinding
+	for _, n := range g.Nodes {
+		if n.Type != "spreadsheet-builder" {
+			continue
+		}
+		raw, _ := sbValue(n.Body, "spreadsheetBuilderConfig")
+		config, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		var what string
+		switch source, _ := config["source"].(string); source {
+		case "code":
+			what = "draws its whole file with Python (source 'code')"
+		case "", "blocks":
+			var sheets []string
+			for _, rawSheet := range asSlice(config["sheets"]) {
+				sheet := asMap(rawSheet)
+				for _, rawBlock := range asSlice(sheet["blocks"]) {
+					if t, _ := asMap(rawBlock)["type"].(string); t == "code" {
+						name, _ := sheet["name"].(string)
+						sheets = append(sheets, strconv.Quote(name))
+						break
+					}
+				}
+			}
+			if len(sheets) == 0 {
+				continue
+			}
+			what = fmt.Sprintf("writes a 'code' block in sheet %s", structureSample(sheets, 3))
+		default:
+			continue
+		}
+		out = append(out, structureFinding{
+			Practice: "spreadsheet-code",
+			Subject:  n.Ref,
+			Message: fmt.Sprintf("spreadsheet node %s %s. Fix: build it natively -- fields, table "+
+				"(columns with type, format, total, formula), batch-results and artifact blocks, or "+
+				"source 'template' for the client's own layout -- and keep code only for what neither "+
+				"does (charts, conditional formats) or when the user asked for code", n.Name, what),
+		})
+	}
+	return out
+}
+
 func structureSample(items []string, limit int) string {
 	if len(items) <= limit {
 		return strings.Join(items, ", ")
@@ -695,4 +745,7 @@ func printStructureFindings(w io.Writer, findings []structureFinding) {
 	}
 	fmt.Fprintf(w, "#   see `altscore workflows-v2 schema-guide variables` and "+
 		"`altscore workflows-v2 schema-guide creditDecisioningEntities`\n")
+	if len(byPractice["spreadsheet-code"]) > 0 {
+		fmt.Fprintf(w, "#   and `altscore workflows-v2 schema-guide tasks spreadsheet-builder`\n")
+	}
 }

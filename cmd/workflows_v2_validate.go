@@ -197,6 +197,8 @@ variable and its fix:
     through self.
   - a variable over 1,000 code chars that is not HTML, parsing or iteration
   - a variable that returns an object (one scalar per variable)
+  - a spreadsheet-builder drawn with Python (source 'code' or a 'code'
+    block) instead of native blocks or a template
 HTML builders, parsing and multi-value arithmetic are left alone. Like the
 readability advisory it never contributes an issue or moves the exit code.
 

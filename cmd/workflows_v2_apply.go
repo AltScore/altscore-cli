@@ -89,7 +89,8 @@ scope conflicts, keyed by real task alias. No API mutations.
 Every mode (--dry-run, --diff and a real apply) prints offline advisories to
 stderr before the apply request. The "[structure]" lines flag a decision made
 in Python instead of a rule-tree, variables a deep path or a literal replaces,
-oversized or self.-chained compute nodes, and object-returning variables; each
+oversized or self.-chained compute nodes, object-returning variables, and
+spreadsheet-builder nodes drawn with Python instead of blocks or a template; each
 names the node or variable and the fix. Advisories never change the exit code
 (see 'workflows-v2 lint --help'). One "# defaults applied" block then lists
 every value the run will use that the spec did not set (PDF report, decision

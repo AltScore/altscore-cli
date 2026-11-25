@@ -719,3 +719,87 @@ func TestGuardedExtractionReadsAsTheDeepPath(t *testing.T) {
 		}
 	}
 }
+
+func addStructureSpreadsheet(spec map[string]any, ref string, config map[string]any) {
+	spec["nodes"] = append(spec["nodes"].([]any), map[string]any{
+		"ref": ref, "type": "spreadsheet-builder", "label": ref,
+		"inputMappings":            map[string]any{"filas": "inputs.rows"},
+		"spreadsheetBuilderConfig": config,
+	})
+}
+
+func TestStructureSpreadsheetCode(t *testing.T) {
+	spec := structureSpecMap(t)
+	addStructureSpreadsheet(spec, "planilla", map[string]any{
+		"fileName": "conteos.xlsx", "source": "code", "code": "ws = wb.add_worksheet('A')\nws.write(0, 0, 'x')"})
+	out := structureRun(t, spec)
+	requireOneLine(t, out, "spreadsheet-code",
+		`spreadsheet node "planilla" draws its whole file with Python (source 'code')`, "source 'template'")
+	if !strings.Contains(out, "schema-guide tasks spreadsheet-builder") {
+		t.Errorf("a spreadsheet finding must point at its schema-guide section:\n%s", out)
+	}
+
+	spec = structureSpecMap(t)
+	addStructureSpreadsheet(spec, "planilla", map[string]any{
+		"fileName": "r.xlsx", "sheets": []any{
+			map[string]any{"name": "Resumen", "blocks": []any{
+				map[string]any{"type": "table", "rowsFrom": "filas", "columns": "auto"},
+				map[string]any{"type": "code", "code": "ws.write(row, 0, 'x')"},
+				map[string]any{"type": "code", "code": "ws.write(row, 0, 'y')"}}},
+			map[string]any{"name": "Detalle", "blocks": []any{
+				map[string]any{"type": "code", "code": "ws.write(row, 0, 'z')"}}}}})
+	requireOneLine(t, structureRun(t, spec), "spreadsheet-code",
+		`spreadsheet node "planilla" writes a 'code' block in sheet "Resumen", "Detalle"`)
+}
+
+// Native files, a missing or odd config, and other node types stay silent: the advisory
+// never speaks about a workflow that does not draw a file with code.
+func TestStructureSpreadsheetCodeNegative(t *testing.T) {
+	for name, config := range map[string]any{
+		"blocks default": map[string]any{"fileName": "r.xlsx", "sheets": []any{
+			map[string]any{"name": "R", "blocks": []any{
+				map[string]any{"type": "table", "rowsFrom": "filas", "columns": "auto"},
+				map[string]any{"type": "fields", "rows": []any{map[string]any{"label": "Total", "value": 1}}}}}}},
+		"blocks explicit": map[string]any{"fileName": "r.xlsx", "source": "blocks", "sheets": []any{
+			map[string]any{"name": "R", "blocks": []any{map[string]any{"type": "batch-results", "columns": "auto"}}}}},
+		"template": map[string]any{"fileName": "r.xlsx", "source": "template",
+			"template": map[string]any{"objectName": "attachments/t/x.xlsx"}},
+		// code mode ignores sheets, so a stale code block under a template is not drawn
+		"template with stale code block": map[string]any{"fileName": "r.xlsx", "source": "template",
+			"template": map[string]any{"objectName": "attachments/t/x.xlsx"},
+			"sheets":   []any{map[string]any{"name": "R", "blocks": []any{map[string]any{"type": "code", "code": "x"}}}}},
+		"not an object": "nope",
+		"nil":           nil,
+		"odd sheets":    map[string]any{"sheets": []any{"x", nil, map[string]any{"blocks": "nope"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec := structureSpecMap(t)
+			addStructureSpreadsheet(spec, "planilla", nil)
+			structureNodeByRef(spec, "planilla")["spreadsheetBuilderConfig"] = config
+			if out := structureRun(t, spec); out != "" {
+				t.Fatalf("want no advisory, got:\n%s", out)
+			}
+		})
+	}
+
+	spec := structureSpecMap(t)
+	spec["nodes"] = append(spec["nodes"].([]any), map[string]any{"ref": "http", "type": "http",
+		"spreadsheetBuilderConfig": map[string]any{"source": "code", "code": "x"}})
+	if out := structureRun(t, spec); out != "" {
+		t.Fatalf("only spreadsheet-builder nodes are judged, got:\n%s", out)
+	}
+}
+
+// lint on a live workflow: the config lives on the task body (snake_case accepted, as BC).
+func TestStructureSpreadsheetCodeWorkflowShape(t *testing.T) {
+	wf := map[string]any{"nodes": []any{map[string]any{
+		"nodeId": "planilla-1a2b3c", "taskAlias": "planilla-1a2b3c", "type": "spreadsheet-builder",
+		"label": "Armar planilla", "data": map[string]any{}}}}
+	bodies := []map[string]any{{"alias": "planilla-1a2b3c",
+		"spreadsheet_builder_config": map[string]any{"source": "code", "code": "x"}}}
+	requireOneLine(t, structureRunWorkflow(wf, bodies), "spreadsheet-code",
+		`spreadsheet node "Armar planilla" (planilla-1a2b3c) draws its whole file with Python`)
+	if out := structureRunWorkflow(wf, nil); out != "" {
+		t.Fatalf("without the task body there is nothing to judge, got:\n%s", out)
+	}
+}
