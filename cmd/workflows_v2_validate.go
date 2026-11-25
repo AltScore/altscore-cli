@@ -197,6 +197,8 @@ variable and its fix:
     through self.
   - a variable over 1,000 code chars that is not HTML, parsing or iteration
   - a variable that returns an object (one scalar per variable)
+  - a spreadsheet-builder drawn with Python (source 'code' or a 'code'
+    block) instead of native blocks or a template
 HTML builders, parsing and multi-value arithmetic are left alone. Like the
 readability advisory it never contributes an issue or moves the exit code.
 
@@ -250,8 +252,8 @@ Exits with non-zero status if any issue is found, from either source. Pass
 			wfAlias, _ := wf["alias"].(string)
 			endTasks := fetchEndTaskBodies(c, asSlice(wf["nodes"]))
 			adviseHandoffReadability(wf, endTasks, fetchWorkflowRules(c, wfAlias), cmd.ErrOrStderr())
-			computeTasks := fetchTaskBodiesOfType(c, asSlice(wf["nodes"]), "compute-variables")
-			adviseWorkflowStructure(structureGraphFromWorkflow(wf, append(endTasks, computeTasks...)), cmd.ErrOrStderr())
+			adviseWorkflowStructure(structureGraphFromWorkflow(wf, structureTaskBodies(c, asSlice(wf["nodes"]), endTasks)),
+				cmd.ErrOrStderr())
 			raw, _ := json.Marshal(report)
 			if err := output.RawJSON(json.RawMessage(raw)); err != nil {
 				return err
