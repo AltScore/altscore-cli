@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/AltScore/altscore-cli/internal/client"
 )
 
 // Where a workflow's logic lives: values wired directly in each node, decisions made by
@@ -119,6 +121,15 @@ func structureGraphFromWorkflow(wf map[string]any, taskBodies []map[string]any) 
 		g.Edges = append(g.Edges, asMap(raw))
 	}
 	return g.finish()
+}
+
+// The task bodies the structure advisory reads on a saved workflow: the end nodes' (already
+// fetched for readability), the compute nodes' and the spreadsheet-builders', whose config
+// lives only on the task, never on the canvas node.
+func structureTaskBodies(c *client.Client, nodes []any, endTasks []map[string]any) []map[string]any {
+	out := append([]map[string]any{}, endTasks...)
+	out = append(out, fetchTaskBodiesOfType(c, nodes, "compute-variables")...)
+	return append(out, fetchTaskBodiesOfType(c, nodes, "spreadsheet-builder")...)
 }
 
 func (g *structureGraph) addVars(vars map[string]any) {

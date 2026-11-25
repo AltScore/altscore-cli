@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -802,4 +804,37 @@ func TestStructureSpreadsheetCodeWorkflowShape(t *testing.T) {
 	if out := structureRunWorkflow(wf, nil); out != "" {
 		t.Fatalf("without the task body there is nothing to judge, got:\n%s", out)
 	}
+}
+
+// lint fetches the spreadsheet-builder's task: its config is not on the canvas node, so
+// without the fetch a saved code-mode workflow was never flagged.
+func TestStructureTaskBodiesFetchesSpreadsheetBuilders(t *testing.T) {
+	var asked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Path)
+		alias := strings.TrimPrefix(r.URL.Path, "/v2/tasks/")
+		body := map[string]any{"alias": alias}
+		if strings.HasPrefix(alias, "planilla") {
+			body["spreadsheetBuilderConfig"] = map[string]any{"source": "code", "code": "x"}
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	defer srv.Close()
+
+	nodes := []any{
+		map[string]any{"nodeId": "planilla-1a2b3c", "taskAlias": "planilla-1a2b3c", "type": "spreadsheet-builder", "label": "Armar planilla"},
+		map[string]any{"nodeId": "calc-1a2b3c", "taskAlias": "calc-1a2b3c", "type": "compute-variables"},
+		map[string]any{"nodeId": "http-1a2b3c", "taskAlias": "http-1a2b3c", "type": "http"},
+	}
+	bodies := structureTaskBodies(newTestClient(t, srv.URL), nodes, []map[string]any{{"alias": "end-1a2b3c"}})
+	if len(bodies) != 3 {
+		t.Fatalf("want the end, compute and spreadsheet bodies, got %v", bodies)
+	}
+	for _, path := range asked {
+		if strings.Contains(path, "http-1a2b3c") {
+			t.Errorf("only the node types the advisory reads are fetched, asked %v", asked)
+		}
+	}
+	requireOneLine(t, structureRunWorkflow(map[string]any{"nodes": nodes}, bodies), "spreadsheet-code",
+		`spreadsheet node "Armar planilla" (planilla-1a2b3c) draws its whole file with Python`)
 }

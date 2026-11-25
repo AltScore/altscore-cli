@@ -252,8 +252,8 @@ Exits with non-zero status if any issue is found, from either source. Pass
 			wfAlias, _ := wf["alias"].(string)
 			endTasks := fetchEndTaskBodies(c, asSlice(wf["nodes"]))
 			adviseHandoffReadability(wf, endTasks, fetchWorkflowRules(c, wfAlias), cmd.ErrOrStderr())
-			computeTasks := fetchTaskBodiesOfType(c, asSlice(wf["nodes"]), "compute-variables")
-			adviseWorkflowStructure(structureGraphFromWorkflow(wf, append(endTasks, computeTasks...)), cmd.ErrOrStderr())
+			adviseWorkflowStructure(structureGraphFromWorkflow(wf, structureTaskBodies(c, asSlice(wf["nodes"]), endTasks)),
+				cmd.ErrOrStderr())
 			raw, _ := json.Marshal(report)
 			if err := output.RawJSON(json.RawMessage(raw)); err != nil {
 				return err
