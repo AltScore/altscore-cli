@@ -144,7 +144,7 @@ Load the file that matches the task:
 | Workflows v2 | [references/workflows-v2.md](references/workflows-v2.md) | discovery round, authoring loop (test mode, locks, feedback turns), `apply`, tasks-v2, CRUD, lock dance, lifecycle, schedules, import/export, execute, helpers, variable resolution, atomic deal patterns, building an Excel file (`spreadsheet-builder`: native blocks first, then template mode with `spreadsheet upload-template`, code only as the exception), reading a batch (`batch-results` summary / counts / rows) and batch post-processing flows (`batch-policy`, `post-processing`, `batch post-process`) |
 | Credit decisioning | [references/credit-decisioning.md](references/credit-decisioning.md) | mapping-tables, scorecards, evaluation-rules, decisions, rule-trees, pitfalls |
 | KYC/KYB good habits | [references/kyc-kyb-habits.md](references/kyc-kyb-habits.md) | tenant/country-agnostic structural habits for onboarding & screening flows — read before authoring a KYC/KYB/onboarding workflow |
-| AltData | [references/altdata.md](references/altdata.md) | source discovery (`describe` pre-flight), data requests |
+| AltData | [references/altdata.md](references/altdata.md) | source discovery (`describe` pre-flight), data requests, tenant source credentials (per-version profiles, `credentialName`) |
 | Python SDK | [references/sdk.md](references/sdk.md) | in-task SDK, modules, borrower methods, macros, evaluators, reading enrichment packages |
 | Report generation | [references/reports.md](references/reports.md) | PDF report components and task patterns |
 | Data-models | [references/data-models.md](references/data-models.md) | schema definitions: identity keys, fields, steps, decisions |
