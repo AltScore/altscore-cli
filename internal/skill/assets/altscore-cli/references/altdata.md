@@ -66,7 +66,7 @@ altscore api DELETE /v2/workflows/sources/<sourceId>/credentials/profiles/<versi
 Which profile a run uses:
 - `sourcesConfig[].credentialName` on the `altdata-enrichment` node picks the profile; omitted means `default`.
 - `sourcesConfig[].testCredentialName` is used instead on test runs (`--test`, or a run flagged as test), e.g. the vendor's UAT credentials; omitted means test runs use `credentialName` too.
-- A per-run override goes in the `X-Source-Credential-Overrides` header of `POST /v2/workflows/<id>/execute`: a JSON list of `{"taskAlias", "sourceId", "credentialName"}`. It wins over both fields above.
+- A per-run override wins over both fields above, but only a direct HTTP client can send it: the `X-Source-Credential-Overrides` header of `POST /v2/workflows/<id>/execute`, a JSON list such as `[{"taskAlias": "buro-pf", "sourceId": "MEX-PRI-0008", "credentialName": "uat"}]` (entries missing any of the three keys, or a malformed value, are ignored). `altscore api` sends no custom headers, so from the CLI pick the profile with `credentialName` / `testCredentialName` on the node instead.
 - A **named** profile (anything but `default`) has no fallback: if it does not exist for that version the source fails instead of quietly using other credentials.
 
 Traps:
