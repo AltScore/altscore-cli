@@ -40,3 +40,37 @@ altscore altdata request-status <request-id>
 # Collect completed request data
 altscore altdata request-collect <request-id>
 ```
+
+### Source credentials (per-version profiles)
+
+Sources that authenticate with the tenant's own provider account (the private bureaus, for example) declare a `credentialsSchema` in `sources-status`. The tenant stores those credentials as **profiles keyed by `(sourceId, version, name)`**. A run of version `v1` reads the `v1` profile named on the node (`default` unless set), never another version's.
+
+There is no dedicated command; use `altscore api`. Writes need the `secrets.write` permission.
+
+```bash
+# List every profile of a source (non-secret values + which secrets are set; secrets never come back)
+altscore api GET /v2/workflows/sources/<sourceId>/credentials/profiles
+
+# Create or update one profile. Pipe the body through stdin so secrets never land in argv or shell history.
+# Secret fields left out of the body keep their stored value; send only what changes.
+printf '%s' "$BODY_JSON" | altscore api PUT /v2/workflows/sources/<sourceId>/credentials/profiles/<version>/<name>
+#   BODY_JSON = {"values": {"<field>": "<value>", ...}}   field names come from the source's credentialsSchema
+
+# Validate the stored profile against the provider (authenticates; no billable data pull)
+altscore api POST /v2/workflows/sources/<sourceId>/credentials/profiles/<version>/<name>/check
+
+# Delete one profile
+altscore api DELETE /v2/workflows/sources/<sourceId>/credentials/profiles/<version>/<name>
+```
+
+Which profile a run uses:
+- `sourcesConfig[].credentialName` on the `altdata-enrichment` node picks the profile; omitted means `default`.
+- `sourcesConfig[].testCredentialName` is used instead on test runs (`--test`, or a run flagged as test), e.g. the vendor's UAT credentials; omitted means test runs use `credentialName` too.
+- A per-run override wins over both fields above, but only a direct HTTP client can send it: the `X-Source-Credential-Overrides` header of `POST /v2/workflows/<id>/execute`, a JSON list such as `[{"taskAlias": "buro-pf", "sourceId": "MEX-PRI-0008", "credentialName": "uat"}]` (entries missing any of the three keys, or a malformed value, are ignored). `altscore api` sends no custom headers, so from the CLI pick the profile with `credentialName` / `testCredentialName` on the node instead.
+- A **named** profile (anything but `default`) has no fallback: if it does not exist for that version the source fails instead of quietly using other credentials.
+
+Traps:
+- **The version-less `/v2/workflows/sources/<sourceId>/credentials` endpoints are retired.** They wrote a record runs had stopped reading after the move to profiles, so a credential "updated" there changed nothing. Always write `.../credentials/profiles/<version>/<name>`.
+- A new source version needs its own profile; credentials are not copied across versions.
+- `check` exercises what is **stored**: save first, then check. A `404` from it means no profile exists for that `(version, name)`.
+- Sources with `credentialsScope: "endUser"` take the borrower's own credentials (`/v2/workflows/borrowers/<borrowerId>/sources/<sourceId>/credentials`), not tenant profiles.
